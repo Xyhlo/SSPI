@@ -145,6 +145,7 @@ namespace Orbis
     {
         public string ArchiveVolumes = "";
         public string ArchivePassword = "";
+        public string ResolutionError = "";
         public string SourceId = "";
         public string SourceVersion = "";
         public string CandidateId = "";
@@ -299,7 +300,12 @@ namespace Orbis
 
         static string ExtractVersion(string value)
         {
-            return NormalizeVersion(value);
+            if (string.IsNullOrWhiteSpace(value)) return "";
+            // Labels also contain firmware numbers; only explicit app-version markers count.
+            Match match = Regex.Match(value,
+                @"(?<![A-Za-z0-9])(?:v(?:er(?:sion)?)?\.?\s*|(?:update|patch)\s*[:=_-]?\s*v?)(?<v>\d{1,3}(?:\.\d{1,3}){1,3})(?![\d.])",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            return match.Success ? match.Groups["v"].Value : "";
         }
 
         static string Host(string url)

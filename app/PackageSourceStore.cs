@@ -78,6 +78,9 @@ namespace Orbis
                 // Commit the replacement before retiring the old source. A failed
                 // install leaves the current registry and sources usable.
                 var installed = Install(bytes);
+                object enable;
+                if (row.TryGetValue("enable", out enable) && Equals(enable, true))
+                    SetEnabled(installed.SourceId, true);
                 object replacements;
                 if (row.TryGetValue("replaces", out replacements) && replacements is System.Collections.IList)
                     foreach (var old in (System.Collections.IList)replacements)

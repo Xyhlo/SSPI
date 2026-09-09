@@ -1033,9 +1033,8 @@ namespace Orbis
                 if (!TryGetForegroundUser(out userId, out error))
                     return false;
 
-                // DLC/patch preflight: BGFT reports obscure task errors (e.g. 0x80991404)
-                // when the base title is absent or region-mismatched. Fail fast with a
-                // clear message instead of registering a task that cannot install.
+                // DLC/patch packages require an installed matching base title.
+                // Transport errors must be diagnosed separately from this check.
                 if ((subType == 7 || subType == 8) && !string.IsNullOrEmpty(titleId))
                 {
                     try
@@ -1210,7 +1209,7 @@ namespace Orbis
                 error = "BGFT loopback: invalid stable URL";
                 return false;
             }
-            return TryRegisterBgftWebDownload(contentUrl, titleId, contentId, contentName,
+            return TryRegisterBgftWebDownload(contentUrl + ".json", titleId, contentId, contentName,
                 subType, expectedSize, true, out taskId, out error, packageType);
         }
 
@@ -1226,7 +1225,7 @@ namespace Orbis
                 error = "BGFT loopback: invalid stable URL";
                 return false;
             }
-            return TryRegisterBgftWebDownload(contentUrl, titleId, contentId, contentName,
+            return TryRegisterBgftWebDownload(contentUrl + ".json", titleId, contentId, contentName,
                 subType, expectedSize, false, out taskId, out error);
         }
 

@@ -99,9 +99,8 @@ namespace Orbis
                 string.Equals(cfg.UnlockProviderId, NoneId, StringComparison.OrdinalIgnoreCase))
                 return hosterUrl;
             if (cancel != null && cancel()) throw new OperationCanceledException();
-            var hosts = DebridHostSupport.Load(cfg, id, true);
-            if (hosts != null && hosts.Supports(hosterUrl) == false)
-                throw new Exception(DebridHostSupport.UnsupportedMessage(cfg, hosterUrl, id));
+            // Host inventories can lag behind aliases and provider support. Let the
+            // selected provider resolve the actual URL and report its own result.
             if (string.Equals(id, DeepbridId, StringComparison.OrdinalIgnoreCase))
             {
                 if (!cfg.HasDeepbrid) throw new Exception("Connect Deepbrid in Settings");

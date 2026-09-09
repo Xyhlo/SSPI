@@ -74,6 +74,7 @@ namespace Orbis
 
             try { Window.Run(); }
             catch (Exception ex) { RecordFailure(ex); throw; }
+            finally { try { Window.Dispose(); } catch { } }
         }
 
         static readonly object FailureLock = new object();
@@ -99,13 +100,18 @@ namespace Orbis
             try
             {
                 string name = new AssemblyName(args.Name).Name;
-                if (name != "System.Buffers" && name != "System.Memory" &&
+                if (name != "SharpCompress" && name != "Microsoft.Bcl.AsyncInterfaces" &&
+                    name != "System.Text.Encoding.CodePages" && name != "System.Threading.Tasks.Extensions" &&
+                    name != "System.Buffers" && name != "System.Memory" &&
                     name != "System.Numerics.Vectors" && name != "System.Runtime.CompilerServices.Unsafe" &&
                     name != "System.ValueTuple" && name != "SixLabors.ImageSharp")
                     return null;
-                string root = Path.GetDirectoryName(typeof(Program).Assembly.Location);
-                string path = Path.Combine(Path.Combine(root, "mono"), Path.Combine("4.5", name + ".dll"));
-                return File.Exists(path) ? Assembly.LoadFrom(path) : null;
+                string location = null, mountedRoot = null, domainRoot = null;
+                try { location = typeof(Program).Assembly.Location; } catch { }
+                try { mountedRoot = Orbis.Internals.IO.GetAppBaseDirectory(); } catch { }
+                try { domainRoot = AppDomain.CurrentDomain.BaseDirectory; } catch { }
+                string path = FindBundledAssembly(name, location, mountedRoot, domainRoot);
+                return path != null ? Assembly.LoadFrom(path) : null;
             }
             catch { return null; }
         }
@@ -116,6 +122,23 @@ namespace Orbis
                 return;
             try { Window.HandleButton(e.Button); }
             catch (Exception ex) { RecordFailure(ex); }
+        }
+
+        internal static string FindBundledAssembly(string name, string location, string mountedRoot, string domainRoot)
+        {
+            string assemblyRoot = null;
+            try { if (!string.IsNullOrWhiteSpace(location)) assemblyRoot = Path.GetDirectoryName(location); } catch { }
+            foreach (string root in new[] { mountedRoot, assemblyRoot, domainRoot, "/app0" })
+            {
+                if (string.IsNullOrWhiteSpace(root)) continue;
+                try
+                {
+                    string path = Path.Combine(root, "mono", "4.5", name + ".dll");
+                    if (File.Exists(path)) return path;
+                }
+                catch { }
+            }
+            return null;
         }
     }
 }

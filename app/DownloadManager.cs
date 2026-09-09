@@ -162,6 +162,7 @@ namespace Orbis
         public int BgftDownloadCompletePolls;
         public int BgftCopyCompletePolls;
         public int BgftTitlePresentPolls;
+        public int BgftInstalledProofPolls;
         /// <summary>Done bytes last time progress advanced (stall detection).</summary>
         public long BgftLastProgressDone;
         public int BgftStallPolls;
@@ -247,6 +248,8 @@ namespace Orbis
         public string Enqueue(GameHit game, PackageCandidate candidate, out string message)
         {
             if (candidate == null) throw new Exception("Bad package candidate");
+            if (!string.IsNullOrWhiteSpace(candidate.ResolutionError))
+                throw new Exception(candidate.ResolutionError);
             if (candidate.ExpectedByteSize.HasValue && candidate.ExpectedByteSize.Value < 0)
                 throw new Exception("Invalid expected package size");
             if (!string.IsNullOrEmpty(candidate.ArchiveVolumes)) ArchiveVolumeSet.Decode(candidate.ArchiveVolumes);
@@ -2019,13 +2022,13 @@ namespace Orbis
 
             string bgftUrl = !string.IsNullOrEmpty(header.EffectiveUrl)
                 ? header.EffectiveUrl : direct;
-            if (ResidentDownloadService.HasDownloader)
+            if (ResidentDownloadService.HasDownloader && actualKind != PkgContentKind.BaseGame)
                 return HandoffResidentPackage(job, attempt, bgftUrl, actualTitleId, actualKindName, contentId, packageSize);
             // Only the version-acknowledged resident verifies the complete patch
             // before BGFT. Older/direct feeders must use the local verified path.
             if (actualKind == PkgContentKind.Patch) { SetFeederForegroundFallback(job, attempt, "Update requires full integrity verification"); return false; }
-            if (_cfg != null && _cfg.UseBgftDirect && _cfg.BgftDirectUrl &&
-                !ResidentDownloadService.HasDownloader &&
+            if (_cfg != null && _cfg.UseBgftDirect && _cfg.DownloadLimitMBps <= 0 &&
+                actualKind == PkgContentKind.BaseGame &&
                 !job.ForceLocalInstall && !string.IsNullOrEmpty(bgftUrl) &&
                 Encoding.UTF8.GetByteCount(bgftUrl) + 1 <= 0x800)
             {
@@ -2133,6 +2136,8 @@ namespace Orbis
                 }
             }
 
+            if (ResidentDownloadService.HasDownloader)
+                return HandoffResidentPackage(job, attempt, bgftUrl, actualTitleId, actualKindName, contentId, packageSize);
             // Only the acknowledged shell worker owns new native handoffs.
             SetFeederForegroundFallback(job, attempt, "Shell downloader is unavailable; keep Game Search open");
             return false;
@@ -3620,15 +3625,45 @@ namespace Orbis
 
         bool ConfirmInstalledUpdate(DlItem item)
         {
-            if (item == null || !item.BgftDownloadPhaseConfirmed || item.BgftCopyCompletePolls < 8 || string.IsNullOrEmpty(item.PackageVersion) ||
-                PkgValidator.BgftSubTypeForKind(item.Kind) != 8) return false;
-            string name, version, icon; InstalledTitleScan.ReadMeta(item.TitleId, out name, out version, out icon);
-            Version wanted, actual;
-            if (!Version.TryParse(item.PackageVersion.TrimStart('v', 'V'), out wanted) ||
-                !Version.TryParse(version.TrimStart('v', 'V'), out actual) || actual < wanted) return false;
+            if (item == null || !item.Background || item.State == DlState.Canceled ||
+                !string.IsNullOrEmpty(item.ArchiveVolumes) || PkgValidator.BgftSubTypeForKind(item.Kind) != 8) return false;
+            int attempt = item.AttemptId;
+            if (string.IsNullOrEmpty(item.PackageVersion))
+            {
+                try { item.PackageVersion = PkgIntegrity.SfoValue(PkgIntegrity.Entry(item.DestPath, 0x1000), "APP_VER"); }
+                catch { return false; }
+                if (string.IsNullOrEmpty(item.PackageVersion)) return false;
+            }
+            string version = null, installedPath = null;
+            foreach (string root in new[] { "/user/patch/", "/mnt/ext0/user/patch/" })
+            {
+                string installed = root + item.TitleId + "/patch.pkg";
+                if (!PkgInstallPolicy.MatchesInstalledContainer(item.DestPath, installed)) continue;
+                try
+                {
+                    byte[] sfo = PkgIntegrity.Entry(installed, 0x1000);
+                    Version wanted, actual;
+                    string candidate = PkgIntegrity.SfoValue(sfo, "APP_VER");
+                    if (PkgIntegrity.SfoValue(sfo, "CATEGORY") != "gp" ||
+                        !Version.TryParse(item.PackageVersion.TrimStart('v', 'V'), out wanted) ||
+                        !Version.TryParse(candidate.TrimStart('v', 'V'), out actual) || actual < wanted) continue;
+                    version = candidate; installedPath = installed; break;
+                }
+                catch { }
+            }
+            if (version == null) { item.BgftInstalledProofPolls = 0; return false; }
+            // BGFT reference-package totals can omit metadata. The promoted patch
+            // is stronger evidence than byte counters, feeder lifetime or an old error.
+            if (++item.BgftInstalledProofPolls < 8) return false;
+            string verificationError;
+            if (!PkgIntegrity.ValidatePatch(installedPath, item.TitleId, "", null, null, out verificationError))
+            { item.BgftInstalledProofPolls = 0; return false; }
             lock (_lock) {
+                if (!item.Background || item.AttemptId != attempt || item.State == DlState.Canceled) return false;
                 item.State = DlState.Installed; item.InstallConfirmed = true; item.InstallOrderReady = true;
+                item.Error = null;
                 item.StatusText = "Installed update v" + version; item.Done = item.Total; item.BytesPerSec = 0; item.EtaSeconds = 0;
+                if (item.ResidentArchive) { ResidentDownloadService.Release(item.Id); item.ResidentArchive = false; }
                 ClearBackground(item);
             }
             SaveManifest(); return true;
@@ -3704,14 +3739,17 @@ namespace Orbis
                 {
                     if (!item.Background) continue;
                     if (item.ResidentArchive || item.State == DlState.Downloading || item.State == DlState.Resolving ||
-                        item.State == DlState.Installing || item.State == DlState.Submitted)
+                        item.State == DlState.Installing || item.State == DlState.Submitted || item.State == DlState.Failed)
                         active.Add(item);
                 }
             }
 
             foreach (var item in active)
             {
+                if (ConfirmInstalledUpdate(item)) continue;
+                if (item.BgftInstalledProofPolls > 0) continue;
                 if (item.ResidentArchive) { RefreshResidentArchive(item); continue; }
+                if (item.State == DlState.Failed) continue;
                 string id;
                 int attempt;
                 int taskId;
@@ -3889,13 +3927,14 @@ namespace Orbis
                     }
                     else
                     {
-                        if (progress.LocalCopyPercent == 100 && ConfirmInstalledUpdate(cur)) { stateChanged = true; goto after_bgft_tick; }
                         const int StallPolls = 150;
+                        bool basePayloadComplete = PkgValidator.BgftSubTypeForKind(cur.Kind) == 6 &&
+                            progress.DownloadComplete && progress.Total > 0 && progress.LocalCopyPercent == 100;
                         if (!cur.BgftDownloadPhaseConfirmed)
                         {
                             long completeAt = expected > 0 ? expected - tol : long.MaxValue;
-                            bool nearDone = expected > 0 && progress.Done >= completeAt;
-                            if (!nearDone || (!cur.BgftDirect && !cur.BgftLoopbackServed))
+                            bool nearDone = basePayloadComplete || (expected > 0 && progress.Done >= completeAt);
+                            if (!nearDone || (!basePayloadComplete && !cur.BgftDirect && !cur.BgftLoopbackServed))
                             {
                                 if (nearDone || progress.Done <= cur.BgftLastProgressDone)
                                     cur.BgftStallPolls++;
@@ -3922,10 +3961,10 @@ namespace Orbis
                         // Credible download-complete candidate: totals match preflight size.
                         bool totalCredible = expected > 0 && progress.Total > 0 &&
                             progress.Total >= expected - tol && progress.Total <= expected + tol;
-                        bool dlCandidate = (cur.BgftLoopback || cur.BgftDirect) &&
+                        bool dlCandidate = basePayloadComplete || ((cur.BgftLoopback || cur.BgftDirect) &&
                             (cur.BgftDirect || cur.BgftLoopbackServed) &&
                             totalCredible && progress.Done >= progress.Total &&
-                            progress.Done >= expected - tol && progress.Done > 0;
+                            progress.Done >= expected - tol && progress.Done > 0);
                         // Install candidate only after download phase confirmed + copy 100.
                         bool copyCandidate = cur.BgftDownloadPhaseConfirmed &&
                             progress.LocalCopyPercent >= 100 &&
@@ -4063,6 +4102,7 @@ namespace Orbis
             item.BgftCopyCompletePolls = 0;
             item.BgftTitlePresentPolls = 0;
             item.BgftLastProgressDone = 0;
+            item.BgftInstalledProofPolls = 0;
             item.BgftStallPolls = 0;
             // Do not zero Done/Total here — foreground progress may already be mid-file.
         }

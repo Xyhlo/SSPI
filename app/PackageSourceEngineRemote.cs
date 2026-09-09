@@ -15,6 +15,7 @@ namespace Orbis
     {
         const int MaxRequests = 8;
         const int MaxResults = 100;
+        internal const int MaxPackages = 512;
         const int MaxResponseChars = 2 * 1024 * 1024;
         const int MaxConfigBytes = 256 * 1024;
         const int DeadlineSeconds = 60;
@@ -108,7 +109,7 @@ namespace Orbis
             if (rows == null) return output;
             foreach (object row in rows)
             {
-                if (output.Count >= MaxResults) break;
+                if (output.Count >= MaxPackages) break;
                 string packageUrl = Value(row, Field(fields, "url", "url"), "url", "packageUrl", "link");
                 Uri parsed;
                 if (!TryAbsoluteHttp(packageUrl, out parsed)) continue;
@@ -133,6 +134,7 @@ namespace Orbis
                     CandidateId = candidateId,
                     ArchiveVolumes = ReadVolumes(row, access),
                     ArchivePassword = Value(row, "archivePassword", "archivePassword") ?? "",
+                    ResolutionError = Value(row, "resolutionError", "resolutionError") ?? "",
                     TitleId = Value(row, Field(fields, "titleId", "titleid"), "titleId", "titleid") ?? titleId ?? "",
                     DisplayName = Value(row, Field(fields, "name", "name"), "name", "displayName") ?? name ?? "",
                     Region = Value(row, Field(fields, "region", "region"), "region") ?? region ?? "",

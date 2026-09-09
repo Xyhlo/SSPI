@@ -6,6 +6,7 @@ typedef struct {
     int size[4], ready[4];
     int stop, finished, result, request;
     int64_t remaining;
+    uint64_t read_us, read_calls;
     OrbisPthread thread;
 } GsStream;
 
@@ -35,9 +36,20 @@ static void *gs_stream_reader(void *opaque)
         if (__atomic_load_n(&stream->stop, __ATOMIC_ACQUIRE) || g_stop || gs_canceled || gs_paused) goto done;
         if (__atomic_load_n(&stream->ready[slot], __ATOMIC_ACQUIRE)) { sceKernelUsleep(500); continue; }
         int wanted = stream->remaining < GS_STREAM_BLOCK ? (int)stream->remaining : GS_STREAM_BLOCK;
-        int n = gs_read(stream->request, stream->data + slot * GS_STREAM_BLOCK, (uint32_t)wanted);
-        if (n <= 0 || n > wanted) goto done;
-        stream->size[slot] = n; stream->remaining -= n;
+        int filled = 0;
+        // TLS commonly returns one record (16 KiB). Coalesce those records before
+        // handing off to the unbuffered disk writer instead of making tiny writes.
+        while (filled < wanted) {
+            if (__atomic_load_n(&stream->stop, __ATOMIC_ACQUIRE) || g_stop || gs_canceled || gs_paused) goto done;
+            uint64_t read_at = gs_stream_clock();
+            int n = gs_read(stream->request, stream->data + slot * GS_STREAM_BLOCK + filled,
+                (uint32_t)(wanted - filled));
+            __atomic_fetch_add(&stream->read_us, gs_stream_clock() - read_at, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stream->read_calls, 1, __ATOMIC_RELAXED);
+            if (n <= 0 || n > wanted - filled) goto done;
+            filled += n;
+        }
+        stream->size[slot] = filled; stream->remaining -= filled;
         __atomic_store_n(&stream->ready[slot], 1, __ATOMIC_RELEASE);
         slot = (slot + 1) % 4;
     }
@@ -82,7 +94,9 @@ static int gs_stream_response(FILE *file, int64_t *committed, GsTransferHash *ha
     stream.request = request; stream.remaining = gs_job.total - *committed;
     if (scePthreadCreate(&stream.thread, NULL, gs_stream_reader, &stream, "sspi-stream")) goto done;
     started = 1;
-    uint64_t limit_at = gs_stream_clock(), now = limit_at, config_at = now;
+    uint64_t limit_at = gs_stream_clock(), now = limit_at, config_at = now, started_at = now, metrics_at = now;
+    uint64_t write_us = 0, hash_us = 0, checkpoint_us = 0, stage_at;
+    int64_t started_bytes = *committed;
     int64_t limit = gs_stream_limit(); double debt = 0; time_t checkpoint_at = time(NULL), status_at = 0;
     while (*committed < gs_job.total) {
         if (g_stop || gs_canceled || gs_paused) goto done;
@@ -91,16 +105,32 @@ static int gs_stream_response(FILE *file, int64_t *committed, GsTransferHash *ha
             sceKernelUsleep(500); continue;
         }
         unsigned char *data = stream.data + slot * GS_STREAM_BLOCK; size_t n = (size_t)stream.size[slot];
+        stage_at = gs_stream_clock();
         if (fwrite(data, 1, n, file) != n) goto done;
+        write_us += gs_stream_clock() - stage_at; stage_at = gs_stream_clock();
         if (*committed == 0) gs_transfer_hash_begin(hash, data, n);
         gs_transfer_hash_feed(hash, *committed, data, n); *committed += (int64_t)n; gs_done = *committed;
+        hash_us += gs_stream_clock() - stage_at;
         __atomic_store_n(&stream.ready[slot], 0, __ATOMIC_RELEASE); slot = (slot + 1) % 4;
         if (*committed - *durable >= 64LL * 1024 * 1024 || time(NULL) - checkpoint_at >= 5) {
+            stage_at = gs_stream_clock();
             if (gs_checkpoint(file, marker, identity, *committed)) goto done;
+            checkpoint_us += gs_stream_clock() - stage_at;
             *durable = *committed; checkpoint_at = time(NULL);
         }
         if (time(NULL) != status_at) { status_at = time(NULL); gs_write_status("feeding", NULL); }
         now = gs_stream_clock();
+        if (now - metrics_at >= 5000000) {
+            char metrics[768];
+            snprintf(metrics, sizeof(metrics), "transport=sceHttp-resident\nworker=" GS_WORKER_VERSION
+                "\nelapsed_ms=%llu\nbytes_written=%lld\nread_calls=%llu\nread_ms=%llu\nwrite_ms=%llu\nhash_ms=%llu\ncheckpoint_ms=%llu\nlimit_bytes_s=%lld\nblock_bytes=%d\nbuffer_count=4\n",
+                (unsigned long long)((now - started_at) / 1000), (long long)(*committed - started_bytes),
+                (unsigned long long)__atomic_load_n(&stream.read_calls, __ATOMIC_RELAXED),
+                (unsigned long long)(__atomic_load_n(&stream.read_us, __ATOMIC_RELAXED) / 1000),
+                (unsigned long long)(write_us / 1000), (unsigned long long)(hash_us / 1000),
+                (unsigned long long)(checkpoint_us / 1000), (long long)limit, GS_STREAM_BLOCK);
+            write_telemetry(GS_IPC_ROOT "/transfer-metrics.txt", metrics); metrics_at = now;
+        }
         if (now - config_at >= 1000000) { limit = gs_stream_limit(); config_at = now; debt = 0; }
         if (limit > 0) {
             debt -= (now - limit_at) * (double)limit / 1000000.0;

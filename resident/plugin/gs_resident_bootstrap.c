@@ -12,7 +12,7 @@
 #define GS_APP_VERSION "5.00"
 #endif
 #define GS_ROOT "/data/GameSearch/resident"
-#define GS_SHELL_PATH GS_ROOT "/gs_resident_shell_" GS_APP_VERSION "-r4.prx"
+#define GS_SHELL_PATH GS_ROOT "/gs_resident_shell_" GS_APP_VERSION "-r6.prx"
 
 __attribute__((visibility("default"))) const char *g_pluginName = "GameSearchBootstrap";
 __attribute__((visibility("default"))) const char *g_pluginDesc = "Starts the Game Search worker in SceShellUI";
@@ -32,7 +32,7 @@ static int shell_is_ready(void)
     char *line = fgets(capability, sizeof(capability), file);
     fclose(file);
     int64_t now = 621355968000000000LL + (int64_t)time(NULL) * 10000000LL;
-    return fields == 2 && line && !strcmp(version, GS_APP_VERSION "-r4") &&
+    return fields == 2 && line && !strcmp(version, GS_APP_VERSION "-r6") &&
         ticks <= now + 20000000LL && ticks >= now - 300000000LL &&
         strstr(capability, "host=shell ") && strstr(capability, "listener=1 ") && strstr(capability, "download=1");
 }

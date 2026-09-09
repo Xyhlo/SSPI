@@ -94,6 +94,7 @@ namespace Orbis
         readonly object _gate = new object();
         readonly string _bundledSourcesDirectory;
         PackageSourceStore _store;
+        internal string BundledSourceError { get; private set; }
 
         public PackageSourceRuntimeBridge() : this(ApplicationBaseDirectory()) { }
 
@@ -126,7 +127,15 @@ namespace Orbis
                 if (_store == null)
                 {
                     var store = new PackageSourceStore();
-                    store.ApplyBundledSources(_bundledSourcesDirectory);
+                    try { store.ApplyBundledSources(_bundledSourcesDirectory); }
+                    catch (Exception ex)
+                    {
+                        // An interrupted or invalid bundled update must not take
+                        // already-working installed catalogs offline.
+                        BundledSourceError = ex.Message;
+                        try { AtomicFile.WriteText(Path.Combine(AppSettings.DataDir, "source-bundle-error.txt"), ex.GetType().Name + ": " + ex.Message); } catch { }
+                        if (store.GetEnabledSources().Count == 0) throw;
+                    }
                     _store = store;
                 }
                 return _store;
@@ -257,7 +266,7 @@ namespace Orbis
             try
             {
                 PackageSourceCoordinator coordinator = Coordinator();
-                List<PackageCandidate> results = coordinator.Resolve(titleId, name, region, catalogUrl, 100);
+                List<PackageCandidate> results = coordinator.Resolve(titleId, name, region, catalogUrl, PackageSourceEngineRemote.MaxPackages);
                 LastPartialWarning = results.Count > 0
                     ? FailedSourceMessage(coordinator.LastReports) : null;
                 if (results.Count == 0)

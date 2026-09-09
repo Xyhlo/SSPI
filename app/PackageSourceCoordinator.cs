@@ -113,8 +113,8 @@ namespace Orbis
         public List<PackageCandidate> Resolve(string titleId, string name, string region,
             string catalogUrl, int limit)
         {
-            if (limit <= 0) limit = 100;
-            if (limit > 100) limit = 100;
+            if (limit <= 0) limit = PackageSourceEngineRemote.MaxPackages;
+            if (limit > PackageSourceEngineRemote.MaxPackages) limit = PackageSourceEngineRemote.MaxPackages;
             var request = new SourceResolveRequest
             {
                 TitleId = (titleId ?? "").Trim(),

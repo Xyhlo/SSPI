@@ -21,7 +21,7 @@
 #endif
 
 #define GS_PLUGIN_VERSION 0x00000103u
-#define GS_WORKER_VERSION GS_APP_VERSION "-r4"
+#define GS_WORKER_VERSION GS_APP_VERSION "-r6"
 #define GS_PORT 8742
 #define GS_IPC_ROOT "/data/GameSearch/resident"
 #define GS_SELFTEST_PATH GS_IPC_ROOT "/plugin-selftest.pkg"
@@ -254,6 +254,28 @@ static int has_pkg_magic(FILE *file)
     return magic[0] == 0x7f && magic[1] == 0x43 && magic[2] == 0x4e && magic[3] == 0x54;
 }
 
+static int serve_reference_json(int socket_id, const char *method, const char *source,
+    const char *piece_route, int64_t length)
+{
+    unsigned char digest[32]; char hex[65], document[1024], headers[192];
+    static const char digits[] = "0123456789abcdef";
+    FILE *file = fopen(source, "rb");
+    if (!file) return -1;
+    int valid = length >= 0x1000 && has_pkg_magic(file) && !fseek(file, 0xfe0, SEEK_SET) &&
+        fread(digest, 1, sizeof(digest), file) == sizeof(digest);
+    fclose(file); if (!valid) return -1;
+    for (int i = 0; i < 32; i++) { hex[i * 2] = digits[digest[i] >> 4]; hex[i * 2 + 1] = digits[digest[i] & 15]; }
+    hex[64] = 0;
+    int size = snprintf(document, sizeof(document),
+        "{\"originalFileSize\":%lld,\"packageDigest\":\"%s\",\"numberOfSplitFiles\":1,\"pieces\":[{\"url\":\"http://127.0.0.1:8742%s\",\"fileOffset\":0,\"fileSize\":%lld,\"hashValue\":\"0000000000000000000000000000000000000000\"}]}",
+        (long long)length, hex, piece_route, (long long)length);
+    if (size < 0 || size >= (int)sizeof(document)) return -1;
+    snprintf(headers, sizeof(headers), "Content-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\n", size);
+    send_head(socket_id, 200, "OK", headers);
+    if (strcmp(method, "HEAD")) send_all(socket_id, document, (size_t)size);
+    return 0;
+}
+
 #include "gs_resident_worker.inc"
 
 static void serve_client(int socket_id)
@@ -265,6 +287,8 @@ static void serve_client(int socket_id)
     char representation[768];
     char source[1024];
     char route[256];
+    char manifest_route[272];
+    int manifest = 0;
     int job_route = 0;
     const char *range_header;
     char *path;
@@ -297,9 +321,11 @@ static void serve_client(int socket_id)
     path = request_path(target);
     snprintf(source, sizeof(source), "%s", GS_SELFTEST_PATH);
     gs_package_url(route, sizeof(route), "");
+    snprintf(manifest_route, sizeof(manifest_route), "%s.json", route);
+    manifest = strcmp(path, manifest_route) == 0;
     if (strcmp(path, "/pkg/SELFTEST.pkg") != 0)
     {
-        if (!gs_job.id[0] || strcmp(path, route) != 0) {
+        if (!gs_job.id[0] || (strcmp(path, route) != 0 && !manifest)) {
             send_empty(socket_id, 404, "Not Found", NULL); return;
         }
         if (!gs_validated || gs_paused || gs_canceled) {
@@ -311,6 +337,11 @@ static void serve_client(int socket_id)
     if (stat(source, &info) != 0 || info.st_size < 4)
     {
         send_empty(socket_id, 404, "Not Found", NULL);
+        return;
+    }
+    if (manifest) {
+        if (serve_reference_json(socket_id, method, source, route, info.st_size))
+            send_empty(socket_id, 503, "Service Unavailable", "Retry-After: 1\r\n");
         return;
     }
     file = fopen(source, "rb");

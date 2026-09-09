@@ -666,8 +666,9 @@ namespace Orbis
                     using (var output = new FileStream(part, mode, FileAccess.Write, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
                     {
                         if (input == null) throw new IOException("Empty download stream");
-                        bytesReadThis = SequentialDownloadEngine.Copy(buffer => input.Read(buffer, 0, buffer.Length),
-                            output, expectedResponse, done, totalUi, progress, cancel);
+                        bytesReadThis = SequentialDownloadEngine.Copy((buffer, start, count) => input.Read(buffer, start, count),
+                            output, expectedResponse, done, totalUi, progress, cancel,
+                            metrics => File.WriteAllText(Path.Combine(AppSettings.DataDir, "managed-download-metrics.txt"), "transport=managed-http\n" + metrics));
                     }
                 }
             }

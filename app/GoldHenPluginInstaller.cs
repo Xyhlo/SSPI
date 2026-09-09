@@ -8,7 +8,7 @@ namespace Orbis
 {
     internal static class GoldHenPluginInstaller
     {
-        const string Version = "5.10-r4";
+        const string Version = "5.10-r6";
         const string GoldHenRoot = "/data/GoldHEN";
         const string PluginPath = "/data/GoldHEN/plugins/gs_resident_plugin.prx";
         const string PluginLine = PluginPath + "=true";
