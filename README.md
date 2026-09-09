@@ -6,14 +6,20 @@
 
 **Current version: 5.10 beta** · C# / Mono · SDL2 · Native C/C++ services
 
+[**Download the public beta**](https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta) · [**Join Discord**](https://discord.gg/hF2vw7ybRs) · [**Report a bug**](https://github.com/Xyhlo/SSPI/issues)
+
+**TorBox and Real-Debrid are the only supported download options in this beta. You need your own service account and API key.** Download `sspi5.10b.pkg` from the release assets; GitHub's source archives are not installable PS4 packages.
+
+This is an early public test, not a stable release. The current build has worked well in a small testing group after several rounds of fixes, but other setups may expose launch failures, extraction errors or installation bugs. Reports from different consoles and firmware versions will help improve it.
+
 This repository is the PS4 application. The [PS5 application](https://github.com/Xyhlo/SSPI-PS5) and [Windows Manager](https://github.com/Xyhlo/SSPI-Windows-Manager) have separate codebases.
 
 ## Features
 
 - **Search by name or CUSA ID.** Browse regions, cover artwork and the installed library.
 - **Compare package types.** Base games, updates, backports and DLC are grouped with versions, firmware requirements, sizes and mirrors when the source supplies them.
-- **SuperPSX 2.0 integration.** The current local beta package includes the source descriptor and installs it on first launch. Search and resolution use a JSON API through the source engine.
-- **Real-Debrid, TorBox and direct links.** Configure a service from your phone or use direct URLs. All source-provided mirrors remain visible; choosing a mirror does not guarantee that your service supports it.
+- **SuperPSX 2.0 integration.** The beta package includes the source descriptor and installs it on first launch. Search and resolution use a JSON API through the source engine.
+- **Real-Debrid and TorBox.** Configure your service from your phone. All source-provided mirrors remain visible; choosing a mirror does not guarantee that your service supports it. Direct-link code remains in the application but is outside this beta's supported download options.
 - **Downloads grouped by game.** See progress, speed, remaining time and individual queued files. Pause, cancel or retry from the controller's contextual action row.
 - **Archive handling.** Download ordered multipart archives, extract supported RAR/ZIP packages, and retain recoverable files when installation needs a retry.
 - **PS4 installation support.** Use BGFT and the optional resident worker where the console supports them, with package validation and installed-content checks.
@@ -22,11 +28,11 @@ This repository is the PS4 application. The [PS5 application](https://github.com
 
 ## Getting started
 
-You need a PS4 that can run homebrew, network access, free storage for downloads and extraction, and a compatible local SSPI package. Debrid credentials are optional and belong to the service you choose.
+You need a PS4 that can run homebrew, network access, free storage for downloads and extraction, the SSPI beta package, and your own TorBox or Real-Debrid account and API key.
 
-1. Install the SSPI PKG using your console's package installer and launch it.
-2. Open **Settings → Connections**. Scan the QR code with a phone on the same local network to configure Real-Debrid or TorBox, or select **Direct links**.
-3. Open **Manage sources** and check that the source you want is enabled. SuperPSX 2.0 is bundled with the current local beta; existing choices to disable or remove it are preserved.
+1. Download `sspi5.10b.pkg` from the [beta release](https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta), install it using your console's package installer and launch it.
+2. Open **Settings → Connections**. Scan the QR code with a phone on the same local network to configure Real-Debrid or TorBox.
+3. Open **Manage sources** and check that the source you want is enabled. SuperPSX 2.0 is bundled with the beta; existing choices to disable or remove it are preserved.
 4. Search for a title, select the correct CUSA/region, then choose a package or mirror. Use **Queue recommended** when the available metadata is sufficient.
 5. Follow progress in **Downloads**. Open **Files** to inspect the base package, update/backport and DLC individually.
 
@@ -76,7 +82,7 @@ Shell-resident downloads require the relevant GoldHEN process/plugin capabilitie
 - A host being listed does not mean a debrid service can unlock it. Service availability, account limits and unsupported hosts can still require a different mirror.
 - Large archives need space for both their downloaded volumes and extracted files.
 - A patch integrity-verification failure can leave the resident status at **Installing** instead of reaching its error handler. Further recovery handling is needed for that failure path; a full progress bar alone is not installation proof.
-- The current supplied SDK/runtime bundle has unresolved public redistribution provenance. This GitHub repository publishes selected source, not a cleared public PKG. See [third-party notices](THIRD_PARTY_NOTICES.md).
+- The supplied SDK/runtime bundle has unresolved redistribution provenance recorded in the [third-party notices](THIRD_PARTY_NOTICES.md). Availability of the beta download does not resolve those recorded issues.
 
 ## Source layout
 
@@ -116,7 +122,7 @@ The main native bootstrap is currently a supplied SDK input. Building the manage
 
 ## Reporting problems
 
-Open an [issue](https://github.com/Xyhlo/SSPI/issues) with:
+Use the [Discord community](https://discord.gg/hF2vw7ybRs) for testing discussion, or open an [issue](https://github.com/Xyhlo/SSPI/issues) with:
 
 - The footer's beta version and build ID.
 - PS4 model, firmware and GoldHEN version.
