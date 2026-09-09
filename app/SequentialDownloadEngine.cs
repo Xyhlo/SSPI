@@ -43,13 +43,26 @@ namespace Orbis
         public static long Copy(Func<byte[], int> read, Stream output, long expectedBytes,
             long offset, long total, Action<long, long> progress, Func<bool> cancel)
         {
+            return CopyCore((buffer, start, count) => read(buffer), false, output,
+                expectedBytes, offset, total, progress, cancel, null);
+        }
+
+        public static long Copy(Func<byte[], int, int, int> read, Stream output, long expectedBytes,
+            long offset, long total, Action<long, long> progress, Func<bool> cancel, Action<string> diagnostic = null)
+        {
+            return CopyCore(read, true, output, expectedBytes, offset, total, progress, cancel, diagnostic);
+        }
+
+        static long CopyCore(Func<byte[], int, int, int> read, bool coalesce, Stream output, long expectedBytes,
+            long offset, long total, Action<long, long> progress, Func<bool> cancel, Action<string> diagnostic)
+        {
             using (var free = new BlockingCollection<Block>(4))
             using (var pending = new BlockingCollection<Block>(4))
             using (var stopped = new ManualResetEvent(false))
             {
                 for (int i = 0; i < 4; i++) free.Add(new Block());
                 Exception writerError = null;
-                long written = 0;
+                long written = 0, writeTicks = 0, readTicks = 0, readCalls = 0;
                 var writer = new Thread(() =>
                 {
                     try
@@ -57,7 +70,9 @@ namespace Orbis
                         foreach (var block in pending.GetConsumingEnumerable())
                         {
                             if (stopped.WaitOne(0)) break;
+                            long writeAt = Stopwatch.GetTimestamp();
                             output.Write(block.Data, 0, block.Count);
+                            Interlocked.Add(ref writeTicks, Stopwatch.GetTimestamp() - writeAt);
                             Interlocked.Add(ref written, block.Count);
                             free.Add(block);
                         }
@@ -67,7 +82,7 @@ namespace Orbis
                 }) { IsBackground = true, Name = "SSPI sequential disk writer" };
                 writer.Start();
                 var watch = Stopwatch.StartNew();
-                long received = 0, lastProgress = -100;
+                long received = 0, lastProgress = -100, lastDiagnostic = 0;
                 double budget = 0;
                 long budgetAt = 0;
                 try
@@ -78,8 +93,23 @@ namespace Orbis
                         if (cancel != null && cancel()) throw new OperationCanceledException("paused");
                         Block block;
                         if (!free.TryTake(out block, 25)) continue;
-                        int n = read(block.Data);
-                        if (n < 0 || n > block.Data.Length) throw new IOException("Invalid download read length");
+                        int n = 0;
+                        // Fill the bounded block: a TLS record is usually only 16 KiB.
+                        // Publishing each record reduced the effective read-ahead to 64 KiB.
+                        do
+                        {
+                            if (writerError != null) throw new IOException("Download storage failed", writerError);
+                            if (cancel != null && cancel()) throw new OperationCanceledException("paused");
+                            long readAt = Stopwatch.GetTimestamp();
+                            int got = read(block.Data, n, block.Data.Length - n);
+                            readTicks += Stopwatch.GetTimestamp() - readAt;
+                            readCalls++;
+                            if (got < 0 || got > block.Data.Length - n) throw new IOException("Invalid download read length");
+                            if (got == 0) break;
+                            n += got;
+                            if (expectedBytes >= 0 && received + n > expectedBytes)
+                                throw new IOException("Response exceeds its declared length");
+                        } while (coalesce && n < block.Data.Length);
                         if (n == 0) { free.Add(block); break; }
                         received = checked(received + n);
                         if (expectedBytes >= 0 && received > expectedBytes)
@@ -112,6 +142,16 @@ namespace Orbis
                         {
                             progress(offset + Interlocked.Read(ref written), total);
                             lastProgress = watch.ElapsedMilliseconds;
+                        }
+                        if (diagnostic != null && watch.ElapsedMilliseconds - lastDiagnostic >= 5000)
+                        {
+                            try { diagnostic("elapsed_ms=" + watch.ElapsedMilliseconds + "\nbytes_written=" + Interlocked.Read(ref written) +
+                                "\nread_calls=" + readCalls + "\nread_ms=" + readTicks * 1000 / Stopwatch.Frequency +
+                                "\nwrite_ms=" + Interlocked.Read(ref writeTicks) * 1000 / Stopwatch.Frequency +
+                                "\nlimit_bytes_s=" + LimitBytesPerSecond + "\nblock_bytes=524288\nbuffer_count=4\n"); }
+                            catch (IOException) { }
+                            catch (UnauthorizedAccessException) { }
+                            lastDiagnostic = watch.ElapsedMilliseconds;
                         }
                     }
                     pending.CompleteAdding();

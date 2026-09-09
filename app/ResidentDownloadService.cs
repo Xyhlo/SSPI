@@ -28,7 +28,7 @@ namespace Orbis
 
     internal static class ResidentDownloadService
     {
-        const string Version = "5.10-r4";
+        const string Version = "5.10-r6";
         const string HostDaemonTitleId = "NPXS20119";
         const int LncAppNotFound = unchecked((int)0x80940005);
         const long SystemAuthId = 0x3800000000000010;

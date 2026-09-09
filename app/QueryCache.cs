@@ -82,7 +82,8 @@ namespace Orbis
                         AccessType = ParseAccess(p[12]), SourceVersion = p[14],
                         ExpectedSha256 = p[15], ExpectedContentId = p[16], SourcePageUrl = p[17],
                         ArchiveVolumes = p[18], RequiredFirmware = p.Length > 20 ? p[20] : "",
-                        ArchivePassword = p.Length > 21 ? p[21] : ""
+                        ArchivePassword = p.Length > 21 ? p[21] : "",
+                        ResolutionError = p.Length > 22 ? p[22] : ""
                     };
                     if (long.TryParse(p[13], NumberStyles.Integer, CultureInfo.InvariantCulture, out size) && size > 0)
                         cand.ExpectedByteSize = size;
@@ -118,7 +119,8 @@ namespace Orbis
                     .Append(Esc(c.ExpectedContentId)).Append('\t').Append(Esc(c.SourcePageUrl)).Append('\t')
                     .Append(Esc(c.ArchiveVolumes)).Append('\t')
                     .Append(c.ExpiresUtc.HasValue ? c.ExpiresUtc.Value.ToUniversalTime().ToString("o") : "").Append('\t')
-                    .Append(Esc(c.RequiredFirmware)).Append('\t').Append(Esc(c.ArchivePassword)).Append('\n');
+                    .Append(Esc(c.RequiredFirmware)).Append('\t').Append(Esc(c.ArchivePassword)).Append('\t')
+                    .Append(Esc(c.ResolutionError)).Append('\n');
             }
             Write("r-" + Key(sourceStamp + "|" + titleId), sb.ToString());
         }

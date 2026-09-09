@@ -254,10 +254,30 @@ namespace Orbis
 
             string path = RequestPath(first[1]);
             Entry entry;
-            lock (_gate) entry = _active != null && _active.Route == path ? _active : null;
+            bool manifest;
+            lock (_gate)
+            {
+                manifest = _active != null && _active.Route + ".json" == path;
+                entry = _active != null && (_active.Route == path || manifest) ? _active : null;
+            }
             if (entry == null)
             {
                 WriteEmpty(stream, 404, "Not Found", null);
+                return;
+            }
+
+            if (manifest)
+            {
+                byte[] document;
+                if (!TryReferencePackage(entry, out document))
+                {
+                    WriteEmpty(stream, 503, "Service Unavailable", "Retry-After: 1\r\n");
+                    return;
+                }
+                WriteHead(stream, 200, "OK", "Content-Type: application/json\r\nContent-Length: " +
+                    document.Length + "\r\nCache-Control: no-store\r\n");
+                if (method != "HEAD") stream.Write(document, 0, document.Length);
+                stream.Flush();
                 return;
             }
 
@@ -443,10 +463,40 @@ namespace Orbis
 
         static string RequestPath(string target)
         {
+            // An origin-form HTTP target is not a file URI. Mono/.NET otherwise
+            // escapes '?' into the path and BGFT's optional query causes a 404.
+            if (target.StartsWith("/", StringComparison.Ordinal))
+            {
+                int query = target.IndexOf('?');
+                return query < 0 ? target : target.Substring(0, query);
+            }
             Uri absolute;
-            if (Uri.TryCreate(target, UriKind.Absolute, out absolute)) return absolute.AbsolutePath;
-            int query = target.IndexOf('?');
-            return query < 0 ? target : target.Substring(0, query);
+            return Uri.TryCreate(target, UriKind.Absolute, out absolute) &&
+                (absolute.Scheme == "http" || absolute.Scheme == "https") ? absolute.AbsolutePath : "";
+        }
+
+        bool TryReferencePackage(Entry entry, out byte[] document)
+        {
+            document = null;
+            if (!entry.Complete || entry.Failed || entry.Length < 0x1000) return false;
+            FileStream file;
+            if (!TryOpen(entry, entry.Length, out file)) return false;
+            using (file)
+            {
+                if (file.Length != entry.Length || !HasPkgMagic(file)) return false;
+                file.Position = 0xFE0;
+                byte[] digest = new byte[32];
+                if (file.Read(digest, 0, digest.Length) != digest.Length) return false;
+                string hex = BitConverter.ToString(digest).Replace("-", "").ToLowerInvariant();
+                // BGFT consumes the reference JSON even for a single local PKG,
+                // following flatz's Remote Package Installer reference format.
+                string json = "{\"originalFileSize\":" + entry.Length +
+                    ",\"packageDigest\":\"" + hex + "\",\"numberOfSplitFiles\":1,\"pieces\":[{\"url\":\"" +
+                    BuildUrl(entry.Route) + "\",\"fileOffset\":0,\"fileSize\":" + entry.Length +
+                    ",\"hashValue\":\"0000000000000000000000000000000000000000\"}]}";
+                document = Encoding.UTF8.GetBytes(json);
+                return true;
+            }
         }
 
         static string RepresentationHeaders(Entry entry, bool partial, long start, long end)

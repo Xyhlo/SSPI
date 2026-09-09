@@ -1109,12 +1109,13 @@ namespace Orbis
                     var mode = append ? FileMode.Append : FileMode.Create;
                     using (var fs = new FileStream(part, mode, FileAccess.Write, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
                     {
-                        bytesReadThis = SequentialDownloadEngine.Copy(buffer =>
+                        bytesReadThis = SequentialDownloadEngine.Copy((buffer, start, count) =>
                         {
-                            int n = sceHttpReadData(req, buffer, (uint)buffer.Length);
+                            int n = ReadDownloadBlock(req, buffer, start, count);
                             if (n < 0) throw new IOException("sceHttpReadData 0x" + n.ToString("X"));
                             return n;
-                        }, fs, expectedResponse, done, totalUi, progress, cancel);
+                        }, fs, expectedResponse, done, totalUi, progress, cancel,
+                            metrics => File.WriteAllText(Path.Combine(AppSettings.DataDir, "native-download-metrics.txt"), "transport=sceHttp-managed-writer\n" + metrics));
                     }
 
                     if (expectedResponse >= 0 && bytesReadThis != expectedResponse)
@@ -1531,6 +1532,15 @@ namespace Orbis
 
         [DllImport("libSceHttp", EntryPoint = "sceHttpReadData", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceHttpReadData(int reqId, byte[] data, uint size);
+
+        [DllImport("libSceHttp", EntryPoint = "sceHttpReadData", CallingConvention = CallingConvention.Cdecl)]
+        static extern int sceHttpReadDataPointer(int reqId, IntPtr data, uint size);
+
+        static unsafe int ReadDownloadBlock(int request, byte[] buffer, int offset, int count)
+        {
+            fixed (byte* data = buffer)
+                return sceHttpReadDataPointer(request, (IntPtr)(data + offset), (uint)count);
+        }
 
         [DllImport("libSceHttp", EntryPoint = "sceHttpGetAllResponseHeaders", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceHttpGetAllResponseHeaders(int reqId, out IntPtr header, out UIntPtr headerSize);

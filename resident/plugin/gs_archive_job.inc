@@ -292,10 +292,33 @@ static int gs_patch_matches_installed(void)
     return 0; /* Missing optional metadata is not a mismatching content ID. */
 }
 
+static int gs_installed_patch_matches(const char *source, int wanted, char *matched, size_t capacity)
+{
+    const char *roots[] = { "/user/patch", "/mnt/ext0/user/patch" };
+    unsigned char a[4096], b[4096]; char path[256], version[32]; struct stat sa, sb;
+    FILE *input = fopen(source, "rb"); if (!input) return 0;
+    if (fstat(fileno(input), &sa) || sa.st_size < 4096) { fclose(input); return 0; }
+    for (int root = 0; root < 2; root++) {
+        snprintf(path, sizeof(path), "%s/%s/patch.pkg", roots[root], gs_job.title);
+        FILE *installed = fopen(path, "rb"); if (!installed) continue;
+        int matches = !fstat(fileno(installed), &sb) && S_ISREG(sb.st_mode) && sa.st_size == sb.st_size;
+        if (matches) matches = !fseek(input, 0, SEEK_SET) && fread(a, 1, sizeof(a), input) == sizeof(a) &&
+            fread(b, 1, sizeof(b), installed) == sizeof(b) && !memcmp(a, "\x7f" "CNT", 4) && !memcmp(a, b, sizeof(a));
+        if (matches) matches = !fseek(input, sa.st_size - sizeof(a), SEEK_SET) && !fseek(installed, sb.st_size - sizeof(b), SEEK_SET) &&
+            fread(a, 1, sizeof(a), input) == sizeof(a) && fread(b, 1, sizeof(b), installed) == sizeof(b) && !memcmp(a, b, sizeof(a));
+        fclose(installed);
+        if (matches && !gs_pkg_sfo(path, "APP_VER", version, sizeof(version)) && gs_version_number(version) >= wanted) {
+            snprintf(matched, capacity, "%s", path);
+            fclose(input); return 1;
+        }
+    }
+    fclose(input); return 0;
+}
+
 static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
 {
-    char journal[1150], record[256], route[256], id[49]; FILE *file; int task = -1, complete = 0, pending = 0, route_version = 5;
-    int bgft, app, users, user = -1, exists = 0, rc, stable = 0, poll_misses = 0;
+    char journal[1150], record[256], route[256], id[49]; FILE *file; int task = -1, complete = 0, pending = 0, route_version = 6;
+    int bgft, app, users, user = -1, exists = 0, rc, stable = 0, poll_misses = 0, installed_stable = 0;
     int (*init)(void *), (*user_init)(void *), (*get_user)(int *), (*app_init)(void), (*app_exists)(const char *, int *);
     int (*reg)(GsBgftParam *, int *), (*start)(int), (*get_progress)(int, GsBgftProgress *);
     GsBgftParam param; struct { void *heap; size_t size; } heap;
@@ -327,12 +350,24 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     file = fopen(journal, "rb");
     if (file) {
         int fields = fscanf(file, "%48s %d %d %d %d", id, &task, &complete, &pending, &route_version); fclose(file);
-        if ((fields != 4 && fields != 5) || (fields == 5 && route_version != 4 && route_version != 5) ||
+        if ((fields != 4 && fields != 5) || (fields == 5 && route_version != 4 && route_version != 5 && route_version != 6) ||
             strcmp(id, gs_job.content) || (pending && task < 0)) return -1;
         if (complete) return 0;
         // A pre-5.09 task owns the old URL until it completes. New registrations
         // always use a distinct URL for each extracted PKG.
         if (task >= 0 && (fields == 4 || route_version == 4)) { route_version = 4; gs_package_legacy_route = 1; }
+    }
+    // Rebuild only a journal-owned legacy task that has already failed with
+    // HTTP 404. Running tasks retain their original route until completion.
+    if (task >= 0 && route_version < 6) {
+        GsBgftProgress prior = {0};
+        if (!get_progress(task, &prior) && (uint32_t)prior.error == 0x80991404u) {
+            gs_archive_task = task;
+            if (gs_cancel_task()) {
+                gs_write_status("failed", "Failed legacy install could not be removed. PKG retained."); return -1;
+            }
+            task = -1;
+        }
     }
     // A title can appear before its BGFT task finishes copying. A saved task
     // still owns this file/route and must be reattached before advancing.
@@ -341,10 +376,14 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     if (task < 0) {
         if (g_stop || gs_canceled) return -1;
         // Persist intent before registration; an interrupted register is never blindly retried.
-        gs_package_legacy_route = 0; route_version = 5;
-        snprintf(record, sizeof(record), "%s -1 0 1 5", gs_job.content);
+        gs_package_legacy_route = 0; route_version = 6;
+        snprintf(record, sizeof(record), "%s -1 0 1 6", gs_job.content);
         if (write_atomic(journal, record)) return -1;
         gs_package_url(route, sizeof(route), "http://127.0.0.1:8742");
+        // BGFT registration consumes reference-package JSON, not raw PKG bytes.
+        // The piece URL inside this document remains the stable .pkg route.
+        if (strlen(route) + 5 >= sizeof(route)) return -1;
+        strcat(route, ".json");
         memset(&param, 0, sizeof(param));
         param.user = user; param.entitlement = 5; param.id = gs_job.content; param.url = route;
         param.name = gs_job.title; param.icon = ""; param.option = 0x10000;
@@ -356,7 +395,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         if (task < 0) {
             char error[160]; snprintf(error, sizeof(error), "PS4 registration failed: BGFT 0x%08X. PKG retained.", (unsigned int)rc);
             // Registration returned without creating a task. Clear only our intent.
-            snprintf(record, sizeof(record), "%s -1 0 0 5", gs_job.content);
+            snprintf(record, sizeof(record), "%s -1 0 0 6", gs_job.content);
             write_atomic(journal, record);
             gs_write_status("failed", error); return -1;
         }
@@ -385,6 +424,25 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         }
     }
     while (!g_stop && !gs_canceled) {
+        // The promoted patch plus its exact package identity takes precedence over
+        // stale BGFT counters/errors. Reference JSON totals can exclude metadata.
+        char installed_path[256];
+        if (kind == 8 && gs_installed_patch_matches(gs_job.destination, wanted, installed_path, sizeof(installed_path))) {
+            if (++installed_stable >= 8) {
+                // The transfer hash certifies our source file, not BGFT's installed
+                // destination. Verify the installed image once before releasing it.
+                int transferred_verified = gs_transfer_verified; gs_transfer_verified = 0;
+                int verified = gs_verify_package(installed_path, 8); gs_transfer_verified = transferred_verified;
+                if (verified) { installed_stable = 0; gs_write_status("installing", NULL); sceKernelUsleep(500000); continue; }
+                gs_done = gs_job.total;
+                snprintf(record, sizeof(record), "%s %d 1 0 %d", gs_job.content, task, route_version);
+                int saved = write_atomic(journal, record);
+                if (!saved) gs_archive_task = -1;
+                return saved;
+            }
+            sceKernelUsleep(500000); continue;
+        }
+        installed_stable = 0;
         GsBgftProgress p = {0};
         rc = get_progress(task, &p);
         if (rc) {
@@ -406,7 +464,9 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         // Copy percentage alone has produced false completion on hardware. Require
         // the whole PKG to have been served or counted by this owned BGFT task.
         uint64_t transferred = p.transferred_total ? p.transferred_total : p.transferred;
-        if (p.copy >= 100 && (gs_served || transferred >= (uint64_t)gs_job.total)) stable++;
+        uint64_t payload = p.length_total ? p.length_total : p.length;
+        int base_payload_complete = kind == 6 && payload > 0 && transferred >= payload;
+        if (p.copy >= 100 && (base_payload_complete || gs_served || transferred >= (uint64_t)gs_job.total)) stable++;
         else stable = 0;
         if (stable >= 8) {
             int confirmed = kind == 6 ? (!app_exists(gs_job.title, &exists) && exists)
@@ -447,7 +507,7 @@ static int gs_cancel_task(void)
     int rc = remove(gs_archive_task);
     if (rc && (uint32_t)rc != 0x80990019u) return -1;
     if (gs_archive_journal[0]) {
-        char record[96]; snprintf(record, sizeof(record), "%s -1 0 0 5", gs_job.content);
+        char record[96]; snprintf(record, sizeof(record), "%s -1 0 0 6", gs_job.content);
         if (write_atomic(gs_archive_journal, record)) return -1;
     }
     gs_archive_task = -1; return 0;

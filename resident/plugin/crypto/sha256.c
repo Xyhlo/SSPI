@@ -46,7 +46,7 @@ void sha256_transform(SHA256_CTX *ctx, const BYTE data[])
 	WORD a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
 
 	for (i = 0, j = 0; i < 16; ++i, j += 4)
-		m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
+		m[i] = ((WORD)data[j] << 24) | ((WORD)data[j + 1] << 16) | ((WORD)data[j + 2] << 8) | data[j + 3];
 	for ( ; i < 64; ++i)
 		m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
 
@@ -98,16 +98,31 @@ void sha256_init(SHA256_CTX *ctx)
 
 void sha256_update(SHA256_CTX *ctx, const BYTE data[], size_t len)
 {
-	WORD i;
-
-	for (i = 0; i < len; ++i) {
-		ctx->data[ctx->datalen] = data[i];
-		ctx->datalen++;
+	if (!len) return;
+	if (ctx->datalen) {
+		size_t needed = 64 - ctx->datalen;
+		size_t take = len < needed ? len : needed;
+		memcpy(ctx->data + ctx->datalen, data, take);
+		ctx->datalen += (WORD)take;
+		data += take;
+		len -= take;
 		if (ctx->datalen == 64) {
 			sha256_transform(ctx, ctx->data);
 			ctx->bitlen += 512;
 			ctx->datalen = 0;
 		}
+	}
+	// Download buffers already contain complete blocks; avoid copying each byte
+	// through the context before hashing it on the PS4's low-power CPU.
+	while (len >= 64) {
+		sha256_transform(ctx, data);
+		ctx->bitlen += 512;
+		data += 64;
+		len -= 64;
+	}
+	if (len) {
+		memcpy(ctx->data, data, len);
+		ctx->datalen = (WORD)len;
 	}
 }
 
