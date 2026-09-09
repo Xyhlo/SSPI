@@ -18,7 +18,7 @@ This repository is the PS4 application. The [PS5 application](https://github.com
 
 - **Search by name or CUSA ID.** Browse regions, cover artwork and the installed library.
 - **Compare package types.** Base games, updates, backports and DLC are grouped with versions, firmware requirements, sizes and mirrors when the source supplies them.
-- **SuperPSX 2.0 integration.** The beta package includes the source descriptor and installs it on first launch. Search and resolution use a JSON API through the source engine.
+- **Bundled source integration.** The beta package includes a source descriptor and installs it on first launch. Search and resolution use a JSON API through the source engine.
 - **Real-Debrid and TorBox.** Configure your service from your phone. All source-provided mirrors remain visible; choosing a mirror does not guarantee that your service supports it. Direct-link code remains in the application but is outside this beta's supported download options.
 - **Downloads grouped by game.** See progress, speed, remaining time and individual queued files. Pause, cancel or retry from the controller's contextual action row.
 - **Archive handling.** Download ordered multipart archives, extract supported RAR/ZIP packages, and retain recoverable files when installation needs a retry.
@@ -32,7 +32,7 @@ You need a PS4 that can run homebrew, network access, free storage for downloads
 
 1. Download `sspi5.10b.pkg` from the [beta release](https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta), install it using your console's package installer and launch it.
 2. Open **Settings → Connections**. Scan the QR code with a phone on the same local network to configure Real-Debrid or TorBox.
-3. Open **Manage sources** and check that the source you want is enabled. SuperPSX 2.0 is bundled with the beta; existing choices to disable or remove it are preserved.
+3. Open **Manage sources** and check that the source you want is enabled. A source is bundled with the beta; existing choices to disable or remove it are preserved.
 4. Search for a title, select the correct CUSA/region, then choose a package or mirror. Use **Queue recommended** when the available metadata is sufficient.
 5. Follow progress in **Downloads**. Open **Files** to inspect the base package, update/backport and DLC individually.
 
@@ -78,7 +78,7 @@ Shell-resident downloads require the relevant GoldHEN process/plugin capabilitie
 
 ### Known limits
 
-- Sources can omit metadata, remove mirrors or return incomplete results. SuperPSX 2.0 integration is not a promise that every catalog entry resolves. An exact-region result is never replaced silently by another region.
+- Sources can omit metadata, remove mirrors or return incomplete results. A bundled connector does not guarantee that every catalog entry resolves. An exact-region result is never replaced silently by another region.
 - A host being listed does not mean a debrid service can unlock it. Service availability, account limits and unsupported hosts can still require a different mirror.
 - Large archives need space for both their downloaded volumes and extracted files.
 - A patch integrity-verification failure can leave the resident status at **Installing** instead of reaching its error handler. Further recovery handling is needed for that failure path; a full progress bar alone is not installation proof.
@@ -108,7 +108,7 @@ The PS4 build uses:
 - LLVM, Python 3 and the .NET runtime used by the local packaging tools.
 - OpenOrbis headers, libraries and packaging support in `SDK/`.
 - The supplied Mono/native runtime, SDL2-CS/ImageSharp dependencies, SQLite and UnRAR inputs, plus the pinned HTTPS dependencies.
-- Local runtime assets, the SuperPSX source descriptor and package provenance records.
+- Local runtime assets, the bundled source descriptor and package provenance records.
 
 With those inputs available, run from the complete PS4 working directory:
 
