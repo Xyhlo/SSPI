@@ -37,6 +37,9 @@ namespace Orbis
         public string AllDebridApiKey = "";
         public string TorBoxApiKey = "";
         public bool ShowFirmwareHints = true;
+        public bool BackgroundMusic = true;
+        public bool InterfaceSounds = true;
+        public int AudioVolume = 35;
         public string UnlockProviderId = UnlockProviders.RealDebridId;
         public bool UseUnlockProvider = true;
         public string ApiBaseUrl = "";
@@ -186,6 +189,9 @@ namespace Orbis
                     string key = line.Substring(0, eq).Trim();
                     string val = line.Substring(eq + 1).Trim();
                     if (Eq(key, "firmware_hints")) ShowFirmwareHints = IsTrue(val);
+                    else if (Eq(key, "background_music")) BackgroundMusic = IsTrue(val);
+                    else if (Eq(key, "interface_sounds")) InterfaceSounds = IsTrue(val);
+                    else if (Eq(key, "audio_volume")) { int volume; if (int.TryParse(val, out volume)) AudioVolume = Math.Max(0, Math.Min(100, volume)); }
                     else if (Eq(key, "connection_mbps")) { int speed; if (int.TryParse(val, out speed)) ConnectionMbps = Math.Max(0, Math.Min(10000, speed)); }
                     else if (Eq(key, "rd_token")) RealDebridToken = val;
                     else if (Eq(key, "use_rd")) UseRealDebrid = IsTrue(val);
@@ -291,6 +297,9 @@ namespace Orbis
                 sb.AppendLine("search_continue=" + (SearchContinue ? "on" : "off"));
                 sb.AppendLine("eta_format=" + EtaFormat);
                 sb.AppendLine("firmware_hints=" + (ShowFirmwareHints ? "1" : "0"));
+                sb.AppendLine("background_music=" + (BackgroundMusic ? "1" : "0"));
+                sb.AppendLine("interface_sounds=" + (InterfaceSounds ? "1" : "0"));
+                sb.AppendLine("audio_volume=" + Math.Max(0, Math.Min(100, AudioVolume)));
                 string path = SettingsPath;
                 AtomicFile.WriteText(path, sb.ToString());
                 ApplyToNetHttp();

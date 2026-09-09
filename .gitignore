@@ -8,6 +8,7 @@
 !/THIRD_PARTY_NOTICES.md
 !/app/AllDebridClient.cs
 !/app/AppSettings.cs
+!/app/UiAudio.cs
 !/app/ArchiveStorage.cs
 !/app/ArchiveVolumeSet.cs
 !/app/AtomicFile.cs

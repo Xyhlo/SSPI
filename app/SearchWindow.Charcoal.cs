@@ -331,139 +331,165 @@ namespace Orbis
 
         void DrawGamePackagePage(IntPtr r, bool busy)
         {
-            const int leftX = 240, rightX = 568, rightW = 1112;
-            DrawCase(r, _selected, new SDL_Rect { x = leftX + 20, y = 164, w = 240, h = 304 });
-            // Left title facts restore detail without touching queue/install behavior.
-            TextFit(r, leftX, 478, 20, 280, LibraryTitle(_selected), White);
-            string leftIdentity = _selected.TitleId ?? "";
-            if (!string.IsNullOrWhiteSpace(_selected.Region) && _selected.Region != "?") leftIdentity += "  ·  " + _selected.Region;
-            TextFit(r, leftX, 504, 17, 280, leftIdentity, Muted);
-            TextFit(r, leftX, 528, 17, 280, PackageSizeSummary(), Muted);
-            bool installedLeft = _libraryGames.Exists(g => string.Equals(g.TitleId, _selected.TitleId, StringComparison.OrdinalIgnoreCase));
-            TextFit(r, leftX, 552, 17, 280, installedLeft ? "In your library" : "Not installed · PS4 " + _firmwareVersion, installedLeft ? Ok : Muted);
-            TextPx(r, rightX, 158, 16, "AVAILABLE PACKAGES", Dim);
-            TextFit(r, rightX, 195, 36, rightW, LibraryTitle(_selected), White);
+            const int leftX = ContentX, leftW = 328, rightX = 620, rightW = 1060;
+            bool installed = _libraryGames.Exists(g => string.Equals(g.TitleId, _selected.TitleId, StringComparison.OrdinalIgnoreCase));
+            TextFit(r, ContentX, 148, 34, ContentWidth, LibraryTitle(_selected), White);
             string identity = _selected.TitleId ?? "";
             if (!string.IsNullOrWhiteSpace(_selected.Region) && _selected.Region != "?") identity += "  ·  " + _selected.Region;
-            TextFit(r, rightX, 254, 18, rightW - 230, identity, Muted);
-            bool installed = installedLeft;
-            if (installed) TextPx(r, rightX + rightW - UiFont.MeasurePx(18, "In your library"), 254, 18, "In your library", Ok);
+            identity += "  ·  PS4 " + _firmwareVersion;
+            TextFit(r, ContentX, 201, 18, ContentWidth - 280, identity, Muted);
+            string library = installed ? "In your library" : "Not installed";
+            TextPx(r, ContentX + ContentWidth - UiFont.MeasurePx(18, library), 201, 18, library, installed ? Ok : Dim);
+            Fill(r, ContentX, 246, ContentWidth, 1, Border);
+
+            DrawCase(r, _selected, new SDL_Rect { x = leftX + (leftW - 192) / 2, y = 278, w = 192, h = 244 });
             if (busy)
             {
-                TextPx(r, rightX, 325, 20, "Checking packages and mirrors…", Muted);
-                DrawActivityRail(r, new SDL_Rect { x = rightX, y = 373, w = rightW, h = 4 });
-                for (int i = 0; i < 4; i++)
+                TextPx(r, rightX, 283, 23, "Finding packages", White);
+                TextPx(r, rightX, 328, 18, "Checking versions and available mirrors…", Muted);
+                DrawActivityRail(r, new SDL_Rect { x = rightX, y = 371, w = rightW, h = 3 });
+                for (int i = 0; i < 5; i++)
                 {
-                    int y = 413 + i * 94;
-                    Fill(r, rightX + 24, y + 20, 64, 24, Raised);
-                    Fill(r, rightX + 128, y + 18, 380 - i * 43, 14, Raised);
-                    Fill(r, rightX + 128, y + 52, 230, 10, Raised);
-                    Fill(r, rightX, y + 85, rightW, 1, Border);
+                    int y = 403 + i * 98;
+                    Fill(r, rightX + 24, y + 19, 290 - i * 24, 15, Raised);
+                    Fill(r, rightX + 24, y + 52, 156, 10, Raised);
+                    Fill(r, rightX + rightW - 174, y + 31, 128, 10, Raised);
+                    Fill(r, rightX, y + 87, rightW, 1, Border);
                 }
                 return;
             }
-            Fill(r, rightX, 346, rightW, 1, Border);
+
             for (int i = 0; i < PackageFilters.Length; i++)
             {
                 int x = rightX + i * rightW / PackageFilters.Length, w = rightW / PackageFilters.Length;
                 string label = PackageFilters[i] + "  " + _detailTypeCounts[i];
-                TextCentered(r, new SDL_Rect { x = x, y = 300, w = w, h = 38 }, 20, label, _packageFilter == i ? White : _detailTypeCounts[i] > 0 ? Muted : Dim);
-                if (_packageFilter == i) Fill(r, x + 24, 345, w - 48, 2, Accent);
+                TextCentered(r, new SDL_Rect { x = x, y = 276, w = w, h = 44 }, 20, label,
+                    _packageFilter == i ? White : _detailTypeCounts[i] > 0 ? Muted : Dim);
+                if (_packageFilter == i) Fill(r, x + 22, 329, w - 44, 2, Accent);
             }
-            GamepadIcons.Draw(r, "l2", rightX, 369, 26);
-            TextFit(r, rightX + 34, 372, 18, 380, (_hostFilter == 0 ? "Any host" : _detailHosts[_hostFilter - 1]), Muted);
-            GamepadIcons.Draw(r, "triangle", rightX + 470, 369, 26);
-            TextFit(r, rightX + 504, 372, 18, 300, "Mirrors", Muted);
-            GamepadIcons.Draw(r, "r2", rightX + rightW - 247, 369, 26);
-            TextFit(r, rightX + rightW - 213, 372, 18, 213, (_latestUpdateOnly ? "Latest update" : "All update versions"), Muted);
+            Fill(r, rightX, 332, rightW, 1, Border);
+            GamepadIcons.Draw(r, "l2", rightX, 350, 26);
+            string selectedHost = _hostFilter > 0 && _hostFilter <= _detailHosts.Count ? _detailHosts[_hostFilter - 1] : "All hosts";
+            TextFit(r, rightX + 36, 352, 18, rightW / 2 - 40, selectedHost, Muted);
+            string versions = _latestUpdateOnly ? "Latest update" : "All update versions";
+            int versionX = rightX + rightW - UiFont.MeasurePx(18, versions);
+            GamepadIcons.Draw(r, "r2", versionX - 36, 350, 26);
+            TextPx(r, versionX, 352, 18, versions, Muted);
+
             if (_detailRows.Count == 0)
             {
-                DesignIcon(r, "download", rightX + rightW / 2 - 20, 470, 40, Dim);
-                TextCentered(r, new SDL_Rect { x = rightX, y = 548, w = rightW, h = 45 }, 28, string.IsNullOrEmpty(_resolveError) ? "No matching packages" : "Packages unavailable", White);
-                TextWrappedCentered(r, rightX + 90, 610, 20, rightW - 180, string.IsNullOrEmpty(_resolveError) ? "Try another package type, host or version." : _resolveError, Muted);
+                DesignIcon(r, string.IsNullOrEmpty(_resolveError) ? "download" : "error", rightX + rightW / 2 - 20, 503, 40, Dim);
+                TextCentered(r, new SDL_Rect { x = rightX, y = 574, w = rightW, h = 45 }, 27,
+                    string.IsNullOrEmpty(_resolveError) ? "No matching packages" : "Packages unavailable", White);
+                TextWrappedCentered(r, rightX + 90, 633, 19, rightW - 180,
+                    string.IsNullOrEmpty(_resolveError) ? "Choose another package type, host or version." : _resolveError, Muted);
                 return;
             }
+
             RefreshQueueModel();
-            const int top = 418, rowH = 94, visible = 5;
-            EnsureVisible(ref _detailScroll, _detailFocus, _detailRows.Count, visible);
-            DrawSelectedPackageInfo(r, leftX, _linkPresentation[_detailRows[_detailFocus]]);
+            const int top = 401, rowH = 98, visible = 5;
+            int focused = Math.Max(0, Math.Min(_detailFocus, _detailRows.Count - 1));
+            EnsureVisible(ref _detailScroll, focused, _detailRows.Count, visible);
+            DrawSelectedPackageInfo(r, leftX, _linkPresentation[_detailRows[focused]]);
             for (int i = 0; i < visible && _detailScroll + i < _detailRows.Count; i++)
             {
                 int ordinal = _detailScroll + i, index = _detailRows[ordinal], y = top + i * rowH;
-                var meta = _linkPresentation[index]; bool child = DetailRowIsChild(ordinal), on = ordinal == _detailFocus;
-                int x = rightX + (child ? 46 : 0), width = rightW - (child ? 46 : 0);
-                if (child) TreeBranch(r, rightX + 22, Math.Max(top, y - 13), y + 45, y + rowH, x, DetailRowIsLastChild(ordinal));
-                var rect = new SDL_Rect { x = x, y = y, w = width, h = 86 };
-                if (on) DesignCard(r, rect, true); else Fill(r, x + 14, y + 85, width - 28, 1, Border);
-                string group = DetailGroupKey(meta); int hosts = 0;
-                for (int j = 0; j < _linkPresentation.Count; j++) if (PackageMatches(j) && DetailGroupKey(_linkPresentation[j]) == group) hosts++;
+                var meta = _linkPresentation[index];
+                bool child = DetailRowIsChild(ordinal), on = ordinal == focused;
+                int x = rightX + (child ? 36 : 0), width = rightW - (child ? 36 : 0);
+                if (child)
+                {
+                    int bottom = DetailRowIsLastChild(ordinal) ? y + 44 : y + rowH;
+                    Fill(r, rightX + 14, Math.Max(top, y - 12), 1, bottom - Math.Max(top, y - 12), Border);
+                    Fill(r, rightX + 14, y + 44, 12, 1, Border);
+                }
+                var rect = new SDL_Rect { x = x, y = y, w = width, h = 88 };
+                if (on) DesignCard(r, rect, true);
+                else Fill(r, x + 20, y + 87, width - 40, 1, Border);
                 bool queued = PackageGroupQueued(index, _queueSnapshot);
-                int tx = x + (child ? 22 : 131), textW = width - (child ? 230 : 335);
-                if (!child)
-                {
-                    var tag = new SDL_Rect { x = x + 23, y = y + 17, w = 88, h = 32 };
-                    TextCentered(r, tag, 15, KindShort(meta.Kind), PackageTint(meta.Kind));
-                }
-                TextFit(r, tx, y + 16, 23, textW, child ? meta.Hoster : PackageDisplayTitle(meta.Kind, meta.PackageTitle, _selected.Name, meta.Hoster, meta.Version), White);
-                string sizeHint = meta.Candidate != null && meta.Candidate.ExpectedByteSize.GetValueOrDefault() > 0
-                    ? DownloadManager.Human(meta.Candidate.ExpectedByteSize.Value) : "";
-                string sub = queued ? "In queue" : child ? "Alternate mirror" : hosts + (hosts == 1 ? " mirror" : " mirrors");
-                if (!string.IsNullOrEmpty(sizeHint)) sub += " · " + sizeHint;
-                SDL_Color subColor = queued ? Ok : Muted;
-                if (meta.Candidate != null && !child)
-                {
-                    string required = meta.Candidate.RequiredFirmware;
-                    if (string.IsNullOrEmpty(required)) required = PkgIntegrity.FirmwareRequirement(meta.Candidate.Label + " " + meta.Candidate.DisplayName);
-                    if (!string.IsNullOrEmpty(required))
-                    {
-                        string fwLabel = PkgIntegrity.FirmwareLabel(required, _firmwareVersion);
-                        bool incompatible = fwLabel.StartsWith("Needs backport", StringComparison.Ordinal);
-                        if (_cfg.ShowFirmwareHints || incompatible)
-                        {
-                            sub += " · " + fwLabel;
-                            if (incompatible) subColor = Warning;
-                        }
-                    }
-                    else if (_cfg.ShowFirmwareHints)
-                    {
-                        sub += " · Firmware not supplied";
-                    }
-                }
-                TextFit(r, tx, y + 50, 17, textW, sub, subColor);
-                if (!child) TextFit(r, x + width - 188, y + 29, 17, 146, meta.Hoster, HosterColor(meta.Hoster));
-                DesignIcon(r, "chevron", x + width - 34, y + 33, 18, on ? White : Dim);
+                bool blocked = meta.Candidate != null && !string.IsNullOrEmpty(meta.Candidate.ResolutionError);
+                string title = child ? meta.Hoster : PackageRowTitle(meta);
+                TextFit(r, x + 24, y + 15, 24, width - (child ? 80 : 276), title, White);
+                string sub = child ? "Alternate mirror" : meta.MirrorCount + (meta.MirrorCount == 1 ? " mirror" : " mirrors");
+                if (queued) sub += "  ·  In queue";
+                else if (blocked) sub += "  ·  Requires another mirror";
+                else if (meta.Candidate != null && meta.Candidate.ExpectedByteSize.GetValueOrDefault() > 0)
+                    sub += "  ·  " + DownloadManager.Human(meta.Candidate.ExpectedByteSize.Value);
+                TextFit(r, x + 24, y + 52, 17, width - 86, sub, blocked ? Warning : queued ? Ok : Muted);
+                if (!child) TextFit(r, x + width - 226, y + 22, 17, 176, meta.Hoster, on ? Muted : Dim);
+                DesignIcon(r, "chevron", x + width - 32, y + 35, 17, on ? White : Dim);
             }
-            DrawScrollBar(r, new SDL_Rect { x = rightX + rightW + 13, y = top, w = 4, h = 462 }, _detailRows.Count, visible, _detailScroll);
-            TextFit(r, rightX, 905, 17, rightW, "Install order   Base → Update → DLC   ·   Square queues recommended", Dim);
+            DrawScrollBar(r, new SDL_Rect { x = rightX + rightW + 13, y = top, w = 4, h = 480 }, _detailRows.Count, visible, _detailScroll);
+            Fill(r, rightX, 910, rightW, 1, Border);
+            TextPx(r, rightX, 930, 16, "Base  →  Update / Backport  →  DLC", Dim);
+            string position = (focused + 1) + " / " + _detailRows.Count;
+            TextPx(r, rightX + rightW - UiFont.MeasurePx(16, position), 930, 16, position, Dim);
         }
+
+        static string PackageRowTitle(PackageCandidatePresentation meta)
+        {
+            string title = SamePackageKind(meta.Kind, "dlc") ? meta.PackageTitle : PackageTitle(meta.Kind);
+            if (!string.IsNullOrWhiteSpace(meta.Version)) title += "  ·  v" + meta.Version.TrimStart('v', 'V');
+            return title;
+        }
+
+        PackageCandidate _inspectorCandidate;
+        string _inspectorArchive = "Package file";
 
         void DrawSelectedPackageInfo(IntPtr r, int x, PackageCandidatePresentation meta)
         {
-            TextPx(r, x, 580, 15, "SELECTED PACKAGE", Dim);
-            string name = SamePackageKind(meta.Kind, "dlc") ? meta.PackageTitle : PackageTitle(meta.Kind);
-            TextWrapped(r, x, 612, 22, 280, name, White);
-            Fill(r, x, 700, 280, 1, Border);
-            TextPx(r, x, 716, 17, "Version", Dim);
-            TextFit(r, x + 98, 716, 18, 182, string.IsNullOrWhiteSpace(meta.Version) ? "Not supplied" : "v" + meta.Version.TrimStart('v', 'V'), Muted);
-            string size = meta.Candidate != null && meta.Candidate.ExpectedByteSize.GetValueOrDefault() > 0
-                ? DownloadManager.Human(meta.Candidate.ExpectedByteSize.Value) : "Not supplied";
-            TextPx(r, x, 748, 17, "Size", Dim);
-            TextFit(r, x + 98, 748, 18, 182, size, Muted);
-            string required = meta.Candidate == null ? "" : meta.Candidate.RequiredFirmware;
-            TextPx(r, x, 780, 17, "Firmware", Dim);
-            string fwText = string.IsNullOrEmpty(required) ? "Not supplied" : required + "+";
-            if (meta.Candidate != null && string.IsNullOrEmpty(required))
+            const int width = 328;
+            var candidate = meta.Candidate;
+            if (!object.ReferenceEquals(_inspectorCandidate, candidate))
             {
-                string inferred = PkgIntegrity.FirmwareRequirement(meta.Candidate.Label + " " + meta.Candidate.DisplayName);
-                if (!string.IsNullOrEmpty(inferred)) fwText = PkgIntegrity.FirmwareLabel(inferred, _firmwareVersion);
+                _inspectorCandidate = candidate;
+                _inspectorArchive = "Package file";
+                if (candidate != null && !string.IsNullOrEmpty(candidate.ArchiveVolumes))
+                {
+                    try
+                    {
+                        int count = ArchiveVolumeSet.Decode(candidate.ArchiveVolumes).Count;
+                        _inspectorArchive = count + (count == 1 ? " archive part" : " archive parts");
+                    }
+                    catch { _inspectorArchive = "Archive details unavailable"; }
+                }
+                else if (candidate != null && !string.IsNullOrEmpty(candidate.ArchivePassword))
+                    _inspectorArchive = "Archive supported";
             }
-            TextFit(r, x + 98, 780, 18, 182, fwText, Muted);
-            TextPx(r, x, 812, 17, "Host", Dim);
-            TextFit(r, x + 98, 812, 18, 182, meta.Hoster ?? "Unknown host", HosterColor(meta.Hoster));
-            TextPx(r, x, 844, 17, "Mirrors", Dim);
-            TextFit(r, x + 98, 844, 18, 182, meta.MirrorCount + (meta.MirrorCount == 1 ? " host" : " hosts"), Muted);
-            TextPx(r, x, 876, 15, "SOURCE", Dim);
-            TextFit(r, x, 900, 18, 280, meta.Source, Muted);
+            TextPx(r, x, 553, 14, "SELECTED PACKAGE", Dim);
+            TextFit(r, x, 580, 24, width, SamePackageKind(meta.Kind, "dlc") ? meta.PackageTitle : PackageTitle(meta.Kind), White);
+            Fill(r, x, 620, width, 1, Border);
+            DrawPackageFact(r, x, 637, "Version", string.IsNullOrWhiteSpace(meta.Version) ? "Not supplied" : "v" + meta.Version.TrimStart('v', 'V'), Muted);
+            string size = candidate != null && candidate.ExpectedByteSize.GetValueOrDefault() > 0
+                ? DownloadManager.Human(candidate.ExpectedByteSize.Value) : "Not supplied";
+            DrawPackageFact(r, x, 669, "Size", size, Muted);
+            string required = candidate == null ? "" : candidate.RequiredFirmware;
+            if (candidate != null && string.IsNullOrEmpty(required))
+                required = PkgIntegrity.FirmwareRequirement(candidate.Label + " " + candidate.DisplayName);
+            string firmware = string.IsNullOrEmpty(required) ? "Not supplied" : PkgIntegrity.FirmwareLabel(required, _firmwareVersion);
+            DrawPackageFact(r, x, 701, "Firmware", firmware, firmware.StartsWith("Needs backport", StringComparison.Ordinal) ? Warning : Muted);
+            DrawPackageFact(r, x, 733, "Host", meta.Hoster ?? "Unknown", Muted);
+            DrawPackageFact(r, x, 765, "Mirrors", meta.MirrorIndex + " of " + meta.MirrorCount, Muted);
+            DrawPackageFact(r, x, 797, "Source", meta.Source, Muted);
+            DrawPackageFact(r, x, 829, "Files", _inspectorArchive, Muted);
+            string note = candidate == null ? "" : candidate.ResolutionError;
+            bool failed = !string.IsNullOrEmpty(note);
+            if (!failed && candidate != null)
+            {
+                string label = (candidate.Label ?? "").Trim();
+                if (!string.IsNullOrEmpty(label) && !string.Equals(label, meta.PackageTitle, StringComparison.OrdinalIgnoreCase)) note = label;
+            }
+            if (!string.IsNullOrEmpty(note))
+            {
+                Fill(r, x, 870, width, 1, Border);
+                TextWrapped(r, x, 889, 16, width, note, failed ? Warning : Dim);
+            }
+        }
+
+        void DrawPackageFact(IntPtr r, int x, int y, string label, string value, SDL_Color color)
+        {
+            TextPx(r, x, y, 16, label, Dim);
+            TextFit(r, x + 98, y, 17, 230, value, color);
         }
 
         static string TransferSizeLine(DlItem item)

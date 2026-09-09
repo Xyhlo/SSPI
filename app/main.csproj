@@ -144,6 +144,7 @@
     <Compile Include="ThemePalette.cs" />
     <Compile Include="TorBoxClient.cs" />
     <Compile Include="UiFont.cs" />
+    <Compile Include="UiAudio.cs" />
     <Compile Include="UiVisualPolicy.cs" />
     <Compile Include="UnlockProviders.cs" />
     <Compile Include="DebridHostSupport.cs" />
@@ -158,6 +159,11 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\assets\audio\*.pcm">
+      <LogicalName>Orbis.Audio.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="SharpCompress" Version="0.48.0" />
