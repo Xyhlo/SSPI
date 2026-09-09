@@ -83,6 +83,15 @@
 !/app/main.csproj
 !/app/packages.config
 !/docs/banner.png
+# Public documentation site and approved PS4 branding.
+!/docs/.nojekyll
+!/docs/index.html
+!/docs/404.html
+!/docs/styles.css
+!/docs/site.js
+!/docs/assets/ps4-logo.png
+!/docs/assets/ps4-favicon.png
+!/docs/assets/waves.svg
 !/https/mbedtls_user_config.h
 !/https/source_https.c
 !/native/io.c

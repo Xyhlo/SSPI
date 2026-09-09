@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111214">
+  <meta name="description" content="The SSPI field guide: set up your PS4, pair Real-Debrid or TorBox, add package sources, manage downloads, and understand updates, archives and installation.">
+  <meta property="og:title" content="SSPI — The PS4 field guide">
+  <meta property="og:description" content="Your sources. Your console. Setup, controls, engine details and troubleshooting for Super Simple Package Installer.">
+  <meta property="og:image" content="https://xyhlo.github.io/SSPI/banner.png">
+  <meta property="og:type" content="website">
+  <link rel="canonical" href="https://xyhlo.github.io/SSPI/">
+  <link rel="icon" href="assets/ps4-favicon.png" type="image/png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="site.js" defer></script>
+  <title>SSPI — The PS4 field guide</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to documentation</a>
+<header class="topbar">
+  <a class="brand" href="#overview" aria-label="SSPI documentation home"><img src="assets/ps4-logo.png" width="44" height="44" alt=""><strong>SSPI</strong><span class="brand-divider"></span><span>PS4 guide</span></a>
+  <div class="header-actions"><span class="version">5.10 <span>BETA</span></span><button class="search-trigger" id="search-open" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search the guide</span><kbd>/</kbd></button><a class="github-link" href="https://github.com/Xyhlo/SSPI">GitHub <span aria-hidden="true">↗</span></a><button id="menu-toggle" class="menu-toggle" aria-expanded="false" aria-controls="sidebar" type="button">Contents</button></div>
+</header>
+<div class="reading-progress" aria-hidden="true"><span id="reading-progress"></span></div>
+<div class="layout">
+<aside class="sidebar" id="sidebar">
+  <nav aria-label="Documentation sections">
+    <div class="nav-group"><p>START HERE</p><a href="#overview" aria-current="location"><span>01</span>Overview</a><a href="#requirements"><span>02</span>Before you start</a><a href="#first-launch"><span>03</span>Your first launch</a><a href="#pairing"><span>04</span>Phone pairing</a><a href="#sources"><span>05</span>Package sources</a></div>
+    <div class="nav-group"><p>ON YOUR CONSOLE</p><a href="#search"><span>06</span>Search &amp; packages</a><a href="#downloads"><span>07</span>The download queue</a><a href="#updates"><span>08</span>Updates &amp; backports</a><a href="#archives"><span>09</span>Archives &amp; staging</a><a href="#storage"><span>10</span>Storage cleanup</a><a href="#appearance"><span>11</span>Appearance &amp; sound</a></div>
+    <div class="nav-group"><p>UNDER THE SURFACE</p><a href="#engine"><span>12</span>The source engine</a><a href="#networking"><span>13</span>Speed &amp; bandwidth</a><a href="#troubleshooting"><span>14</span>Troubleshooting</a><a href="#reference"><span>15</span>Settings &amp; data</a><a href="#beta"><span>16</span>Beta testing</a></div>
+  </nav>
+  <div class="sidebar-foot"><span class="status-dot"></span>Documentation · 09 Sep 2026<br><a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta">Read the beta notes ↗</a></div>
+</aside>
+<main id="content" tabindex="-1">
+<div class="page-toolbar"><div class="breadcrumbs"><span id="page-group">Start here</span><span aria-hidden="true">/</span><strong id="page-name">Overview</strong></div><span id="page-count">01 / 16</span><details class="mobile-outline" id="mobile-outline"><summary>On this page <span aria-hidden="true">⌄</span></summary><nav id="mobile-toc" aria-label="On this page"></nav></details></div>
+<div class="page-scroll" id="page-scroll" tabindex="0" aria-label="Documentation article"><div class="page-frame">
+<section id="overview" class="hero" aria-labelledby="hero-title" data-title="Overview">
+  <div class="hero-pattern" aria-hidden="true"></div><div class="hero-copy"><p class="eyebrow">SUPER SIMPLE PACKAGE INSTALLER</p><h1 id="hero-title">Your sources.<br>Your console.</h1><p class="hero-description">A practical guide to searching, downloading and installing packages. All on your PS4.</p><div class="hero-actions"><a class="button primary" href="#first-launch">Set up SSPI <span aria-hidden="true">↗</span></a><a class="button" href="https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta">Download beta ↗</a></div><div class="hero-meta"><span>PS4 HOMEBREW</span><span>5.10 BETA</span></div></div><img class="hero-logo" src="assets/ps4-logo.png" width="340" height="340" alt="SSPI PS4 silver cartridge logo" fetchpriority="high">
+</section>
+<div class="intro-strip"><p><strong>Link. Search. Download.</strong> SSPI combines configurable package sources, Real-Debrid or TorBox, a persistent queue and PS4 installation services. A PC does not need to stay running.</p><a href="#requirements">What you'll need <span aria-hidden="true">↓</span></a></div>
+<section id="requirements" class="doc-section" data-title="Before you start">
+<div class="section-heading"><span class="section-number">02</span><div><p class="eyebrow">THE BASICS</p><h2>Before you start<a class="permalink" href="#requirements" aria-label="Link to Before you start">#</a></h2></div></div>
+<div class="callout"><strong>The public beta is available.</strong><p>Download <code>sspi5.10b.pkg</code> from the <a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta">5.10 beta release</a>. GitHub's source ZIP is source code, not an installable PS4 package.</p></div>
+<div class="feature-grid">
+<article><span class="mini-label">CONSOLE</span><h3>A PS4 that runs homebrew</h3><p>You need a working homebrew environment. Firmware coverage is still being tested; neither a successful build nor the absence of a minimum-firmware gate proves compatibility with every console.</p></article>
+<article><span class="mini-label">SOURCE</span><h3>Bundled and ready to enable</h3><p>The beta includes SuperPSX 2.0 and installs its source descriptor on first launch. Existing choices to disable or remove it are preserved. Check the enabled sources before searching.</p></article>
+<article><span class="mini-label">DOWNLOAD ACCESS</span><h3>Your own service account</h3><p><strong>TorBox and Real-Debrid are the only supported download options for this PS4 beta.</strong> Bring your own account and API key. Host support and account limits still apply.</p></article>
+<article><span class="mini-label">LOCAL SETUP</span><h3>A phone and free storage</h3><p>Use a browser on the same LAN as the PS4. Allow room for downloads, archive extraction and installed content. A wired console and Wi-Fi phone can pair if the network lets them reach each other.</p></article>
+</div>
+<h3>What has been tested</h3><p>The current build has worked well in a small group after several rounds of fixes. Host builds and local regression checks have passed. More consoles may still expose launch, extraction or installation failures. Treat this as a public test and report what happens on your setup.</p>
+<h3>Background downloads</h3><p>Shell-resident operation depends on compatible GoldHEN process/plugin capabilities and the matching worker. If those are unavailable, keep SSPI open for the in-app paths. A firmware compatibility matrix has not yet been established.</p>
+</section>
+<section id="first-launch" class="doc-section" data-title="Your first launch">
+<div class="section-heading"><span class="section-number">03</span><div><p class="eyebrow">FROM INSTALLATION TO YOUR FIRST QUEUE</p><h2>Your first launch<a class="permalink" href="#first-launch" aria-label="Link to Your first launch">#</a></h2></div></div>
+<ol class="steps">
+<li><span class="step-index">01</span><div><h3>Install the beta package</h3><p>Install <code>sspi5.10b.pkg</code> using your console's package installer, then launch SSPI. The bundled source is prepared on first launch.</p></div></li>
+<li><span class="step-index">02</span><div><h3>Connect a download service</h3><p>Press <kbd>OPTIONS</kbd> and open <strong>Settings → Connections</strong>. Scan the QR with a phone on the same LAN. Add your Real-Debrid or TorBox key, choose the preferred service and save.</p></div></li>
+<li><span class="step-index">03</span><div><h3>Check your source</h3><p>Open <strong>Package sources</strong> and confirm SuperPSX 2.0 is enabled. Other compatible <code>.gssource</code> packages can be added through the phone setup page.</p></div></li>
+<li><span class="step-index">04</span><div><h3>Search and choose</h3><p>Return to Search. Press <kbd>×</kbd> on the search field to enter a name or CUSA ID. Open the correct title and region, then inspect package types, versions and mirrors before queuing.</p></div></li>
+<li><span class="step-index">05</span><div><h3>Follow the individual files</h3><p>Switch to <strong>Downloads</strong>. Open <strong>Files</strong> on the selected game to see each package. A full download bar is not proof of installation; wait for the installation result and confirm the content on the PS4.</p></div></li>
+</ol>
+<div class="checklist-panel"><div><h3>Ready for a first test?</h3><p>This checklist is saved in this browser. It does not configure your console.</p></div><div class="checklist"><label><input type="checkbox" data-check="worker"> SSPI launches on the PS4</label><label><input type="checkbox" data-check="service"> Service selected and key saved</label><label><input type="checkbox" data-check="source"> Source installed and enabled</label><label><input type="checkbox" data-check="space"> Download and extraction space available</label></div><button class="text-button" id="reset-checks" type="button">Reset checklist</button></div>
+</section>
+<section id="pairing" class="doc-section" data-title="Phone pairing">
+<div class="section-heading"><span class="section-number">04</span><div><p class="eyebrow">CONFIGURE FROM YOUR OWN NETWORK</p><h2>Phone pairing<a class="permalink" href="#pairing" aria-label="Link to Phone pairing">#</a></h2></div></div>
+<p>The QR opens SSPI's setup page on your console. Use the address shown by your PS4; it includes the current local IP and a pairing token. This documentation website is not the setup server.</p>
+<div class="connection-flow"><div><span class="mini-label">PHONE</span><strong>Scan the current QR</strong><small>Browser on the same LAN</small></div><span class="flow-arrow" aria-hidden="true">→</span><div><span class="mini-label">PS4</span><strong>Local setup page</strong><small>Keep SSPI open</small></div><span class="flow-arrow" aria-hidden="true">→</span><div><span class="mini-label">SAVED LOCALLY</span><strong>Services and sources</strong><small>Settings stay on your console</small></div></div>
+<h3>Save a service</h3><p>In <strong>Link services</strong>, paste your own key and choose the preferred download service. Save before leaving the page. Both keys can remain stored while one service is active. A saved key does not confirm that a subscription is active or that a particular host is supported.</p>
+<h3>Switch services</h3><p>In <strong>Settings → Connections</strong>, select Real-Debrid or TorBox. Switching preserves the other saved key and applies to new downloads; it does not move a running transfer between services. Direct-link code remains present but is outside this beta's supported download options.</p>
+<h3>If the page does not open</h3><p>Keep SSPI open, rescan the current QR and check that the phone can reach the console. Guest-network isolation, a phone VPN or an old console IP can prevent access. Ethernet and Wi-Fi can be used together on the same reachable LAN.</p>
+<div class="callout"><strong>Keep your pairing link private.</strong><p>The local page uses HTTP and an access token. Use a trusted LAN; do not forward its port to the internet. Never share the QR, full pairing URL, API keys or settings files in an issue report.</p></div>
+</section>
+<section id="sources" class="doc-section" data-title="Package sources">
+<div class="section-heading"><span class="section-number">05</span><div><p class="eyebrow">CATALOG CONNECTIONS</p><h2>Package sources<a class="permalink" href="#sources" aria-label="Link to Package sources">#</a></h2></div></div>
+<p>A <code>.gssource</code> is a source connector packaged as a ZIP. It describes where and how SSPI searches and resolves package information. It is not a game, a PKG or a service account.</p>
+<h3>SuperPSX 2.0 in this beta</h3><p>The release includes the source descriptor, and its search and resolution requests use a JSON API through SSPI's engine. A successful source installation confirms that the connector was accepted; it does not guarantee that every catalog entry or host is currently available.</p>
+<h3>Add or enable a source</h3><p>Open <strong>Connections → Package sources</strong>. Highlight a source and use the displayed action to enable or disable it. To add another, open the phone setup page and supply the actual <code>.gssource</code> download URL. A GitHub file-view page or website landing page is not the archive itself.</p>
+<h3>Updates and removal</h3><p>Source upgrades can repair result mapping without replacing the application. The current installer preserves an existing usable source if an upgrade fails. Disabling or removing a bundled source is remembered. Sources supplied separately should be intended for PS4 and the supported engine version.</p>
+<h3>What the engine reads</h3><p>The manifest identifies the source, version and engine. Recipe sources describe requests and result mapping; remote-API sources call a configured result service. SSPI validates the package layout and declared files. Valid metadata does not establish publisher trust or package compatibility.</p>
+<p>See the <a href="https://github.com/Xyhlo/SSPI/blob/main/app/PackageSourceModels.cs">source models</a> and <a href="https://github.com/Xyhlo/SSPI/blob/main/app/PackageSourcePackage.cs">source package reader</a> for the implementation.</p>
+</section>
+<section id="search" class="doc-section" data-title="Search & package details">
+<div class="section-heading"><span class="section-number">06</span><div><p class="eyebrow">FIND THE RIGHT PACKAGE</p><h2>Search & package details<a class="permalink" href="#search" aria-label="Link to Search & package details">#</a></h2></div></div>
+<p>Search by title or CUSA ID. Opening a result resolves its available packages. Search and package resolution are separate steps, so a title may appear even when one of its download routes is unavailable.</p>
+<h3>Read the package information</h3><p>Use the type tabs for <strong>All, Base, Updates, DLC and Backport</strong>. The selected package shows available version, size, required firmware, source and mirror information. Missing values remain unknown. A firmware number is not an application version.</p>
+<div class="table-wrap"><table><thead><tr><th>Control</th><th>Action</th></tr></thead><tbody><tr><td>D-pad</td><td>Move focus; left/right changes the active filter where shown.</td></tr><tr><td>Cross</td><td>Open a title or queue the selected package.</td></tr><tr><td>Triangle</td><td>Show or hide the selected package's mirrors.</td></tr><tr><td>L2 / R2</td><td>Host and update-version filters, as shown on screen.</td></tr><tr><td>Square</td><td>Queue the recommended selection.</td></tr><tr><td>Circle</td><td>Return to the previous screen.</td></tr></tbody></table></div>
+<h3>Mirrors are alternatives</h3><p>All source-provided hosts are visible. A listed host may still be unsupported by your selected service. Pick a usable mirror for the package you want; do not queue every mirror as a different update.</p>
+<h3>Recommended packages</h3><p>Recommendations depend on the source's metadata. Review the CUSA, region, package kind and update/backport choice before proceeding. An exact-region result is not silently replaced with another region.</p>
+</section>
+<section id="downloads" class="doc-section" data-title="The download queue">
+<div class="section-heading"><span class="section-number">07</span><div><p class="eyebrow">FOLLOW EACH STAGE</p><h2>The download queue<a class="permalink" href="#downloads" aria-label="Link to The download queue">#</a></h2></div></div>
+<p>Downloads are grouped by game. The selected game expands to show artwork and progress; other games remain compact. Open <strong>Files</strong> to inspect each base package, update, backport or DLC.</p>
+<div class="table-wrap"><table><thead><tr><th>State</th><th>What is happening</th></tr></thead><tbody><tr><td>Queued / Resolving</td><td>Waiting for a dependency, source resolution or a usable service link.</td></tr><tr><td>Downloading</td><td>Transferring package data or archive volumes.</td></tr><tr><td>Extracting / Finalizing</td><td>Preparing, extracting or validating local files.</td></tr><tr><td>Installing</td><td>The console installation task is still being checked.</td></tr><tr><td>Installed</td><td>The installation path has reported completion. Confirm the content and version on the console.</td></tr><tr><td>Needs attention / Failed</td><td>Open Files for the package-level error. Recoverable files may remain available for retry.</td></tr></tbody></table></div>
+<h3>Pause, cancel or retry</h3><p>Focus the relevant game or package and follow the centered action row. The actions change with its state. Canceling a task, removing queue history and deleting downloaded storage are different operations.</p>
+<h3>Completion and stale status</h3><p>The latest beta includes installed-content checks to reconcile stale BGFT counters and false stalls. A full transfer bar alone is still not installation proof. If the PS4 confirms completion while SSPI remains Installing or Failed, capture both states and the build ID before retrying.</p>
+<p>A remaining patch integrity-verification failure path can leave the resident status at Installing. Report the exact system error and package combination rather than repeatedly starting duplicate tasks.</p>
+</section>
+<section id="updates" class="doc-section" data-title="Updates & backports">
+<div class="section-heading"><span class="section-number">08</span><div><p class="eyebrow">MATCH THE INSTALLED CONTENT</p><h2>Updates & backports<a class="permalink" href="#updates" aria-label="Link to Updates & backports">#</a></h2></div></div>
+<div class="type-grid"><article><span class="kind">BASE</span><h3>Base package</h3><p>The main application. Match later packages to its title ID and intended release.</p></article><article><span class="kind update">UPD</span><h3>Update</h3><p>A patch for a compatible base. Check its application version separately from its firmware requirement.</p></article><article><span class="kind backport">BP</span><h3>Backport</h3><p>A source-supplied compatibility variant. It can be an alternative to the regular update, not another mandatory step.</p></article><article><span class="kind dlc">DLC</span><h3>Add-on content</h3><p>Requires the matching base and may have additional update or release requirements.</p></article></div>
+<h3>Choose deliberately</h3><ol class="plain-steps"><li>Check the installed title ID, region and base version.</li><li>Choose an update or backport intended for that base and firmware.</li><li>Let the base finish before dependent packages. Close the game being updated.</li><li>Confirm the version in the PS4 interface and test launch after installation.</li></ol>
+<p>A shared CUSA ID and structurally valid file do not prove that every base/patch combination is compatible. Do not queue all update revisions, mirrors and backport variants as consecutive steps.</p>
+<h3>Library update checks</h3><p>Checks use enabled sources and cached metadata. A newly published update can take time to appear. Missing version information or a source failure is not proof that a title is up to date.</p>
+<h3>When BGFT reports an error</h3><p>Keep the exact hexadecimal code and the corresponding PS4 Notifications details. Record whether the error occurred before installation, during transfer, or after the system reported completion. Preserve recoverable package files until the task's ownership is resolved.</p>
+</section>
+<section id="archives" class="doc-section" data-title="Archives & staging">
+<div class="section-heading"><span class="section-number">09</span><div><p class="eyebrow">FROM VOLUMES TO INSTALLABLE FILES</p><h2>Archives & staging<a class="permalink" href="#archives" aria-label="Link to Archives & staging">#</a></h2></div></div>
+<p>Direct PKGs skip extraction. For supported RAR, multipart RAR and ZIP downloads, SSPI stages the archive data and extracts installable packages before handing them to the console.</p>
+<div class="process-strip"><span>Resolve volumes</span><span>Download</span><span>Extract</span><span>Validate</span><span>Install</span></div>
+<h3>Multipart sets</h3><p>Every required part must belong to the same archive set and finish downloading. A <code>.part1.rar</code> or numbered volume is not a standalone package. Missing, truncated or mismatched parts can prevent extraction even when the first volume is complete.</p>
+<h3>Plan for peak storage</h3><div class="storage-formula"><span>Archive volumes</span><b>+</b><span>Extracted packages</span><b>+</b><span>Installed content</span><b>+</b><span>Working room</span></div><p>Large or solid archives take time on the PS4's HDD. Network bandwidth settings do not accelerate decompression. Unsupported archive features or a damaged upload may require a different mirror or a corrected set.</p>
+<h3>Keep useful retry files</h3><p>Failed installations can retain complete files. Do not manually delete staging data while a worker or system task may own it. Use the queue and Storage controls after work has finished or cancellation has been confirmed.</p>
+</section>
+<section id="storage" class="doc-section" data-title="Storage cleanup">
+<div class="section-heading"><span class="section-number">10</span><div><p class="eyebrow">MANAGE SSPI FILES</p><h2>Storage cleanup<a class="permalink" href="#storage" aria-label="Link to Storage cleanup">#</a></h2></div></div>
+<p>Open <strong>Settings → Storage</strong> to inspect downloaded files and eligible leftovers. This is not a browser for the entire PS4 drive and does not uninstall installed titles.</p>
+<h3>Delete through the app</h3><p>Refresh the listing, select the file and follow the displayed delete and confirmation actions. Check its name and size first. Cleanup protects active work and recovery information; a file that appears unused can still belong to a pending install.</p>
+<h3>History and storage differ</h3><p><strong>General → Clear removable history</strong> clears eligible queue entries. It does not mean that every downloaded file has been removed. Use PS4 system storage management to uninstall installed content.</p>
+<h3>Deletion is refused</h3><p>Finish or cancel relevant pending/background jobs, wait for confirmation and refresh. If ownership cannot be confirmed, retain the files and report the task state. Do not delete journals or reset queue files to force an installation past an error.</p>
+</section>
+<section id="appearance" class="doc-section" data-title="Appearance & sound">
+<div class="section-heading"><span class="section-number">11</span><div><p class="eyebrow">MAKE THE INTERFACE YOURS</p><h2>Appearance & sound<a class="permalink" href="#appearance" aria-label="Link to Appearance & sound">#</a></h2></div></div>
+<h3>Accent and background</h3><p><strong>Settings → Appearance</strong> provides accent choices and built-in backgrounds. The phone setup page can also save appearance settings. Restore original charcoal to return to the plain background while keeping the chosen accent.</p>
+<p>Built-in patterns provide the available background options. Arbitrary uploaded background images are not part of this beta's setup flow.</p>
+<h3>Quiet interface audio</h3><p><strong>Settings → Sound</strong> has separate switches for background music and interface sounds, plus volume. The default is 35%, with music mixed below the effects. Left/right changes volume in 5% steps; zero mutes it. Preferences save automatically.</p>
+<p>Navigation and completion cues are designed to stay subtle. Audio runs away from the rendering thread and is optional; failure to open an audio device should leave the application usable without sound.</p>
+</section>
+<section id="engine" class="doc-section" data-title="The source engine">
+<div class="section-heading"><span class="section-number">12</span><div><p class="eyebrow">DISCOVERY, DELIVERY AND INSTALLATION</p><h2>The source engine<a class="permalink" href="#engine" aria-label="Link to The source engine">#</a></h2></div></div>
+<ol class="engine-flow"><li><span>01</span><div><h3>Search</h3><p>Enabled sources return title records for your query. The app combines those results and keeps their source identity.</p></div></li><li><span>02</span><div><h3>Resolve</h3><p>Opening a title produces package candidates: kind, title ID, version, region, host, link and any supplied size, firmware, archive or checksum information.</p></div></li><li><span>03</span><div><h3>Unlock</h3><p>The selected Real-Debrid or TorBox account requests a usable download route. A source returning a host link is not the same as the provider accepting it.</p></div></li><li><span>04</span><div><h3>Transfer</h3><p>The application or resident worker transfers the data, preserves progress and applies the configured bandwidth limit. The transfer path coalesces small reads with bounded buffers.</p></div></li><li><span>05</span><div><h3>Prepare</h3><p>Archive sets are extracted and package structure, length and available identity/integrity information are checked. Missing expected metadata limits what can be verified.</p></div></li><li><span>06</span><div><h3>Install</h3><p>BGFT and the package-specific installation paths register work, track progress and reconcile installed content. A task being accepted does not mean it has finished.</p></div></li></ol>
+<h3>Caching</h3><p>Search results, resolution data, eligible responses and artwork are cached to avoid repeating work. Source changes, expired links and provider failures can still need fresh requests. Caching does not guarantee that an old mirror remains available.</p>
+<p>The bundled SuperPSX 2.0 connector uses JSON results. The codebase also retains compatibility engines for other source formats. Read the <a href="https://github.com/Xyhlo/SSPI#source-layout">source layout</a> to find the managed and native implementations.</p>
+</section>
+<section id="networking" class="doc-section" data-title="Speed & bandwidth">
+<div class="section-heading"><span class="section-number">13</span><div><p class="eyebrow">MEASURE THE ACTUAL TRANSFER</p><h2>Speed & bandwidth<a class="permalink" href="#networking" aria-label="Link to Speed & bandwidth">#</a></h2></div></div>
+<h3>Mbps and MB/s</h3><p>Connection plans usually advertise <strong>Mbps</strong>; the download display uses <strong>MB/s</strong>. Divide by eight for the theoretical decimal equivalent, before protocol overhead, disk work and host limits.</p>
+<div class="speed-calculator"><label for="connection-speed">Connection speed <span>Mbps</span></label><input id="connection-speed" type="number" min="0" max="100000" value="300"><span aria-hidden="true">÷ 8</span><output id="speed-result" for="connection-speed">37.5 <span>MB/s</span></output><small>Theoretical equivalent, not a speed test</small></div>
+<h3>Bandwidth limit</h3><p>Open <strong>Settings → General → Bandwidth limit</strong>. Use <strong>Unlimited</strong> when measuring the fastest available route. The old Parallel ranges setting is no longer the user-facing transfer control.</p>
+<p>A 300 Mbps connection has a theoretical ceiling of 37.5 MB/s before overhead. SSPI cannot promise 30 MB/s for every host, provider route, console or disk. A steady 11 MB/s is also consistent with a 100 Mbps link, but that must be checked at the router or switch rather than assumed from the number alone.</p>
+<h3>Compare one route at a time</h3><p>Use Ethernet, the same large file, host and debrid service, with other disk/network work quiet. Record sustained speed after startup and the bandwidth setting. A console internet test is not a measurement of that specific download route.</p>
+<h3>TorBox preparation and rate limits</h3><p>An uncached file may need to reach TorBox before it can be delivered to the PS4. That wait is provider preparation, not console transfer speed. Unsupported hosts and account limits can still stop resolution. If a provider returns HTTP 429, wait for its retry window.</p>
+</section>
+<section id="troubleshooting" class="doc-section" data-title="Troubleshooting">
+<div class="section-heading"><span class="section-number">14</span><div><p class="eyebrow">START WITH THE STAGE THAT FAILED</p><h2>Troubleshooting<a class="permalink" href="#troubleshooting" aria-label="Link to Troubleshooting">#</a></h2></div></div>
+<p>Open the individual package in <strong>Files</strong> and keep the exact error wording. Search, service unlocking, extraction and installation are different stages.</p>
+<details id="trouble-launch"><summary>The app does not launch <span>+</span></summary><div><p>Confirm the installed SSPI package and the console's homebrew environment. Report the PS4 model, firmware, GoldHEN version and any system error. Older firmware coverage is still being established; do not treat the beta as universally compatible.</p></div></details>
+<details id="trouble-pairing"><summary>The QR setup page will not open <span>+</span></summary><div><p>Keep SSPI open, rescan the current QR and check that the phone and console can reach each other. Disable guest isolation or a phone VPN if it blocks local access. Never post the full token-bearing URL publicly.</p></div></details>
+<details id="trouble-source"><summary>A source fails to install or search <span>+</span></summary><div><p>Check the source is enabled and its URL returns a real .gssource archive. Capture its version and the full transport or engine error. An HTTPS/module error occurs before package installation; it is not an archive failure. A website loading on your phone does not prove the PS4 transport works.</p></div></details>
+<details id="trouble-results"><summary>No results or an update is missing <span>+</span></summary><div><p>Try the exact CUSA ID and clear restrictive region, host or type filters. A source can be unavailable or omit metadata. Cached update checks can delay a new badge. Missing results do not prove that no update exists.</p></div></details>
+<details id="trouble-service"><summary>A debrid link fails <span>+</span></summary><div><p>Check the active service, account access and host support. All mirrors remain visible even if a service cannot unlock them. Try a supported alternative. For TorBox, distinguish preparation from failure; repeated recreation of the same job can consume limits.</p></div></details>
+<details id="trouble-install"><summary>BGFT fails or SSPI stays on Installing <span>+</span></summary><div><p>Record both the SSPI row and PS4 Notifications details, including the complete error code. Check title ID, base version and the selected update/backport. The beta reconciles stale counters, but a patch integrity-verification failure can still remain Installing. Preserve files while task ownership is unresolved and report the timeline.</p></div></details>
+<details id="trouble-extraction"><summary>Multipart extraction fails <span>+</span></summary><div><p>Check that every volume is complete and belongs to the same set. Confirm free space for archive data and extracted packages. Missing parts, damaged uploads or unsupported archive features can require a corrected set or another mirror. Renaming a part file to .pkg does not convert it.</p></div></details>
+<details id="trouble-speed"><summary>Downloads seem slower than expected <span>+</span></summary><div><p>Use the <a href="#networking">speed guide</a>, set the bandwidth limit to Unlimited and compare sustained speed on the same route. Include connection type, host, service, stage and free storage in the report.</p></div></details>
+</section>
+<section id="reference" class="doc-section" data-title="Settings & local data">
+<div class="section-heading"><span class="section-number">15</span><div><p class="eyebrow">QUICK REFERENCE</p><h2>Settings & local data<a class="permalink" href="#reference" aria-label="Link to Settings & local data">#</a></h2></div></div>
+<p><kbd>OPTIONS</kbd> opens or closes Settings. <kbd>L1</kbd>/<kbd>R1</kbd> switch main tabs or settings pages. Follow the bottom action row for the current screen.</p>
+<div class="table-wrap"><table><thead><tr><th>Page</th><th>Controls</th></tr></thead><tbody><tr><td>General</td><td>Bandwidth limit, download statistics, focused-download graph, firmware hints and removable history.</td></tr><tr><td>Connections</td><td>Real-Debrid, TorBox, phone setup and enabled package sources.</td></tr><tr><td>Appearance</td><td>Accent and built-in background choices.</td></tr><tr><td>Storage</td><td>Downloaded files and eligible cleanup.</td></tr><tr><td>Sound</td><td>Music, interface sounds and volume.</td></tr></tbody></table></div>
+<h3>Data stays on the console</h3><p>Runtime data remains under <code>/data/GameSearch/</code>, preserving the app's historical directory identity. Settings, credentials, sources, queue state, staging data and caches belong to that local workspace. Updating the same application does not require publishing or sharing these files.</p>
+<h3>Development source</h3><p>The GitHub repository contains selected production source, manifests, notices and this public guide. SDKs, runtime dependencies, source descriptors and build outputs remain separate. A source ZIP is not an installable package or a complete build environment.</p>
+<p>See the <a href="https://github.com/Xyhlo/SSPI#building-in-the-development-workspace">build requirements</a>, <a href="https://github.com/Xyhlo/SSPI/blob/main/LICENSE">license</a> and <a href="https://github.com/Xyhlo/SSPI/blob/main/THIRD_PARTY_NOTICES.md">third-party notices</a>. Build artifacts belong under the development workspace's Build-Output directory.</p>
+</section>
+<section id="beta" class="doc-section" data-title="Beta testing">
+<div class="section-heading"><span class="section-number">16</span><div><p class="eyebrow">HELP MAKE THE NEXT BUILD BETTER</p><h2>Beta testing<a class="permalink" href="#beta" aria-label="Link to Beta testing">#</a></h2></div></div>
+<p><strong>5.10 is an early public beta.</strong> It has worked well for the initial testers after a number of fixes, but more hardware and package combinations will expose more bugs. Launch failures, extraction problems and installation errors are still possible.</p>
+<p>The guide was updated on 9 September 2026 for the public beta. Read the <a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta">release notes</a> for the package download and checksum. Local build/test results do not establish universal firmware support, a fixed frame rate or a guaranteed download speed.</p>
+<div class="report-panel"><div class="report-header"><h3>A useful issue report</h3><button class="button small" id="copy-report" type="button">Copy template</button></div><pre id="report-template">SSPI version and footer build ID:
+PS4 model / firmware / GoldHEN version:
+Worker status (if using background downloads):
+Connection: Ethernet or Wi-Fi
+Service / host (no keys):
+Source name and version:
+Title ID / installed base version:
+Update, backport or DLC version:
+Package type: direct PKG or archive set
+File size / free storage / bandwidth limit:
+Steps to reproduce:
+Stage that failed / full SSPI error:
+PS4 system status and error code:
+Expected result / actual result:</pre><p id="copy-status" role="status" class="fine-print"></p></div>
+<p>Remove keys, pairing tokens, signed URLs and private settings from screenshots and logs. When SSPI and the PS4 disagree, include both states. Reports that reproduce an issue help more than a summary saying it does not work.</p>
+<div class="closing-actions"><a class="button primary" href="https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta">Download beta ↗</a><a class="button" href="https://discord.gg/hF2vw7ybRs">Join Discord ↗</a><a class="button" href="https://github.com/Xyhlo/SSPI/issues/new">Report a bug ↗</a></div>
+</section>
+<nav class="page-pagination" aria-label="Previous and next topics"><a id="previous-page" href="#overview"><span>← Previous</span><strong>Overview</strong></a><a id="next-page" href="#requirements"><span>Next →</span><strong>Before you start</strong></a></nav>
+<footer class="site-footer"><div><strong>Super Simple Package Installer</strong><p>5.10 public beta · <a href="https://discord.gg/hF2vw7ybRs">Discord community</a></p></div><a href="https://github.com/Xyhlo/SSPI/issues/new">Report an issue ↗</a></footer>
+</div></div>
+</main>
+<aside class="page-outline" aria-label="Article navigation"><p>On this page</p><nav id="page-toc" aria-label="On this page"></nav><div class="outline-links"><a href="https://github.com/Xyhlo/SSPI/blob/main/docs/index.html">View this documentation ↗</a><a href="https://github.com/Xyhlo/SSPI/issues/new">Suggest a correction ↗</a><a href="https://discord.gg/hF2vw7ybRs">Join Discord ↗</a></div></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title"><div class="search-dialog-top"><h2 id="search-title">Search the field guide</h2><button id="search-close" type="button" aria-label="Close search">Esc <span aria-hidden="true">×</span></button></div><label class="sr-only" for="search-input">Search terms</label><input id="search-input" type="search" placeholder="Try “TorBox”, “backport”, or “pairing”…" autocomplete="off"><p id="search-summary" role="status">Type a word or phrase to find a section.</p><div id="search-results"></div><div class="search-dialog-footer"><span><kbd>↑</kbd> <kbd>↓</kbd> Navigate</span><span><kbd>Enter</kbd> Open</span><span><kbd>Esc</kbd> Close</span></div></dialog>
+</body>
+</html>
