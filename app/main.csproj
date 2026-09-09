@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{7071404E-A6D9-4345-9616-D74AE2F38148}</ProjectGuid>
+    <OutputType>Exe</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
+    <RootNamespace>Orbis</RootNamespace>
+    <AssemblyName>main</AssemblyName>
+    <TargetFrameworkVersion>v4.8.1</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <LangVersion>default</LangVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x64' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Prefer32bit>false</Prefer32bit>
+    <OutputPath>..\..\Build-Output\PS4\managed-debug\</OutputPath>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x64' ">
+    <DebugType>pdbonly</DebugType>
+    <Deterministic>true</Deterministic>
+    <Optimize>true</Optimize>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Prefer32bit>false</Prefer32bit>
+    <OutputPath>..\..\Build-Output\PS4\managed\</OutputPath>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Buffers">
+      <HintPath>..\SDK\managed\SDL2-CS\ImageSharp\artifacts\bin\src\ImageSharp\Release\net45\System.Buffers.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="System.Core" />
+    <Reference Include="System.Data" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="ICSharpCode.SharpZipLib">
+      <HintPath>..\SDK\pkg-tools\DotNetTemplate\binaries\Common\mono\4.5\ICSharpCode.SharpZipLib.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="System.Memory">
+      <HintPath>..\SDK\managed\SDL2-CS\ImageSharp\artifacts\bin\src\ImageSharp\Release\net45\System.Memory.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="System.Runtime.CompilerServices.Unsafe">
+      <HintPath>..\SDK\managed\SDL2-CS\ImageSharp\artifacts\bin\src\ImageSharp\Release\net45\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="System.Numerics.Vectors">
+      <HintPath>..\SDK\managed\SDL2-CS\ImageSharp\artifacts\bin\src\ImageSharp\Release\net45\System.Numerics.Vectors.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="System.ValueTuple">
+      <HintPath>..\SDK\managed\SDL2-CS\ImageSharp\artifacts\bin\src\ImageSharp\Release\net45\System.ValueTuple.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="SixLabors.ImageSharp">
+      <HintPath>..\SDK\managed\SDL2-CS\ImageSharp\artifacts\bin\src\ImageSharp\Release\net45\SixLabors.ImageSharp.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="System.Xml" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="AppSettings.cs" />
+    <Compile Include="..\..\Build-Output\PS4\generated\BuildIdentity.cs" />
+    <Compile Include="AtomicFile.cs" />
+    <Compile Include="AllDebridClient.cs" />
+    <Compile Include="CoverCache.cs" />
+    <Compile Include="DeepbridClient.cs" />
+
+    <Compile Include="DownloadManager.cs" />
+    <Compile Include="DownloadLinkParser.cs" />
+    <Compile Include="DownloadTransferSettings.cs" />
+    <Compile Include="SequentialDownloadEngine.cs" />
+    <Compile Include="FreeHosterClient.cs" />
+    <Compile Include="FirmwareInfo.cs" />
+<Compile Include="GamepadIcons.cs" />
+<Compile Include="GoldHenPluginInstaller.cs" />
+<Compile Include="InstalledTitleScan.cs" />
+    <Compile Include="Internals\IO.cs" />
+    <Compile Include="Internals\Kernel.cs" />
+    <Compile Include="Internals\UserService.cs" />
+    <Compile Include="JsonLite.cs" />
+    <Compile Include="LoopbackPkgServer.cs" />
+    <Compile Include="LoopbackPkgFeeder.cs" />
+    <Compile Include="NativeHttp.cs" />
+    <Compile Include="NativeImeDialog.cs" />
+    <Compile Include="NetHttp.cs" />
+    <Compile Include="OrbisClient.cs" />
+    <Compile Include="PackageSourceCoordinator.cs" />
+    <Compile Include="PackageSourceEngineRecipe.cs" />
+    <Compile Include="PackageSourceEngineRecipe.V2.cs" />
+    <Compile Include="ResolverPageCache.cs" />
+    <Compile Include="SourceHttps.cs" />
+    <Compile Include="PackageSourceEngineRemote.cs" />
+    <Compile Include="PackageSourceModels.cs" />
+    <Compile Include="PackageSourcePackage.cs" />
+    <Compile Include="PackageSourceRuntime.cs" />
+    <Compile Include="PackageSourceStore.cs" />
+    <Compile Include="PackageArchive.cs" />
+    <Compile Include="ArchiveStorage.cs" />
+    <Compile Include="ArchiveVolumeSet.cs" />
+    <Compile Include="PairServer.cs" />
+    <Compile Include="PcGameApi.cs" />
+    <Compile Include="PixelFont.cs" />
+    <Compile Include="PkgInstaller.cs" />
+    <Compile Include="BgftOwnershipJournal.cs" />
+    <Compile Include="BgftCancellation.cs" />
+    <Compile Include="PkgInstallPath.cs" />
+    <Compile Include="PkgInstallPolicy.cs" />
+    <Compile Include="PkgValidator.cs" />
+    <Compile Include="PkgIntegrity.cs" />
+    <Compile Include="Program.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="QueryCache.cs" />
+    <Compile Include="QrCode.cs" />
+    <Compile Include="RealDebridClient.cs" />
+    <Compile Include="ResidentDownloadService.cs" />
+    <Compile Include="ResidentSfo.cs" />
+    <Compile Include="SearchWindow.cs" />
+    <Compile Include="SearchWindow.Branding.cs" />
+    <Compile Include="SearchWindow.Charcoal.cs" />
+    <Compile Include="SearchWindow.Refined.cs" />
+    <Compile Include="SearchWindow.Design.cs" />
+    <Compile Include="SearchWindow.Release.cs" />
+    <Compile Include="SearchWindow.Patterns.cs" />
+    <Compile Include="BackdropPattern.cs" />
+    <Compile Include="String\CString.cs" />
+    <Compile Include="String\StringBufferA.cs" />
+    <Compile Include="TlsBootstrap.cs" />
+    <Compile Include="ThemePalette.cs" />
+    <Compile Include="TorBoxClient.cs" />
+    <Compile Include="UiFont.cs" />
+    <Compile Include="UiVisualPolicy.cs" />
+    <Compile Include="UnlockProviders.cs" />
+    <Compile Include="DebridHostSupport.cs" />
+    <Compile Include="User.cs" />
+    <Compile Include="Util.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\SDK\managed\SDL2-CS\SDL2-CS.csproj">
+      <Project>{85480198-8711-4355-830e-72fd794ad3f6}</Project>
+      <Name>SDL2-CS</Name>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="SharpCompress" Version="0.48.0" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
+         Other similar extension points exist, see Microsoft.Common.targets.
+    <Target Name="BeforeBuild">
+    </Target>
+    <Target Name="AfterBuild">
+    </Target>
+    -->
+</Project>

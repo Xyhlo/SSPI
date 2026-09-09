@@ -1,0 +1,12 @@
+{
+  "productName": "Super Simple Package Installer",
+  "version": "5.10",
+  "assemblyVersion": "5.0.10.1",
+  "titleId": "SRCH00001",
+  "contentId": "IV0000-SRCH00001_00-GAMESEARCH000000",
+  "dataDirectory": "/data/GameSearch",
+  "packageTimestampUtc": "2026-09-06T02:56:27Z",
+  "releaseChannel": "beta",
+  "betaRevision": 2,
+  "outputRoot": "../Build-Output/PS4"
+}

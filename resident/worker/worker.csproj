@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x64</Platform>
+    <ProjectGuid>{A6316BB6-C4D4-4D15-AFEB-35A216D80D44}</ProjectGuid>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Orbis</RootNamespace>
+    <AssemblyName>main</AssemblyName>
+    <TargetFrameworkVersion>v4.8.1</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <LangVersion>default</LangVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x64' ">
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <OutputPath>bin\x64\Release\</OutputPath>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Prefer32bit>false</Prefer32bit>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="WorkerProgram.cs" />
+    <Compile Include="WorkerSupport.cs" />
+    <Compile Include="..\..\app\DownloadTransferSettings.cs"><Link>DownloadTransferSettings.cs</Link></Compile>
+    <Compile Include="..\..\app\SequentialDownloadEngine.cs" />
+    <Compile Include="..\..\app\Internals\IO.cs"><Link>Internals\IO.cs</Link></Compile>
+    <Compile Include="..\..\app\Internals\Kernel.cs"><Link>Internals\Kernel.cs</Link></Compile>
+    <Compile Include="..\..\app\LoopbackPkgFeeder.cs"><Link>LoopbackPkgFeeder.cs</Link></Compile>
+    <Compile Include="..\..\app\LoopbackPkgServer.cs"><Link>LoopbackPkgServer.cs</Link></Compile>
+    <Compile Include="..\..\app\NativeHttp.cs"><Link>NativeHttp.cs</Link></Compile>
+    <Compile Include="..\..\app\NetHttp.cs"><Link>NetHttp.cs</Link></Compile>
+    <Compile Include="..\..\app\PkgValidator.cs"><Link>PkgValidator.cs</Link></Compile>
+    <Compile Include="..\..\app\String\CString.cs"><Link>String\CString.cs</Link></Compile>
+    <Compile Include="..\..\app\String\StringBufferA.cs"><Link>String\StringBufferA.cs</Link></Compile>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
