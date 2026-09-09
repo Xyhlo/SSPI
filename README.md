@@ -6,7 +6,7 @@
 
 **Current version: 5.10 beta** · C# / Mono · SDL2 · Native C/C++ services
 
-[**Download the public beta**](https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta) · [**Join Discord**](https://discord.gg/hF2vw7ybRs) · [**Report a bug**](https://github.com/Xyhlo/SSPI/issues)
+[**Download the public beta**](https://github.com/Xyhlo/SSPI/releases/tag/v5.10-beta) · [**Read the guide**](https://xyhlo.github.io/SSPI/) · [**Join Discord**](https://discord.gg/hF2vw7ybRs) · [**Report a bug**](https://github.com/Xyhlo/SSPI/issues)
 
 **TorBox and Real-Debrid are the only supported download options in this beta. You need your own service account and API key.** Download `sspi5.10b.pkg` from the release assets; GitHub's source archives are not installable PS4 packages.
 
@@ -96,7 +96,7 @@ Shell-resident downloads require the relevant GoldHEN process/plugin capabilitie
 | [`resident/worker/`](resident/worker) | Managed worker entry point and project |
 | [`product.json`](product.json) | Version, package identity and output convention |
 
-The Git allowlist publishes production code, project manifests, license notices and the README banner. SDKs, binaries, runtime artwork/fonts/audio, source descriptors, recordings, tests, internal build scripts and release artifacts stay in the local development workspace. They are not hidden dependencies that a NuGet restore will supply.
+The Git allowlist publishes production code, project manifests, license notices, approved PS4 documentation artwork and the public guide. SDKs, binaries, runtime artwork/fonts/audio, source descriptors, recordings, tests, internal build scripts and release artifacts stay in the local development workspace. They are not hidden dependencies that a NuGet restore will supply.
 
 ## Building in the development workspace
 
