@@ -376,6 +376,7 @@ namespace Orbis
             _landingContinue.Clear();
             _landingPebble = null;
             List<DlItem> items = _dlMgr == null ? null : _dlMgr.Snapshot();
+            PollDownloadAudio(items);
             if (items != null)
             {
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -610,9 +611,109 @@ namespace Orbis
         }
 
         #region Input
+        bool _audioStarted;
+        bool _audioSnapshotPrimed;
+        readonly Dictionary<string, DlState> _audioDownloadStates = new Dictionary<string, DlState>();
+        readonly HashSet<string> _audioSeen = new HashSet<string>();
+        readonly List<string> _audioRemoved = new List<string>();
+
+        void ApplyAudioSettings()
+        {
+            UiAudio.SetEnabled(_cfg.BackgroundMusic, _cfg.InterfaceSounds);
+            float master = Math.Max(0, Math.Min(100, _cfg.AudioVolume)) / 100f;
+            UiAudio.SetVolume(master * 0.35f, master);
+        }
+
+        void PollDownloadAudio(List<DlItem> items)
+        {
+            if (items == null) return;
+            bool installed = false;
+            _audioSeen.Clear();
+            foreach (DlItem item in items)
+            {
+                if (item == null || string.IsNullOrEmpty(item.Id)) continue;
+                _audioSeen.Add(item.Id);
+                DlState previous;
+                bool known = _audioDownloadStates.TryGetValue(item.Id, out previous);
+                if (_audioSnapshotPrimed && item.State == DlState.Installed &&
+                    (!known || previous != DlState.Installed)) installed = true;
+                _audioDownloadStates[item.Id] = item.State;
+            }
+            _audioRemoved.Clear();
+            foreach (string id in _audioDownloadStates.Keys)
+                if (!_audioSeen.Contains(id)) _audioRemoved.Add(id);
+            foreach (string id in _audioRemoved) _audioDownloadStates.Remove(id);
+            _audioSnapshotPrimed = true;
+            if (installed) UiAudio.Play(UiSound.Installed);
+        }
+
+        static void PlayButtonSound(DS4Button button)
+        {
+            if (button == DS4Button.SCE_PAD_BUTTON_UP || button == DS4Button.SCE_PAD_BUTTON_DOWN ||
+                button == DS4Button.SCE_PAD_BUTTON_LEFT || button == DS4Button.SCE_PAD_BUTTON_RIGHT ||
+                button == DS4Button.SCE_PAD_BUTTON_L1 || button == DS4Button.SCE_PAD_BUTTON_R1)
+                UiAudio.Play(UiSound.Navigate);
+            else if (button == DS4Button.SCE_PAD_BUTTON_CIRCLE) UiAudio.Play(UiSound.Back);
+            else if (button == DS4Button.SCE_PAD_BUTTON_CROSS || button == DS4Button.SCE_PAD_BUTTON_OPTIONS)
+                UiAudio.Play(UiSound.Confirm);
+        }
+
+        static void PlayToastSound(string message)
+        {
+            string value = (message ?? "").ToLowerInvariant();
+            if (value.Contains("fail") || value.Contains("error") || value.Contains("could not") || value.Contains("corrupt"))
+                UiAudio.Play(UiSound.Error);
+            else if (value.Contains("queued") || value.Contains("added")) UiAudio.Play(UiSound.Queued);
+            // Installed cues come from state transitions, never historical status text.
+        }
+
+        static readonly int[] SettingsPages = { 0, 1, 3, 5, 4 };
+        void CycleSettingsPage(int direction)
+        {
+            int current = Array.IndexOf(SettingsPages, _settingsPage == 2 ? 1 : _settingsPage);
+            _settingsPage = SettingsPages[(Math.Max(0, current) + direction + SettingsPages.Length) % SettingsPages.Length];
+            if (_settingsPage == 1) StartPairSession();
+        }
+
+        void HandleSettingsSound(DS4Button button)
+        {
+            if (button == DS4Button.SCE_PAD_BUTTON_UP) { _settingsFocus = (_settingsFocus + 2) % 3; return; }
+            if (button == DS4Button.SCE_PAD_BUTTON_DOWN) { _settingsFocus = (_settingsFocus + 1) % 3; return; }
+            if (button != DS4Button.SCE_PAD_BUTTON_CROSS && button != DS4Button.SCE_PAD_BUTTON_LEFT &&
+                button != DS4Button.SCE_PAD_BUTTON_RIGHT) return;
+            bool music = _cfg.BackgroundMusic, effects = _cfg.InterfaceSounds;
+            int volume = _cfg.AudioVolume;
+            if (_settingsFocus == 0) _cfg.BackgroundMusic = !_cfg.BackgroundMusic;
+            else if (_settingsFocus == 1) _cfg.InterfaceSounds = !_cfg.InterfaceSounds;
+            else _cfg.AudioVolume = Math.Max(0, Math.Min(100, volume + (button == DS4Button.SCE_PAD_BUTTON_LEFT ? -5 : 5)));
+            if (!_cfg.Save())
+            {
+                _cfg.BackgroundMusic = music; _cfg.InterfaceSounds = effects; _cfg.AudioVolume = volume;
+                User.NotifyToast("Could not save sound settings");
+            }
+            ApplyAudioSettings();
+            Invalidated = true;
+        }
+
+        void DrawSettingsSound(IntPtr r, SDL_Rect sheet)
+        {
+            int x = sheet.x, y = sheet.y + 25, w = sheet.w;
+            TextPx(r, x, y, 27, "Sound", White);
+            TextPx(r, x, y + 43, 18, "Quiet ambience and gentle feedback. Changes save automatically.", Muted);
+            DrawSettingsRow(r, x, y + 112, w, 83, 0, "Background music", "A soft, original ambient loop", _cfg.BackgroundMusic ? "ON" : "OFF");
+            DrawSettingsRow(r, x, y + 221, w, 83, 1, "Interface sounds", "Navigation, queue and installation feedback", _cfg.InterfaceSounds ? "ON" : "OFF");
+            DrawSettingsRow(r, x, y + 330, w, 83, 2, "Volume", "LEFT / RIGHT adjusts in 5% steps", _cfg.AudioVolume == 0 ? "Muted" : _cfg.AudioVolume + "%");
+            TextPx(r, x, y + 466, 18, "Music stays beneath the interface sounds.", Dim);
+        }
+
         public void HandleButton(DS4Button button)
         {
-            lock (_lock) HandleButtonCore(button);
+            lock (_lock)
+            {
+                bool sound = _launchFinished;
+                HandleButtonCore(button);
+                if (sound) PlayButtonSound(button);
+            }
         }
 
         void HandleButtonCore(DS4Button button)
@@ -637,7 +738,7 @@ namespace Orbis
                 // L1/R1 switch settings pages while overlay is open
                 if (button == DS4Button.SCE_PAD_BUTTON_L1)
                 {
-                    _settingsPage = (_settingsPage + 4) % 5; if (_settingsPage == 2) _settingsPage = 1; if (_settingsPage == 1) StartPairSession();
+                    CycleSettingsPage(-1);
                     _settingsFocus = 0;
                     _settingsScroll = 0;
                     Invalidated = true;
@@ -645,7 +746,7 @@ namespace Orbis
                 }
                 if (button == DS4Button.SCE_PAD_BUTTON_R1)
                 {
-                    _settingsPage = (_settingsPage + 1) % 5; if (_settingsPage == 2) _settingsPage = 3; if (_settingsPage == 1) StartPairSession();
+                    CycleSettingsPage(1);
                     _settingsFocus = 0;
                     _settingsScroll = 0;
                     Invalidated = true;
@@ -840,6 +941,7 @@ namespace Orbis
             else if (_settingsPage == 1) HandleSettingsUnlock(b);
             else if (_settingsPage == 2) HandleSettingsPackageSources(b);
             else if (_settingsPage == 4) HandleStorage(b);
+            else if (_settingsPage == 5) HandleSettingsSound(b);
             else HandleSettingsAppearance(b);
         }
 
@@ -2191,13 +2293,9 @@ namespace Orbis
             }
             List<PackageCandidate> cachedCands;
             string sourceStamp = _packageSources.CatalogFingerprint();
-            bool hostListReady = !_cfg.UseUnlockProvider || _cfg.UnlockProviderId == UnlockProviders.NoneId ||
-                DebridHostSupport.Load(_cfg, _cfg.UnlockProviderId, false) != null;
-            if (hostListReady && QueryCache.TryResolve(_selected.TitleId, out cachedCands, sourceStamp) && cachedCands != null &&
+            if (QueryCache.TryResolve(_selected.TitleId, out cachedCands, sourceStamp) && cachedCands != null &&
                 cachedCands.Count > 0)
             {
-                string hostMessage;
-                cachedCands = DebridHostSupport.Filter(_cfg, cachedCands, false, out hostMessage);
                 var cachedLinks = new List<PkgLink>();
                 for (int i = 0; i < cachedCands.Count; i++)
                     cachedLinks.Add(PackageCandidateAdapter.ToPkgLink(cachedCands[i]));
@@ -2213,7 +2311,6 @@ namespace Orbis
                 _browseBusy = false;
                 _busyKind = BusyKind.None;
                 _screen = BrowseScreen.Detail;
-                if (cachedCands.Count == 0) _resolveError = hostMessage;
                 SetStatus(cachedCands.Count + " links (cached)");
                 return;
             }
@@ -2232,8 +2329,6 @@ namespace Orbis
                     if (candidates == null)
                         throw new Exception(string.IsNullOrEmpty(sourceError) ? "Package Source resolve failed" : sourceError);
                     if (candidates.Count > 0) QueryCache.PutResolve(sel.TitleId, candidates, sourceStamp);
-                    string hostMessage;
-                    candidates = DebridHostSupport.Filter(_cfg, candidates, true, out hostMessage);
                     var links = new List<PkgLink>();
                     foreach (var candidate in candidates)
                         links.Add(PackageCandidateAdapter.ToPkgLink(candidate));
@@ -2253,7 +2348,7 @@ namespace Orbis
                         _detailFocus = _detailScroll = 0;
                         if (focusFirstUpdate) FocusFirstUpdateRow();
                         _browseBusy = false; _busyKind = BusyKind.None;
-                        _resolveError = links.Count == 0 ? (hostMessage ?? "No matching package links") : null;
+                        _resolveError = links.Count == 0 ? "No matching package links" : null;
                         _status = links.Count + " links (Package Sources)";
                     }
                 }
@@ -2297,9 +2392,6 @@ namespace Orbis
                     if (candidates == null)
                         throw new Exception(string.IsNullOrEmpty(sourceError)
                             ? "Package Source resolve failed" : sourceError);
-                    string hostMessage;
-                    candidates = DebridHostSupport.Filter(_cfg, candidates, true, out hostMessage);
-                    if (candidates.Count == 0 && hostMessage != null) throw new Exception(hostMessage);
                     lock (_lock) { if (gen != _resolveGeneration) return; }
                     int queued = QueueRecommendedCandidates(game, candidates);
                     lock (_lock)
@@ -2383,7 +2475,8 @@ namespace Orbis
             for (int i = 0; i < candidates.Count; i++)
             {
                 PackageCandidate candidate = candidates[i];
-                if (candidate == null || !SamePackageKind(candidate.PackageKindHint, kind)) continue;
+                if (candidate == null || !string.IsNullOrWhiteSpace(candidate.ResolutionError) ||
+                    !SamePackageKind(candidate.PackageKindHint, kind)) continue;
                 if (best < 0) { best = i; continue; }
                 int version = ComparePackageVersions(candidate.PackageVersion, candidates[best].PackageVersion);
                 if (latestVersion && version > 0) { best = i; continue; }
@@ -2723,6 +2816,12 @@ namespace Orbis
         public override void OnCycleBegin(uint FrameTime, uint NextFrameTime)
         {
             _frameTime = FrameTime;
+            if (_launchFinished && !_audioStarted)
+            {
+                _audioStarted = true;
+                UiAudio.Init(_cfg.BackgroundMusic, _cfg.InterfaceSounds);
+                ApplyAudioSettings();
+            }
             string nextStatus;
             if (User.TryTakeStatus(out nextStatus))
                 SetStatus(nextStatus);
@@ -2744,6 +2843,7 @@ namespace Orbis
                     _toastText = nextToast;
                     _toastStartedAt = UiTick();
                     _toastActive = true;
+                    PlayToastSound(nextToast);
                 }
             }
             bool busyAnim;
@@ -3040,6 +3140,7 @@ namespace Orbis
                 }
                 else if (_settingsPage == 1) { add("cross", "Select"); add("square", "QR setup"); add("circle", "Close"); }
                 else if (_settingsPage == 3) { add("cross", "Select"); add("triangle", "Restore"); add("circle", "Close"); }
+                else if (_settingsPage == 5) { add("cross", _settingsFocus == 2 ? "Volume" : "Toggle"); add("circle", "Close"); }
                 else if (_settingsPage == 0 && _settingsFocus == 0)
                 {
                     add("cross", "Bandwidth limit");
@@ -3170,9 +3271,9 @@ namespace Orbis
         void DrawSettingsOverlay(IntPtr r)
         {
             DrawHeader(r);
-            string[] pages = { "General", "Connections", "Appearance", "Storage" };
-            int[] ids = { 0, 1, 3, 4 };
-            var tabGroup = new SDL_Rect { x = (W - 904) / 2, y = 140, w = 904, h = 56 };
+            string[] pages = { "General", "Connections", "Appearance", "Sound", "Storage" };
+            int[] ids = { 0, 1, 3, 5, 4 };
+            var tabGroup = new SDL_Rect { x = (W - 1128) / 2, y = 140, w = 1128, h = 56 };
             SoftRect(r, tabGroup, C(29, 29, 29)); StrokeRect(r, tabGroup, Border, 1);
             GamepadIcons.Draw(r, "l1", tabGroup.x - 60, tabGroup.y + 10, 36);
             GamepadIcons.Draw(r, "r1", tabGroup.x + tabGroup.w + 24, tabGroup.y + 10, 36);
@@ -3186,6 +3287,7 @@ namespace Orbis
             else if (_settingsPage == 2) DrawSettingsPackageSourcesPage(r, sheet);
             else if (_settingsPage == 3) DrawSettingsAppearancePage(r, sheet);
             else if (_settingsPage == 4) DrawStorage(r, sheet);
+            else if (_settingsPage == 5) DrawSettingsSound(r, sheet);
             else DrawSettingsGeneralPage(r, sheet);
             DrawSourceInstallNotification(r, sheet);
             if (_softKbOpen && (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox || _softKbForSourceUrl))

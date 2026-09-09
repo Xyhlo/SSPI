@@ -94,6 +94,7 @@ namespace Orbis
 
         public override void Dispose()
         {
+            UiAudio.Shutdown();
             FinishLaunchBranding();
             foreach (var frame in _caseSizes.Values) if (frame != IntPtr.Zero) SDL_DestroyTexture(frame);
             _caseSizes.Clear();
