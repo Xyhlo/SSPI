@@ -27,6 +27,9 @@
   <ItemGroup>
     <Compile Include="WorkerProgram.cs" />
     <Compile Include="WorkerSupport.cs" />
+    <Compile Include="../../app/ServiceHttpException.cs"><Link>ServiceHttpException.cs</Link></Compile>
+    <Compile Include="..\..\app\SspiLog.cs"><Link>SspiLog.cs</Link></Compile>
+    <Compile Include="..\..\app\AtomicFile.cs"><Link>AtomicFile.cs</Link></Compile>
     <Compile Include="..\..\app\DownloadTransferSettings.cs"><Link>DownloadTransferSettings.cs</Link></Compile>
     <Compile Include="..\..\app\SequentialDownloadEngine.cs" />
     <Compile Include="..\..\app\Internals\IO.cs"><Link>Internals\IO.cs</Link></Compile>
@@ -34,8 +37,10 @@
     <Compile Include="..\..\app\LoopbackPkgFeeder.cs"><Link>LoopbackPkgFeeder.cs</Link></Compile>
     <Compile Include="..\..\app\LoopbackPkgServer.cs"><Link>LoopbackPkgServer.cs</Link></Compile>
     <Compile Include="..\..\app\NativeHttp.cs"><Link>NativeHttp.cs</Link></Compile>
+    <Compile Include="..\..\app\TransferClient.cs"><Link>TransferClient.cs</Link></Compile>
     <Compile Include="..\..\app\NetHttp.cs"><Link>NetHttp.cs</Link></Compile>
     <Compile Include="..\..\app\PkgValidator.cs"><Link>PkgValidator.cs</Link></Compile>
+    <Compile Include="..\..\app\PkgIntegrity.cs"><Link>PkgIntegrity.cs</Link></Compile>
     <Compile Include="..\..\app\String\CString.cs"><Link>String\CString.cs</Link></Compile>
     <Compile Include="..\..\app\String\StringBufferA.cs"><Link>String\StringBufferA.cs</Link></Compile>
   </ItemGroup>

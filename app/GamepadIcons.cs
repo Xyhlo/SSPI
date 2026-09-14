@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -77,8 +77,10 @@ namespace Orbis
                 artwork = false;
                 byte[] pixels = TryLoadArtwork(key, size, out artwork);
                 if (pixels == null) pixels = Rasterize(key, size);
-                SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+                // Artwork is already rasterized at its final pixel size.
+                SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
                 texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888, (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, size, size);
+                SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
                 if (texture == IntPtr.Zero) return false;
                 var pin = GCHandle.Alloc(pixels, GCHandleType.Pinned);
                 try { if (SDL_UpdateTexture(texture, IntPtr.Zero, pin.AddrOfPinnedObject(), size * 4) != 0) { SDL_DestroyTexture(texture); return false; } }
@@ -123,7 +125,7 @@ namespace Orbis
                     using (var cropped = image.Clone(ctx =>
                     {
                         ctx.Crop(new Rectangle(x0, y0, cw, ch));
-                        if (tw != cw || th != ch) ctx.Resize(tw, th, KnownResamplers.Bicubic);
+                        if (tw != cw || th != ch) ctx.Resize(tw, th, KnownResamplers.Lanczos3);
                     }))
                     {
                         var canvas = new byte[size * size * 4];

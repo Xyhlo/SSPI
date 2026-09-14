@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
@@ -59,7 +59,6 @@ namespace Orbis
         public void PushMbps(double mbps)
         {
             if (mbps < 0) mbps = 0;
-            if (mbps > 800) mbps = 800;
             Mbps[Write] = mbps;
             Write = (Write + 1) % Cap;
             if (Count < Cap) Count++;
@@ -112,14 +111,25 @@ namespace Orbis
         public string CandidateId = "";
         /// <summary>Direct, HosterLanding, or Unknown. Empty is a legacy Unknown value.</summary>
         public string AccessType = "";
+        public string MirrorCandidates = "";
         public string FanOutPendingPaths = "";
         public string ArchiveVolumes = "";
         public string ArchivePassword = "";
+        public bool LocalSource;
+        public string LocalSourceFingerprint = "";
         public string InstallAfterId = "";
+        public bool InstallAfterConfirmed;
         public bool BgftLocalInstall;
         // Persisted as resident_archive for compatibility; V4 PKGs also let the
         // resident own installation through to BGFT acknowledgement.
         public bool ResidentArchive;
+        public bool ResidentStaged;
+        public bool ResidentRemovePending;
+        public bool ResidentAutoInstall;
+        public string ResidentGeneration;
+        public string ResolvedProviderId = "";
+        internal bool ForegroundTransfer;
+        internal string BackgroundWaitLoggedReason;
         public bool InstallOrderReady;
         public string ExpectedSha256 = "";
         public long ExpectedByteSize;
@@ -134,7 +144,11 @@ namespace Orbis
         public long Total;
         public double BytesPerSec;
         public int EtaSeconds;
-        internal long StatsAt, StatsDone, StatsTotal, StatsAdvancedAt;
+        internal long StatsAt, StatsDone, StatsTotal, StatsAdvancedAt, StatsObservedDone;
+        internal bool StatsInitialized;
+        internal LiveTransferMeter LiveMeter;
+        internal double[] RateSamples;
+        internal long BgftRejectedCompletionTotal;
         internal string StatsPhase;
         internal int StatsAttempt;
         public string Error;
@@ -169,13 +183,22 @@ namespace Orbis
         /// <summary>Skip system BGFT for this attempt (after stall/fail → in-app).</summary>
         public bool ForceLocalInstall;
         public long RetryAfterUtcTicks;
+        public int TransientHttpRetries;
+        public int InstallRetries;
+        // Reuse a resolved URL for transient failures; never persist it in diagnostics.
+        public string HttpRetryUrl;
+        public int ResidentLinkRenewals;
+        public long ResidentLastRenewalBytes;
+        public bool ResidentRetryPending;
         /// <summary>Incremented each transfer claim; Refresh must not stomp a newer attempt.</summary>
         public int AttemptId;
         public bool PauseRequested;
+        // Last accepted resident command wins over a status sampled before it.
+        public bool? ResidentPauseDesired;
         public bool CancelRequested;
     }
 
-    /// <summary>Sequential PKG download queue with pause/resume and manifest persistence.</summary>
+    /// <summary>Bounded transfer queue with independent, ordered package installation.</summary>
     internal sealed class DownloadManager
     {
         sealed class PendingLocalChild
@@ -189,31 +212,38 @@ namespace Orbis
         readonly object _lock = new object();
         readonly object _saveLock = new object();
         readonly object _packageInstallGate = new object();
+        long _nextInstallHandoffAt, _nextJobStartAt;
         readonly object _bgftRefreshGate = new object();
+        readonly object _transferRouteGate = new object();
         readonly LoopbackPkgServer _loopback = new LoopbackPkgServer();
         readonly List<DlItem> _items = new List<DlItem>();
         readonly AppSettings _cfg;
         const int WorkerCount = 1;
+        bool _startupCleanupPending = true;
+        long _startupCleanupAfter;
         readonly Thread[] _workers = new Thread[WorkerCount];
         readonly HashSet<string> _activeIds = new HashSet<string>(StringComparer.Ordinal);
         readonly HashSet<string> _activePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         volatile bool _run = true;
         long _saveVersion;
         long _savedVersion;
+        int _residentPreparationAttempted;
         readonly NerdTelemetry _nerd = new NerdTelemetry();
         public NerdTelemetry Nerd { get { return _nerd; } }
 
         public DownloadManager(AppSettings cfg)
         {
+            NetHttp.ConfigureDownloadTrace(BuildIdentity.SourceHash);
             _cfg = cfg;
             if (_cfg != null) _cfg.ApplyToNetHttp();
             LoadManifest();
-            CleanupFanOutStateOnStartup();
+            _startupCleanupAfter = TransferClockMs() + 5000;
             for (int i = 0; i < _workers.Length; i++)
             {
                 int workerIndex = i;
                 _workers[i] = new Thread(() => WorkerLoop(workerIndex))
                     { IsBackground = true, Name = "DlMgr-" + (i + 1) };
+                try { _workers[i].Priority = ThreadPriority.BelowNormal; } catch (PlatformNotSupportedException) { }
                 _workers[i].Start();
             }
         }
@@ -233,6 +263,16 @@ namespace Orbis
             }
         }
 
+        public bool IsPipelineActive
+        {
+            get
+            {
+                lock (_lock)
+                    return _activeIds.Count != 0 || _items.Exists(item => item.Background ||
+                        item.State == DlState.Installing || item.State == DlState.Submitted);
+            }
+        }
+
         public string Enqueue(GameHit game, PkgLink link)
         {
             string message;
@@ -246,6 +286,11 @@ namespace Orbis
 
         /// <summary>Queues a complete immutable Package Source candidate snapshot.</summary>
         public string Enqueue(GameHit game, PackageCandidate candidate, out string message)
+        {
+            return Enqueue(game, candidate, null, out message);
+        }
+
+        public string Enqueue(GameHit game, PackageCandidate candidate, IList<PackageCandidate> mirrors, out string message)
         {
             if (candidate == null) throw new Exception("Bad package candidate");
             if (!string.IsNullOrWhiteSpace(candidate.ResolutionError))
@@ -268,6 +313,7 @@ namespace Orbis
                 var item = Find(id);
                 if (item != null)
                 {
+                    if (mirrors != null) item.MirrorCandidates = PackageMirrorFallback.Encode(candidate, mirrors);
                     if (string.IsNullOrEmpty(item.ArchiveVolumes)) item.ArchiveVolumes = candidate.ArchiveVolumes ?? "";
                     item.ArchivePassword = candidate.ArchivePassword ?? "";
                     // The candidate identity overload above either creates a row or fills only
@@ -285,7 +331,7 @@ namespace Orbis
                         string integrityError;
                         if (!VerifyCandidateFile(item, out integrityError))
                         {
-                            DeleteDownloadFiles(item.DestPath);
+                            DeleteDownloadFiles(item);
                             item.State = DlState.Failed;
                             item.Error = integrityError;
                             item.StatusText = "Candidate integrity check failed";
@@ -314,9 +360,10 @@ namespace Orbis
             lock (_lock)
             {
                 foreach (var existing in _items)
-                    if (string.Equals(existing.TitleId, game.TitleId, StringComparison.OrdinalIgnoreCase) &&
-                        string.Equals(existing.Kind, link.Kind, StringComparison.OrdinalIgnoreCase) &&
-                        string.Equals(existing.HosterUrl, link.Url, StringComparison.OrdinalIgnoreCase))
+                    if (((sourceId == "personal" && existing.SourceId == "personal") ||
+                        (string.Equals(existing.TitleId, game.TitleId, StringComparison.OrdinalIgnoreCase) &&
+                         string.Equals(existing.Kind, link.Kind, StringComparison.OrdinalIgnoreCase))) &&
+                        string.Equals(existing.HosterUrl, link.Url, StringComparison.Ordinal))
                     {
                         existingId = existing.Id;
                         if (!string.IsNullOrEmpty(game.ImageUrl) &&
@@ -325,7 +372,7 @@ namespace Orbis
                             existing.ImageUrl = game.ImageUrl;
                             changed = true;
                         }
-                        if (!string.IsNullOrEmpty(game.Name) &&
+                        if (!(sourceId == "personal" && string.IsNullOrEmpty(game.TitleId)) && !string.IsNullOrEmpty(game.Name) &&
                             !string.Equals(existing.Name, game.Name, StringComparison.Ordinal))
                         {
                             existing.Name = game.Name;
@@ -376,7 +423,11 @@ namespace Orbis
                             existing.PauseRequested = false;
                             existing.CancelRequested = false;
                             existing.State = DlState.Queued;
+                            existing.TransientHttpRetries = 0;
+                            existing.HttpRetryUrl = null;
+                            existing.RetryAfterUtcTicks = 0;
                             existing.InstallConfirmed = false;
+                            existing.InstallOrderReady = false;
                             existing.Error = null;
                             string partial = existing.DestPath + ".part";
                             if (File.Exists(partial))
@@ -507,12 +558,102 @@ namespace Orbis
             return id;
         }
 
+        public int QueueLocalFiles(IList<string> paths, out string error)
+        {
+            error = null;
+            if (paths == null || paths.Count == 0) { error = "Select a PKG, ZIP or first RAR volume"; return 0; }
+            if (paths.Count > 256) { error = "Select up to 256 files at a time"; return 0; }
+            var pending = new List<DlItem>();
+            var problems = new List<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string path in paths)
+            {
+                try
+                {
+                    string canonical;
+                    if (!LocalInstallSource.TryNormalizePath(path, out canonical)) throw new IOException("USB paths cannot contain parent links, colons, or names longer than 240 UTF-8 bytes");
+                    if (!seen.Add(canonical)) continue;
+                    LocalInstallSource source = LocalInstallSource.Read(canonical, true);
+                    pending.Add(new DlItem {
+                        Id = "usb_" + Guid.NewGuid().ToString("N"), TitleId = source.TitleId,
+                        Name = source.Name, ImageUrl = source.ImagePath, Kind = source.Kind,
+                        Label = "USB · " + Path.GetFileName(canonical), DestPath = canonical,
+                        HosterUrl = "local:" + source.Fingerprint, SourceId = "local-usb", AccessType = "Local",
+                        CandidateId = source.Fingerprint, LocalSource = true, LocalSourceFingerprint = source.Fingerprint,
+                        ExpectedContentId = source.ContentId, ExpectedByteSize = source.Size,
+                        PackageVersion = source.Version, Total = source.Size, Done = source.Size,
+                        State = DlState.Queued, StatusText = "Queued for USB installation; source file retained"
+                    });
+                }
+                catch (Exception ex)
+                {
+                    string label;
+                    try { label = Path.GetFileName(path ?? ""); } catch { label = "Selected file"; }
+                    if (problems.Count < 5) problems.Add(label + ": " + ex.Message);
+                }
+            }
+            pending.Sort((a, b) => {
+                if ((a.Kind == "archive") != (b.Kind == "archive")) return a.Kind == "archive" ? 1 : -1;
+                int title = string.Compare(a.TitleId, b.TitleId, StringComparison.OrdinalIgnoreCase);
+                if (title != 0) return title;
+                if (InstallPrecedes(a, b)) return -1;
+                if (InstallPrecedes(b, a)) return 1;
+                return string.Compare(a.DestPath, b.DestPath, StringComparison.Ordinal);
+            });
+            var added = new List<DlItem>(); int duplicates = 0;
+            lock (_lock)
+            {
+                foreach (DlItem item in pending)
+                {
+                    bool duplicate = false;
+                    foreach (DlItem existing in _items)
+                        if (SamePath(existing.DestPath, item.DestPath) ||
+                            (existing.LocalSource && !string.IsNullOrEmpty(item.ExpectedContentId) &&
+                                existing.ExpectedContentId == item.ExpectedContentId && existing.LocalSourceFingerprint == item.LocalSourceFingerprint))
+                        { duplicate = true; break; }
+                    if (duplicate) { duplicates++; continue; }
+                    DlItem previous = null;
+                    foreach (DlItem other in _items)
+                    {
+                        if (other.State == DlState.Canceled || string.IsNullOrEmpty(item.TitleId) ||
+                            !string.Equals(other.TitleId, item.TitleId, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!InstallPrecedes(other, item) && !(other.LocalSource && !InstallPrecedes(item, other) && InstallRank(other.Kind) == 1 &&
+                            InstallRank(item.Kind) == 1 && other.PackageVersion == item.PackageVersion)) continue;
+                        if (previous == null || InstallPrecedes(previous, other)) previous = other;
+                    }
+                    if (previous != null) { item.InstallAfterId = previous.Id; item.InstallAfterConfirmed = InstallPrerequisiteReady(previous); }
+                    _items.Insert(0, item); added.Add(item);
+                }
+                if (added.Count > 0 && !SaveManifest())
+                {
+                    foreach (DlItem item in added) _items.Remove(item);
+                    error = "USB queue could not be saved; original files are unchanged"; return 0;
+                }
+            }
+            if (duplicates > 0) problems.Add(duplicates + " file(s) already in the queue");
+            if (problems.Count > 0) error = string.Join("; ", problems.ToArray());
+            return added.Count;
+        }
+
+        public bool CanChangeStaging()
+        {
+            lock (_lock)
+            {
+                foreach (var item in _items)
+                    if ((item.State != DlState.Installed && item.State != DlState.Canceled) ||
+                        item.ResidentRemovePending || ResidentDownloadService.HasJob(item.Id)) return false;
+                return _activeIds.Count == 0 && !ResidentDownloadService.HasPendingOwnership;
+            }
+        }
+
         internal static string[] StorageRoots()
-        { return new[] { AppSettings.DownloadDir, Path.Combine(AppSettings.DataDir, "resident/archives") }; }
+        { var roots = new List<string> { AppSettings.StagingRoot("ps4"), Path.Combine(AppSettings.DataDir, "resident/archives") };
+            for (int i=0;i<8;i++) roots.Add(AppSettings.StagingRoot("/mnt/usb"+i)); return roots.ToArray(); }
 
         static bool IsPathClaimedByJob(DlItem job, string full)
         {
             if (job == null || string.IsNullOrEmpty(full)) return false;
+            if (job.LocalSource && SamePath(job.DestPath, full)) return true;
             if (!string.IsNullOrEmpty(job.FanOutPendingPaths))
             {
                 string[] paths = job.FanOutPendingPaths.Split(new[] { '\n' },
@@ -524,10 +665,10 @@ namespace Orbis
                 catch { extractRoot = null; }
                 if (extractRoot != null && full.StartsWith(extractRoot, StringComparison.OrdinalIgnoreCase)) return true;
             }
-            string[] family = { job.DestPath, job.DestPath + ".part", job.DestPath + ".resume", job.DestPath + ".ranges" };
+            string[] family = { job.DestPath, job.DestPath + ".part", job.DestPath + ".resume", job.DestPath + ".ranges", job.DestPath + ".map", job.DestPath + ".map.tmp", job.DestPath + ".sha256-ok", job.DestPath + ".sha256-ok.tmp" };
             foreach (string p in family)
                 if (!string.IsNullOrEmpty(p) && SamePath(p, full))
-                    return job.Background || job.State == DlState.Downloading || job.State == DlState.Finalizing ||
+                    return job.Background || job.State == DlState.Queued || job.State == DlState.Downloading || job.State == DlState.Finalizing ||
                         job.State == DlState.Installing || job.State == DlState.Submitted ||
                         job.State == DlState.Resolving || job.State == DlState.Paused;
             if (job.Background)
@@ -554,6 +695,8 @@ namespace Orbis
                     }
                     if (root == null || !File.Exists(full))
                     { detail = "File is missing or outside downloaded storage"; return false; }
+                    if (full.EndsWith(".xfer-lock", StringComparison.OrdinalIgnoreCase))
+                    { detail = "Transfer ownership records are kept for safe resume"; return false; }
                     if (full.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
                     { detail = "Installation journals are kept for recovery"; return false; }
                     // Extraction/resident journals can own files not yet represented by a child row.
@@ -574,11 +717,13 @@ namespace Orbis
         public List<DlItem> Snapshot()
         {
             ReconcileLocalFiles(false);
+            long now = TransferClockMs();
             lock (_lock)
             {
                 var list = new List<DlItem>(_items.Count);
                 foreach (var i in _items)
                 {
+                    bool freshStats = HasCurrentTransferStats(i, now);
                     list.Add(new DlItem
                     {
                         Id = i.Id,
@@ -593,11 +738,20 @@ namespace Orbis
                     PackageVersion = i.PackageVersion,
                         CandidateId = i.CandidateId,
                         AccessType = i.AccessType,
+                        MirrorCandidates = i.MirrorCandidates,
                         ArchiveVolumes = i.ArchiveVolumes,
                         ArchivePassword = i.ArchivePassword,
+                        LocalSource = i.LocalSource,
+                        LocalSourceFingerprint = i.LocalSourceFingerprint,
                         InstallAfterId = i.InstallAfterId,
+                        InstallAfterConfirmed = i.InstallAfterConfirmed,
                         BgftLocalInstall = i.BgftLocalInstall,
                         ResidentArchive = i.ResidentArchive,
+                        ResidentStaged = i.ResidentStaged,
+                        ResidentRemovePending = i.ResidentRemovePending,
+                        ResidentAutoInstall = i.ResidentAutoInstall,
+                        ResidentGeneration = i.ResidentGeneration,
+                        ResolvedProviderId = i.ResolvedProviderId,
                         InstallOrderReady = i.InstallOrderReady,
                         ExpectedSha256 = i.ExpectedSha256,
                         ExpectedByteSize = i.ExpectedByteSize,
@@ -609,8 +763,9 @@ namespace Orbis
                         State = i.State,
                         Done = i.Done,
                         Total = i.Total,
-                        BytesPerSec = i.BytesPerSec,
-                        EtaSeconds = i.EtaSeconds,
+                        BytesPerSec = freshStats ? i.BytesPerSec : 0,
+                        RateSamples = i.LiveMeter == null ? null : i.LiveMeter.CopyRates(),
+                        EtaSeconds = freshStats ? i.EtaSeconds : 0,
                         Error = i.Error,
                         StatusText = i.StatusText,
                         InstallConfirmed = i.InstallConfirmed,
@@ -628,123 +783,45 @@ namespace Orbis
             }
         }
 
-        long _lastReconcileTicks;
+        long _lastReconcileAt;
 
         /// <summary>Completed requires DestPath. Installed may have no PKG (deleted after install).</summary>
         public void ReconcileLocalFiles(bool force)
         {
-            long now = DateTime.UtcNow.Ticks;
-            if (!force && now - _lastReconcileTicks < TimeSpan.TicksPerSecond * 2)
-                return;
-            _lastReconcileTicks = now;
+            long now = TransferClockMs();
+            if (!force && now - _lastReconcileAt < 2000) return;
+            _lastReconcileAt = now;
             bool changed = false;
             lock (_lock)
             {
-                foreach (var it in _items)
+                foreach (var item in _items)
                 {
-                    if (it.ResidentArchive || (it.Background && it.State != DlState.Installed)) continue;
-                    if (it.State == DlState.Installed)
+                    // Rendering a snapshot must never hash, delete, or take ownership
+                    // from a transfer/installer. Their worker owns reconciliation.
+                    if (item.Background || item.ResidentArchive || item.ResidentRemovePending ||
+                        _activeIds.Contains(item.Id) || item.State == DlState.Installing ||
+                        item.State == DlState.Submitted) continue;
+                    if (item.State == DlState.Installed && item.InstallConfirmed) continue;
+                    if (item.State != DlState.Completed && item.State != DlState.Installed) continue;
+                    if (string.IsNullOrEmpty(item.DestPath)) continue;
+                    if (File.Exists(item.DestPath))
                     {
-                        string localError = null;
-                        PkgContentKind localKind;
-                        string localKindName;
-                        string localContentId;
-                        string localTitleId;
-                        long localSize = 0;
-                        bool destValid = !string.IsNullOrEmpty(it.DestPath) && File.Exists(it.DestPath) &&
-                            TryValidateLocalPackage(it, out localKind, out localKindName,
-                                out localContentId, out localTitleId, out localSize, out localError);
-                        if (!destValid && !string.IsNullOrEmpty(it.DestPath) && File.Exists(it.DestPath))
-                            DiscardInvalidDownload(it, localError ?? "Invalid PKG on disk");
-
-                        // AppExists(CUSA) only proves the base game. DLC/update must not
-                        // stay Installed just because the base is present or a leftover
-                        // dest file exists.
-                        if (PkgInstallPolicy.IsAddonOrPatchName(it.Kind))
+                        if (item.State == DlState.Installed)
                         {
-                            if (destValid)
-                            {
-                                it.State = DlState.Completed;
-                                it.InstallConfirmed = false;
-                                it.StatusText = "PKG on disk — CROSS installs";
-                                it.Done = it.Total = localSize;
-                            }
-                            else
-                            {
-                                it.State = DlState.Failed;
-                                it.InstallConfirmed = false;
-                                it.Error = localError ?? "DLC/update not on disk";
-                                it.StatusText = "Not on disk — CROSS re-downloads";
-                                it.Done = 0;
-                                it.Total = 0;
-                            }
-                            changed = true;
-                            continue;
-                        }
-                        if (!string.IsNullOrEmpty(it.TitleId) &&
-                            !PkgInstaller.IsTitleInstalled(it.TitleId))
-                        {
-                            it.State = DlState.Failed;
-                            it.InstallConfirmed = false;
-                            it.Error = destValid ? "Removed on PS4" : (localError ?? "Removed on PS4");
-                            it.StatusText = destValid
-                                ? "Uninstalled on PS4 — CROSS re-downloads"
-                                : "Invalid leftover removed — CROSS re-downloads";
-                            if (!destValid)
-                            {
-                                it.Done = 0;
-                                it.Total = 0;
-                            }
-                            changed = true;
+                            item.State = DlState.Completed; item.InstallOrderReady = false;
+                            item.StatusText = "File retained; verify before installation"; changed = true;
                         }
                         continue;
                     }
-                    if (it.State != DlState.Completed && it.State != DlState.Installing &&
-                        it.State != DlState.Submitted)
-                        continue;
-                    if (string.IsNullOrEmpty(it.DestPath)) continue;
-                    if (File.Exists(it.DestPath))
-                    {
-                        if (it.State == DlState.Completed)
-                        {
-                            string localError;
-                            PkgContentKind localKind;
-                            string localKindName;
-                            string localContentId;
-                            string localTitleId;
-                            long localSize;
-                            if (!TryValidateLocalPackage(it, out localKind, out localKindName,
-                                out localContentId, out localTitleId, out localSize, out localError))
-                            {
-                                DiscardInvalidDownload(it, localError ?? "Invalid PKG on disk");
-                                it.State = DlState.Failed;
-                                it.StatusText = "Invalid file removed — CROSS re-downloads";
-                                changed = true;
-                            }
-                        }
-                        continue;
-                    }
-                    if (it.State == DlState.Installing || it.State == DlState.Submitted)
-                    {
-                        it.State = DlState.Failed;
-                        it.Error = "PKG missing during install";
-                        it.StatusText = "PKG missing — re-download";
-                        it.Done = 0;
-                        changed = true;
-                        continue;
-                    }
-                    it.State = DlState.Failed;
-                    it.Error = "PKG missing on disk";
-                    it.StatusText = "PKG missing — CROSS to re-queue";
-                    it.Done = 0;
-                    it.Total = 0;
-                    it.BytesPerSec = 0;
-                    it.EtaSeconds = 0;
+                    item.State = DlState.Failed; item.InstallConfirmed = item.InstallOrderReady = false;
+                    item.Error = "PKG missing on disk";
+                    item.StatusText = "PKG missing; reconnect the staging drive or retry";
                     changed = true;
                 }
             }
             if (changed) SaveManifest();
         }
+
 
         public bool EnsureLocalPackage(string id, out string error)
         {
@@ -806,15 +883,31 @@ namespace Orbis
                 {
                     if (it.State == DlState.Failed)
                     {
+                        if (it.ResidentStaged)
+                        {
+                            it.ResidentRetryPending = true;
+                            it.ResidentLinkRenewals = 0; it.ResidentLastRenewalBytes = 0;
+                            it.CancelRequested = it.PauseRequested = false;
+                            it.State = DlState.Resolving;
+                            it.StatusText = "Stopping previous attempt; verified files retained for retry";
+                            if (SaveManifest()) ResidentDownloadService.Release(it.Id);
+                            return;
+                        }
                         ResidentDownloadService.MarkFailed(it.Id);
                         it.CancelRequested = true;
                         it.StatusText = "Stopping previous resident task before retry";
                         SaveManifest(); return;
                     }
-                    bool pause = it.State != DlState.Paused;
-                    ResidentDownloadService.SetPaused(it.Id, pause);
+                    bool pause = !(it.ResidentPauseDesired ?? (it.State == DlState.Paused));
+                    if (!ResidentDownloadService.SetPaused(it.Id, pause))
+                    {
+                        it.StatusText = "Background command could not be saved: " + ResidentDownloadService.LastError;
+                        SaveManifest(); return;
+                    }
+                    it.ResidentPauseDesired = pause;
+                    it.PauseRequested = pause;
                     it.State = pause ? DlState.Paused : DlState.Downloading;
-                    it.StatusText = pause ? "Resident archive pause requested" : "Resident archive resumed";
+                    it.StatusText = pause ? "Background download pause requested" : "Background download resume requested";
                     SaveManifest(); return;
                 }
                 if (it.Background)
@@ -868,8 +961,18 @@ namespace Orbis
                     SaveManifest();
                     return;
                 }
-                if (it.State == DlState.Downloading || it.State == DlState.Resolving ||
-                    it.State == DlState.Finalizing)
+                if (it.State == DlState.Queued)
+                {
+                    it.State = DlState.Paused;
+                    it.PauseRequested = true;
+                    it.HttpRetryUrl = null;
+                    it.RetryAfterUtcTicks = 0;
+                    it.StatusText = "Paused · partial file kept";
+                    SaveManifest();
+                    return;
+                }
+                if (!it.PauseRequested && (it.State == DlState.Downloading || it.State == DlState.Resolving ||
+                    it.State == DlState.Finalizing))
                 {
                     if (it.State == DlState.Finalizing && !(it.StatusText ?? "").StartsWith("Extracting", StringComparison.Ordinal))
                     {
@@ -884,16 +987,17 @@ namespace Orbis
                     {
                         string part = it.DestPath + ".part";
                         if (File.Exists(part))
-                            it.Done = new FileInfo(part).Length;
+                            it.Done = ParallelDownloadCheckpoint.DurableBytes(part);
                     }
                     catch { }
                 }
-                else if (it.State == DlState.Paused || it.State == DlState.Failed ||
+                else if (it.PauseRequested || it.State == DlState.Paused || it.State == DlState.Failed ||
                          it.State == DlState.Canceled)
                 {
                     bool restartRequired = it.State == DlState.Failed &&
-                        DownloadResumeInfo.IsRestartRequired(it.Error);
-                    if (restartRequired)
+                        !File.Exists(it.DestPath) && DownloadResumeInfo.IsRestartRequired(it.Error) &&
+                        !TransferClient.HasCompletedJournal(it.DestPath);
+                    if (restartRequired && !it.LocalSource)
                     {
                         DeletePartialOwned(it.DestPath);
                         it.Done = 0;
@@ -903,7 +1007,9 @@ namespace Orbis
                     {
                         string part = it.DestPath + ".part";
                         if (File.Exists(part))
-                            it.Done = new FileInfo(part).Length;
+                            it.Done = ParallelDownloadCheckpoint.DurableBytes(part);
+                        else if (File.Exists(it.DestPath))
+                            it.Done = it.Total = new FileInfo(it.DestPath).Length;
                         else
                         {
                             it.Done = 0;
@@ -916,6 +1022,10 @@ namespace Orbis
                     it.Error = null;
                     it.PauseRequested = false;
                     it.CancelRequested = false;
+                    it.TransientHttpRetries = 0;
+                    it.InstallRetries = 0;
+                    it.HttpRetryUrl = null;
+                    it.RetryAfterUtcTicks = 0;
                     it.StatusText = restartRequired
                         ? "Restarting from zero (server rejected resume)"
                         : it.Done > 0
@@ -994,7 +1104,7 @@ namespace Orbis
                 it.CancelRequested = false;
                 it.PauseRequested = false;
                 it.StatusText = "Canceled";
-                DeleteDownloadFiles(it.DestPath);
+                DeleteDownloadFiles(it);
                 SaveManifest();
                 return true;
             }
@@ -1030,7 +1140,6 @@ namespace Orbis
         public bool Remove(string id, out string error)
         {
             error = null;
-            DlItem removed = null;
             lock (_lock)
             {
                 var it = Find(id);
@@ -1038,6 +1147,31 @@ namespace Orbis
                 {
                     error = "Download not found";
                     return false;
+                }
+                if (it.Background && (it.ResidentStaged || it.ResidentArchive))
+                {
+                    bool wasPending = it.ResidentRemovePending, wasCanceled = it.CancelRequested;
+                    string previousStatus = it.StatusText;
+                    it.ResidentRemovePending = true;
+                    it.CancelRequested = true;
+                    it.StatusText = "Removing background job; waiting for worker acknowledgement";
+                    if (!SaveManifest())
+                    {
+                        it.ResidentRemovePending = wasPending; it.CancelRequested = wasCanceled;
+                        it.StatusText = previousStatus; error = "Could not save the removal request"; return false;
+                    }
+                    ResidentDownloadService.Release(it.Id);
+                    return true;
+                }
+                if (it.Background && !_activeIds.Contains(it.Id))
+                {
+                    int activeTask;
+                    if (!PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
+                        out activeTask, out error))
+                    { it.BgftTaskId = activeTask; return false; }
+                    ClearBackground(it);
+                    it.State = DlState.Canceled;
+                    it.StatusText = "Canceled";
                 }
                 if (_activeIds.Contains(it.Id) || it.State == DlState.Resolving ||
                     it.State == DlState.Downloading || it.State == DlState.Finalizing ||
@@ -1072,7 +1206,7 @@ namespace Orbis
                         error = "Extracted package cleanup failed";
                         return false;
                     }
-                    DeleteDownloadFiles(it.DestPath);
+                    DeleteDownloadFiles(it);
                     _items.Remove(it);
                     SaveManifest();
                     return true;
@@ -1093,8 +1227,8 @@ namespace Orbis
                 if (string.Equals(it.AccessType, "FanOutSource",
                     StringComparison.OrdinalIgnoreCase))
                 {
-                    DeleteDownloadFiles(it.DestPath);
-                    if (File.Exists(it.DestPath))
+                    DeleteDownloadFiles(it);
+                    if (!it.LocalSource && File.Exists(it.DestPath))
                     {
                         error = "Downloaded source cleanup failed";
                         return false;
@@ -1108,14 +1242,11 @@ namespace Orbis
                     error = "Extracted package cleanup failed";
                     return false;
                 }
-                removed = it;
+                if (it.State == DlState.Failed || it.State == DlState.Canceled)
+                    DeleteUnclaimedDownloadFiles(it);
+                PreserveConfirmedDependency(it);
                 _items.Remove(it);
                 SaveManifest();
-            }
-            if (removed != null &&
-                (removed.State == DlState.Failed || removed.State == DlState.Canceled))
-            {
-                DeleteDownloadFiles(removed.DestPath);
             }
             return true;
         }
@@ -1166,27 +1297,48 @@ namespace Orbis
                     drop.Add(it);
                 }
                 foreach (var it in drop)
+                {
+                    if (it.State == DlState.Failed || it.State == DlState.Canceled)
+                        DeleteUnclaimedDownloadFiles(it);
+                    PreserveConfirmedDependency(it);
                     _items.Remove(it);
+                }
                 if (drop.Count > 0)
                     SaveManifest();
             }
-            foreach (var it in drop)
-            {
-                if (it.State == DlState.Failed || it.State == DlState.Canceled)
-                {
-                    DeleteDownloadFiles(it.DestPath);
-                }
-            }
             return drop.Count;
+        }
+
+        // Caller holds _lock until cleanup and removal finish, so a replacement
+        // cannot claim the deterministic destination while old files are deleted.
+        bool DeleteUnclaimedDownloadFiles(DlItem item)
+        {
+            if (item.LocalSource) return false;
+            foreach (DlItem other in _items)
+                if (!object.ReferenceEquals(other, item) && SamePath(other.DestPath, item.DestPath))
+                    return false;
+            DeleteDownloadFiles(item);
+            return !File.Exists(item.DestPath) && !File.Exists(item.DestPath + ".part");
+        }
+
+        void PreserveConfirmedDependency(DlItem removed)
+        {
+            if (removed.State != DlState.Installed || !removed.InstallConfirmed) return;
+            foreach (DlItem child in _items)
+                if (!object.ReferenceEquals(child, removed) &&
+                    string.Equals(child.InstallAfterId, removed.Id, StringComparison.Ordinal))
+                    child.InstallAfterConfirmed = true;
         }
 
         public void QueueLocalInstall(string id)
         {
             lock (_lock) {
                 var it = Find(id); if (it == null || it.Background || it.State == DlState.Installing || it.State == DlState.Submitted) return;
-                it.State = DlState.Queued; it.ForceLocalInstall = true; it.Error = null;
+                it.State = DlState.Queued; it.ForceLocalInstall = !it.LocalSource && !BackgroundSelected; it.Error = null;
+                it.InstallRetries = 0;
+                it.InstallOrderReady = false;
                 it.PauseRequested = it.CancelRequested = false; it.RetryAfterUtcTicks = 0;
-                it.StatusText = "Queued for update verification";
+                it.StatusText = BackgroundSelected ? "Queued for resident installation" : "Queued for package verification";
             }
             SaveManifest();
         }
@@ -1198,17 +1350,26 @@ namespace Orbis
             item.Done = item.Total = Math.Max(0, size);
         }
 
-        public void MarkInstalling(string id, string msg)
+        public int MarkInstalling(string id, string msg)
         {
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return;
+                if (it == null) return -1;
+                it.AttemptId++;
                 it.State = DlState.Installing;
                 it.InstallConfirmed = false;
+                it.InstallOrderReady = false;
                 it.StatusText = msg ?? "Installing...";
                 SaveManifest();
+                return it.AttemptId;
             }
+        }
+
+        static bool AcceptInstallCallback(DlItem item, int attempt)
+        {
+            return item != null && (attempt < 0 || item.AttemptId == attempt) &&
+                item.State != DlState.Canceled && item.State != DlState.Installed;
         }
 
         public void MarkInstalled(string id, string msg)
@@ -1221,14 +1382,15 @@ namespace Orbis
             MarkInstallAccepted(id, msg, -1);
         }
 
-        public void MarkInstallAccepted(string id, string msg, int bgftTaskId)
+        public void MarkInstallAccepted(string id, string msg, int bgftTaskId, int attempt = -1)
         {
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return;
+                if (!AcceptInstallCallback(it, attempt)) return;
                 it.State = DlState.Submitted;
                 it.InstallConfirmed = false;
+                it.InstallOrderReady = false;
                 it.Error = null;
                 it.StatusText = msg ?? "Sent to PS4 — verify · PKG kept";
                 it.BytesPerSec = 0;
@@ -1241,12 +1403,12 @@ namespace Orbis
             }
         }
 
-        public void MarkAlreadyInstalled(string id, string msg)
+        public void MarkAlreadyInstalled(string id, string msg, int attempt = -1)
         {
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return;
+                if (!AcceptInstallCallback(it, attempt)) return;
                 it.State = DlState.Completed;
                 it.InstallConfirmed = false;
                 it.Error = null;
@@ -1286,7 +1448,9 @@ namespace Orbis
                     error = "Install is not awaiting verification";
                     return false;
                 }
+                it.AttemptId++;
                 it.InstallConfirmed = false;
+                it.InstallOrderReady = false;
                 if (!string.IsNullOrEmpty(it.DestPath) && File.Exists(it.DestPath))
                 {
                     it.State = DlState.Completed;
@@ -1310,67 +1474,51 @@ namespace Orbis
         /// <summary>
         /// Confirmed install success. When deleteLocalPackage, removes DestPath so re-queue is clean.
         /// </summary>
-        public bool MarkInstalled(string id, string msg, bool deleteLocalPackage)
+        public bool MarkInstalled(string id, string msg, bool deleteLocalPackage, int attempt = -1)
         {
-            string path = null;
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return false;
-                path = it.DestPath;
+                if (!AcceptInstallCallback(it, attempt)) return false;
                 it.State = DlState.Installed;
                 it.InstallConfirmed = true;
+                _nextInstallHandoffAt = TransferClockMs() + 3000;
+                it.InstallOrderReady = true;
                 it.Error = null;
                 it.StatusText = msg ?? "Installed";
                 it.BytesPerSec = 0;
                 it.EtaSeconds = 0;
-                if (File.Exists(it.DestPath)) it.Total = new FileInfo(it.DestPath).Length;
+                // Staging storage may disappear after the existence check. The
+                // confirmed install keeps its recorded size if metadata is unavailable.
+                try { if (File.Exists(it.DestPath)) it.Total = new FileInfo(it.DestPath).Length; }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
                 it.Done = it.Total;
                 ClearBackground(it);
                 it.Background = false;
-            }
-            bool deleted = !deleteLocalPackage;
-            // Persist proof before cleanup so a power loss cannot turn a confirmed install
-            // into an unverified legacy row with a missing PKG.
-            bool proofSaved = !deleteLocalPackage || SaveManifest();
-            if (deleteLocalPackage && IsOwnedDownloadPath(path))
-            {
-                if (proofSaved) try
-                {
-                    if (File.Exists(path)) File.Delete(path);
-                    deleted = !File.Exists(path);
-                }
-                catch { deleted = false; }
-                if (proofSaved) try { DownloadResumeInfo.DeletePartial(path + ".part"); } catch { }
-            }
-            if (deleteLocalPackage && !proofSaved)
-            {
-                deleted = false;
-                lock (_lock)
-                {
-                    var it = Find(id);
-                    if (it != null) it.StatusText = (msg ?? "Installed") +
+                deleteLocalPackage = true; // Clean only this confirmed installation, never failed/pending jobs.
+                bool deleted = false;
+                // Save proof before deletion and retain ownership until cleanup finishes.
+                // A retry cannot replace this attempt between the save and file deletion.
+                bool proofSaved = !deleteLocalPackage || SaveManifest();
+                if (deleteLocalPackage && proofSaved && IsOwnedDownloadPath(it.DestPath))
+                    deleted = DeleteUnclaimedDownloadFiles(it);
+                if (deleteLocalPackage && !proofSaved)
+                    it.StatusText = (msg ?? "Installed") +
                         "; PKG retained because history could not be saved";
-                }
+                else if (deleteLocalPackage && !deleted)
+                    it.StatusText = (msg ?? "Installed") + "; PKG retained";
+                SaveManifest();
+                return deleted;
             }
-            if (deleteLocalPackage && proofSaved && !deleted)
-            {
-                lock (_lock)
-                {
-                    var it = Find(id);
-                    if (it != null) it.StatusText = (msg ?? "Installed") + "; PKG retained";
-                }
-            }
-            SaveManifest();
-            return deleted;
         }
 
-        public void UpdateInstallProgress(string id, int percent)
+        public void UpdateInstallProgress(string id, int percent, int attempt = -1)
         {
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return;
+                if (!AcceptInstallCallback(it, attempt)) return;
                 it.State = DlState.Installing;
                 it.InstallConfirmed = false;
                 it.StatusText = percent >= 0 ? "Installing " + percent + "%" : "Installing...";
@@ -1407,14 +1555,15 @@ namespace Orbis
             if (changed) SaveManifest();
         }
 
-        public void MarkInstallFailed(string id, string err)
+        public void MarkInstallFailed(string id, string err, int attempt = -1)
         {
             string path;
             string titleId;
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return;
+                if (!AcceptInstallCallback(it, attempt)) return;
+                if (attempt < 0) attempt = it.AttemptId;
                 path = it.DestPath;
                 titleId = it.TitleId;
             }
@@ -1432,7 +1581,8 @@ namespace Orbis
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return;
+                if (!AcceptInstallCallback(it, attempt)) return;
+                it.InstallOrderReady = false;
                 if (valid)
                 {
                     it.State = DlState.Completed;
@@ -1454,20 +1604,19 @@ namespace Orbis
             }
         }
 
-        public void MarkPackageInvalid(string id, string err)
+        public void MarkPackageInvalid(string id, string err, int attempt = -1)
         {
-            string path;
             lock (_lock)
             {
                 var it = Find(id);
-                if (it == null) return;
-                path = it.DestPath;
+                if (!AcceptInstallCallback(it, attempt)) return;
+                // Validation failure retains bytes for inspection or stage retry.
                 it.State = DlState.Failed;
                 it.InstallConfirmed = false;
+                it.InstallOrderReady = false;
                 it.Error = err;
                 it.StatusText = "Bad PKG — CROSS to re-download";
             }
-            DeleteDownloadFiles(path);
             SaveManifest();
         }
 
@@ -1478,6 +1627,20 @@ namespace Orbis
             return null;
         }
 
+        static bool InstallPrerequisiteReady(DlItem item)
+        {
+            return item != null &&
+                ((item.State == DlState.Installed && item.InstallConfirmed) ||
+                 (item.State == DlState.Completed && item.InstallOrderReady && string.IsNullOrEmpty(item.Error)));
+        }
+
+        static bool TryInitialTitlePresence(PkgContentKind kind, string titleId, out bool present)
+        {
+            present = false;
+            return kind == PkgContentKind.BaseGame && !string.IsNullOrEmpty(titleId) &&
+                PkgInstaller.TryIsTitleInstalled(titleId, out present);
+        }
+
         bool InstallDependencyReady(DlItem item)
         {
             lock (_lock)
@@ -1485,29 +1648,23 @@ namespace Orbis
                 if (!string.IsNullOrEmpty(item.InstallAfterId))
                 {
                     DlItem previous = Find(item.InstallAfterId);
-                    if (previous == null || !(previous.InstallOrderReady || previous.InstallConfirmed))
+                    if (!item.InstallAfterConfirmed && !InstallPrerequisiteReady(previous))
                     {
-                        item.StatusText = previous != null && previous.State == DlState.Failed
+                        item.StatusText = previous != null && (previous.State == DlState.Failed || !string.IsNullOrEmpty(previous.Error))
                             ? "Waiting: previous package failed · retry it first" : "Waiting for previous package installation";
                         return false;
                     }
+                    item.InstallAfterConfirmed = true;
                 }
-                int rank = InstallRank(item.Kind);
                 foreach (var other in _items)
                 {
                     if (other == item || !string.Equals(item.TitleId, other.TitleId, StringComparison.OrdinalIgnoreCase) ||
-                        string.IsNullOrEmpty(item.TitleId) || other.InstallConfirmed || other.InstallOrderReady ||
+                        string.IsNullOrEmpty(item.TitleId) || InstallPrerequisiteReady(other) ||
                         other.State == DlState.Canceled) continue;
-                    bool earlier = InstallRank(other.Kind) < rank;
-                    Version a, b;
-                    if (rank == 1 && InstallRank(other.Kind) == 1 &&
-                        Version.TryParse((other.PackageVersion ?? "").TrimStart('v','V'), out a) &&
-                        Version.TryParse((item.PackageVersion ?? "").TrimStart('v','V'), out b))
-                        earlier = a < b || (a == b && !string.Equals(other.Kind, "backport", StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(item.Kind, "backport", StringComparison.OrdinalIgnoreCase));
-                    if (earlier || other.Background || other.State == DlState.Installing)
+                    if (InstallPrecedes(other, item) || (other.Background && !other.ResidentStaged) || other.State == DlState.Installing)
                     {
-                        item.StatusText = other.State == DlState.Failed ? "Waiting: a required package failed" : "Waiting for this title's earlier package";
+                        item.StatusText = other.State == DlState.Failed || !string.IsNullOrEmpty(other.Error)
+                            ? "Waiting: a required package failed" : "Waiting for this title's earlier package";
                         return false;
                     }
                 }
@@ -1521,6 +1678,88 @@ namespace Orbis
             return sub == 6 ? 0 : sub == 8 ? 1 : 2;
         }
 
+        static bool InstallPrecedes(DlItem previous, DlItem next)
+        {
+            int before = InstallRank(previous.Kind), after = InstallRank(next.Kind);
+            if (before != after) return before < after;
+            if (before != 1) return false;
+            Version a, b;
+            if (Version.TryParse((previous.PackageVersion ?? "").TrimStart('v', 'V'), out a) &&
+                Version.TryParse((next.PackageVersion ?? "").TrimStart('v', 'V'), out b) && a != b)
+                return a < b;
+            // Unknown catalog versions still must not let an ordinary update
+            // overwrite a backport that was queued before it.
+            return !string.Equals(previous.Kind, "backport", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(next.Kind, "backport", StringComparison.OrdinalIgnoreCase);
+        }
+
+        string ResidentDependencyId(DlItem item)
+        {
+            lock (_lock)
+            {
+                if (!item.InstallAfterConfirmed && !string.IsNullOrEmpty(item.InstallAfterId)) return item.InstallAfterId;
+                DlItem latest = null;
+                foreach (var other in _items)
+                {
+                    if (other == item || string.IsNullOrEmpty(item.TitleId) ||
+                        !string.Equals(item.TitleId, other.TitleId, StringComparison.OrdinalIgnoreCase) ||
+                        other.State == DlState.Canceled || InstallPrerequisiteReady(other)) continue;
+                    if (!InstallPrecedes(other, item)) continue;
+                    if (latest == null || InstallPrecedes(latest, other)) latest = other;
+                }
+                return latest == null ? "" : latest.Id;
+            }
+        }
+
+        bool HasUnstartedPrerequisite(DlItem item)
+        {
+            lock (_lock)
+            {
+                string id = ResidentDependencyId(item);
+                DlItem previous = string.IsNullOrEmpty(id) ? null : Find(id);
+                return previous != null && previous.State == DlState.Queued && !previous.Background;
+            }
+        }
+
+        bool CanInstallWithResidentDependency(string dependencyId)
+        {
+            lock (_lock)
+            {
+                if (string.IsNullOrEmpty(dependencyId)) return true;
+                DlItem previous = Find(dependencyId);
+                return previous != null && previous.ResidentAutoInstall && previous.Background;
+            }
+        }
+
+        bool CanPublishResidentStaged(DlItem job, int attempt)
+        {
+            return object.ReferenceEquals(Find(job.Id), job) && job.AttemptId == attempt &&
+                job.State == DlState.Downloading && job.Background && job.ResidentStaged &&
+                !job.CancelRequested && !job.PauseRequested;
+        }
+
+
+        // Resident-owned automatic jobs may accept more durable metadata, but
+        // local processing must wait until the resident gives up disk ownership.
+        bool HasBlockingPipelineOwner(out bool residentBusy)
+        {
+            residentBusy = false;
+            foreach (var item in _items)
+            {
+                if (item.Background && item.ResidentStaged && item.ResidentAutoInstall)
+                { residentBusy = true; continue; }
+                if ((item.Background && (item.State != DlState.Installed && item.State != DlState.Canceled)) ||
+                    item.State == DlState.Installing || (item.State == DlState.Submitted && !item.InstallOrderReady)) return true;
+            }
+            return false;
+        }
+
+        internal static bool CanPrepareResidentHandoff(DlItem item, bool backgroundSelected)
+        {
+            return backgroundSelected && item != null && !item.ForceLocalInstall &&
+                !item.ResidentRetryPending && string.IsNullOrEmpty(item.ArchiveVolumes) &&
+                !string.Equals(item.AccessType, "FanOutSource", StringComparison.OrdinalIgnoreCase);
+        }
 
         void WorkerLoop(int workerIndex)
         {
@@ -1536,24 +1775,29 @@ namespace Orbis
                 string activePath = null;
                 lock (_lock)
                 {
-                    bool backgroundBusy = false;
-                    foreach (var item in _items)
-                        if (item.Background && (item.State == DlState.Downloading || item.State == DlState.Resolving ||
-                            item.State == DlState.Finalizing || item.State == DlState.Paused))
-                        {
-                            backgroundBusy = true;
-                            break;
-                        }
-                    for (int index = backgroundBusy ? -1 : _items.Count - 1; index >= 0; index--)
+                    bool residentBusy = false;
+                    bool backgroundBusy = HasBlockingPipelineOwner(out residentBusy);
+                    bool localPending = false;
+                    foreach (var pending in _items)
+                        if (pending.State == DlState.Queued && !pending.Background && File.Exists(pending.DestPath) &&
+                            InstallDependencyReady(pending)) { localPending = true; break; }
+                    for (int index = backgroundBusy || _activeIds.Count >= WorkerCount || TransferClockMs() < _nextJobStartAt
+                        ? -1 : _items.Count - 1; index >= 0; index--)
                     {
                         var i = _items[index];
                         // Never claim a BGFT-owned row as a new foreground job.
                         string pathKey = NormalizePath(i.DestPath);
-                        if (i.State == DlState.Queued && !i.Background && (!File.Exists(i.DestPath) || InstallDependencyReady(i)) &&
+                        bool local = File.Exists(i.DestPath);
+                        bool publishOnly = residentBusy && CanPrepareResidentHandoff(i, BackgroundSelected) &&
+                            CanInstallWithResidentDependency(ResidentDependencyId(i));
+                        if (i.State == DlState.Queued && !i.Background &&
+                            (!residentBusy || publishOnly) && (!localPending || local || publishOnly) &&
+                            (publishOnly ? !HasUnstartedPrerequisite(i) : InstallDependencyReady(i)) &&
                             i.RetryAfterUtcTicks <= DateTime.UtcNow.Ticks && !_activeIds.Contains(i.Id) &&
                             !_activePaths.Contains(pathKey))
                         {
                             job = i;
+                            _nextJobStartAt = TransferClockMs() + 3000;
                             _activeIds.Add(i.Id);
                             _activePaths.Add(pathKey);
                             activePath = pathKey;
@@ -1562,13 +1806,18 @@ namespace Orbis
                             i.AttemptId++;
                             attempt = i.AttemptId;
                             i.State = DlState.Resolving;
-                            i.StatusText = "Unlocking link...";
+                            i.StatusText = "Preparing download; keep SSPI open until background handoff";
                             break;
                         }
                     }
                 }
                 if (job == null)
                 {
+                    bool cleanup;
+                    lock (_lock) cleanup = _startupCleanupPending && TransferClockMs() >= _startupCleanupAfter &&
+                        _activeIds.Count == 0 && !_items.Exists(item => item.Background || item.State == DlState.Installing ||
+                            item.State == DlState.Submitted);
+                    if (cleanup) { _startupCleanupPending = false; CleanupFanOutStateOnStartup(); }
                     Thread.Sleep(500);
                     continue;
                 }
@@ -1580,6 +1829,7 @@ namespace Orbis
                     lock (_lock)
                     {
                         _activeIds.Remove(job.Id);
+                        job.ForegroundTransfer = false;
                         if (activePath != null) _activePaths.Remove(activePath);
                     }
                 }
@@ -1590,6 +1840,38 @@ namespace Orbis
         {
             try
             {
+                if (CommitRequestedStop(job, attempt)) return;
+                if (WaitForSelectedBackground(job, attempt)) return;
+                if (job.LocalSource) { RunLocalSource(job, attempt); return; }
+                bool metadataOnly;
+                lock (_lock) { bool residentBusy; HasBlockingPipelineOwner(out residentBusy); metadataOnly = BackgroundSelected && residentBusy; }
+                if (!CanPrepareNativeBgft(job, BackgroundSelected))
+                    AppSettings.RequireStaging(Path.GetDirectoryName(job.DestPath));
+                if (metadataOnly && File.Exists(job.DestPath))
+                {
+                    HandoffRetainedMetadata(job, attempt);
+                    return;
+                }
+                if (!metadataOnly) TransferClient.TryPublishCompleted(job.DestPath, job.TitleId, job.Kind,
+                    job.ExpectedContentId, job.ExpectedSha256, job.ExpectedByteSize,
+                    () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested,
+                    text => { lock (_lock) { if(job.AttemptId==attempt){job.State=DlState.Finalizing;job.StatusText=text;} } });
+                if (File.Exists(job.DestPath) && string.IsNullOrEmpty(job.ArchiveVolumes))
+                {
+                    FinishDownloadedObject(job, attempt);
+                    return;
+                }
+                if (Volatile.Read(ref _residentPreparationAttempted) == 1 && !ResidentDownloadService.HasStagedDownloader)
+                    Interlocked.CompareExchange(ref _residentPreparationAttempted, 0, 1);
+                string residentPreparationError = PrepareResidentOnce(
+                    _cfg != null && _cfg.UseBgftDirect,
+                    ref _residentPreparationAttempted, PrepareResidentWorker);
+                if (!string.IsNullOrEmpty(residentPreparationError))
+                {
+                    LogBgftEvent("resident-preparation", job, residentPreparationError);
+                    if (residentPreparationError.StartsWith("Downloader updated:", StringComparison.Ordinal))
+                        User.NotifyToast("Background downloader updated. Finish active jobs, then restart PS4 and re-enable GoldHEN.");
+                }
                 if (CommitRequestedStop(job, attempt)) return;
                 if (!string.IsNullOrEmpty(job.ArchiveVolumes))
                 {
@@ -1620,10 +1902,10 @@ namespace Orbis
                     lock (_lock)
                     {
                         if (job.AttemptId != attempt) return;
-                        DiscardInvalidDownload(job, existingError ?? "Invalid file on disk");
-                        job.StatusText = "Re-downloading (invalid file removed)";
+                        RetainUnrecognizedDownload(job, attempt, existingError ?? "Local validation failed; file retained");
                     }
                     SaveManifest();
+                    return;
                 }
                 if (string.Equals(job.AccessType, "Extracted", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1631,26 +1913,41 @@ namespace Orbis
                     return;
                 }
                 string direct = job.HosterUrl;
-                string foregroundStatus = "Downloading in Game Search...";
+                string foregroundStatus = "Downloading in SSPI...";
+                if (job.AccessType == "Personal")
+                {
+                    // Resolve routing on the worker, never while drawing the link overlay.
+                    bool hoster = FreeHosterClient.IsSupportedHoster(new Uri(job.HosterUrl));
+                    if (!hoster && LinkAccessType(job.HosterUrl) != "Direct")
+                        foreach (string provider in UnlockProviders.EnabledIds(_cfg))
+                        {
+                            try { if (DebridHostSupport.Load(_cfg, provider, false).GetState(job.HosterUrl) == DebridHostState.Supported) { hoster=true; break; } }
+                            catch { }
+                        }
+                    job.AccessType = hoster ? "HosterLanding" : "Direct";
+                }
                 // A source-declared Direct candidate is already a byte-stream URL. It must not
                 // be sent to a Link Service or interpreted as a free-hoster landing page.
-                if (IsDirectAccess(job.AccessType))
+                if (job.TransientHttpRetries > 0 && !string.IsNullOrEmpty(job.HttpRetryUrl))
+                {
+                    direct = job.HttpRetryUrl;
+                }
+                else if (job.AccessType == "Cloud")
+                { direct = CloudCatalog.Resolve(_cfg, job.HosterUrl); foregroundStatus = "Downloading cloud file..."; }
+                else if (IsDirectAccess(job.AccessType))
                 {
                     foregroundStatus = "Downloading direct...";
                 }
                 // Unknown (including legacy empty values) preserves the old routing behavior.
-                else if (_cfg.UseUnlockProvider &&
-                    !string.Equals(_cfg.UnlockProviderId, UnlockProviders.NoneId, StringComparison.OrdinalIgnoreCase))
+                else if (_cfg.UseUnlockProvider && UnlockProviders.EnabledIds(_cfg).Length > 0)
                 {
                     lock (_lock)
                     {
                         if (job.AttemptId != attempt) return;
                         job.StatusText = "Unlocking (" + UnlockProviders.DisplayName(_cfg.UnlockProviderId) + ")...";
                     }
-                    direct = UnlockProviders.Unrestrict(_cfg, job.HosterUrl,
-                        text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } },
-                        () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested);
-                    foregroundStatus = "Downloading (" + UnlockProviders.DisplayName(_cfg.UnlockProviderId) + ")...";
+                    direct = ResolveJobHost(job, attempt);
+                    foregroundStatus = "Downloading (" + UnlockProviders.DisplayName(job.ResolvedProviderId) + ")...";
                 }
                 else
                 {
@@ -1663,7 +1960,8 @@ namespace Orbis
                     }
                     try
                     {
-                        direct = FreeHosterClient.ResolveDirect(job.HosterUrl);
+                        direct = FreeHosterClient.ResolveDirect(job.HosterUrl,
+                            string.Equals(job.AccessType, "HosterLanding", StringComparison.OrdinalIgnoreCase));
                         foregroundStatus = "Downloading (free)...";
                     }
                     catch (Exception freeEx)
@@ -1686,14 +1984,27 @@ namespace Orbis
 
                 string part = job.DestPath + ".part";
                 long existing = 0;
-                if (File.Exists(part)) existing = new FileInfo(part).Length;
+                if (File.Exists(part)) existing = ParallelDownloadCheckpoint.DurableBytes(part);
 
                 if (existing == 0)
-                    foregroundStatus = "Downloading in Game Search...";
+                    foregroundStatus = "Downloading in SSPI...";
 
+                job.HttpRetryUrl = direct;
                 BeginNerdSession(job, direct);
 
-                if (TryRunLoopbackBgftFeeder(job, attempt, direct)) return;
+                lock (_transferRouteGate)
+                {
+                    if (!OtherForegroundTransfer(job))
+                    {
+                        if (TryRunLoopbackBgftFeeder(job, attempt, direct)) return;
+                    }
+                    else TraceBackgroundRoute(NetHttp.BackgroundRoute.ForegroundBusy);
+                    TraceBackgroundRoute(NetHttp.BackgroundRoute.ForegroundSelected);
+                    if (WaitForSelectedBackground(job, attempt, "Waiting for a compatible resident handoff; change Download mode to In-app for this file") ||
+                        DeferWhileResidentTransfers(job, attempt)) return;
+                    lock (_lock) job.ForegroundTransfer = true;
+                }
+                foregroundStatus = "Downloading · Keep SSPI open";
                 if (File.Exists(job.DestPath))
                 {
                     PkgContentKind afterKind;
@@ -1712,11 +2023,12 @@ namespace Orbis
                     lock (_lock)
                     {
                         if (job.AttemptId != attempt) return;
-                        DiscardInvalidDownload(job, afterError ?? "Invalid file on disk");
+                        RetainUnrecognizedDownload(job, attempt, afterError ?? "Local validation failed; file retained");
                     }
                     SaveManifest();
+                    return;
                 }
-                existing = File.Exists(part) ? new FileInfo(part).Length : 0;
+                existing = ParallelDownloadCheckpoint.DurableBytes(part);
 
                 // Preflight: refuse before bulk transfer when the known remainder
                 // plus extraction/install headroom cannot fit.
@@ -1738,20 +2050,20 @@ namespace Orbis
                         staleContent = job.BgftContentId;
                         staleSub = job.BgftSubType;
                     }
-                    ClearBackground(job);
-                    job.Background = false;
-                    if (!stopBeforeTransfer)
-                    {
-                        job.State = DlState.Downloading;
-                        job.StatusText = foregroundStatus;
-                    }
                 }
                 if (stopBeforeTransfer && CommitRequestedStop(job, attempt)) return;
                 if (!string.IsNullOrEmpty(staleContent) && staleSub > 0)
                 {
-                    int activeTask;
-                    string cerr;
-                    PkgInstaller.CancelBackground(-1, staleContent, staleSub, out activeTask, out cerr);
+                    if (!TryCancelBackgroundIdentity(job, staleContent, staleSub, "foreground transfer handoff"))
+                    { SaveManifest(); return; }
+                }
+                lock (_lock)
+                {
+                    if (!AcceptInstallCallback(job, attempt) || job.PauseRequested || job.CancelRequested) return;
+                    ClearBackground(job);
+                    job.Background = false;
+                    job.State = DlState.Downloading;
+                    job.StatusText = foregroundStatus;
                 }
                 SaveManifest();
 
@@ -1764,15 +2076,18 @@ namespace Orbis
                 var progSync = new object();
                 long lastPublishedAt = 0;
                 long lastPublishedBytes = -1;
-                long speedWindowStart = DateTime.UtcNow.Ticks;
-                long speedWindowBytes = existing;
-                double emaBps = 0;
+                lock (_lock)
+                {
+                    if (job.AttemptId != attempt || job.Background || job.PauseRequested || job.CancelRequested) return;
+                    job.StatsInitialized = false;
+                    UpdateTransferStats(job, existing, job.Total, "foreground", TransferClockMs(), 0);
+                }
                 string resumeTitleId = existing > 0 &&
                     PackageArchive.Detect(part) == PackageObjectKind.Pkg ? job.TitleId : null;
                 string resumePackageId = !string.IsNullOrEmpty(job.ExpectedContentId) ? job.ExpectedContentId :
                     (!string.IsNullOrEmpty(job.ExpectedSha256) ? "sha256:" + job.ExpectedSha256 : null);
-                Action<long, long> report =
-                    (done, total) =>
+                Action<long, long, long> report =
+                    (done, total, received) =>
                     {
                         // Coalesce concurrent range reports instead of blocking a network reader
                         // behind another worker's EMA/UI update.
@@ -1784,62 +2099,33 @@ namespace Orbis
                                 if (job.AttemptId != attempt || job.Background ||
                                     job.PauseRequested || job.CancelRequested) return;
                             }
-                            long now = DateTime.UtcNow.Ticks;
-                            long bps = 0;
-                            // Parallel→single fallback can drop done; reset EMA so speed isn't nonsense.
+                            long now = TransferClockMs();
+                            // Publish counter rollback immediately so the shared estimator rebases.
                             if (lastPublishedBytes >= 0 && done < lastPublishedBytes)
                             {
-                                emaBps = 0;
-                                speedWindowStart = now;
-                                speedWindowBytes = done;
                                 lastPublishedAt = 0;
                                 lastPublishedBytes = -1;
                             }
 
-                            if (done != total && lastPublishedBytes >= 0 &&
-                                done - lastPublishedBytes < 256 * 1024 &&
-                                now - lastPublishedAt < TimeSpan.TicksPerMillisecond * 250)
+                            if (done != total && lastPublishedBytes >= 0 && now - lastPublishedAt < 200)
                                 return;
-
-                            long elapsedTicks = now - speedWindowStart;
-                            if (elapsedTicks > TimeSpan.TicksPerMillisecond * 400)
-                            {
-                                double secs = elapsedTicks / (double)TimeSpan.TicksPerSecond;
-                                if (secs > 0.05)
-                                {
-                                    double inst = (done - speedWindowBytes) / secs;
-                                    emaBps = emaBps <= 0 ? inst : (emaBps * 0.7 + inst * 0.3);
-                                    bps = (long)emaBps;
-                                }
-                                speedWindowStart = now;
-                                speedWindowBytes = done;
-                            }
-                            else if (emaBps > 0) bps = (long)emaBps;
-
-                            int eta = 0;
-                            if (bps > 1024 && total > done)
-                                eta = (int)Math.Min(int.MaxValue, (total - done) / bps);
 
                             lock (_lock)
                             {
                                 if (job.AttemptId != attempt || job.Background ||
                                     job.PauseRequested || job.CancelRequested) return;
+                                UpdateLiveTransferStats(job, done, total, received, "foreground", now);
+                                double bps = job.BytesPerSec;
                                 if (lastPublishedBytes >= 0 && done < lastPublishedBytes)
                                     _nerd.DropEvents++;
                                 if (bps < 1024 && lastPublishedBytes >= 0 &&
                                     done == lastPublishedBytes)
                                     _nerd.StallEvents++;
-                                job.Done = done;
-                                // Monotonic total — never shrink (DLC size flicker)
-                                if (total > 0 && (job.Total <= 0 || total >= job.Done))
-                                    job.Total = total;
-                                job.BytesPerSec = bps;
-                                job.EtaSeconds = eta;
                                 bool transferComplete = total > 0 && done >= total;
                                 if (transferComplete)
                                 {
                                     job.State = DlState.Finalizing;
-                                    job.StatusText = "Finalizing transfer...";
+                                    job.StatusText = "Waiting to install...";
                                     job.BytesPerSec = 0;
                                     job.EtaSeconds = 0;
                                     _nerd.Finalizing = true;
@@ -1847,39 +2133,40 @@ namespace Orbis
                                 else if (job.State != DlState.Finalizing)
                                 {
                                     job.State = DlState.Downloading;
-                                    job.StatusText = "Downloading";
+                                    job.StatusText = "Downloading · Keep SSPI open";
                                 }
                                 _nerd.Done = done;
                                 _nerd.Total = job.Total;
-                                if (bps > 0)
-                                    _nerd.PushMbps((bps * 8.0) / (1000.0 * 1000.0));
+                                _nerd.PushMbps((bps * 8.0) / (1000.0 * 1000.0));
                             }
                             lastPublishedAt = now;
                             lastPublishedBytes = done;
                         }
                         finally { Monitor.Exit(progSync); }
                     };
-                long size;
-                try
-                {
-                    size = NetHttp.DownloadFileResumable(direct, job.DestPath, existing,
-                        report, cancel, 0, null, resumeTitleId, resumePackageId);
-                }
-                catch (Exception transferEx) when (IsAuthExpiry(transferEx) && CanRefreshUnlock(job))
-                {
-                    // One bounded in-attempt refresh: fresh signed URL, retained
-                    // partial bytes resume under the package-identity rule.
-                    lock (_lock)
+                long size = DownloadLinkRecovery.Run(direct,
+                    (url, durable) =>
                     {
-                        if (job.AttemptId != attempt) return;
-                        job.StatusText = "Refreshing expired link...";
-                    }
-                    direct = UnlockProviders.Unrestrict(_cfg, job.HosterUrl,
+                        job.HttpRetryUrl = url;
+                        string knownPackageTitle = durable > 0 && PackageArchive.Detect(part) == PackageObjectKind.Pkg
+                            ? job.TitleId : resumeTitleId;
+                        // A fresh URL can contain an archive. Only the verified PKG
+                        // preflight may supply a strict title to its range transfer.
+                        return NetHttp.DownloadFileResumable(url, job.DestPath, durable,
+                            null, cancel, 0, null, knownPackageTitle,
+                            resumePackageId, job.ExpectedSha256, report,
+                            text => { lock (_lock) { if (job.AttemptId == attempt && !job.CancelRequested && !job.PauseRequested)
+                                { job.State = DlState.Finalizing; job.StatusText = text; job.BytesPerSec = 0; job.EtaSeconds = 0; } } });
+                    },
+                    () => TransferClient.DurableBytes(job.DestPath),
+                    () => CanRefreshUnlock(job),
+                    () => UnlockProviders.Unrestrict(_cfg, job.HosterUrl,
                         text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } },
-                        () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested);
-                    size = NetHttp.DownloadFileResumable(direct, job.DestPath, existing,
-                        report, cancel, 0, null, resumeTitleId, resumePackageId);
-                }
+                        cancel,
+                        provider => { lock (_lock) { if (job.AttemptId == attempt) job.ResolvedProviderId = provider; } },
+                        job.ResolvedProviderId),
+                    cancel,
+                    count => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = "Refreshing rejected link..."; } });
 
                 lock (_lock)
                 {
@@ -1888,7 +2175,7 @@ namespace Orbis
                     job.BytesPerSec = 0;
                     job.EtaSeconds = 0;
                     job.StatusText = string.IsNullOrEmpty(job.ExpectedSha256)
-                        ? "Verifying package..." : "Verifying package SHA-256...";
+                        ? "Checking package metadata..." : "Checking verified package SHA-256...";
                     _nerd.Finalizing = true;
                 }
                 SaveManifest();
@@ -1905,17 +2192,138 @@ namespace Orbis
             catch (Exception ex)
             {
                 if (CommitRequestedStop(job, attempt)) return;
+                if (TryScheduleHttpRetry(job, attempt, ex)) return;
+                job.HttpRetryUrl = null;
                 SetFailureIfCurrent(job, attempt, ex.Message);
             }
         }
 
+        bool TryScheduleHttpRetry(DlItem job, int attempt, Exception error)
+        {
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt || job.Background || job.PauseRequested || job.CancelRequested)
+                    return false;
+                long retryAt;
+                if (!DownloadHttpException.TryGetRetry(error, job.TransientHttpRetries,
+                    DateTime.UtcNow, out retryAt)) return false;
+                job.TransientHttpRetries++;
+                job.RetryAfterUtcTicks = retryAt;
+                job.State = DlState.Queued;
+                job.Error = null;
+                job.BytesPerSec = 0;
+                job.EtaSeconds = 0;
+                job.StatusText = "Server temporarily unavailable · retry " + job.TransientHttpRetries + "/3 scheduled";
+            }
+            SaveManifest();
+            return true;
+        }
+
+        internal static string PrepareResidentOnce(bool enabled, ref int attempted, Func<string> prepare)
+        {
+            if (!enabled || Interlocked.CompareExchange(ref attempted, -1, 0) != 0) return null;
+            try
+            {
+                string error = prepare();
+                // The service throttles failed activation attempts. A failed first
+                // attempt must not suppress activation for the entire app session.
+                Interlocked.Exchange(ref attempted, string.IsNullOrEmpty(error) ? 1 : 0);
+                return error;
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref attempted, 0);
+                return "Background downloader unavailable: " + ex.GetType().Name;
+            }
+        }
+
+        static string PrepareResidentWorker()
+        {
+            string error;
+            return ResidentDownloadService.EnsureAvailable(out error) ? null : error;
+        }
+
+        bool BackgroundSelected { get { return _cfg != null && _cfg.UseBgftDirect; } }
+
+        internal static string SelectedModeWaitingReason(bool backgroundSelected, bool workerReady, string reason)
+        {
+            if (!backgroundSelected || (workerReady && string.IsNullOrEmpty(reason))) return null;
+            return "Background mode waiting: " + (string.IsNullOrWhiteSpace(reason) ? "resident worker is not ready" : reason);
+        }
+
+        bool WaitForSelectedBackground(DlItem job, int attempt, string reason = null)
+        {
+            if (!BackgroundSelected) return false;
+            bool logReason;
+            if (string.IsNullOrEmpty(reason))
+            {
+                string error;
+                if (ResidentDownloadService.EnsureAvailable(out error)) { job.BackgroundWaitLoggedReason = null; return false; }
+                reason = string.IsNullOrEmpty(error) ? ResidentDownloadService.ReadinessDetail : error;
+            }
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt || job.Background) return true;
+                if (job.CancelRequested || job.PauseRequested) { CommitRequestedStop(job, attempt); return true; }
+                job.State = DlState.Queued;
+                job.StatusText = SelectedModeWaitingReason(true, false, reason);
+                job.Error = null; job.BytesPerSec = 0; job.EtaSeconds = 0;
+                job.ForegroundTransfer = false; job.ForceLocalInstall = false;
+                job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(15).Ticks;
+                logReason = !string.Equals(job.BackgroundWaitLoggedReason, reason, StringComparison.Ordinal);
+                job.BackgroundWaitLoggedReason = reason;
+            }
+            if (logReason) SspiLog.Write("resident", "background job waiting: " + reason);
+            SaveManifest(); return true;
+        }
+
+        bool OtherForegroundTransfer(DlItem job)
+        {
+            lock (_lock) foreach (var other in _items)
+                if (other != job && other.ForegroundTransfer) return true;
+            return false;
+        }
+
+        bool DeferWhileResidentTransfers(DlItem job, int attempt)
+        {
+            bool busy = ResidentDownloadService.StagedTransfersActive;
+            lock (_lock)
+            {
+                foreach (var other in _items)
+                    if (other != job && other.Background && !other.BgftLocalInstall &&
+                        other.State != DlState.Installed && other.State != DlState.Canceled) busy = true;
+                if (!busy) return false;
+                if (job.AttemptId != attempt) return true;
+                job.State = DlState.Queued;
+                job.StatusText = "Waiting for background transfer capacity";
+                job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(2).Ticks;
+            }
+            SaveManifest(); return true;
+        }
+
+        static void TraceBackgroundRoute(NetHttp.BackgroundRoute reason)
+        { NetHttp.TraceBackgroundRoute(reason, ResidentDownloadService.ObservedWorkerVersion); }
+
         bool TryRunLoopbackBgftFeeder(DlItem job, int attempt, string direct)
         {
-            if (!InstallDependencyReady(job)) return false;
+            if (_cfg == null || !_cfg.UseBgftDirect)
+            { TraceBackgroundRoute(NetHttp.BackgroundRoute.Disabled); return false; }
             lock (_lock) foreach (var other in _items)
-                if (other != job && other.Background) return false;
-            if (_cfg == null || !_cfg.UseBgftDirect ||
-                (job.ForceLocalInstall && !ResidentDownloadService.HasDownloader)) return false;
+                if (other != job && other.Background && !other.ResidentStaged && !other.ResidentAutoInstall && !other.BgftLocalInstall)
+                { TraceBackgroundRoute(NetHttp.BackgroundRoute.LegacyWorkerBusy); return WaitForSelectedBackground(job, attempt, "Waiting for the active resident archive or installation"); }
+            // Foreground and native staging use different resume journals. Never transfer
+            // ownership of an existing foreground file without converting its journal.
+            if (File.Exists(job.DestPath))
+            { TraceBackgroundRoute(NetHttp.BackgroundRoute.ExistingLocalFile); return false; }
+            if (File.Exists(job.DestPath + ".part") && !File.Exists(job.DestPath + ".map"))
+            { TraceBackgroundRoute(NetHttp.BackgroundRoute.ExistingPartial); return WaitForSelectedBackground(job, attempt, "Saved partial uses In-app resume; choose In-app mode and Retry to keep its downloaded bytes"); }
+            string workerError;
+            bool residentReady = ResidentDownloadService.EnsureAvailable(out workerError);
+            TraceBackgroundRoute(residentReady ? NetHttp.BackgroundRoute.WorkerReady :
+                ResidentDownloadService.RunningWorkerRequiresRestart ? NetHttp.BackgroundRoute.WorkerRestartRequired :
+                NetHttp.BackgroundRoute.WorkerUnavailable);
+            if (CommitRequestedStop(job, attempt)) return true;
+            if (!residentReady) return WaitForSelectedBackground(job, attempt, workerError);
 
             HttpRangeResult header;
             try
@@ -1923,34 +2331,33 @@ namespace Orbis
                 lock (_lock)
                 {
                     if (job.AttemptId != attempt) return true;
-                    job.StatusText = "Checking PS4 system download...";
+                    job.StatusText = "Checking download format...";
                 }
                 header = NetHttp.ReadRangeDirect(direct, 0, LoopbackPkgFeeder.HeaderBytes, 60000);
             }
             catch (Exception ex)
             {
                 SetFeederForegroundFallback(job, attempt, ex.Message);
-                return false;
+                return true;
             }
             if (CommitRequestedStop(job, attempt)) return true;
 
             if (header == null || header.Data == null || !LoopbackPkgFeeder.IsPkgHeader(header.Data))
             {
-                if (header != null && header.Data != null && header.Data.Length >= 8 && header.Total > 0 &&
-                    header.Data[0] == 0x52 && header.Data[1] == 0x61 && header.Data[2] == 0x72 &&
-                    header.Data[3] == 0x21 && header.Data[4] == 0x1a && header.Data[5] == 7)
+                if (IsResidentArchiveHeader(header))
                 {
+                    string passwordError = ResidentArchivePasswordError(header.Data, job.ArchivePassword);
+                    if (passwordError != null)
+                    { SetFailureIfCurrent(job, attempt, passwordError); return true; }
                     if (job.ExpectedByteSize > 0 && job.ExpectedByteSize != header.Total)
                     { SetFailureIfCurrent(job, attempt, "Archive size mismatch"); return true; }
-                    string name = ArchiveVolumeSet.FileName(job.HosterUrl, job.Label);
-                    if (string.IsNullOrEmpty(name)) name = "archive.rar";
-                    var volumes = new List<ArchiveVolume> { new ArchiveVolume { Name = name,
-                        Url = header.EffectiveUrl ?? direct, AccessType = "Direct", Size = header.Total,
-                        Sha256 = job.ExpectedSha256 } };
-                    if (TryHandoffArchive(job, attempt, volumes, new List<string> { job.DestPath })) return true;
+                    if (ResidentDownloadService.HasStagedDownloader)
+                        return HandoffStagedPackage(job, attempt, direct, job.TitleId, job.Kind, "", header.Total, true);
+                    SetFeederForegroundFallback(job, attempt, "Archive download requires SSPI to remain open");
+                    return true;
                 }
                 SetFeederForegroundFallback(job, attempt, "Origin did not return a PKG header");
-                return false;
+                return true;
             }
 
             string contentId;
@@ -1965,7 +2372,7 @@ namespace Orbis
                 packageSize != header.Total)
             {
                 SetFeederForegroundFallback(job, attempt, "PKG preflight was incomplete");
-                return false;
+                return true;
             }
 
             string parsedTitleId;
@@ -1995,152 +2402,227 @@ namespace Orbis
             string identityError;
             if (!PkgValidator.CheckRequestedIdentity(job.Kind, actualKind, job.TitleId, contentId, out identityError))
             { SetFailureIfCurrent(job, attempt, identityError); return true; }
-            if (PkgInstallPolicy.RequiresInstalledBase(actualKind) &&
-                (string.IsNullOrEmpty(actualTitleId) || !PkgInstaller.IsTitleInstalled(actualTitleId)))
+            lock (_lock)
             {
-                SetFeederForegroundFallback(job, attempt,
-                    actualKind == PkgContentKind.Patch
-                        ? "Update requires installed base game"
-                        : "DLC requires installed base game");
-                return false;
+                if (job.AttemptId != attempt) return true;
+                // Retain the parsed identity for signed-link renewal and the final local
+                // validation gate even when the source supplied only a title and host URL.
+                if (string.IsNullOrEmpty(job.ExpectedContentId)) job.ExpectedContentId = contentId;
+                if (job.ExpectedByteSize <= 0) job.ExpectedByteSize = packageSize;
             }
-
-            try
+            // The durable resident owner validates and installs when its dependencies settle.
+            if (ResidentDownloadService.HasStagedDownloader)
             {
-                HttpRangeResult rangeProbe = NetHttp.ReadRangeDirect(direct,
-                    LoopbackPkgFeeder.HeaderBytes, 1, 60000);
-                if (rangeProbe == null || rangeProbe.Data == null || rangeProbe.Data.Length != 1 ||
-                    rangeProbe.Total != packageSize)
-                    throw new IOException("Origin does not provide stable byte ranges");
+                bool nativeBgft = (actualKind == PkgContentKind.BaseGame || actualKind == PkgContentKind.Patch) &&
+                    CanPrepareNativeBgft(job, BackgroundSelected) &&
+                    CanInstallWithResidentDependency(ResidentDependencyId(job));
+                return HandoffStagedPackage(job, attempt, direct, actualTitleId, actualKindName, contentId, packageSize, false, nativeBgft);
             }
-            catch (Exception ex)
+            // SSPI owns WAN transfers. BGFT receives a validated local file at install time;
+            // a missing resident must not silently revert base games to an opaque single stream.
+            if (NetHttp.CanUseParallelDownload(direct, actualTitleId))
+                SelectForegroundParallelDownload(job, attempt);
+            else
+                SetFeederForegroundFallback(job, attempt, "Background downloader unavailable; keep SSPI open");
+            return true;
+        }
+
+        internal static string ResidentArchivePasswordError(byte[] header, string password)
+        {
+            if (PackageArchive.IsSevenZipHeader(header))
             {
-                SetFeederForegroundFallback(job, attempt, ex.Message);
-                return false;
+                if (!string.IsNullOrEmpty(password)) return "Encrypted 7z archives are not supported; the archive is kept.";
+                if (!ResidentDownloadService.SupportsSevenZipArchive)
+                    return "Restart the PS4 and enable GoldHEN to load this build's 7z extractor; files are kept.";
+                return null;
             }
-            if (CommitRequestedStop(job, attempt)) return true;
+            if (string.IsNullOrEmpty(password)) return null;
+            if (!ResidentDownloadService.ValidArchivePassword(password))
+                return "Archive password exceeds 256 UTF-8 bytes or is invalid";
+            if (header != null && header.Length >= 4 && header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21)
+                return null;
+            return "Encrypted ZIP archives are not supported; the archive is kept. Choose an unencrypted ZIP or a supported RAR archive.";
+        }
 
-            string bgftUrl = !string.IsNullOrEmpty(header.EffectiveUrl)
-                ? header.EffectiveUrl : direct;
-            if (ResidentDownloadService.HasDownloader && actualKind != PkgContentKind.BaseGame)
-                return HandoffResidentPackage(job, attempt, bgftUrl, actualTitleId, actualKindName, contentId, packageSize);
-            // Only the version-acknowledged resident verifies the complete patch
-            // before BGFT. Older/direct feeders must use the local verified path.
-            if (actualKind == PkgContentKind.Patch) { SetFeederForegroundFallback(job, attempt, "Update requires full integrity verification"); return false; }
-            if (_cfg != null && _cfg.UseBgftDirect && _cfg.DownloadLimitMBps <= 0 &&
-                actualKind == PkgContentKind.BaseGame &&
-                !job.ForceLocalInstall && !string.IsNullOrEmpty(bgftUrl) &&
-                Encoding.UTF8.GetByteCount(bgftUrl) + 1 <= 0x800)
+        void RunLocalSource(DlItem job, int attempt)
+        {
+            if (CommitRequestedStop(job, attempt)) return;
+            if (!File.Exists(job.DestPath))
             {
-                lock (_lock)
-                {
-                    if (job.AttemptId != attempt) return true;
-                    job.StatusText = "Trying direct PS4 system download...";
+                lock (_lock) if (job.AttemptId == attempt) {
+                    job.State = DlState.Queued; job.Error = null; job.BytesPerSec = 0; job.EtaSeconds = 0;
+                    job.StatusText = "Reconnect the USB drive containing " + Path.GetFileName(job.DestPath);
+                    job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(5).Ticks;
                 }
-
-                string directDisplayName = !string.IsNullOrEmpty(job.Name)
-                    ? job.Name : (!string.IsNullOrEmpty(actualTitleId) ? actualTitleId : "package");
-                int directSubType = PkgValidator.BgftSubTypeForKind(actualKindName);
-                bool directTitleKnown = actualKind == PkgContentKind.BaseGame &&
-                    !string.IsNullOrEmpty(actualTitleId);
-                bool directTitleAtStart = directTitleKnown &&
-                    PkgInstaller.IsTitleInstalled(actualTitleId);
-                int directTaskId;
-                string directError;
-                bool directStarted = PkgInstaller.TryStartDirectBgftWebDownload(bgftUrl,
-                    actualTitleId, contentId, directDisplayName, directSubType, packageSize,
-                    out directTaskId, out directError);
-                string directHost = "";
-                try { directHost = new Uri(bgftUrl).Host; }
-                catch { }
-
-                if (directStarted)
+                SaveManifest(); return;
+            }
+            LocalInstallSource source = LocalInstallSource.Read(job.DestPath, false);
+            if (source.Fingerprint != job.LocalSourceFingerprint || source.Size != job.ExpectedByteSize)
+                throw new IOException("USB file changed since it was queued; remove this row and select the file again");
+            if (!BackgroundSelected)
+            {
+                lock (_lock) { job.ForceLocalInstall = true; job.StatusText = "Preparing USB installation in SSPI"; }
+                if (source.ExpectedKind == 0)
                 {
-                    bool attemptChanged;
-                    lock (_lock)
-                    {
-                        attemptChanged = job.AttemptId != attempt;
-                        if (attemptChanged)
-                        {
-                            job.BgftTaskId = directTaskId;
-                            job.BgftContentId = contentId;
-                            job.BgftSubType = directSubType;
-                        }
-                        else
-                        {
-                            job.Kind = actualKindName;
-                            if (!string.IsNullOrEmpty(actualTitleId)) job.TitleId = actualTitleId;
-                            job.Background = true;
-                            job.BgftLoopback = false;
-                            job.BgftResident = false;
-                            job.BgftDirect = true;
-                            job.BgftLoopbackServed = true;
-                            job.BgftContentId = contentId;
-                            job.BgftSubType = directSubType;
-                            job.BgftExpectedSize = packageSize;
-                            job.BgftTaskId = directTaskId;
-                            job.BgftTitlePresenceKnown = directTitleKnown;
-                            job.BgftTitlePresentAtStart = directTitleAtStart;
-                            job.BgftDownloadPhaseConfirmed = false;
-                            ResetBgftTransientPolls(job);
-                            job.State = DlState.Downloading;
-                            job.Done = 0;
-                            job.Total = packageSize;
-                            job.StatusText = "PS4 system download started";
-                        }
-                    }
-                    if (attemptChanged)
-                    {
-                        TryCancelBackgroundIdentity(job, contentId, directSubType,
-                            "direct task registered after attempt change");
-                        return true;
-                    }
-                    SaveManifest();
-                    User.NotifyToast("PS4 download started");
-                    LogBgftEvent("direct-start", job, "task=" + directTaskId +
-                        " host=" + directHost + " sub=" + directSubType + " size=" + packageSize);
-                    return true;
+                    AppSettings.RequireStaging(AppSettings.DownloadDir);
+                    FanOutArchive(job, attempt);
                 }
-
-                string directFailure = directError ?? "BGFT direct registration failed";
-                if (directFailure.StartsWith("ALREADY_INSTALLED:", StringComparison.Ordinal) &&
-                    PkgInstaller.IsTitleInstalled(actualTitleId))
-                {
-                    lock (_lock)
-                    {
-                        if (job.AttemptId != attempt) return true;
-                        ClearBackground(job);
-                        job.State = DlState.Installed;
-                        job.InstallConfirmed = true;
-                        CompleteByteCounters(job);
-                        job.Error = null;
-                        job.StatusText = "Already installed";
-                    }
-                    SaveManifest();
-                    return true;
+                else FinishDownloadedObject(job, attempt);
+                return;
+            }
+            string dependency = ResidentDependencyId(job);
+            if (source.ExpectedKind == 0 && PackageArchive.Detect(job.DestPath) == PackageObjectKind.SevenZip)
+            {
+                string archiveError = ResidentArchivePasswordError(new byte[] { 0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c }, job.ArchivePassword);
+                if (archiveError != null) { SetFailureIfCurrent(job, attempt, archiveError); return; }
+            }
+            if (!CanInstallWithResidentDependency(dependency))
+            {
+                lock (_lock) if (job.AttemptId == attempt) {
+                    job.State = DlState.Queued; job.StatusText = "Waiting for the required package to finish installing";
+                    job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(2).Ticks;
                 }
-                if (directTaskId >= 0 || directFailure.StartsWith(
-                    "BGFT_UNRESOLVED:", StringComparison.Ordinal))
+                SaveManifest(); return;
+            }
+            HandoffStagedPackage(job, attempt, "", source.TitleId, source.Kind, source.ContentId,
+                source.Size, source.ExpectedKind == 0, false, true);
+        }
+
+        void HandoffRetainedMetadata(DlItem job, int attempt)
+        {
+            var header = new byte[LoopbackPkgFeeder.HeaderBytes];
+            long size;
+            using (var file = new FileStream(job.DestPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                size = file.Length; int read = 0;
+                while (read < header.Length) { int n = file.Read(header, read, header.Length - read); if (n == 0) break; read += n; }
+            }
+            if (IsResidentArchiveHeader(new HttpRangeResult { Data = header, Total = size }))
+            {
+                string passwordError = ResidentArchivePasswordError(header, job.ArchivePassword);
+                if (passwordError != null) { SetFailureIfCurrent(job, attempt, passwordError); return; }
+                if (job.ExpectedByteSize > 0 && job.ExpectedByteSize != size)
+                { SetFailureIfCurrent(job, attempt, "Retained archive size does not match; file kept"); return; }
+                HandoffStagedPackage(job, attempt, job.HosterUrl, job.TitleId, job.Kind, "", size, true);
+                return;
+            }
+            string content, error, title = job.TitleId; long declared; PkgContentKind kind;
+            if (!PkgValidator.TryGetContentIdFromHeader(header, out content) ||
+                !PkgValidator.TryGetContentKindFromHeader(header, out kind, out error) ||
+                !PkgValidator.TryGetPackageSizeFromHeader(header, out declared) || declared != size ||
+                !PkgValidator.CheckRequestedIdentity(job.Kind, kind, job.TitleId, content, out error) ||
+                (!string.IsNullOrEmpty(job.ExpectedContentId) && job.ExpectedContentId != content) ||
+                (job.ExpectedByteSize > 0 && job.ExpectedByteSize != size))
+            { SetFailureIfCurrent(job, attempt, "Retained package metadata does not match; file kept"); return; }
+            PkgValidator.TryGetTitleIdFromContentId(content, out title);
+            // Header admission only; the resident checks package metadata and any
+            // explicit publisher SHA in its serial slot before installation.
+            HandoffStagedPackage(job, attempt, job.HosterUrl, title, KindName(kind, job.Kind), content, size);
+        }
+
+        internal static bool CanPrepareNativeBgft(DlItem job, bool backgroundSelected)
+        {
+            if (job == null || !backgroundSelected || !string.IsNullOrEmpty(job.ArchiveVolumes) ||
+                !string.IsNullOrWhiteSpace(job.ExpectedSha256) || !string.IsNullOrEmpty(job.ArchivePassword)) return false;
+            int subtype = PkgValidator.BgftSubTypeForKind(job.Kind);
+            if (subtype != 6 && subtype != 8) return false;
+            foreach (string suffix in new[] { "", ".part", ".map", ".ranges", ".resume" })
+                if (File.Exists(job.DestPath + suffix)) return false;
+            string destination = NativeBgftDestination(job.Id);
+            foreach (string suffix in new[] { "", ".part", ".map", ".ranges", ".resume" })
+                if (File.Exists(destination + suffix)) return false;
+            return true;
+        }
+
+        static string NativeBgftDestination(string id)
+        { return Path.Combine(AppSettings.StagingRoot("ps4"), "bgft-" + id + ".pkg").Replace('\\', '/'); }
+
+        bool HandoffStagedPackage(DlItem job, int attempt, string url, string titleId,
+            string kind, string contentId, long size, bool archive = false, bool nativeBgft = false, bool localSource = false)
+        {
+            if (!nativeBgft && !localSource)
+            {
+                AppSettings.RequireStaging(Path.GetDirectoryName(job.DestPath));
+                if (!File.Exists(job.DestPath)) RequireTransferSpace(size, archive);
+            }
+            string dependencyId;
+            bool autoInstall;
+            lock (_lock)
+            {
+                if (!AcceptInstallCallback(job, attempt) || job.CancelRequested || job.PauseRequested)
+                { CommitRequestedStop(job, attempt); return true; }
+                if (nativeBgft) job.DestPath = NativeBgftDestination(job.Id);
+                job.Kind = kind; job.TitleId = titleId;
+                dependencyId = ResidentDependencyId(job);
+                // Only native-owned predecessors publish native installed receipts. Other
+                // routes can still stage concurrently, then use the app's install gate.
+                autoInstall = CanInstallWithResidentDependency(dependencyId);
+                job.ResidentArchive = true; job.ResidentStaged = true;
+                job.ResidentGeneration = null;
+                job.ResidentPauseDesired = null;
+                job.ResidentAutoInstall = autoInstall;
+                job.Background = true; job.BgftResident = true; job.BgftTaskId = -1;
+                job.BgftContentId = contentId; job.BgftExpectedSize = size;
+                job.State = DlState.Downloading; job.Total = size; job.StatsInitialized = false;
+                job.StatusText = localSource ? "Preparing USB installation; source file retained" : "Publishing background download ownership";
+            }
+            if (!SaveManifest())
+            {
+                lock (_lock) { job.ResidentArchive = job.ResidentStaged = job.ResidentAutoInstall = job.Background = job.BgftResident = false; }
+                throw new IOException("Could not save background transfer ownership");
+            }
+            string error; bool busy;
+            int lanes = DownloadTransferSettings.ConnectionsFor(url, NetHttp.DownloadRangeCount);
+            lock (_lock)
+            {
+                // Keep publication atomic with UI cancellation/removal. Before publication
+                // there is no native slot for a control message to reach.
+                if (!CanPublishResidentStaged(job, attempt))
                 {
-                    if (directTaskId >= 0) lock (_lock) job.BgftTaskId = directTaskId;
-                    if (!TryCancelBackgroundIdentity(job, contentId, directSubType, directFailure))
+                    if (object.ReferenceEquals(Find(job.Id), job) && job.AttemptId == attempt)
                     {
+                        ClearBackground(job); job.ResidentArchive = false;
+                        if (job.CancelRequested) { job.State = DlState.Canceled; job.StatusText = "Canceled"; }
+                        else if (job.PauseRequested) { job.State = DlState.Paused; job.StatusText = "Paused before background handoff"; }
+                        job.CancelRequested = job.PauseRequested = false;
+                        job.BytesPerSec = 0; job.EtaSeconds = 0;
                         SaveManifest();
-                        return true;
                     }
+                    return true;
                 }
-                else
+                bool published = localSource
+                    ? ResidentDownloadService.TryStartLocalSource(job.Id, job.DestPath, titleId, contentId, size,
+                        archive ? 0 : PkgValidator.BgftSubTypeForKind(kind), dependencyId,
+                        archive ? job.ArchivePassword : null, out error, out busy)
+                    : nativeBgft
+                    ? ResidentDownloadService.TryStartNativeBgftPackage(job.Id, url, job.DestPath, titleId,
+                        contentId, size, PkgValidator.BgftSubTypeForKind(kind), lanes, autoInstall,
+                        autoInstall ? dependencyId : "", out error, out busy)
+                    : ResidentDownloadService.TryStartStagedPackageWithPassword(job.Id, url, job.DestPath, titleId,
+                        job.ExpectedSha256, contentId, size, archive ? 0 : PkgValidator.BgftSubTypeForKind(kind), lanes,
+                        autoInstall, autoInstall ? dependencyId : "", archive ? job.ArchivePassword : null, out error, out busy);
+                if (!published)
                 {
-                    LogBgftEvent("direct-failed", job, "host=" + directHost +
-                        " sub=" + directSubType + " size=" + packageSize + " " + directFailure);
+                    job.ResidentStaged = job.ResidentAutoInstall = false;
+                    TraceBackgroundRoute(busy ? NetHttp.BackgroundRoute.PublicationBusy : NetHttp.BackgroundRoute.PublicationFailed);
+                    return ResidentPublicationFailed(job, busy ? "Another resident job is active" : error);
                 }
             }
+            TraceBackgroundRoute(NetHttp.BackgroundRoute.Published);
+            NetHttp.TraceDownloadDecision(true, NetHttp.DownloadDecision.ResidentSelected, lanes);
+            lock (_lock) if (job.AttemptId == attempt)
+                job.StatusText = "Background queue saved; waiting for worker acknowledgement";
+            return true;
+        }
 
-            if (ResidentDownloadService.HasDownloader)
-                return HandoffResidentPackage(job, attempt, bgftUrl, actualTitleId, actualKindName, contentId, packageSize);
-            // Only the acknowledged shell worker owns new native handoffs.
-            SetFeederForegroundFallback(job, attempt, "Shell downloader is unavailable; keep Game Search open");
-            return false;
+        internal static bool IsResidentArchiveHeader(HttpRangeResult header)
+        {
+            if (header == null || header.Data == null || header.Data.Length < 8 || header.Total <= 0) return false;
+            byte[] data = header.Data;
+            return (data[0] == 0x52 && data[1] == 0x61 && data[2] == 0x72 && data[3] == 0x21 &&
+                data[4] == 0x1a && data[5] == 7 && (data[6] == 0 || (data[6] == 1 && data[7] == 0))) ||
+                (data[0] == 0x50 && data[1] == 0x4b && data[2] == 3 && data[3] == 4) ||
+                PackageArchive.IsSevenZipHeader(data);
         }
 
         bool HandoffResidentPackage(DlItem job, int attempt, string url, string titleId,
@@ -2165,6 +2647,7 @@ namespace Orbis
             if (!ResidentDownloadService.TryStartPackage(job.Id, url, job.DestPath, titleId,
                 job.ExpectedSha256, contentId, size, PkgValidator.BgftSubTypeForKind(kind), out error))
                 return ResidentPublicationFailed(job, error);
+            NetHttp.TraceDownloadDecision(true, NetHttp.DownloadDecision.ResidentSelected);
             return true;
         }
 
@@ -2174,6 +2657,7 @@ namespace Orbis
             lock (_lock)
             {
                 job.ResidentArchive = false; job.Background = false; job.BgftResident = false;
+                job.ResidentStaged = job.ResidentAutoInstall = false;
                 if (busy)
                 {
                     job.State = DlState.Queued;
@@ -2181,6 +2665,7 @@ namespace Orbis
                     job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(2).Ticks;
                 }
             }
+            if (BackgroundSelected) return WaitForSelectedBackground(job, job.AttemptId, error ?? "Resident handoff is not ready");
             SaveManifest();
             if (!busy) throw new IOException(error);
             return true;
@@ -2240,8 +2725,24 @@ namespace Orbis
                     job.State != DlState.Queued || !job.ForceLocalInstall;
         }
 
+        void SelectForegroundParallelDownload(DlItem job, int attempt)
+        {
+            if (WaitForSelectedBackground(job, attempt, ResidentDownloadService.ReadinessDetail)) return;
+            DiscardHeaderOnlyPartial(job);
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt) return;
+                job.ForceLocalInstall = true;
+                job.StatusText = "Parallel download · Keep SSPI open";
+            }
+            LogBgftEvent("transport-app-parallel", job, "Validated provider ranges; local verification before installation");
+            User.NotifyToast("Downloading in SSPI: keep the app open");
+            SaveManifest();
+        }
+
         void SetFeederForegroundFallback(DlItem job, int attempt, string reason)
         {
+            if (WaitForSelectedBackground(job, attempt, reason)) return;
             DiscardHeaderOnlyPartial(job);
             lock (_lock)
             {
@@ -2250,19 +2751,13 @@ namespace Orbis
                 job.StatusText = "Using in-app download: " + ClipMsg(reason, 42);
             }
             if (!string.IsNullOrEmpty(reason)) LogBgftEvent("fallback-local", job, reason);
-            try
-            {
-                Directory.CreateDirectory(AppSettings.DataDir);
-                File.WriteAllText(Path.Combine(AppSettings.DataDir, "resident-error.txt"),
-                    DateTime.UtcNow.ToString("o") + " " + (reason ?? "") + "\n");
-            }
-            catch { }
+            SspiLog.Write("resident", reason ?? "");
             SaveManifest();
         }
 
         static void DiscardHeaderOnlyPartial(DlItem job)
         {
-            if (job == null || string.IsNullOrEmpty(job.DestPath)) return;
+            if (job == null || job.LocalSource || string.IsNullOrEmpty(job.DestPath)) return;
             try
             {
                 string part = job.DestPath + ".part";
@@ -2289,7 +2784,7 @@ namespace Orbis
                     job.EtaSeconds = 0;
                     _nerd.Finalizing = false;
                     // Delete before publishing Canceled so a retry cannot race stale cleanup.
-                    DeleteDownloadFiles(job.DestPath);
+                    DeleteDownloadFiles(job);
                     changed = true;
                 }
                 else if (job.PauseRequested)
@@ -2297,7 +2792,7 @@ namespace Orbis
                     try
                     {
                         string part = job.DestPath + ".part";
-                        if (File.Exists(part)) job.Done = new FileInfo(part).Length;
+                        if (File.Exists(part)) job.Done = ParallelDownloadCheckpoint.DurableBytes(part);
                     }
                     catch { }
                     job.State = DlState.Paused;
@@ -2320,6 +2815,8 @@ namespace Orbis
             lock (_lock)
             {
                 if (job.AttemptId != attempt) return;
+                LogBgftEvent("job-stage-failed", job, "stage=" + job.State +
+                    " completed_file=" + File.Exists(job.DestPath) + " detail=" + message);
                 job.State = DlState.Failed;
                 job.Error = message;
                 job.StatusText = "Fail: " + Clip(message, 40);
@@ -2355,13 +2852,14 @@ namespace Orbis
             {
                 if (string.IsNullOrEmpty(c)) continue;
                 string l = c.ToLowerInvariant();
-                if (l.EndsWith(".rar") || l.EndsWith(".zip") || l.EndsWith(".7z") || l.Contains(".part")) return true;
+                if (l.EndsWith(".rar") || l.EndsWith(".zip") || l.EndsWith(".7z") || l.EndsWith(".7zip") || l.Contains(".part")) return true;
             }
             return false;
         }
 
         static List<string> ArchivePaths(DlItem job)
         {
+            if (job.LocalSource) return LocalInstallSource.ArchivePaths(job.DestPath);
             var volumes = ArchiveVolumeSet.Decode(job.ArchiveVolumes);
             var paths = new List<string>();
             if (volumes.Count == 0) { paths.Add(job.DestPath); return paths; }
@@ -2375,9 +2873,8 @@ namespace Orbis
 
         bool TryHandoffArchive(DlItem job, int attempt, List<ArchiveVolume> volumes, List<string> paths)
         {
-            // The resident protocol has no archive-password field. Keep encrypted
-            // archives in the managed extractor, which validates size and CRC.
-            if (!string.IsNullOrEmpty(job.ArchivePassword)) return false;
+            if (!ResidentDownloadService.ValidArchivePassword(job.ArchivePassword))
+            { SetFailureIfCurrent(job, attempt, "Archive password exceeds 256 UTF-8 bytes or is invalid"); return true; }
             if (!InstallDependencyReady(job)) return false;
             lock (_lock) foreach (var other in _items) if (other != job && other.Background) return false;
             if (_cfg == null || !_cfg.UseBgftDirect || !ResidentDownloadService.HasDownloader) return false;
@@ -2413,33 +2910,74 @@ namespace Orbis
                 { CommitRequestedStop(job, attempt); return true; }
                 // Persist ownership before publishing IPC, so restart cannot claim a second writer.
                 job.ResidentArchive = true; job.Background = true; job.BgftResident = true;
+                job.ResidentGeneration = Guid.NewGuid().ToString("N");
+                job.ResidentPauseDesired = null;
+                job.ResidentAutoInstall = true;
                 job.State = DlState.Downloading; job.StatusText = "Handing RAR volumes to resident downloader";
             }
             if (!SaveManifest())
             {
-                lock (_lock) { job.ResidentArchive = false; job.Background = false; job.BgftResident = false; }
+                lock (_lock) { job.ResidentArchive = false; job.Background = false; job.BgftResident = false; job.ResidentAutoInstall = false; }
                 throw new IOException("Could not save archive ownership");
             }
             string error;
-            if (!ResidentDownloadService.TryStartArchive(job.Id, job.DestPath, job.TitleId, job.ExpectedContentId, resolved, paths, out error))
+            if (!ResidentDownloadService.TryStartArchiveWithPassword(job.Id, job.DestPath, job.TitleId, job.ExpectedContentId, resolved, paths, job.ResidentGeneration, job.ArchivePassword, out error))
                 return ResidentPublicationFailed(job, error);
+            NetHttp.TraceDownloadDecision(true, NetHttp.DownloadDecision.ResidentSelected);
             return true;
         }
 
         string ResolveVolume(ArchiveVolume volume)
         {
             if (IsDirectAccess(volume.AccessType)) return volume.Url;
-            if (_cfg.UseUnlockProvider && !string.Equals(_cfg.UnlockProviderId,
-                UnlockProviders.NoneId, StringComparison.OrdinalIgnoreCase))
+            if (_cfg.UseUnlockProvider && UnlockProviders.EnabledIds(_cfg).Length > 0)
                 return UnlockProviders.Unrestrict(_cfg, volume.Url);
-            return FreeHosterClient.ResolveDirect(volume.Url);
+            return FreeHosterClient.ResolveDirect(volume.Url,
+                string.Equals(volume.AccessType, "HosterLanding", StringComparison.OrdinalIgnoreCase));
+        }
+
+        string ResolveJobHost(DlItem job, int attempt)
+        {
+            var unavailableProviders = new HashSet<string>(StringComparer.Ordinal);
+            Func<bool> cancelled = () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested;
+            Action<string> progress = text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } };
+            return PackageMirrorFallback.Resolve(job.HosterUrl, job.MirrorCandidates,
+                url => UnlockProviders.Unrestrict(_cfg, url, progress, cancelled,
+                    provider => { lock (_lock) { if (!cancelled()) job.ResolvedProviderId = provider; } }, null, unavailableProviders),
+                () => !cancelled() && string.IsNullOrEmpty(job.ArchiveVolumes) &&
+                    !File.Exists(job.DestPath) && !File.Exists(job.DestPath + ".part") &&
+                    !File.Exists(job.DestPath + ".ranges") && !File.Exists(job.DestPath + ".resume"),
+                mirror =>
+                {
+                    lock (_lock)
+                    {
+                        if (cancelled()) throw new OperationCanceledException();
+                        job.HosterUrl = mirror.Url;
+                        job.CandidateId = mirror.CandidateId;
+                        job.AccessType = mirror.AccessType;
+                        job.SourcePageUrl = mirror.SourcePageUrl;
+                        job.SourceAttribution = mirror.SourceAttribution;
+                        job.ExpectedSha256 = string.IsNullOrEmpty(mirror.ExpectedSha256) ? "" : NormalizeSha256(mirror.ExpectedSha256, true);
+                        job.ExpectedContentId = mirror.ExpectedContentId ?? "";
+                        job.ExpectedByteSize = mirror.ExpectedByteSize;
+                        job.ExpiresUtc = mirror.ExpiresUtc;
+                        job.ArchivePassword = mirror.ArchivePassword;
+                    }
+                    if (!SaveManifest()) throw new IOException("Could not save the selected package mirror");
+                }, progress, cancelled);
         }
 
         void DownloadArchiveVolumes(DlItem job, int attempt)
         {
             var volumes = ArchiveVolumeSet.Decode(job.ArchiveVolumes);
             var paths = ArchivePaths(job);
-            if (TryHandoffArchive(job, attempt, volumes, paths)) return;
+            lock (_transferRouteGate)
+            {
+                if (!OtherForegroundTransfer(job) && TryHandoffArchive(job, attempt, volumes, paths)) return;
+                if (WaitForSelectedBackground(job, attempt, "Archive handoff is waiting for resident capacity") ||
+                    DeferWhileResidentTransfers(job, attempt)) return;
+                lock (_lock) job.ForegroundTransfer = true;
+            }
             {
                 long missing = 0;
                 for (int i = 0; i < volumes.Count; i++)
@@ -2449,62 +2987,46 @@ namespace Orbis
             for (int i = 0; i < volumes.Count; i++)
             {
                 if (CommitRequestedStop(job, attempt)) return;
+                if (WaitForSelectedBackground(job, attempt, "Background selected; remaining archive volumes are waiting for resident handoff")) return;
                 ArchiveVolume volume = volumes[i];
                 string path = paths[i];
                 if (!File.Exists(path))
                 {
-                    lock (_lock) { job.State = DlState.Downloading; job.StatusText = "Downloading RAR volume " + (i + 1) + "/" + volumes.Count; }
+                    lock (_lock) { job.State = DlState.Downloading; job.StatusText = "RAR volume " + (i + 1) + "/" + volumes.Count + " · Keep SSPI open"; }
                     string direct = ResolveVolume(volume);
                     string part = path + ".part";
                     long offset = File.Exists(part) ? new FileInfo(part).Length : 0;
                     long baseBytes = 0;
-                    long setKnown = 0;
-                    int unknownVolumes = 0;
                     for (int k = 0; k < volumes.Count; k++)
                     {
-                        if (volumes[k].Size > 0) setKnown = checked(setKnown + volumes[k].Size);
-                        else unknownVolumes++;
                         if (k < i)
                         {
                             try { if (File.Exists(paths[k])) baseBytes = checked(baseBytes + new FileInfo(paths[k]).Length); }
                             catch { }
                         }
                     }
-                    long volumeStartTicks = DateTime.UtcNow.Ticks;
+                    string statsPhase = "volume:" + i;
+                    lock (_lock)
+                    {
+                        if (job.AttemptId != attempt) return;
+                        job.StatsInitialized = false;
+                        UpdateTransferStats(job, checked(baseBytes + offset),
+                            ArchiveTransferTotal(volumes, baseBytes, i, 0), statsPhase, TransferClockMs(), 0);
+                    }
                     NetHttp.DownloadFileResumable(direct, path, offset,
-                        (done, total) =>
+                        null,
+                        () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested,
+                        60000, null, null, volume.Sha256, volume.Sha256,
+                        (done, total, received) =>
                         {
                             lock (_lock)
                             {
-                                if (job.AttemptId != attempt) return;
-                                job.Done = checked(baseBytes + done);
-                                long volumeTotal = Math.Max(total, volume.Size);
-                                long setTotal = checked(baseBytes + volumeTotal);
-                                for (int k = i + 1; k < volumes.Count; k++)
-                                    setTotal = checked(setTotal + Math.Max(0, volumes[k].Size));
-                                if (setKnown <= 0 || unknownVolumes > 0)
-                                    setTotal = Math.Max(setTotal, job.Done);
-                                job.Total = setTotal;
-                                long elapsed = DateTime.UtcNow.Ticks - volumeStartTicks;
-                                if (elapsed > TimeSpan.TicksPerMillisecond * 400)
-                                {
-                                    double secs = elapsed / (double)TimeSpan.TicksPerSecond;
-                                    if (secs > 0.05)
-                                    {
-                                        long bps = (long)((job.Done - baseBytes) / secs);
-                                        if (bps > 0)
-                                        {
-                                            job.BytesPerSec = bps;
-                                            job.EtaSeconds = job.Total > job.Done
-                                                ? (int)Math.Min(int.MaxValue, (job.Total - job.Done) / bps) : 0;
-                                        }
-                                    }
-                                }
-                                job.StatusText = "Downloading RAR volume " + (i + 1) + "/" + volumes.Count;
+                                if (job.AttemptId != attempt || job.PauseRequested || job.CancelRequested) return;
+                                UpdateLiveTransferStats(job, checked(baseBytes + done),
+                                    ArchiveTransferTotal(volumes, baseBytes, i, total), received, statsPhase, TransferClockMs());
+                                job.StatusText = "RAR volume " + (i + 1) + "/" + volumes.Count + " · Keep SSPI open";
                             }
-                        },
-                        () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested,
-                        60000, null, null, volume.Sha256);
+                        });
                 }
                 var probe = new DlItem { DestPath = path, ExpectedSha256 = volume.Sha256,
                     ExpectedByteSize = volume.Size };
@@ -2516,6 +3038,20 @@ namespace Orbis
                 SaveManifest();
             }
             FinishDownloadedObject(job, attempt);
+        }
+
+        internal static long ArchiveTransferTotal(IList<ArchiveVolume> volumes, long completedBytes, int index, long currentTotal)
+        {
+            if (volumes == null || index < 0 || index >= volumes.Count || completedBytes < 0) return 0;
+            long total = completedBytes;
+            for (int i = index; i < volumes.Count; i++)
+            {
+                long size = i == index && currentTotal > 0 ? currentTotal : volumes[i].Size;
+                // A partial sum is not the complete archive size and cannot support its ETA.
+                if (size <= 0 || total > long.MaxValue - size) return 0;
+                total += size;
+            }
+            return total;
         }
 
         void FinishDownloadedObject(DlItem job, int attempt)
@@ -2547,12 +3083,28 @@ namespace Orbis
             }
 
             if (objectKind == PackageObjectKind.Zip || objectKind == PackageObjectKind.Rar4 ||
-                objectKind == PackageObjectKind.Rar5)
+                objectKind == PackageObjectKind.Rar5 || objectKind == PackageObjectKind.SevenZip)
             {
                 string error;
                 if (!VerifyCandidateFile(job, out error))
                 {
                     RetainUnrecognizedDownload(job, attempt, error);
+                    return;
+                }
+                if (BackgroundSelected && string.IsNullOrEmpty(job.ArchiveVolumes))
+                {
+                    if (WaitForSelectedBackground(job, attempt)) return;
+                    string passwordError = objectKind == PackageObjectKind.SevenZip
+                        ? ResidentArchivePasswordError(new byte[] { 0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c }, job.ArchivePassword)
+                        : objectKind == PackageObjectKind.Zip
+                        ? ResidentArchivePasswordError(new byte[] { 0x50, 0x4b, 3, 4 }, job.ArchivePassword)
+                        : ResidentArchivePasswordError(new byte[] { 0x52, 0x61, 0x72, 0x21 }, job.ArchivePassword);
+                    if (passwordError != null) { SetFailureIfCurrent(job, attempt, passwordError); return; }
+                    string source = !string.IsNullOrEmpty(job.HttpRetryUrl) ? job.HttpRetryUrl : job.HosterUrl;
+                    Uri uri;
+                    if (!Uri.TryCreate(source, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https"))
+                    { WaitForSelectedBackground(job, attempt, "Retained archive needs its original source metadata for resident extraction"); return; }
+                    HandoffStagedPackage(job, attempt, source, job.TitleId, job.Kind, "", new FileInfo(job.DestPath).Length, true);
                     return;
                 }
                 if (objectKind == PackageObjectKind.Rar4 || objectKind == PackageObjectKind.Rar5)
@@ -2629,6 +3181,7 @@ namespace Orbis
                     StatusText = "Recovered extracted package",
                     BgftTaskId = -1
                 };
+                if (job.LocalSource) ApplyLocalArchiveMetadata(child, paths[i]);
                 adopted.Add(new PendingLocalChild
                 {
                     Item = child,
@@ -2644,6 +3197,7 @@ namespace Orbis
 
         void FanOutArchive(DlItem job, int attempt)
         {
+            if (WaitForSelectedBackground(job, attempt, "Archive extraction requires a resident handoff; choose In-app mode to extract this archive here")) return;
             string staging = Path.Combine(AppSettings.DownloadDir, ".extract", UrlTag(job.Id));
             var pending = new List<PendingLocalChild>();
             bool committed = false;
@@ -2653,15 +3207,27 @@ namespace Orbis
                 // so adopt them directly instead of extracting again.
                 if (TryAdoptMovedFanOutChildren(job, attempt, pending))
                 {
-                    lock (_lock) { job.State = DlState.Finalizing; job.StatusText = "Recovered extracted packages..."; }
+                    lock (_lock) {
+                        if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) { CommitRequestedStop(job, attempt); return; }
+                        job.State = DlState.Finalizing; job.StatusText = "Recovered extracted packages...";
+                    }
                     goto AdoptedPlan;
                 }
                 PrepareExtractionDirectory(staging);
                 var paths = ArchivePaths(job);
-                lock (_lock) { job.State = DlState.Finalizing; job.StatusText = "Extracting packages..."; }
+                lock (_lock) {
+                    if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) { CommitRequestedStop(job, attempt); return; }
+                    job.State = DlState.Finalizing; job.StatusText = "Extracting packages...";
+                }
+                LogBgftEvent("archive-extraction-start", job, "Managed archive extraction started");
                 List<PackageArchiveEntry> entries = PackageArchive.ExtractPackages(paths, staging,
                     () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested,
-                    (done, total) => { lock (_lock) { job.Done = done; job.Total = total; job.StatusText = "Extracting packages..."; } }, job.ArchivePassword);
+                    (done, total) => { lock (_lock) {
+                        if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) return;
+                        job.Done = done; job.Total = total;
+                        job.StatusText = "Extracting packages" + (total > 0 ? " - " + Math.Min(100, done * 100.0 / total).ToString("0") + "%" : "...");
+                    } }, job.ArchivePassword);
+                LogBgftEvent("archive-extraction-complete", job, "Extracted package count=" + entries.Count);
                 for (int i = 0; i < entries.Count; i++)
                 {
                     PackageArchiveEntry entry = entries[i];
@@ -2704,6 +3270,7 @@ namespace Orbis
                         StatusText = "Extracted and validated",
                         BgftTaskId = -1
                     };
+                    if (job.LocalSource) ApplyLocalArchiveMetadata(child, entry.ExtractedPath);
                     pending.Add(new PendingLocalChild
                     {
                         Item = child,
@@ -2736,10 +3303,11 @@ namespace Orbis
                     p.Item.PackageVersion = v;
                     if (v.Length == 0) continue;
                     string first;
-                    if (patchVersions.TryGetValue(v, out first))
+                    string identity = (p.Item.ExpectedContentId ?? "") + "|" + v;
+                    if (patchVersions.TryGetValue(identity, out first))
                         throw new InvalidDataException("Archive contains competing updates for version " + v +
                             " (" + first + ", " + (p.Item.Label ?? "") + "); no packages installed");
-                    patchVersions[v] = p.Item.Label ?? "";
+                    patchVersions[identity] = p.Item.Label ?? "";
                 }
 
                 pending.Sort((left, right) =>
@@ -3042,14 +3610,23 @@ namespace Orbis
 
         void FinalizeFanOutSource(DlItem parent)
         {
-            foreach (string path in ArchivePaths(parent)) DeleteDownloadFiles(path);
-            DeleteDownloadFiles(parent.DestPath);
+            if (!parent.LocalSource)
+                foreach (string path in ArchivePaths(parent)) DeleteDownloadFiles(path);
+            DeleteDownloadFiles(parent);
             lock (_lock)
             {
                 if (!File.Exists(parent.DestPath)) _items.Remove(parent);
-                else parent.StatusText = "Packages queued; source cleanup pending";
+                else parent.StatusText = parent.LocalSource ? "Packages queued; USB source retained" : "Packages queued; source cleanup pending";
             }
             SaveManifest();
+        }
+
+        static void ApplyLocalArchiveMetadata(DlItem child, string path)
+        {
+            LocalInstallSource source = LocalInstallSource.ReadMetadata(path, true);
+            child.Name = source.Name; child.ImageUrl = source.ImagePath; child.PackageVersion = source.Version;
+            if (source.ExpectedKind == 8 && System.Text.RegularExpressions.Regex.IsMatch(child.Label ?? "", @"(?:^|[^A-Za-z0-9])backport(?:[^A-Za-z0-9]|$)", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                child.Kind = "backport";
         }
 
         static string BuildDerivedDestination(string titleId, string kind, string identity)
@@ -3071,7 +3648,7 @@ namespace Orbis
             return paths.ToString();
         }
 
-        static string LinkAccessType(string url)
+        internal static string LinkAccessType(string url)
         {
             Uri uri;
             if (Uri.TryCreate(url, UriKind.Absolute, out uri))
@@ -3079,7 +3656,9 @@ namespace Orbis
                 string path = uri.AbsolutePath ?? "";
                 if (path.EndsWith(".pkg", StringComparison.OrdinalIgnoreCase) ||
                     path.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) ||
-                    path.EndsWith(".rar", StringComparison.OrdinalIgnoreCase)) return "Direct";
+                    path.EndsWith(".rar", StringComparison.OrdinalIgnoreCase) ||
+                    path.EndsWith(".7z", StringComparison.OrdinalIgnoreCase) ||
+                    path.EndsWith(".7zip", StringComparison.OrdinalIgnoreCase)) return "Direct";
             }
             return "HosterLanding";
         }
@@ -3181,7 +3760,7 @@ namespace Orbis
             for (int i = 0; i < sources.Count; i++)
             {
                 DlItem source = sources[i];
-                DeleteDownloadFiles(source.DestPath);
+                DeleteDownloadFiles(source);
                 lock (_lock)
                 {
                     if (!File.Exists(source.DestPath))
@@ -3189,7 +3768,7 @@ namespace Orbis
                         _items.Remove(source);
                         changed = true;
                     }
-                    else source.StatusText = "Packages queued; source cleanup pending";
+                    else source.StatusText = source.LocalSource ? "Packages queued; USB source retained" : "Packages queued; source cleanup pending";
                 }
             }
             try
@@ -3249,6 +3828,31 @@ namespace Orbis
         void HandleValidatedLocalPackage(DlItem job, int attempt, PkgContentKind actualKind,
             string actualKindName, string contentId, string actualTitleId, long size)
         {
+            if (BackgroundSelected)
+            {
+                if (WaitForSelectedBackground(job, attempt)) return;
+                string source = !string.IsNullOrEmpty(job.HttpRetryUrl) ? job.HttpRetryUrl : job.HosterUrl;
+                Uri uri;
+                if (!Uri.TryCreate(source, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https"))
+                { WaitForSelectedBackground(job, attempt, "Retained package needs its original source metadata for resident installation"); return; }
+                HandoffStagedPackage(job, attempt, source, actualTitleId, actualKindName, contentId, size);
+                return;
+            }
+            lock (_packageInstallGate)
+            {
+                bool busy = TransferClockMs() < _nextInstallHandoffAt;
+                lock (_lock) foreach (var other in _items)
+                    if (other != job && (other.State == DlState.Installing ||
+                        (other.State == DlState.Submitted && !other.InstallOrderReady))) busy = true;
+                if (busy) { RequeueValidatedLocalPackage(job, attempt, size); return; }
+                try { HandleValidatedLocalPackageCore(job,attempt,actualKind,actualKindName,contentId,actualTitleId,size); }
+                finally { _nextInstallHandoffAt=TransferClockMs()+3000; }
+            }
+        }
+
+        void HandleValidatedLocalPackageCore(DlItem job, int attempt, PkgContentKind actualKind,
+            string actualKindName, string contentId, string actualTitleId, long size)
+        {
             lock (_packageInstallGate)
             {
                 if (CommitRequestedStop(job, attempt)) return;
@@ -3269,7 +3873,7 @@ namespace Orbis
                 string metadataError;
                 if (!PkgIntegrity.CheckMetadata(job.DestPath, actualTitleId,
                     actualKind == PkgContentKind.Patch ? "gp" : actualKind == PkgContentKind.AddOn ? "ac" : "gd", out metadataError))
-                { MarkInstallFailed(job.Id, metadataError); return; }
+                { MarkInstallFailed(job.Id, metadataError, attempt); return; }
                 if (!InstallDependencyReady(job))
                 {
                     lock (_lock) { job.State = DlState.Queued; job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(2).Ticks; }
@@ -3284,21 +3888,29 @@ namespace Orbis
                 if (actualKind == PkgContentKind.Patch)
                 {
                     string integrityError;
-                    if (!PkgIntegrity.CheckInstalledBase(job.DestPath, actualTitleId, out integrityError))
-                    { MarkInstallFailed(job.Id, integrityError); return; }
-                    if (!PkgIntegrity.ValidatePatch(job.DestPath, actualTitleId, FirmwareInfo.Probe(),
-                        text => { lock (_lock) job.StatusText = text; },
+                    if (!PkgIntegrity.WaitForInstalledBase(job.DestPath, actualTitleId,
+                        text => { lock (_lock) { if (AcceptInstallCallback(job, attempt)) job.StatusText = text; } },
                         () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested, out integrityError))
-                    { MarkInstallFailed(job.Id, integrityError); return; }
+                    {
+                        if (CommitRequestedStop(job, attempt)) return;
+                        if (PkgIntegrity.IsInstalledBaseUnavailable(integrityError) &&
+                            RetryLocalInstall(job, attempt, integrityError)) return;
+                        MarkInstallFailed(job.Id, integrityError, attempt); return;
+                    }
+                    if (!PkgIntegrity.ValidatePatch(job.DestPath, actualTitleId, FirmwareInfo.Probe(),
+                        text => { lock (_lock) { if (AcceptInstallCallback(job, attempt)) job.StatusText = text; } },
+                        () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested, out integrityError))
+                    { MarkInstallFailed(job.Id, integrityError, attempt); return; }
                     string identityError;
                     if (!PkgValidator.CheckRequestedIdentity(actualKindName, actualKind, actualTitleId, contentId, out identityError))
-                    { MarkInstallFailed(job.Id, identityError); return; }
+                    { MarkInstallFailed(job.Id, identityError, attempt); return; }
                     try { job.PackageVersion = PkgIntegrity.SfoValue(PkgIntegrity.Entry(job.DestPath, 0x1000), "APP_VER"); } catch { }
                     string installedName, installedVersion, installedIcon, versionError;
                     InstalledTitleScan.ReadMeta(actualTitleId, out installedName, out installedVersion, out installedIcon);
                     if (!PkgIntegrity.CheckUpdateVersion(job.PackageVersion, installedVersion, out versionError))
-                    { MarkInstallFailed(job.Id, versionError); return; }
+                    { MarkInstallFailed(job.Id, versionError, attempt); return; }
                 }
+                if (WaitForSelectedBackground(job, attempt, "Background selected; validated package is waiting for resident installation")) return;
                 bool useLoopback = actualKind == PkgContentKind.Patch;
                 bool baseReady = !PkgInstallPolicy.RequiresInstalledBase(actualKind) ||
                     (!string.IsNullOrEmpty(actualTitleId) && PkgInstaller.IsTitleInstalled(actualTitleId));
@@ -3326,9 +3938,8 @@ namespace Orbis
                     else
                     {
                         int subType = PkgValidator.BgftSubTypeForKind(actualKindName);
-                        bool titleKnown = actualKind == PkgContentKind.BaseGame &&
-                            !string.IsNullOrEmpty(actualTitleId);
-                        bool titleAtStart = titleKnown && PkgInstaller.IsTitleInstalled(actualTitleId);
+                        bool titleAtStart;
+                        bool titleKnown = TryInitialTitlePresence(actualKind, actualTitleId, out titleAtStart);
                         string displayName = !string.IsNullOrEmpty(job.Name)
                             ? job.Name : (!string.IsNullOrEmpty(actualTitleId) ? actualTitleId : "package");
                         bool registrationCurrent;
@@ -3441,7 +4052,11 @@ namespace Orbis
 
                 _loopback.Release(job.Id);
                 if (actualKind == PkgContentKind.Patch)
-                { MarkInstallFailed(job.Id, fallbackReason ?? "BGFT update registration failed; PKG retained"); return; }
+                {
+                    string error = fallbackReason ?? "BGFT update registration failed; PKG retained";
+                    if (!RetryLocalInstall(job, attempt, error)) MarkInstallFailed(job.Id, error, attempt);
+                    return;
+                }
                 lock (_lock)
                 {
                     if (job.AttemptId != attempt) return;
@@ -3465,8 +4080,8 @@ namespace Orbis
                 job.State = DlState.Queued;
                 job.Done = job.Total = size;
                 job.Error = null;
-                job.StatusText = "Waiting for active PS4 system download";
-                job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(2).Ticks;
+                job.StatusText = "Waiting for PS4 installer; file retained";
+                job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(3).Ticks;
                 _nerd.Finalizing = false;
             }
             SaveManifest();
@@ -3489,13 +4104,14 @@ namespace Orbis
             string installedTitleId;
             string error;
             int taskId;
+            if (WaitForSelectedBackground(job, attempt, "Local package installation is waiting for the resident worker")) return;
             InstallOutcome outcome = PkgInstaller.InstallLocal(job.DestPath, actualTitleId,
                 actualKindName, out installedTitleId, out error, out taskId, false);
             if (outcome == InstallOutcome.Started)
             {
                 if (taskId < 0)
                 {
-                    MarkInstallAccepted(job.Id, "Sent to PS4 — verification pending · PKG kept");
+                    MarkInstallAccepted(job.Id, "Sent to PS4 — verification pending · PKG kept", -1, attempt);
                     return;
                 }
                 string checkTitleId = !string.IsNullOrEmpty(installedTitleId)
@@ -3507,7 +4123,7 @@ namespace Orbis
                     {
                         lock (_lock)
                         {
-                            if (job.AttemptId != attempt) return;
+                            if (!AcceptInstallCallback(job, attempt)) return;
                             job.State = DlState.Installing;
                             job.StatusText = percent >= 0
                                 ? "Installing " + percent + "%" : "Installing...";
@@ -3519,31 +4135,54 @@ namespace Orbis
                     }, out localCopyComplete, out waitError);
                 if (completed)
                 {
-                    lock (_lock) job.InstallOrderReady = localCopyComplete;
+                    lock (_lock) { if (AcceptInstallCallback(job, attempt)) job.InstallOrderReady = localCopyComplete; }
                     bool confirmedBase = actualKind == PkgContentKind.BaseGame &&
                         localCopyComplete && !string.IsNullOrEmpty(checkTitleId) &&
                         PkgInstaller.IsTitleInstalled(checkTitleId);
                     if (confirmedBase)
-                        MarkInstalled(job.Id, "Installed " + checkTitleId + " — local PKG kept", false);
+                        MarkInstalled(job.Id, "Installed " + checkTitleId + " — local PKG kept", false, attempt);
                     else
                         MarkInstallAccepted(job.Id,
                             actualKind == PkgContentKind.Patch || actualKind == PkgContentKind.AddOn
                                 ? "Sent to PS4 — verify update/DLC · PKG kept"
                                 : "Sent to PS4 — verification pending · PKG kept",
-                            taskId);
+                            taskId, attempt);
                     return;
                 }
                 if ((waitError ?? "").StartsWith("BGFT progress") || (waitError ?? "").IndexOf("timeout", StringComparison.OrdinalIgnoreCase) >= 0)
-                    MarkInstallAccepted(job.Id, "PS4 install status unavailable · task and PKG retained", taskId);
-                else MarkInstallFailed(job.Id, waitError ?? "Local PKG install failed");
+                    MarkInstallAccepted(job.Id, "PS4 install status unavailable · task and PKG retained", taskId, attempt);
+                else MarkInstallFailed(job.Id, waitError ?? "Local PKG install failed", attempt);
                 return;
             }
             if (outcome == InstallOutcome.AlreadyInstalled)
             {
-                MarkAlreadyInstalled(job.Id, "Already installed; local PKG kept");
+                if (actualKind == PkgContentKind.AddOn && PkgInstaller.IsAddonInstalled(job.DestPath, true))
+                { MarkInstalled(job.Id, "Add-on installation confirmed by PS4 content", false, attempt); return; }
+                MarkAlreadyInstalled(job.Id, "Already installed; local PKG kept", attempt);
                 return;
             }
-            MarkInstallFailed(job.Id, error ?? "Local PKG install failed");
+            if (outcome == InstallOutcome.NotReady && RetryLocalInstall(job, attempt, error)) return;
+            MarkInstallFailed(job.Id, error ?? "Local PKG install failed", attempt);
+        }
+
+        bool RetryLocalInstall(DlItem job, int attempt, string reason)
+        {
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested ||
+                    job.Background || job.InstallRetries >= 3 || !File.Exists(job.DestPath)) return false;
+                int seconds = 3 << job.InstallRetries++;
+                job.Done = job.Total = new FileInfo(job.DestPath).Length;
+                job.State = DlState.Queued;
+                job.Error = null;
+                job.StatusText = "PS4 installer settling; retry in " + seconds + "s (file retained)";
+                job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(seconds).Ticks;
+                _nextInstallHandoffAt = TransferClockMs() + seconds * 1000;
+                job.BytesPerSec = 0; job.EtaSeconds = 0;
+                LogBgftEvent("local-install-retry", job, reason ?? "Installer not ready");
+                SaveManifest();
+                return true;
+            }
         }
 
         void RetainUnrecognizedDownload(DlItem job, int attempt, string error)
@@ -3555,7 +4194,7 @@ namespace Orbis
                 if (kind == PackageObjectKind.Pkg)
                     status = "Package verification failed; file retained";
                 else if (kind == PackageObjectKind.Zip || kind == PackageObjectKind.Rar4 ||
-                    kind == PackageObjectKind.Rar5)
+                    kind == PackageObjectKind.Rar5 || kind == PackageObjectKind.SevenZip)
                     status = "Archive verification failed; file retained";
                 else if (!string.IsNullOrEmpty(error) &&
                     (error.IndexOf("SHA-256", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -3590,32 +4229,79 @@ namespace Orbis
             return s.Length <= n ? s : s.Substring(0, n);
         }
 
-        internal static void UpdateTransferStats(DlItem item, long done, long total, string phase, long nowMs, int nativeEta)
+        internal static void UpdateLiveTransferStats(DlItem item, long done, long total, long received, string phase, long nowMs)
         {
-            item.Done = done; item.Total = total;
-            bool transferring = phase == "downloading" || phase == "feeding" || phase == "extracting" || phase == "bgft";
-            long elapsed = nowMs - item.StatsAt;
-            if (!transferring || item.StatsAt == 0 || elapsed < 0 || elapsed > 15000 || done < item.StatsDone ||
-                item.StatsPhase != phase || item.StatsTotal != total || item.StatsAttempt != item.AttemptId)
+            if (received < 0 || !IsTransferStatsPhase(phase))
             {
-                item.StatsAt = item.StatsAdvancedAt = nowMs; item.StatsDone = done; item.StatsTotal = total;
-                item.StatsPhase = phase; item.StatsAttempt = item.AttemptId;
-                item.BytesPerSec = 0; item.EtaSeconds = transferring ? nativeEta : 0;
+                item.LiveMeter = null;
+                UpdateTransferStats(item, done, total, phase, nowMs, 0);
                 return;
             }
-            if (elapsed < 1000) return;
-            long delta = done - item.StatsDone;
-            if (delta > 0)
+            if (!item.StatsInitialized || item.LiveMeter == null) item.LiveMeter = new LiveTransferMeter();
+            item.LiveMeter.Sample(received, done, total, phase, item.AttemptId, nowMs);
+            item.Done = Math.Max(0, done);item.Total = Math.Max(0, total);
+            item.BytesPerSec = item.LiveMeter.Rate;item.EtaSeconds = item.LiveMeter.Eta;
+            item.StatsInitialized = true;item.StatsPhase = phase;item.StatsAttempt = item.AttemptId;
+            item.StatsAt = nowMs;item.StatsAdvancedAt = item.LiveMeter.AdvancedAt;
+        }
+
+        internal static void UpdateTransferStats(DlItem item, long done, long total, string phase, long nowMs, int nativeEta)
+        {
+            done = Math.Max(0, done); total = Math.Max(0, total); nowMs = Math.Max(0, nowMs);
+            item.Done = done; item.Total = total;
+            bool transferring = IsTransferStatsPhase(phase);
+            long elapsed = nowMs - item.StatsAt;
+            if (!transferring || !item.StatsInitialized || elapsed < 0 || elapsed > 15000 || done < item.StatsObservedDone ||
+                item.StatsPhase != phase || item.StatsAttempt != item.AttemptId)
             {
-                double rate = delta * 1000.0 / elapsed;
-                item.BytesPerSec = item.BytesPerSec > 0 ? item.BytesPerSec * .65 + rate * .35 : rate;
-                item.StatsAdvancedAt = nowMs;
+                item.StatsAt = item.StatsAdvancedAt = nowMs; item.StatsDone = done; item.StatsTotal = total;
+                item.StatsObservedDone = done; item.StatsInitialized = true;
+                item.StatsPhase = phase; item.StatsAttempt = item.AttemptId;
+                item.BytesPerSec = 0; item.EtaSeconds = 0;
+                return;
             }
-            else if (nowMs - item.StatsAdvancedAt >= 5000) item.BytesPerSec = 0;
-            item.StatsAt = nowMs; item.StatsDone = done;
-            item.EtaSeconds = nativeEta > 0 ? nativeEta : total > done && item.BytesPerSec > 0
-                ? (int)Math.Min(int.MaxValue, Math.Ceiling((total - done) / item.BytesPerSec)) : 0;
-            if (total > 0 && done >= total) { item.BytesPerSec = 0; item.EtaSeconds = 0; }
+            if (done > item.StatsObservedDone) item.StatsAdvancedAt = nowMs;
+            item.StatsObservedDone = done; item.StatsTotal = total;
+            if ((total > 0 && done >= total) || nowMs - item.StatsAdvancedAt >= 5000)
+            {
+                item.StatsAt = nowMs; item.StatsDone = done;
+                item.BytesPerSec = 0; item.EtaSeconds = 0;
+                return;
+            }
+            // Warm up for two seconds, then smooth by elapsed time rather than callback frequency.
+            if (elapsed >= (item.BytesPerSec > 0 ? 1000 : 2000))
+            {
+                double rate = (done - item.StatsDone) * 1000.0 / elapsed;
+                double weight = 1.0 - Math.Exp(-elapsed / 5000.0);
+                item.BytesPerSec = item.BytesPerSec > 0
+                    ? item.BytesPerSec + (rate - item.BytesPerSec) * weight : rate;
+                item.StatsAt = nowMs; item.StatsDone = done;
+            }
+            // BGFT's restSec values may describe a different phase or be stale. Only recent
+            // observed byte movement can support the download estimate shown by SSPI.
+            item.EtaSeconds = TransferEtaSeconds(done, total, item.BytesPerSec);
+        }
+
+        static bool IsTransferStatsPhase(string phase)
+        {
+            return phase == "downloading" || phase == "feeding" || phase == "bgft" ||
+                phase == "foreground" || (phase != null && phase.StartsWith("volume:", StringComparison.Ordinal));
+        }
+
+        internal static bool HasCurrentTransferStats(DlItem item, long nowMs)
+        {
+            return item != null && item.StatsInitialized && item.State == DlState.Downloading &&
+                !item.PauseRequested && !item.CancelRequested && item.StatsAttempt == item.AttemptId &&
+                IsTransferStatsPhase(item.StatsPhase) && nowMs >= item.StatsAdvancedAt &&
+                nowMs - item.StatsAdvancedAt < 5000;
+        }
+
+        internal static int TransferEtaSeconds(long done, long total, double bytesPerSec)
+        {
+            if (done < 0 || total <= done || bytesPerSec <= 0 ||
+                double.IsNaN(bytesPerSec) || double.IsInfinity(bytesPerSec)) return 0;
+            double seconds = Math.Ceiling((total - done) / bytesPerSec);
+            return seconds >= int.MaxValue ? int.MaxValue : Math.Max(1, (int)seconds);
         }
 
         static long TransferClockMs()
@@ -3623,35 +4309,58 @@ namespace Orbis
             return (long)(System.Diagnostics.Stopwatch.GetTimestamp() * (1000.0 / System.Diagnostics.Stopwatch.Frequency));
         }
 
-        bool ConfirmInstalledUpdate(DlItem item)
+        internal static bool MatchesInstalledUpdateIdentity(string content, string version, string title,
+            string installedContent, string installedVersion, string installedTitle, string category)
         {
+            Version wanted, actual;
+            return category == "gp" && !string.IsNullOrEmpty(content) &&
+                PkgValidator.ContentIdMatchesTitleId(content, title) &&
+                string.Equals(content, installedContent, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(title, installedTitle, StringComparison.OrdinalIgnoreCase) &&
+                Version.TryParse((version ?? "").TrimStart('v', 'V'), out wanted) &&
+                Version.TryParse((installedVersion ?? "").TrimStart('v', 'V'), out actual) && actual >= wanted;
+        }
+
+        bool TryFindInstalledUpdate(DlItem item, out string installedPath, out string version)
+        {
+            installedPath = version = null;
             if (item == null || !item.Background || item.State == DlState.Canceled ||
                 !string.IsNullOrEmpty(item.ArchiveVolumes) || PkgValidator.BgftSubTypeForKind(item.Kind) != 8) return false;
-            int attempt = item.AttemptId;
             if (string.IsNullOrEmpty(item.PackageVersion))
             {
                 try { item.PackageVersion = PkgIntegrity.SfoValue(PkgIntegrity.Entry(item.DestPath, 0x1000), "APP_VER"); }
                 catch { return false; }
                 if (string.IsNullOrEmpty(item.PackageVersion)) return false;
             }
-            string version = null, installedPath = null;
             foreach (string root in new[] { "/user/patch/", "/mnt/ext0/user/patch/" })
             {
                 string installed = root + item.TitleId + "/patch.pkg";
-                if (!PkgInstallPolicy.MatchesInstalledContainer(item.DestPath, installed)) continue;
                 try
                 {
+                    bool sameContainer = PkgInstallPolicy.MatchesInstalledContainer(item.DestPath, installed);
+                    long expected = item.BgftExpectedSize > 0 ? item.BgftExpectedSize : item.Total;
+                    if (!sameContainer && !item.BgftDownloadPhaseConfirmed &&
+                        !(item.BgftLocalInstall && expected > 0 && item.Done >= expected)) continue;
                     byte[] sfo = PkgIntegrity.Entry(installed, 0x1000);
-                    Version wanted, actual;
+                    string installedContent;
+                    if (!PkgValidator.TryGetContentId(installed, out installedContent)) continue;
                     string candidate = PkgIntegrity.SfoValue(sfo, "APP_VER");
-                    if (PkgIntegrity.SfoValue(sfo, "CATEGORY") != "gp" ||
-                        !Version.TryParse(item.PackageVersion.TrimStart('v', 'V'), out wanted) ||
-                        !Version.TryParse(candidate.TrimStart('v', 'V'), out actual) || actual < wanted) continue;
+                    string content = !string.IsNullOrEmpty(item.BgftContentId) ? item.BgftContentId : item.ExpectedContentId;
+                    if (!MatchesInstalledUpdateIdentity(content, item.PackageVersion, item.TitleId, installedContent,
+                        candidate, PkgIntegrity.SfoValue(sfo, "TITLE_ID"), PkgIntegrity.SfoValue(sfo, "CATEGORY"))) continue;
                     version = candidate; installedPath = installed; break;
                 }
                 catch { }
             }
-            if (version == null) { item.BgftInstalledProofPolls = 0; return false; }
+            return version != null;
+        }
+
+        bool ConfirmInstalledUpdate(DlItem item)
+        {
+            string version, installedPath;
+            int attempt = item.AttemptId;
+            if (!TryFindInstalledUpdate(item, out installedPath, out version))
+            { item.BgftInstalledProofPolls = 0; return false; }
             // BGFT reference-package totals can omit metadata. The promoted patch
             // is stronger evidence than byte counters, feeder lifetime or an old error.
             if (++item.BgftInstalledProofPolls < 8) return false;
@@ -3659,7 +4368,8 @@ namespace Orbis
             if (!PkgIntegrity.ValidatePatch(installedPath, item.TitleId, "", null, null, out verificationError))
             { item.BgftInstalledProofPolls = 0; return false; }
             lock (_lock) {
-                if (!item.Background || item.AttemptId != attempt || item.State == DlState.Canceled) return false;
+                if (!object.ReferenceEquals(Find(item.Id), item) || !item.Background ||
+                    !AcceptInstallCallback(item, attempt)) return false;
                 item.State = DlState.Installed; item.InstallConfirmed = true; item.InstallOrderReady = true;
                 item.Error = null;
                 item.StatusText = "Installed update v" + version; item.Done = item.Total; item.BytesPerSec = 0; item.EtaSeconds = 0;
@@ -3671,45 +4381,145 @@ namespace Orbis
 
         void RefreshResidentArchive(DlItem item)
         {
-            ResidentDownloadStatus status;
-            if (!ResidentDownloadService.TryGetStatus(item.Id, out status))
+            int attempt = item.AttemptId;
+            if (item.ResidentRemovePending)
             {
-                lock (_lock) item.StatusText = ResidentDownloadService.HasDownloader
-                    ? "Waiting for shell download acknowledgement" : "Waiting for GoldHEN shell downloader";
+                lock (_lock)
+                {
+                    if (!object.ReferenceEquals(Find(item.Id), item)) return;
+                    if (_activeIds.Contains(item.Id) || ResidentDownloadService.HasJob(item.Id))
+                    {
+                        ResidentDownloadService.Release(item.Id);
+                        item.StatusText = "Removing background job; waiting for worker acknowledgement";
+                        return;
+                    }
+                    // The native owner removes its durable job only after readers, transfer
+                    // threads and any owned BGFT task have stopped. Until then keep the data.
+                    if (!ResidentDownloadService.HasDownloader) return;
+                    if (!TryCleanupFanOutPending(item)) { item.StatusText = "Stored files could not be removed"; return; }
+                    DeleteDownloadFiles(item);
+                    PreserveConfirmedDependency(item);
+                    _items.Remove(item);
+                    SaveManifest();
+                }
                 return;
+            }
+            if (item.ResidentRetryPending)
+            {
+                lock (_lock)
+                {
+                    if (!object.ReferenceEquals(Find(item.Id), item) || !AcceptInstallCallback(item, attempt)) return;
+                    // The job file disappears only after the native lanes have stopped.
+                    // Never start another writer while the old signed URL still owns the file.
+                    if (ResidentDownloadService.HasStagedJob(item.Id))
+                    {
+                        ResidentDownloadService.Release(item.Id);
+                        item.StatusText = "Waiting for background transfer to stop before retry";
+                        return;
+                    }
+                    ClearBackground(item);
+                    item.ResidentArchive = false;
+                    item.ResidentRetryPending = false;
+                    item.State = item.CancelRequested ? DlState.Canceled : item.PauseRequested ? DlState.Paused : DlState.Queued;
+                    item.StatusText = item.CancelRequested ? "Canceled; partial download retained" :
+                        item.PauseRequested ? "Paused; partial download retained" : "Preparing retry; verified files retained";
+                    item.CancelRequested = item.PauseRequested = false;
+                    item.Error = null; item.BytesPerSec = 0; item.EtaSeconds = 0;
+                    item.StatsInitialized = false;
+                    item.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(2).Ticks;
+                    SaveManifest();
+                }
+                return;
+            }
+            ResidentDownloadStatus status;
+            if (!ResidentDownloadService.TryGetStatus(item.Id, item.ResidentGeneration, out status))
+            {
+                lock (_lock) {
+                    if (!object.ReferenceEquals(Find(item.Id), item) || !AcceptInstallCallback(item, attempt)) return;
+                    item.StatusText = ResidentDownloadService.HasDownloader
+                        ? "Waiting for shell download acknowledgement" : "Waiting for GoldHEN shell downloader";
+                }
+                return;
+            }
+            // Old feeder records can require an app attachment. Generation-bound jobs
+            // own BGFT registration, task journaling, starting and completion themselves.
+            if (status.State == "awaiting-bgft" && !ResidentDownloadService.OwnsBgftLifetime(item.Id) &&
+                ResidentDownloadService.TryAttachPendingBgft(item.Id, out int attachedTask))
+            {
+                lock (_lock)
+                {
+                    if (object.ReferenceEquals(Find(item.Id), item) && item.AttemptId == attempt)
+                        item.BgftTaskId = attachedTask;
+                }
             }
             bool changed = false, release = false;
             lock (_lock)
             {
-                if (!item.ResidentArchive || !item.Background) return;
+                if (!object.ReferenceEquals(Find(item.Id), item) || !AcceptInstallCallback(item, attempt) ||
+                    !item.ResidentArchive || !item.Background) return;
+                if (CanRenewResidentLink(item, status, CanRefreshUnlock(item)))
+                {
+                    item.ResidentLinkRenewals++;
+                    item.ResidentLastRenewalBytes = status.Done;
+                    item.ResidentRetryPending = true;
+                    item.State = DlState.Resolving;
+                    item.StatusText = "Renewing expired download link";
+                    item.Error = null; item.BytesPerSec = 0; item.EtaSeconds = 0;
+                    if (SaveManifest()) ResidentDownloadService.Release(item.Id);
+                    else
+                    {
+                        item.ResidentRetryPending = false;
+                        item.ResidentLinkRenewals--;
+                    }
+                    return;
+                }
                 if (item.State == DlState.Failed && status.State == "failed" && item.Error == status.Error) return;
+                if (item.ResidentStaged && !item.ResidentAutoInstall && status.State == "staged")
+                {
+                    long length;
+                    try { length = File.Exists(item.DestPath) ? new FileInfo(item.DestPath).Length : -1; }
+                    catch (IOException) { item.StatusText = "Waiting to inspect staged download"; return; }
+                    catch (UnauthorizedAccessException) { item.StatusText = "Waiting for access to staged download"; return; }
+                    if (TryAcceptStagedPackage(item, status, length))
+                    {
+                        // Persist adoption before retiring native ownership. No BGFT success is
+                        // inferred here; the queued local package still has all install gates.
+                        if (SaveManifest()) ResidentDownloadService.Release(item.Id);
+                        else
+                        {
+                            item.Background = item.BgftResident = item.ResidentArchive = item.ResidentStaged = true;
+                            item.State = DlState.Finalizing;
+                        }
+                    }
+                    return;
+                }
                 // Extraction counts output bytes; the resident total still describes compressed input.
-                UpdateTransferStats(item, status.Done, status.State == "extracting" ? 0 : status.Total,
-                    status.State, TransferClockMs(), 0);
-                item.StatusText = status.State == "extracting" ? "Extracting RAR packages in resident worker" :
+                UpdateLiveTransferStats(item, status.Done, status.State == "extracting" ? 0 : status.Total,
+                    status.NetworkBytes, status.State, TransferClockMs());
+                item.StatusText = status.State == "extracting" ? "Extracting archive packages in resident worker" :
                     status.State == "installing" ? "Installing packages in order" :
                     status.State == "validating" ? "Verifying package integrity · " + Human(status.Done) + " checked" : "Resident download: " + status.State;
-                if (status.State == "installing") item.State = DlState.Installing;
-                else if (status.State == "validating" || status.State == "extracting")
-                { item.State = DlState.Finalizing; item.BytesPerSec = 0; item.EtaSeconds = 0; }
-                else if (status.State == "downloading" || status.State == "feeding" || status.State == "ready") item.State = DlState.Downloading;
+                ApplyResidentTransferPhase(item, status);
+                if ((status.State == "feeding" || status.State == "installing") && !string.IsNullOrEmpty(status.Error))
+                    item.StatusText = status.Error;
                 if (status.State == "installed")
                 {
                     item.State = DlState.Installed; item.InstallConfirmed = true; item.InstallOrderReady = true;
                     item.Background = false; item.BgftResident = false; item.Error = null;
                     item.BytesPerSec = 0; item.EtaSeconds = 0; CompleteByteCounters(item);
-                    item.StatusText = "Installed · verified by PS4 · local files retained";
+                    item.StatusText = "Installed · verified by PS4";
                     release = true; changed = true;
                 }
                 else if (status.State == "submitted")
                 {
-                    item.State = DlState.Submitted; item.InstallConfirmed = false; item.InstallOrderReady = true;
+                    item.State = DlState.Submitted; item.InstallConfirmed = false; item.InstallOrderReady = false;
                     item.Background = false; item.BgftResident = false;
                     item.StatusText = "Packages sent to PS4 in order; files retained";
                     release = true; changed = true;
                 }
                 else if (status.State == "failed" || status.State == "canceled")
                 {
+                    item.BytesPerSec = 0; item.EtaSeconds = 0;
                     item.State = status.State == "canceled" ? DlState.Canceled : DlState.Failed;
                     item.Error = status.Error;
                     item.StatusText = !string.IsNullOrEmpty(status.Error) ? status.Error :
@@ -3730,6 +4540,77 @@ namespace Orbis
             }
         }
 
+        internal static bool CanRenewResidentLink(DlItem item, ResidentDownloadStatus status, bool canResolve)
+        {
+            return item != null && status != null && canResolve && item.ResidentStaged && item.Background &&
+                !item.BgftLocalInstall && !item.ResidentRetryPending &&
+                !item.CancelRequested && !item.PauseRequested && item.State != DlState.Canceled &&
+                item.ResidentLinkRenewals < 3 && status.Id == item.Id && status.State == "failed" &&
+                status.Total > 0 && status.Done < status.Total &&
+                (item.ResidentLinkRenewals == 0 || status.Done > item.ResidentLastRenewalBytes) &&
+                DownloadLinkRecovery.IsExpired(status.Error);
+        }
+
+        internal static void ApplyResidentTransferPhase(DlItem item, ResidentDownloadStatus status)
+        {
+            if (status.State == "queued")
+            {
+                item.State = DlState.Queued; item.BytesPerSec = 0; item.EtaSeconds = 0;
+                item.StatusText = string.IsNullOrEmpty(status.Error)
+                    ? "Queued; waiting for the current package to finish" : status.Error;
+            }
+            if (status.State == "installing") item.State = DlState.Installing;
+            else if (status.State == "validating" || status.State == "extracting")
+            { item.State = DlState.Finalizing; item.BytesPerSec = 0; item.EtaSeconds = 0; }
+            else if (status.State == "downloading" || status.State == "feeding" || status.State == "ready")
+                item.State = DlState.Downloading;
+            if (item.ResidentAutoInstall && (status.State == "waiting" || status.State == "staged"))
+            {
+                item.State = DlState.Queued; item.BytesPerSec = 0; item.EtaSeconds = 0;
+                item.StatusText = string.IsNullOrEmpty(status.Error)
+                    ? (status.Total > 0 && status.Done >= status.Total
+                        ? "Downloaded; waiting for required package installation"
+                        : "Waiting for PS4 download and installation") : status.Error;
+            }
+            if ((status.State == "storage-wait" || status.State == "waiting-storage") && !item.PauseRequested)
+            { item.State = DlState.Queued; item.BytesPerSec = 0; item.EtaSeconds = 0; item.StatusText = string.IsNullOrEmpty(status.Error) ? "Reconnect the selected staging drive; background files are retained" : status.Error; }
+            if (status.State == "paused" && item.ResidentPauseDesired == false)
+            { item.State = DlState.Downloading; item.BytesPerSec = 0; item.EtaSeconds = 0; item.StatusText = "Background download resume requested"; }
+            else if (status.State == "paused" || item.ResidentPauseDesired == true || (item.ResidentStaged && item.PauseRequested))
+            { item.State = DlState.Paused; item.BytesPerSec = 0; item.EtaSeconds = 0; item.StatusText = "Background download paused"; }
+        }
+
+        internal static bool TryAcceptStagedPackage(DlItem item, ResidentDownloadStatus status, long fileSize)
+        {
+            if (item == null || status == null || !item.ResidentStaged || item.ResidentAutoInstall || !item.Background ||
+                status.State != "staged" || !string.Equals(item.Id, status.Id, StringComparison.Ordinal)) return false;
+            if (item.CancelRequested)
+            {
+                item.State = DlState.Canceled; item.CancelRequested = false;
+                item.StatusText = "Canceled; downloaded file retained";
+            }
+            else
+            {
+                long expected = Math.Max(item.ExpectedByteSize, item.BgftExpectedSize);
+                if (expected <= 0 || status.Total != expected || status.Done != expected || fileSize != expected)
+                {
+                    item.State = DlState.Failed; item.Error = "Staged download size did not match the complete package";
+                    item.BytesPerSec = 0; item.EtaSeconds = 0;
+                    return false;
+                }
+                item.State = item.PauseRequested ? DlState.Paused : DlState.Queued;
+                item.StatusText = item.PauseRequested ? "Downloaded; paused before installation" : "Downloaded; waiting for package validation and installation";
+                item.Done = item.Total = expected;
+            }
+            item.ResidentArchive = item.ResidentStaged = item.Background = item.BgftResident = false;
+            item.ResidentPauseDesired = null;
+            item.BgftTaskId = -1; item.BgftSubType = 0;
+            item.InstallConfirmed = item.InstallOrderReady = false;
+            item.Error = null; item.BytesPerSec = 0; item.EtaSeconds = 0; item.StatsInitialized = false;
+            item.RetryAfterUtcTicks = 0;
+            return true;
+        }
+
         void RefreshBackgroundTasks()
         {
             var active = new List<DlItem>();
@@ -3737,8 +4618,11 @@ namespace Orbis
             {
                 foreach (var item in _items)
                 {
-                    if (!item.Background) continue;
-                    if (item.ResidentArchive || item.State == DlState.Downloading || item.State == DlState.Resolving ||
+                    if (!item.Background) {
+                        if (item.State == DlState.Submitted && PkgValidator.BgftSubTypeForKind(item.Kind) == 7) active.Add(item);
+                        continue;
+                    }
+                    if (item.ResidentArchive || item.ResidentStaged || item.State == DlState.Downloading || item.State == DlState.Resolving ||
                         item.State == DlState.Installing || item.State == DlState.Submitted || item.State == DlState.Failed)
                         active.Add(item);
                 }
@@ -3746,6 +4630,16 @@ namespace Orbis
 
             foreach (var item in active)
             {
+                if (!item.Background && item.State == DlState.Submitted) {
+                    if (!PkgInstaller.IsAddonInstalled(item.DestPath, false)) { item.BgftInstalledProofPolls = 0; continue; }
+                    if (++item.BgftInstalledProofPolls < 3) continue;
+                    if (PkgInstaller.IsAddonInstalled(item.DestPath, true)) {
+                        MarkInstalled(item.Id, "Add-on installation confirmed by PS4 content", false, item.AttemptId);
+                        User.NotifyToast("Add-on installed");
+                    } else item.BgftInstalledProofPolls = 0;
+                    continue;
+                }
+                if (item.ResidentStaged) { RefreshResidentArchive(item); continue; }
                 if (ConfirmInstalledUpdate(item)) continue;
                 if (item.BgftInstalledProofPolls > 0) continue;
                 if (item.ResidentArchive) { RefreshResidentArchive(item); continue; }
@@ -3819,8 +4713,8 @@ namespace Orbis
                             var cur = Find(id);
                             if (cur != null && cur.Background && cur.AttemptId == attempt)
                             {
-                                UpdateTransferStats(cur, Math.Min(residentStatus.Done, Math.Max(0, residentStatus.Total - 1)),
-                                    residentStatus.Total, residentStatus.State, TransferClockMs(), 0);
+                                UpdateLiveTransferStats(cur, Math.Min(residentStatus.Done, Math.Max(0, residentStatus.Total - 1)),
+                                    residentStatus.Total, residentStatus.NetworkBytes, residentStatus.State, TransferClockMs());
                                 cur.StatusText = residentStatus.State == "awaiting-bgft"
                                     ? "Starting PS4 system download"
                                     : "Preparing PS4 system download " +
@@ -3904,21 +4798,18 @@ namespace Orbis
                         // diagnostics (task/content/subtype/kind/title/progress) so a
                         // DLC failure like 0x80991404 can be traced to transfer vs
                         // install. The downloaded file and ownership are retained.
-                        // Root cause for 0x80991404 (HTTP 404): BGFT fetched a URL
-                        // the local server no longer owns. Before 5.10 the app and
-                        // resident shell shared port 8742 with different /pkg routes,
-                        // so a task could 404 against the other owner's listener.
-                        // App loopback is now 8743; resident stays on 8742.
+                        // A direct provider task and a local loopback task have
+                        // different failure routes; the code alone is not a diagnosis.
                         string code = "BGFT 0x" + unchecked((uint)progress.ErrorResult).ToString("X");
                         string diag = code + " task=" + cur.BgftTaskId +
                             " sub=" + cur.BgftSubType + " kind=" + (kind ?? cur.Kind) +
                             " title=" + (titleId ?? cur.TitleId) +
                             " content=" + (contentId ?? cur.BgftContentId ?? "") +
                             " done=" + progress.Done + "/" + progress.Total +
-                            " copy=" + progress.LocalCopyPercent + "%";
-                        if (unchecked((uint)progress.ErrorResult) == 0x80991404u)
-                            diag += " · HTTP 404: local package URL not found — retry uses a fresh local URL, file kept";
-                        LogBgftEvent("task-error-retained", cur, diag);
+                            " copy=" + progress.LocalCopyPercent + "%" +
+                            " expected=" + expected + " route=" +
+                            (cur.BgftDirect ? "direct" : cur.BgftLoopback ? "loopback" : "local");
+                        LogBgftEvent("task-error-retained", cur, diag, progress);
                         // Release the loopback route so a fresh retry (or the next
                         // queued package) does not reuse a stale 404 route.
                         if (cur.BgftLoopback) FeederMarkFailed(cur);
@@ -3928,8 +4819,18 @@ namespace Orbis
                     else
                     {
                         const int StallPolls = 150;
-                        bool basePayloadComplete = PkgValidator.BgftSubTypeForKind(cur.Kind) == 6 &&
-                            progress.DownloadComplete && progress.Total > 0 && progress.LocalCopyPercent == 100;
+                        bool basePayloadComplete;
+                        bool dlCandidate = BgftDownloadCompleteCandidate(cur, progress, expected, tol,
+                            out basePayloadComplete);
+                        if (!dlCandidate && progress.DownloadComplete && progress.Total > 0 &&
+                            progress.LocalCopyPercent == 100 &&
+                            !PkgInstallPolicy.CompleteBgftPayload(expected, progress.Done, progress.Total, tol) &&
+                            cur.BgftRejectedCompletionTotal != progress.Total)
+                        {
+                            cur.BgftRejectedCompletionTotal = progress.Total;
+                            LogBgftEvent("partial-completion-rejected", cur,
+                                "reported=" + progress.Done + "/" + progress.Total + " expected=" + expected, progress);
+                        }
                         if (!cur.BgftDownloadPhaseConfirmed)
                         {
                             long completeAt = expected > 0 ? expected - tol : long.MaxValue;
@@ -3945,6 +4846,8 @@ namespace Orbis
                                 }
                                 if (cur.BgftStallPolls >= StallPolls)
                                 {
+                                    LogBgftEvent("task-stall", cur,
+                                        "polls=" + cur.BgftStallPolls + " expected=" + expected, progress);
                                     FallbackBgftToLocal(cur,
                                         cur.BgftDirect
                                             ? (nearDone ? "direct transfer size mismatch"
@@ -3958,13 +4861,6 @@ namespace Orbis
                             }
                         }
 
-                        // Credible download-complete candidate: totals match preflight size.
-                        bool totalCredible = expected > 0 && progress.Total > 0 &&
-                            progress.Total >= expected - tol && progress.Total <= expected + tol;
-                        bool dlCandidate = basePayloadComplete || ((cur.BgftLoopback || cur.BgftDirect) &&
-                            (cur.BgftDirect || cur.BgftLoopbackServed) &&
-                            totalCredible && progress.Done >= progress.Total &&
-                            progress.Done >= expected - tol && progress.Done > 0);
                         // Install candidate only after download phase confirmed + copy 100.
                         bool copyCandidate = cur.BgftDownloadPhaseConfirmed &&
                             progress.LocalCopyPercent >= 100 &&
@@ -4083,8 +4979,11 @@ namespace Orbis
         void ClearBackground(DlItem item)
         {
             if (item == null) return;
+            item.ResidentPauseDesired = null;
             if (item.BgftLoopback) FeederRelease(item);
             item.Background = false;
+            item.ResidentStaged = false;
+            item.ResidentAutoInstall = false;
             item.BgftLocalInstall = false;
             item.BgftLoopback = false;
             item.BgftResident = false;
@@ -4114,6 +5013,20 @@ namespace Orbis
             item.BgftCopyCompletePolls = 0;
             item.BgftTitlePresentPolls = 0;
             item.BgftStallPolls = 0;
+            item.BgftRejectedCompletionTotal = 0;
+        }
+
+        internal static bool BgftDownloadCompleteCandidate(DlItem item, BgftProgress progress,
+            long expected, long tolerance, out bool basePayloadComplete)
+        {
+            basePayloadComplete = false;
+            if (item == null || progress == null || progress.ErrorResult != 0 ||
+                !PkgInstallPolicy.CompleteBgftPayload(expected, progress.Done, progress.Total, tolerance)) return false;
+            // A PlayGo/chunk completion or copy=100 signal never substitutes for the full PKG size.
+            basePayloadComplete = PkgValidator.BgftSubTypeForKind(item.Kind) == 6 &&
+                progress.DownloadComplete && progress.LocalCopyPercent == 100;
+            return basePayloadComplete || ((item.BgftLoopback || item.BgftDirect) &&
+                (item.BgftDirect || item.BgftLoopbackServed));
         }
 
         bool TryCancelBackgroundIdentity(DlItem item, string contentId, int subType, string reason,
@@ -4121,8 +5034,7 @@ namespace Orbis
         {
             int activeTask = -1;
             string cancelError = null;
-            bool canceled = !string.IsNullOrEmpty(contentId) && subType > 0 &&
-                PkgInstaller.CancelBackground(item != null ? item.BgftTaskId : -1,
+            bool canceled = PkgInstaller.CancelBackground(item != null ? item.BgftTaskId : -1,
                     contentId, subType,
                     out activeTask, out cancelError);
             if (canceled) return true;
@@ -4160,7 +5072,7 @@ namespace Orbis
         }
 
 
-        static void LogBgftEvent(string kind, DlItem it, string detail)
+        static void LogBgftEvent(string kind, DlItem it, string detail, BgftProgress progress = null)
         {
             try
             {
@@ -4181,9 +5093,11 @@ namespace Orbis
                     " total=" + it.Total +
                     " exp=" + it.BgftExpectedSize +
                     " host=" + host +
-                    " " + ClipMsg(detail, 120) +
+                    " content=" + (it.BgftContentId ?? it.ExpectedContentId ?? "") + " subtype=" + it.BgftSubType +
+                    " path=" + (it.DestPath ?? "") + " " + ClipMsg(detail, 1024) +
+                    (progress == null ? "" : " " + PkgInstaller.FormatBackgroundProgress(progress)) +
                     Environment.NewLine;
-                File.AppendAllText(Path.Combine(dir, "bgft-download.log"), line);
+                SspiLog.Write("download", line);
             }
             catch { }
         }
@@ -4205,11 +5119,26 @@ namespace Orbis
                         if (i > 0) sb.Append(',');
                         sb.Append('{');
                         sb.Append("\"resident_archive\":").Append(it.ResidentArchive ? "true" : "false").Append(',');
+                        sb.Append("\"resident_staged\":").Append(it.ResidentStaged ? "true" : "false").Append(',');
+                        sb.Append("\"resident_remove_pending\":").Append(it.ResidentRemovePending ? "true" : "false").Append(',');
+                        sb.Append("\"resident_link_renewals\":").Append(it.ResidentLinkRenewals).Append(',');
+                        sb.Append("\"resident_last_renewal_bytes\":").Append(it.ResidentLastRenewalBytes).Append(',');
+                        sb.Append("\"resident_retry_pending\":").Append(it.ResidentRetryPending ? "true" : "false").Append(',');
+                        sb.Append("\"http_retries\":").Append(it.TransientHttpRetries).Append(',');
+                        sb.Append("\"install_retries\":").Append(it.InstallRetries).Append(',');
+                        sb.Append("\"http_retry_at\":").Append(it.TransientHttpRetries > 0 || it.InstallRetries > 0 ? it.RetryAfterUtcTicks : 0).Append(',');
+                        sb.Append("\"resident_auto_install\":").Append(it.ResidentAutoInstall ? "true" : "false").Append(',');
+                        sb.Append("\"resident_generation\":\"").Append(JsonLite.Escape(it.ResidentGeneration ?? "")).Append("\",");
+                        sb.Append("\"resident_pause\":\"").Append(it.ResidentPauseDesired == true ? "pause" : it.ResidentPauseDesired == false ? "resume" : "").Append("\",");
+                        sb.Append("\"resolved_provider_id\":\"").Append(JsonLite.Escape(it.ResolvedProviderId)).Append("\",");
                         sb.Append("\"install_order_ready\":").Append(it.InstallOrderReady ? "true" : "false").Append(',');
                         sb.Append("\"archive_volumes\":\"").Append(JsonLite.Escape(it.ArchiveVolumes)).Append("\",");
                         sb.Append("\"archive_password\":\"").Append(JsonLite.Escape(it.ArchivePassword)).Append("\",");
+                        sb.Append("\"local_source\":").Append(it.LocalSource ? "true" : "false").Append(',');
+                        sb.Append("\"local_source_fingerprint\":\"").Append(JsonLite.Escape(it.LocalSourceFingerprint)).Append("\",");
                         sb.Append("\"bgft_local_install\":").Append(it.BgftLocalInstall ? "true" : "false").Append(",");
                         sb.Append("\"install_after_id\":\"").Append(JsonLite.Escape(it.InstallAfterId)).Append("\",");
+                        sb.Append("\"install_after_confirmed\":").Append(it.InstallAfterConfirmed ? "true" : "false").Append(',');
                         sb.Append("\"id\":\"").Append(JsonLite.Escape(it.Id)).Append("\",");
                         sb.Append("\"title_id\":\"").Append(JsonLite.Escape(it.TitleId)).Append("\",");
                         sb.Append("\"name\":\"").Append(JsonLite.Escape(it.Name)).Append("\",");
@@ -4222,6 +5151,7 @@ namespace Orbis
                     sb.Append("\"package_version\":\"").Append(JsonLite.Escape(it.PackageVersion)).Append("\",");
                         sb.Append("\"candidate_id\":\"").Append(JsonLite.Escape(it.CandidateId)).Append("\",");
                         sb.Append("\"access_type\":\"").Append(JsonLite.Escape(it.AccessType)).Append("\",");
+                        sb.Append("\"mirror_candidates\":\"").Append(JsonLite.Escape(it.MirrorCandidates)).Append("\",");
                         sb.Append("\"fanout_pending_paths\":\"").Append(JsonLite.Escape(it.FanOutPendingPaths)).Append("\",");
                         sb.Append("\"expected_sha256\":\"").Append(JsonLite.Escape(it.ExpectedSha256)).Append("\",");
                         sb.Append("\"expected_size\":").Append(it.ExpectedByteSize).Append(',');
@@ -4280,6 +5210,21 @@ namespace Orbis
 
         void RecoverBackgroundOnStartup(DlItem item, ref string storedState)
         {
+            if (item.ResidentRemovePending && (item.ResidentStaged || item.ResidentArchive))
+            {
+                item.Background = item.BgftResident = item.ResidentArchive = true;
+                item.CancelRequested = true;
+                item.State = DlState.Paused; storedState = "Paused";
+                item.StatusText = "Removing background job; waiting for worker acknowledgement";
+                return;
+            }
+            if (item.ResidentRetryPending && item.ResidentStaged)
+            {
+                item.Background = item.BgftResident = item.ResidentArchive = true;
+                item.State = DlState.Resolving; storedState = "Resolving";
+                item.StatusText = "Recovering pending download retry";
+                return;
+            }
             if (string.Equals(storedState, "Failed", StringComparison.OrdinalIgnoreCase))
             {
                 item.State = DlState.Failed;
@@ -4289,9 +5234,9 @@ namespace Orbis
             if (item.ResidentArchive)
             {
                 ResidentDownloadStatus resident;
-                if (!ResidentDownloadService.HasJob(item.Id) && !ResidentDownloadService.TryGetStatus(item.Id, out resident))
+                if (!ResidentDownloadService.HasJob(item.Id) && !ResidentDownloadService.TryGetStatus(item.Id, item.ResidentGeneration, out resident))
                 {
-                    item.ResidentArchive = false; item.Background = false; item.BgftResident = false;
+                    item.ResidentArchive = false; item.ResidentStaged = false; item.ResidentAutoInstall = false; item.Background = false; item.BgftResident = false;
                     item.State = DlState.Queued; storedState = "Queued";
                     item.StatusText = "Retrying unpublished archive handoff";
                     return;
@@ -4303,6 +5248,36 @@ namespace Orbis
             string contentId = item.BgftContentId;
             int subType = item.BgftSubType;
             long expectedSize = item.BgftExpectedSize > 0 ? item.BgftExpectedSize : item.Total;
+            string installedUpdatePath, installedUpdateVersion;
+            if (TryFindInstalledUpdate(item, out installedUpdatePath, out installedUpdateVersion))
+            {
+                item.BgftInstalledProofPolls = 1;
+                item.State = DlState.Installing; storedState = "Installing";
+                item.StatusText = "Verifying installed update v" + installedUpdateVersion;
+                return;
+            }
+            bool currentTaskFound;
+            int currentTask;
+            string lookupError;
+            if (!item.BgftResident && PkgInstaller.TryFindBackgroundTaskIdentity(contentId, subType,
+                out currentTaskFound, out currentTask, out lookupError) && !currentTaskFound)
+            {
+                // Confirmed task absence releases stale queue ownership even when the
+                // user has already removed the source PKG. Never control a recycled ID.
+                if (!PkgInstaller.CancelBackground(item.BgftTaskId, contentId, subType, out currentTask, out lookupError))
+                {
+                    item.State = DlState.Resolving; storedState = "Resolving";
+                    item.StatusText = lookupError ?? "Waiting to reconcile the previous PS4 task";
+                    return;
+                }
+                FeederMarkFailed(item);
+                ClearBackground(item);
+                item.State = File.Exists(item.DestPath) ? DlState.Queued : DlState.Failed;
+                item.Error = item.State == DlState.Failed ? "Previous PS4 task and source PKG are unavailable; Retry downloads again" : null;
+                item.StatusText = item.State == DlState.Queued ? "Previous PS4 task ended; retained PKG is ready to retry" : item.Error;
+                storedState = item.State.ToString();
+                return;
+            }
             bool installedProof = item.BgftTitlePresenceKnown && !item.BgftTitlePresentAtStart &&
                 subType == 6 && PkgValidator.BgftSubTypeForKind(item.Kind) == 6 &&
                 !string.IsNullOrEmpty(item.TitleId) &&
@@ -4366,9 +5341,10 @@ namespace Orbis
 
             if (item.BgftResident)
             {
-                string residentError;
                 ResidentDownloadStatus residentStatus;
-                if (ResidentDownloadService.EnsureAvailable(out residentError) &&
+                // Reattach an existing compatible owner without loading a new worker
+                // during manifest recovery. The previous revision may still be busy.
+                if (ResidentDownloadService.IsAlive(item.Id) &&
                     ResidentDownloadService.TryGetStatus(item.Id, out residentStatus) &&
                     residentStatus.State != "failed" && residentStatus.State != "canceled" &&
                     residentStatus.State != "idle")
@@ -4414,8 +5390,22 @@ namespace Orbis
                         ? "Installing" : "Downloading";
                     return;
                 }
-                if (!string.IsNullOrEmpty(residentError))
-                    LogBgftEvent("resident-recovery", item, residentError);
+                if (ResidentDownloadService.HasJob(item.Id) &&
+                    (!ResidentDownloadService.TryGetStatus(item.Id, out residentStatus) ||
+                    (residentStatus.State != "failed" && residentStatus.State != "canceled" &&
+                     residentStatus.State != "idle")))
+                {
+                    // A heartbeat can be absent while the worker resumes. Keep the
+                    // durable owner for the existing background polling/retry path.
+                    item.Background = true;
+                    item.BgftLoopback = true;
+                    item.BgftResident = true;
+                    item.BgftFeederMisses = 0;
+                    item.State = DlState.Downloading;
+                    item.StatusText = "Waiting for background downloader";
+                    storedState = "Downloading";
+                    return;
+                }
             }
 
             PkgContentKind actualKind;
@@ -4631,45 +5621,32 @@ namespace Orbis
             return true;
         }
 
-        void ResetQueueFor501()
+        internal void RestoreLocalFileForProcessing(DlItem item, string storedState, long size)
         {
-            string marker = Path.Combine(AppSettings.DataDir, "fresh-5.01.done");
-            if (File.Exists(marker)) return;
-            try
+            ClearBackground(item);
+            item.Done = item.Total = size;
+            item.InstallConfirmed = false;
+            item.BytesPerSec = 0; item.EtaSeconds = 0;
+            DlState previous;
+            if (!Enum.TryParse(storedState, true, out previous)) previous = DlState.Paused;
+            switch (previous)
             {
-                Directory.CreateDirectory(AppSettings.DataDir);
-                RecoverManifest();
-                string backup = ManifestPath + ".before-5.01";
-                if (File.Exists(ManifestPath))
-                {
-                    string json = File.ReadAllText(ManifestPath);
-                    if (!File.Exists(backup)) File.Copy(ManifestPath, backup);
-                    foreach (string obj in JsonLite.ExtractObjectArray(json, "items"))
-                    {
-                        string id = JsonLite.GetString(obj, "id") ?? "";
-                        if (JsonLite.GetBool(obj, "background") || JsonLite.GetBool(obj, "bgft_loopback"))
-                        {
-                            int task;
-                            string error;
-                            bool canceled = PkgInstaller.CancelBackground(
-                                ParseInt(JsonLite.GetString(obj, "bgft_task"), -1),
-                                JsonLite.GetString(obj, "bgft_content_id") ?? "",
-                                ParseInt(JsonLite.GetString(obj, "bgft_sub_type"), 0), out task, out error);
-                            if (!canceled) File.AppendAllText(Path.Combine(AppSettings.DataDir, "fresh-5.01.log"),
-                                id + " | " + (error ?? "PS4 task could not be canceled") + Environment.NewLine);
-                        }
-                    }
-                }
-                ResidentDownloadService.ResetQueueForFreshStart();
-                File.WriteAllText(ManifestPath + ".tmp", "{\"items\":[]}");
-                ReplaceManifest(ManifestPath + ".tmp", ManifestPath);
-                if (File.Exists(ManifestPath + ".bak")) File.Delete(ManifestPath + ".bak");
-                File.WriteAllText(marker, DateTime.UtcNow.ToString("o"));
+                case DlState.Failed: case DlState.Canceled: case DlState.Paused:
+                    item.State = previous;
+                    item.StatusText = "File retained; " + previous.ToString().ToLowerInvariant();
+                    break;
+                case DlState.Completed: case DlState.Submitted: case DlState.Installed:
+                    item.State = DlState.Completed;
+                    item.StatusText = "File retained; verify before installation";
+                    break;
+                default:
+                    item.State = DlState.Queued;
+                    item.Error = null;
+                    item.StatusText = "Downloaded file queued for verification and installation";
+                    break;
             }
-            catch (Exception ex)
-            {
-                try { Orbis.Internals.Kernel.Log("Fresh queue reset: " + ex.Message); } catch { }
-            }
+            if (string.Equals(item.AccessType, "FanOutSource", StringComparison.OrdinalIgnoreCase))
+            { item.State = DlState.Completed; item.StatusText = "Downloaded source cleanup pending"; }
         }
 
         void LoadManifest()
@@ -4701,11 +5678,30 @@ namespace Orbis
                         PackageVersion = JsonLite.GetString(obj, "package_version") ?? "",
                         CandidateId = JsonLite.GetString(obj, "candidate_id") ?? "",
                         AccessType = JsonLite.GetString(obj, "access_type") ?? "",
+                        MirrorCandidates = JsonLite.GetString(obj, "mirror_candidates") ?? "",
                         ArchiveVolumes = JsonLite.GetString(obj, "archive_volumes") ?? "",
                         ArchivePassword = JsonLite.GetString(obj, "archive_password") ?? "",
+                        LocalSource = JsonLite.GetBool(obj, "local_source"),
+                        LocalSourceFingerprint = JsonLite.GetString(obj, "local_source_fingerprint") ?? "",
                         InstallAfterId = JsonLite.GetString(obj, "install_after_id") ?? "",
+                        InstallAfterConfirmed = JsonLite.GetBool(obj, "install_after_confirmed"),
                         BgftLocalInstall = JsonLite.GetBool(obj, "bgft_local_install"),
                         ResidentArchive = JsonLite.GetBool(obj, "resident_archive"),
+                        ResidentStaged = JsonLite.GetBool(obj, "resident_staged"),
+                        ResidentRemovePending = JsonLite.GetBool(obj, "resident_remove_pending"),
+                        ResidentLinkRenewals = Math.Max(0, ParseInt(JsonLite.GetString(obj, "resident_link_renewals"), 0)),
+                        ResidentLastRenewalBytes = Math.Max(0, ParseLong(JsonLite.GetString(obj, "resident_last_renewal_bytes"))),
+                        ResidentRetryPending = JsonLite.GetBool(obj, "resident_retry_pending"),
+                        InstallRetries = Math.Max(0, Math.Min(3, ParseInt(JsonLite.GetString(obj, "install_retries"), 0))),
+                        TransientHttpRetries = Math.Max(0, Math.Min(3, ParseInt(JsonLite.GetString(obj, "http_retries"), 0))),
+                        RetryAfterUtcTicks = Math.Max(0, Math.Min(DateTime.UtcNow.AddMinutes(5).Ticks,
+                            ParseLong(JsonLite.GetString(obj, "http_retry_at")))),
+                        ResidentAutoInstall = JsonLite.GetBool(obj, "resident_auto_install"),
+                        ResidentGeneration = JsonLite.GetString(obj, "resident_generation") ?? "",
+                        ResidentPauseDesired = JsonLite.GetString(obj, "resident_pause") == "pause" ? (bool?)true :
+                            JsonLite.GetString(obj, "resident_pause") == "resume" ? (bool?)false : null,
+                        PauseRequested = JsonLite.GetBool(obj, "background") && JsonLite.GetString(obj, "resident_pause") == "pause",
+                        ResolvedProviderId = JsonLite.GetString(obj, "resolved_provider_id") ?? "",
                         InstallOrderReady = JsonLite.GetBool(obj, "install_order_ready"),
                         FanOutPendingPaths = JsonLite.GetString(obj, "fanout_pending_paths") ?? "",
                         ExpectedSha256 = JsonLite.GetString(obj, "expected_sha256") ?? "",
@@ -4749,12 +5745,20 @@ namespace Orbis
                     string uniqueName = it.TitleId + "_" + it.Kind + "_" + UrlTag(it.HosterUrl) + ".pkg";
                     foreach (char c in Path.GetInvalidFileNameChars()) uniqueName = uniqueName.Replace(c, '_');
                     string uniquePath = Path.Combine(AppSettings.DownloadDir, uniqueName);
-                    if (!IsOwnedDownloadPath(it.DestPath))
+                    if (it.LocalSource)
+                    {
+                        string canonical;
+                        if (!LocalInstallSource.TryNormalizePath(it.DestPath, out canonical) ||
+                            !System.Text.RegularExpressions.Regex.IsMatch(it.LocalSourceFingerprint, "^[a-f0-9]{64}$"))
+                        { migrated = true; continue; }
+                    }
+                    else if (!IsOwnedDownloadPath(it.DestPath))
                     {
                         it.DestPath = uniquePath;
                         migrated = true;
                     }
-                    else if (!string.Equals(it.DestPath, uniquePath, StringComparison.OrdinalIgnoreCase))
+                    else if (!it.Background && !it.ResidentStaged && !it.ResidentArchive &&
+                        !string.Equals(it.DestPath, uniquePath, StringComparison.OrdinalIgnoreCase))
                     {
                         bool hasLegacyFiles = File.Exists(it.DestPath) ||
                             File.Exists(it.DestPath + ".part") || File.Exists(it.DestPath + ".part.resume");
@@ -4837,6 +5841,20 @@ namespace Orbis
                         it.InstallOrderReady = true; it.StatusText = "Installed (confirmed); local files retained";
                         _items.Add(it); continue;
                     }
+                    if (!it.Background && it.InstallConfirmed && string.Equals(st, "Installed", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Completion is persisted before optional retained-file cleanup.
+                        // A missing cache file does not revoke package-level install proof.
+                        it.State = DlState.Installed;
+                        it.InstallOrderReady = true;
+                        it.Error = null;
+                        ClearBackground(it);
+                        if (it.Total > 0) it.Done = it.Total;
+                        else CompleteByteCounters(it);
+                        it.StatusText = File.Exists(it.DestPath)
+                            ? "Installed (confirmed); local PKG retained" : "Installed (confirmed)";
+                        _items.Add(it); continue;
+                    }
                     if (it.ResidentArchive && string.Equals(st, "Submitted", StringComparison.OrdinalIgnoreCase))
                     {
                         it.State = DlState.Submitted; it.Background = false; it.BgftResident = false;
@@ -4849,6 +5867,14 @@ namespace Orbis
                         _items.Add(it);
                         migrated = true;
                         continue;
+                    }
+                    if (it.LocalSource && !File.Exists(it.DestPath))
+                    {
+                        DlState previous;
+                        if (!Enum.TryParse(st, true, out previous)) previous = DlState.Paused;
+                        it.State = previous == DlState.Canceled || previous == DlState.Paused || previous == DlState.Failed ? previous : DlState.Queued;
+                        it.StatusText = "Reconnect the USB drive containing " + Path.GetFileName(it.DestPath);
+                        _items.Add(it); continue;
                     }
                     if (File.Exists(it.DestPath))
                     {
@@ -4866,103 +5892,10 @@ namespace Orbis
                             migrated = true;
                             continue;
                         }
-                        PackageObjectKind diskObject;
-                        try { diskObject = PackageArchive.Detect(it.DestPath); }
-                        catch { diskObject = PackageObjectKind.Unknown; }
-                        if (diskObject != PackageObjectKind.Pkg)
-                        {
-                            ClearBackground(it);
-                            it.Done = it.Total = new FileInfo(it.DestPath).Length;
-                            if (string.Equals(it.AccessType, "FanOutSource",
-                                StringComparison.OrdinalIgnoreCase))
-                            {
-                                it.State = DlState.Completed;
-                                it.StatusText = "Downloaded source cleanup pending";
-                            }
-                            else if (string.Equals(st, "Failed", StringComparison.OrdinalIgnoreCase))
-                                it.State = DlState.Failed;
-                            else if (string.Equals(st, "Canceled", StringComparison.OrdinalIgnoreCase))
-                                it.State = DlState.Canceled;
-                            else if (string.Equals(st, "Paused", StringComparison.OrdinalIgnoreCase))
-                            {
-                                it.State = DlState.Paused;
-                                it.StatusText = "Downloaded object paused";
-                            }
-                            else
-                            {
-                                it.State = DlState.Queued;
-                                it.Error = null;
-                                it.StatusText = "Downloaded object queued for processing";
-                            }
-                            _items.Add(it);
-                            migrated = true;
-                            continue;
-                        }
-                        PkgContentKind diskKind;
-                        string diskKindName;
-                        string diskContentId;
-                        string diskTitleId;
-                        long diskSize;
-                        string vd;
-                        if (TryValidateLocalPackage(it, out diskKind, out diskKindName,
-                            out diskContentId, out diskTitleId, out diskSize, out vd))
-                        {
-                            it.Kind = diskKindName;
-                            if (!string.IsNullOrEmpty(diskTitleId)) it.TitleId = diskTitleId;
-                            bool queuedLocal = string.Equals(st, "Queued", StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(st, "Resolving", StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(st, "Downloading", StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(st, "Finalizing", StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(st, "Installing", StringComparison.OrdinalIgnoreCase);
-                            if (string.Equals(st, "Installed", StringComparison.OrdinalIgnoreCase) &&
-                                it.InstallConfirmed)
-                            {
-                                if (PkgInstallPolicy.IsAddonOrPatchName(it.Kind))
-                                {
-                                    it.State = DlState.Completed;
-                                    it.InstallConfirmed = false;
-                                    it.StatusText = "PKG on disk — CROSS installs";
-                                    migrated = true;
-                                }
-                                else
-                                    it.State = DlState.Installed;
-                            }
-                            else if (string.Equals(st, "Submitted", StringComparison.OrdinalIgnoreCase))
-                            {
-                                it.State = DlState.Completed;
-                                it.InstallConfirmed = false;
-                                it.StatusText = "Previous install request unverified — CROSS retries";
-                            }
-                            else if (queuedLocal)
-                            {
-                                it.State = DlState.Queued;
-                                it.InstallConfirmed = false;
-                                if (string.Equals(st, "Installing", StringComparison.OrdinalIgnoreCase))
-                                    it.ForceLocalInstall = true;
-                                it.StatusText = "Validated local PKG queued";
-                            }
-                            else
-                            {
-                                it.State = DlState.Completed;
-                                it.InstallConfirmed = false;
-                            }
-                            ClearBackground(it);
-                            it.Done = it.Total = diskSize;
-                            if (!queuedLocal && (it.State != DlState.Completed ||
-                                !string.Equals(st, "Submitted", StringComparison.OrdinalIgnoreCase))
-                            )
-                                it.StatusText = it.State == DlState.Installed
-                                ? "Installed; local PKG retained"
-                                : it.State == DlState.Submitted
-                                    ? "Sent to PS4 — verify · PKG kept"
-                                    : "Complete+valid";
-                        }
-                        else
-                        {
-                            DiscardInvalidDownload(it, vd ?? "Invalid PKG on disk");
-                            it.State = DlState.Failed;
-                            it.StatusText = "Invalid file removed — CROSS re-downloads";
-                        }
+                        // Reopening attaches the queue. Expensive integrity checks run
+                        // only after this item's serial processing slot is acquired.
+                        RestoreLocalFileForProcessing(it, st, new FileInfo(it.DestPath).Length);
+                        migrated = true;
                     }
                     else
                     {
@@ -5014,7 +5947,7 @@ namespace Orbis
                             {
                                 it.State = DlState.Failed;
                                 string part = it.DestPath + ".part";
-                                if (File.Exists(part)) it.Done = new FileInfo(part).Length;
+                                if (File.Exists(part)) it.Done = ParallelDownloadCheckpoint.DurableBytes(part);
                                 it.StatusText = string.IsNullOrEmpty(it.StatusText)
                                     ? "Failed — CROSS retries" : it.StatusText;
                             }
@@ -5023,7 +5956,7 @@ namespace Orbis
                                 it.State = DlState.Paused;
                                 string part = it.DestPath + ".part";
                                 if (File.Exists(part))
-                                    it.Done = new FileInfo(part).Length;
+                                    it.Done = ParallelDownloadCheckpoint.DurableBytes(part);
                                 it.StatusText = it.Done > 0 ? ("Paused " + Human(it.Done)) : "Paused";
                             }
                         }
@@ -5126,7 +6059,7 @@ namespace Orbis
                     if (File.Exists(item.DestPath)) rank += 2000000000000L;
                     string part = item.DestPath + ".part";
                     if (File.Exists(part)) rank += 1000000000000L +
-                        Math.Min(999999999999L, new FileInfo(part).Length);
+                        Math.Min(999999999999L, ParallelDownloadCheckpoint.DurableBytes(part));
                 }
                 catch { }
             }
@@ -5156,10 +6089,8 @@ namespace Orbis
         void DiscardInvalidDownload(DlItem item, string reason)
         {
             if (item == null) return;
-            if (!string.IsNullOrEmpty(item.DestPath))
-                DeleteDownloadFiles(item.DestPath);
-            item.Done = 0;
-            item.Total = 0;
+            try { if (File.Exists(item.DestPath)) item.Done = item.Total = new FileInfo(item.DestPath).Length;
+                else item.Done = ParallelDownloadCheckpoint.DurableBytes(item.DestPath + ".part"); } catch { }
             item.InstallConfirmed = false;
             item.ForceLocalInstall = false;
             item.Error = reason;
@@ -5168,11 +6099,18 @@ namespace Orbis
             ClearBackground(item);
         }
 
+        static void DeleteDownloadFiles(DlItem item)
+        {
+            if (item != null && !item.LocalSource) DeleteDownloadFiles(item.DestPath);
+        }
+
         static void DeleteDownloadFiles(string finalPath)
         {
             if (!IsOwnedDownloadPath(finalPath)) return;
             try { DownloadResumeInfo.DeletePartial(finalPath + ".part"); } catch { }
             try { if (File.Exists(finalPath)) File.Delete(finalPath); } catch { }
+            try { File.Delete(finalPath + ".map"); File.Delete(finalPath + ".map.tmp"); } catch { }
+            try { File.Delete(finalPath + ".sha256-ok"); File.Delete(finalPath + ".sha256-ok.tmp"); } catch { }
         }
 
         static void DeletePartialOwned(string finalPath)
@@ -5185,16 +6123,13 @@ namespace Orbis
         {
             if (string.IsNullOrEmpty(path)) return false;
             string full = NormalizePath(path);
-            string[] roots =
-            {
-                NormalizePath(AppSettings.DownloadDir),
-                NormalizePath("/data/GameSearch/downloads"),
-                NormalizePath("/user/data/GameSearch/downloads")
-            };
+            var roots = new List<string>(StorageRoots());
+            roots.Add(NormalizePath("/data/SSPI/downloads"));
+            roots.Add(NormalizePath("/user/data/SSPI/downloads"));
             foreach (string root in roots)
             {
                 if (string.IsNullOrEmpty(root)) continue;
-                string prefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                string prefix = NormalizePath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
                     Path.DirectorySeparatorChar;
                 if (full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
             }
@@ -5220,21 +6155,16 @@ namespace Orbis
 
         bool CanRefreshUnlock(DlItem job)
         {
-            if (job == null || IsDirectAccess(job.AccessType)) return false;
+            if (job == null || job.AccessType == "Cloud" || IsDirectAccess(job.AccessType)) return false;
             AppSettings cfg = _cfg;
             return cfg != null && cfg.UseUnlockProvider &&
-                !string.Equals(cfg.UnlockProviderId, UnlockProviders.NoneId,
-                    StringComparison.OrdinalIgnoreCase) &&
+                UnlockProviders.EnabledIds(cfg).Length > 0 &&
                 !string.IsNullOrEmpty(job.HosterUrl);
         }
 
         static bool IsAuthExpiry(Exception ex)
         {
-            string message = ex != null && ex.Message != null ? ex.Message : "";
-            return message.IndexOf("HTTP 401", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                message.IndexOf("HTTP 403", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                message.IndexOf(" 401 ", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                message.IndexOf(" 403 ", StringComparison.OrdinalIgnoreCase) >= 0;
+            return DownloadLinkRecovery.IsExpired(ex);
         }
 
         static string NormalizeSha256(string value, bool rejectInvalid)

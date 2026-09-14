@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -15,16 +16,27 @@
 #include <orbis/Net.h>
 #include <orbis/libkernel.h>
 #include "../native/goldhen_process.h"
+#include "../native/worker_presence.h"
+#include "../native/filesystem_context.h"
 
 #ifndef GS_APP_VERSION
-#define GS_APP_VERSION "5.10"
+#define GS_APP_VERSION "5.11"
 #endif
 
 #define GS_PLUGIN_VERSION 0x00000103u
-#define GS_WORKER_VERSION GS_APP_VERSION "-r6"
+#define GS_WORKER_VERSION GS_APP_VERSION "-api3"
+#ifndef GS_BUILD_ID
+#define GS_BUILD_ID "unversioned"
+#endif
 #define GS_PORT 8742
-#define GS_IPC_ROOT "/data/GameSearch/resident"
-#define GS_SELFTEST_PATH GS_IPC_ROOT "/plugin-selftest.pkg"
+/* libkernel uses the PS4/FreeBSD socket ABI. The bundled musl MSG_NOSIGNAL
+ * value is Linux-specific, so suppress SIGPIPE with the native socket option. */
+#define GS_SO_NOSIGPIPE 0x0800
+#define GS_HTTP_CLIENTS 8
+#define GS_IPC_ROOT "/data/SSPI/resident"
+#define GS_IPC_ROOT_SHARED "/user/data/SSPI/resident"
+#define GS_SHARED_BOOT_PATH "/user/data/SSPI/resident/plugin-boot.txt"
+#define GS_SHARED_HEARTBEAT_PATH "/user/data/SSPI/resident/heartbeat.txt"
 #define DOTNET_EPOCH_TICKS 621355968000000000LL
 
 /*
@@ -42,13 +54,86 @@ static volatile int g_stop;
 static volatile int g_started;
 static volatile int g_listener = -1;
 static OrbisPthread g_main_thread;
+static int g_main_thread_created;
 static volatile int g_client_count;
+typedef struct {
+    OrbisPthread thread;
+    int socket_id, created, finished;
+} GsHttpClient;
+static GsHttpClient g_clients[GS_HTTP_CLIENTS];
+static uint64_t g_epoch;
+static int g_transfer_ready, g_bgft_ready;
+static const char *g_ipc_root = GS_IPC_ROOT;
+static int g_shared_storage_result;
+static int g_capability_attempts;
+static int g_capability_network_rc;
+static int g_capability_transfer_rc;
+static int g_capability_bgft_rc;
+static int g_ready_boot_written;
+static GsFilesystemContext g_filesystem_context = { .fd = -1 };
 
-static void ensure_directories(void)
+static int gs_ipc_path(char *out, size_t cap, const char *leaf)
 {
-    mkdir("/data", 0777);
-    mkdir("/data/GameSearch", 0777);
-    mkdir(GS_IPC_ROOT, 0777);
+    int length;
+    if (!out || !cap || !leaf || leaf[0] != '/') return -1;
+    length = snprintf(out, cap, "%s%s", g_ipc_root, leaf);
+    if (length < 0 || (size_t)length >= cap) {
+        if (cap) out[0] = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static int gs_storage_probe(const char *root, int canonical)
+{
+    int result;
+    int directory = sceKernelOpen(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0);
+    if (directory < 0) return directory;
+    sceKernelClose(directory);
+    result = gs_data_prepare_root();
+    if (result && canonical) return result;
+    result = gs_data_ensure_directory(root, 0777);
+    if (result) return result;
+    char path[192], actual[96], expected[96], leaf[64];
+    int length = snprintf(leaf, sizeof(leaf), "/.storage-check-%d-%llu", getpid(), (unsigned long long)g_epoch);
+    if (length < 0 || length >= (int)sizeof(leaf) || gs_ipc_path(path, sizeof(path), leaf)) return -5;
+    length = snprintf(expected, sizeof(expected), "SSPI storage %s %llu\n", GS_BUILD_ID, (unsigned long long)g_epoch);
+    if (length < 0 || length >= (int)sizeof(expected)) return -5;
+    int file = sceKernelOpen(path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (file < 0) return file;
+    int64_t count = sceKernelWrite(file, expected, (size_t)length);
+    if (count != length) result = count < 0 ? (int)count : -5;
+    if (!result && sceKernelLseek(file, 0, SEEK_SET) != 0) result = -5;
+    if (!result) {
+        count = sceKernelRead(file, actual, (size_t)length);
+        if (count != length || memcmp(actual, expected, (size_t)length)) result = count < 0 ? (int)count : -5;
+    }
+    int close_result = sceKernelClose(file);
+    int unlink_result = sceKernelUnlink(path);
+    if (!result) result = close_result ? close_result : unlink_result;
+    return result;
+}
+
+static int ensure_directories(void)
+{
+    // The application stages the canonical directory. SceShellUI started
+    // before GoldHEN patched ShellCore and sees the same storage at /user/data.
+    int result = gs_storage_probe(GS_IPC_ROOT, 1);
+    if (result) {
+        int canonical = result;
+        (void)sceKernelMkdir("/user/data", 0777);
+        (void)sceKernelMkdir("/user/data/SSPI", 0777);
+        (void)sceKernelMkdir(GS_IPC_ROOT_SHARED, 0777);
+        g_ipc_root = GS_IPC_ROOT_SHARED;
+        result = gs_storage_probe(GS_IPC_ROOT_SHARED, 0);
+        g_shared_storage_result = result;
+        if (result) {
+            g_ipc_root = GS_IPC_ROOT;
+            return canonical;
+        }
+        gs_log_write("resident", "storage-root=shared");
+    }
+    return gs_log_prepare_files();
 }
 
 static int write_atomic_mode(const char *path, const char *body, int durable)
@@ -97,46 +182,98 @@ static void write_heartbeat(void)
     time_t now = time(NULL);
     if (now == last) return;
     last = now;
-    char body[192];
+    char body[512], path[128], capability[192];
     int64_t dotnet_ticks_now = DOTNET_EPOCH_TICKS +
         (int64_t)time(NULL) * 10000000LL;
-    snprintf(body, sizeof(body), "%s\n%lld\nhost=shell pid=%d listener=1 download=1\n",
+    // The listener proves the worker thread is alive even while its optional
+    // network/BGFT capabilities are still retrying. Keep the last return codes
+    // visible so a console log can explain which capability is not ready.
+    capability[0] = 0;
+    if (!g_transfer_ready || !g_bgft_ready)
+        snprintf(capability, sizeof(capability),
+            "capattempts=%d capnet=0x%08X captransfer=0x%08X capbgft=0x%08X ",
+            g_capability_attempts, (unsigned)g_capability_network_rc,
+            (unsigned)g_capability_transfer_rc, (unsigned)g_capability_bgft_rc);
+    snprintf(body, sizeof(body), "%s\n%lld\nhost=shell pid=%d listener=%d download=%d transfer=%d bgft=%d %sv=2 api=3 engine=sceHttp-chunks build=%s epoch=%llu staged=10 usb=1 archives=1 zip=1 sevenzip=1 fscontext=1 hostcontext=preserved usbcontext=0 revision=1 migration=%d\n",
         GS_WORKER_VERSION, (long long)dotnet_ticks_now,
-        getpid());
-    write_telemetry(GS_IPC_ROOT "/heartbeat.txt", body);
+        getpid(), g_listener >= 0 ? 1 : 0, g_transfer_ready, g_transfer_ready, g_bgft_ready,
+        capability, GS_BUILD_ID, (unsigned long long)g_epoch,
+        access("/data/SSPI/.migration-active", F_OK) == 0);
+    if (gs_ipc_path(path, sizeof(path), "/heartbeat.txt")) return;
+    write_telemetry(path, body);
 }
 
 static void write_boot(const char *state, int code)
 {
-    char body[192];
+    gs_log_write("resident", "boot state=%s code=%d build=%s epoch=%llu", state ? state : "unknown", code, GS_BUILD_ID, (unsigned long long)g_epoch);
+    char body[192], path[128];
     int64_t ticks = DOTNET_EPOCH_TICKS + (int64_t)time(NULL) * 10000000LL;
     snprintf(body, sizeof(body), "%s\n%lld\n%s code=%d pid=%d\n",
-        GS_APP_VERSION, (long long)ticks, state ? state : "unknown", code, getpid());
-    write_atomic(GS_IPC_ROOT "/plugin-boot.txt", body);
+        GS_WORKER_VERSION, (long long)ticks, state ? state : "unknown", code, getpid());
+    if (gs_ipc_path(path, sizeof(path), "/plugin-boot.txt")) return;
+    write_atomic(path, body);
+}
+
+static int wait_for_storage(void)
+{
+    while (!g_stop) {
+        int result = ensure_directories();
+        if (!result) return 0;
+        char body[320], message[160];
+        int64_t ticks = DOTNET_EPOCH_TICKS + (int64_t)time(NULL) * 10000000LL;
+        snprintf(body, sizeof(body), "%s\n%lld\nstorage-unavailable code=%d shared=0x%08x pid=%d build=%s epoch=%llu canonical=/data/SSPI/resident shared_root=/user/data/SSPI/resident\n",
+            GS_WORKER_VERSION, (long long)ticks, result, (unsigned)g_shared_storage_result, getpid(), GS_BUILD_ID, (unsigned long long)g_epoch);
+        // This diagnostic runs before either root is usable and always uses the
+        // shared staging path so the application can read it under its /data view.
+        write_atomic(GS_SHARED_BOOT_PATH, body);
+        snprintf(message, sizeof(message), "SSPI resident storage-unavailable: 0x%08x\n", (unsigned)result);
+        sceKernelDebugOutText(0, message);
+        for (int i = 0; i < 100 && !g_stop; i++) {
+            if (i % 10 == 0) {
+                ticks = DOTNET_EPOCH_TICKS + (int64_t)time(NULL) * 10000000LL;
+                snprintf(body, sizeof(body), "%s\n%lld\nhost=shell pid=%d listener=0 download=0 transfer=0 bgft=0 v=2 api=3 staged=10 storage=0 build=%s epoch=%llu \n",
+                    GS_WORKER_VERSION, (long long)ticks, getpid(), GS_BUILD_ID, (unsigned long long)g_epoch);
+                write_telemetry(GS_SHARED_HEARTBEAT_PATH, body);
+            }
+            sceKernelUsleep(100000);
+        }
+    }
+    return -1;
 }
 
 static int send_all(int socket_id, const void *data, size_t size)
 {
     const unsigned char *at = (const unsigned char *)data;
+    uint64_t stalled_at = sceKernelGetProcessTime();
     while (size > 0)
     {
+        if (g_stop) return -1;
         ssize_t sent = send(socket_id, at, size, 0);
         if (sent < 0 && errno == EINTR) continue;
-        if (sent <= 0) return -1;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_stop &&
+            sceKernelGetProcessTime() - stalled_at < 90000000) {
+            sceKernelUsleep(10000); continue;
+        }
+        if (sent <= 0) {
+            gs_log_write("resident", "bgft-http-send fd=%d errno=%d remaining=%llu", socket_id, errno, (unsigned long long)size);
+            return -1;
+        }
         at += sent;
         size -= (size_t)sent;
+        stalled_at = sceKernelGetProcessTime();
     }
     return 0;
 }
 
-static void send_head(int socket_id, int status, const char *reason, const char *extra)
+static int send_head(int socket_id, int status, const char *reason, const char *extra)
 {
     char headers[1024];
     int length = snprintf(headers, sizeof(headers),
         "HTTP/1.1 %d %s\r\n%sConnection: close\r\n\r\n",
         status, reason, extra ? extra : "");
     if (length > 0 && length < (int)sizeof(headers))
-        send_all(socket_id, headers, (size_t)length);
+        return send_all(socket_id, headers, (size_t)length);
+    return -1;
 }
 
 static void send_empty(int socket_id, int status, const char *reason, const char *extra)
@@ -149,7 +286,7 @@ static void send_empty(int socket_id, int status, const char *reason, const char
 static int read_headers(int socket_id, char *buffer, size_t capacity)
 {
     size_t used = 0;
-    while (used + 1 < capacity)
+    while (!g_stop && used + 1 < capacity)
     {
         ssize_t count = recv(socket_id, buffer + used, capacity - used - 1, 0);
         if (count < 0 && errno == EINTR) continue;
@@ -255,9 +392,9 @@ static int has_pkg_magic(FILE *file)
 }
 
 static int serve_reference_json(int socket_id, const char *method, const char *source,
-    const char *piece_route, int64_t length)
+    const char *piece_route, int64_t length, const char *remote_url)
 {
-    unsigned char digest[32]; char hex[65], document[1024], headers[192];
+    unsigned char digest[32]; char hex[65], headers[192], local_url[512];
     static const char digits[] = "0123456789abcdef";
     FILE *file = fopen(source, "rb");
     if (!file) return -1;
@@ -266,14 +403,29 @@ static int serve_reference_json(int socket_id, const char *method, const char *s
     fclose(file); if (!valid) return -1;
     for (int i = 0; i < 32; i++) { hex[i * 2] = digits[digest[i] >> 4]; hex[i * 2 + 1] = digits[digest[i] & 15]; }
     hex[64] = 0;
-    int size = snprintf(document, sizeof(document),
-        "{\"originalFileSize\":%lld,\"packageDigest\":\"%s\",\"numberOfSplitFiles\":1,\"pieces\":[{\"url\":\"http://127.0.0.1:8742%s\",\"fileOffset\":0,\"fileSize\":%lld,\"hashValue\":\"0000000000000000000000000000000000000000\"}]}",
-        (long long)length, hex, piece_route, (long long)length);
-    if (size < 0 || size >= (int)sizeof(document)) return -1;
+    snprintf(local_url, sizeof(local_url), "http://127.0.0.1:8742%s", piece_route);
+    const char *url = remote_url ? remote_url : local_url;
+    size_t url_length = strlen(url), used = 0;
+    if (url_length >= 8192) return -1;
+    char *escaped = (char *)malloc(url_length * 2 + 1);
+    char *document = (char *)malloc(url_length * 2 + 512);
+    if (!escaped || !document) { free(escaped); free(document); return -1; }
+    for (size_t i = 0; i < url_length; i++) {
+        unsigned char c = (unsigned char)url[i];
+        if (c < 32 || c == 127) { free(escaped); free(document); return -1; }
+        if (c == '\\' || c == '"') escaped[used++] = '\\';
+        escaped[used++] = (char)c;
+    }
+    escaped[used] = 0;
+    int size = snprintf(document, url_length * 2 + 512,
+        "{\"originalFileSize\":%lld,\"packageDigest\":\"%s\",\"numberOfSplitFiles\":1,\"pieces\":[{\"url\":\"%s\",\"fileOffset\":0,\"fileSize\":%lld,\"hashValue\":\"0000000000000000000000000000000000000000\"}]}",
+        (long long)length, hex, escaped, (long long)length);
+    free(escaped);
+    if (size < 0 || size >= (int)(url_length * 2 + 512)) { free(document); return -1; }
     snprintf(headers, sizeof(headers), "Content-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\n", size);
-    send_head(socket_id, 200, "OK", headers);
-    if (strcmp(method, "HEAD")) send_all(socket_id, document, (size_t)size);
-    return 0;
+    int rc = send_head(socket_id, 200, "OK", headers);
+    if (!rc && strcmp(method, "HEAD")) rc = send_all(socket_id, document, (size_t)size);
+    free(document); return rc;
 }
 
 #include "gs_resident_worker.inc"
@@ -293,19 +445,12 @@ static void serve_client(int socket_id)
     const char *range_header;
     char *path;
     struct stat info;
-    struct timeval timeout;
     FILE *file;
     unsigned char *transfer_buffer;
     int partial = 0;
     int64_t start = 0;
     int64_t end;
     int64_t remaining;
-
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(socket_id, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    timeout.tv_sec = 30;
-    setsockopt(socket_id, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     if (read_headers(socket_id, request, sizeof(request)) < 0 ||
         sscanf(request, "%7s %1023s %15s", method, target, version) != 3)
@@ -319,7 +464,29 @@ static void serve_client(int socket_id)
         return;
     }
     path = request_path(target);
-    snprintf(source, sizeof(source), "%s", GS_SELFTEST_PATH);
+    if (!strcmp(path, "/sspi-icon.png")) {
+        FILE *icon = fopen("/user/appmeta/SRCH00001/icon0.png", "rb");
+        struct stat icon_info;
+        if (!icon || gs_file_stat(icon, &icon_info) || icon_info.st_size <= 0 || icon_info.st_size > 512 * 1024) {
+            if (icon) fclose(icon);
+            send_empty(socket_id, 404, "Not Found", NULL); return;
+        }
+        char icon_headers[128];
+        snprintf(icon_headers, sizeof(icon_headers), "Content-Type: image/png\r\nContent-Length: %lld\r\n", (long long)icon_info.st_size);
+        if (!send_head(socket_id, 200, "OK", icon_headers) && !strcmp(method, "GET")) {
+            unsigned char icon_buffer[16384];
+            int64_t offset = 0;
+            while (offset < icon_info.st_size) {
+                size_t wanted = (size_t)(icon_info.st_size - offset);
+                if (wanted > sizeof(icon_buffer)) wanted = sizeof(icon_buffer);
+                int got = sceKernelPread(fileno(icon), icon_buffer, wanted, offset);
+                if (got <= 0 || send_all(socket_id, icon_buffer, (size_t)got)) break;
+                offset += got;
+            }
+        }
+        fclose(icon); return;
+    }
+    if (gs_ipc_path(source, sizeof(source), "/plugin-selftest.pkg")) source[0] = 0;
     gs_package_url(route, sizeof(route), "");
     snprintf(manifest_route, sizeof(manifest_route), "%s.json", route);
     manifest = strcmp(path, manifest_route) == 0;
@@ -328,23 +495,41 @@ static void serve_client(int socket_id)
         if (!gs_job.id[0] || (strcmp(path, route) != 0 && !manifest)) {
             send_empty(socket_id, 404, "Not Found", NULL); return;
         }
-        if (!gs_validated || gs_paused || gs_canceled) {
+        if (!gs_validated || gs_canceled || (gs_paused && gs_stream_slot < 0)) {
             send_empty(socket_id, 503, "Service Unavailable", "Retry-After: 1\r\n"); return;
+        }
+        if (!gs_storage_matches(gs_job.storage_root, gs_job.storage_token)) {
+            send_empty(socket_id, 503, "Service Unavailable", "Retry-After: 3\r\n"); return;
         }
         snprintf(source, sizeof(source), "%s", gs_job.destination);
         job_route = 1;
     }
-    if (stat(source, &info) != 0 || info.st_size < 4)
+    file = fopen(source, "rb");
+    if (!file || gs_file_stat(file, &info) || info.st_size < 4)
     {
+        if (file) fclose(file);
         send_empty(socket_id, 404, "Not Found", NULL);
         return;
     }
+    // Sparse staging length is not the representation length. Missing ranges
+    // are held below until the resident has written and committed their chunks.
+    if (job_route && gs_stream_slot >= 0) {
+        info.st_size = gs_job.total;
+        // A stdio read-ahead must not cache unwritten sparse bytes beyond a
+        // committed range. The explicit 256 KiB buffer already batches I/O.
+        setvbuf(file, NULL, _IONBF, 0);
+    }
     if (manifest) {
-        if (serve_reference_json(socket_id, method, source, route, info.st_size))
-            send_empty(socket_id, 503, "Service Unavailable", "Retry-After: 1\r\n");
+        fclose(file);
+        if (job_route && gs_job.native_bgft) info.st_size = gs_job.total;
+        int rc = serve_reference_json(socket_id, method, source, route, info.st_size,
+            job_route && gs_job.native_bgft ? gs_job.url : NULL);
+        gs_log_write("resident", "bgft-http-manifest job=%s method=%s rc=%d bytes=%lld", gs_job.id, method, rc, (long long)info.st_size);
         return;
     }
-    file = fopen(source, "rb");
+    if (job_route && gs_job.native_bgft) {
+        fclose(file); send_empty(socket_id, 404, "Not Found", NULL); return;
+    }
     if (!file)
     {
         send_empty(socket_id, 503, "Service Unavailable", "Retry-After: 1\r\n");
@@ -374,6 +559,8 @@ static void serve_client(int socket_id)
     }
 
     remaining = end - start + 1;
+    if (job_route) gs_log_write("resident", "bgft-http job=%s method=%s start=%lld end=%lld bytes=%lld stream=%d",
+        gs_job.id, method, (long long)start, (long long)end, (long long)info.st_size, gs_stream_slot >= 0);
     snprintf(representation, sizeof(representation),
         "Content-Type: application/octet-stream\r\n"
         "Content-Length: %lld\r\n"
@@ -392,41 +579,139 @@ static void serve_client(int socket_id)
             (long long)remaining, (long long)start, (long long)end,
             (long long)info.st_size);
     }
-    send_head(socket_id, partial ? 206 : 200,
-        partial ? "Partial Content" : "OK", representation);
+    if (send_head(socket_id, partial ? 206 : 200,
+        partial ? "Partial Content" : "OK", representation)) { fclose(file); return; }
     if (strcmp(method, "HEAD") == 0)
-    {
-        fclose(file);
-        return;
-    }
-    if (fseek(file, (long)start, SEEK_SET) != 0)
     {
         fclose(file);
         return;
     }
     transfer_buffer = (unsigned char *)malloc(256 * 1024);
     if (!transfer_buffer) { fclose(file); return; }
-    while (remaining > 0 && !g_stop && (!job_route || (!gs_paused && !gs_canceled)))
+    uint64_t body_started = sceKernelGetProcessTime(), body_logged_at = body_started;
+    uint64_t read_us = 0, send_us = 0, wait_us = 0, gate_us = 0;
+    while (remaining > 0 && !g_stop && (!job_route || (gs_validated && !gs_canceled && (!gs_paused || gs_stream_slot >= 0))))
     {
+        uint64_t now = sceKernelGetProcessTime();
+        if (job_route && now - body_logged_at >= 5000000) {
+            body_logged_at = now;
+            gs_log_write("resident", "bgft-http-body job=%s fd=%d start=%lld sent=%lld remaining=%lld elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
+                gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining,
+                (unsigned long long)((now - body_started) / 1000), (unsigned long long)(read_us / 1000),
+                (unsigned long long)(send_us / 1000), (unsigned long long)(wait_us / 1000), (unsigned long long)(gate_us / 1000));
+        }
         size_t wanted = remaining < 256 * 1024 ? (size_t)remaining : 256 * 1024;
-        size_t count = fread(transfer_buffer, 1, wanted, file);
-        if (count == 0 || send_all(socket_id, transfer_buffer, count) != 0) break;
+        if (job_route && gs_stream_slot >= 0) {
+            uint64_t before = sceKernelGetProcessTime();
+            int64_t available = gs_stage_stream_readable(end + 1 - remaining);
+            gate_us += sceKernelGetProcessTime() - before;
+            if (available < 0) break;
+            if (!available || gs_paused) {
+                before = sceKernelGetProcessTime(); sceKernelUsleep(20000);
+                wait_us += sceKernelGetProcessTime() - before; continue;
+            }
+            if ((int64_t)wanted > available) wanted = (size_t)available;
+        }
+        uint64_t before = sceKernelGetProcessTime();
+        ssize_t count = sceKernelPread(fileno(file), transfer_buffer, wanted, (off_t)(end + 1 - remaining));
+        int read_error = errno;
+        read_us += sceKernelGetProcessTime() - before;
+        if (count < 0 && read_error == EINTR) continue;
+        if (count <= 0 || (size_t)count > wanted) {
+            gs_log_write("resident", "bgft-http-read job=%s offset=%lld wanted=%llu result=%lld errno=%d",
+                gs_job.id, (long long)(end + 1 - remaining), (unsigned long long)wanted, (long long)count, read_error);
+            break;
+        }
+        before = sceKernelGetProcessTime();
+        int send_result = send_all(socket_id, transfer_buffer, (size_t)count);
+        send_us += sceKernelGetProcessTime() - before;
+        if (send_result != 0) break;
         remaining -= (int64_t)count;
     }
     free(transfer_buffer);
+    if (job_route) gs_log_write("resident", "bgft-http-end job=%s fd=%d start=%lld sent=%lld remaining=%lld canceled=%d paused=%d elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
+        gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining, gs_canceled, gs_paused,
+        (unsigned long long)((sceKernelGetProcessTime() - body_started) / 1000), (unsigned long long)(read_us / 1000),
+        (unsigned long long)(send_us / 1000), (unsigned long long)(wait_us / 1000), (unsigned long long)(gate_us / 1000));
     if (job_route) gs_record_served(start, end + 1 - remaining);
     fclose(file);
 }
 
 static void *client_thread(void *argument)
 {
-    int socket_id = *(int *)argument;
-    free(argument);
+    GsHttpClient *client = (GsHttpClient *)argument;
+    int socket_id = client->socket_id;
+    int no_sigpipe = 1;
+    if (setsockopt(socket_id, SOL_SOCKET, GS_SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe))) {
+        gs_log_write("resident", "bgft-http-nosigpipe fd=%d errno=%d", socket_id, errno);
+        goto done;
+    }
+    // BSD accept can inherit the listener's O_NONBLOCK. A temporary empty
+    // receive/send queue must not truncate a BGFT manifest or package body.
+    int flags = fcntl(socket_id, F_GETFL, 0);
+    if (flags < 0 || fcntl(socket_id, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+        gs_log_write("resident", "bgft-http-config fd=%d errno=%d", socket_id, errno);
+        goto done;
+    }
+    struct timeval timeout = { 5, 0 };
+    if (setsockopt(socket_id, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) {
+        gs_log_write("resident", "bgft-http-recv-timeout fd=%d errno=%d", socket_id, errno);
+        goto done;
+    }
+    timeout.tv_sec = 30;
+    if (setsockopt(socket_id, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))) {
+        gs_log_write("resident", "bgft-http-send-timeout fd=%d errno=%d", socket_id, errno);
+        goto done;
+    }
     serve_client(socket_id);
-    shutdown(socket_id, SHUT_RDWR);
+    // Advertised Connection: close is deliberate. Flush the response through
+    // FIN, then drain the peer briefly so unread input does not cause a reset.
+    shutdown(socket_id, SHUT_WR);
+    struct timeval drain = { 1, 0 };
+    setsockopt(socket_id, SOL_SOCKET, SO_RCVTIMEO, &drain, sizeof(drain));
+    unsigned char tail[512]; size_t drained = 0;
+    uint64_t drain_started = sceKernelGetProcessTime();
+    while (!g_stop && drained < 16384 && sceKernelGetProcessTime() - drain_started < 2000000) {
+        ssize_t n = recv(socket_id, tail, sizeof(tail), 0);
+        if (n <= 0) break;
+        drained += (size_t)n;
+    }
+done:
     close(socket_id);
     __sync_sub_and_fetch(&g_client_count, 1);
+    __atomic_store_n(&client->finished, 1, __ATOMIC_RELEASE);
     return NULL;
+}
+
+static void gs_reap_clients(int all)
+{
+    for (int i = 0; i < GS_HTTP_CLIENTS; i++) {
+        GsHttpClient *client = &g_clients[i];
+        if (!client->created || (!all && !__atomic_load_n(&client->finished, __ATOMIC_ACQUIRE))) continue;
+        /* The finished flag is published before the thread's final return.
+         * Joining also proves that no thread can return through unloaded code. */
+        scePthreadJoin(client->thread, NULL);
+        client->created = 0;
+    }
+}
+
+static void gs_start_client(int socket_id)
+{
+    gs_reap_clients(0);
+    for (int i = 0; i < GS_HTTP_CLIENTS; i++) {
+        GsHttpClient *client = &g_clients[i];
+        if (client->created) continue;
+        client->socket_id = socket_id;
+        __atomic_store_n(&client->finished, 0, __ATOMIC_RELAXED);
+        __sync_add_and_fetch(&g_client_count, 1);
+        if (!scePthreadCreate(&client->thread, NULL, client_thread, client, "gs-http")) {
+            client->created = 1;
+            return;
+        }
+        __sync_sub_and_fetch(&g_client_count, 1);
+        break;
+    }
+    close(socket_id);
 }
 
 static int start_listener(void)
@@ -442,8 +727,9 @@ static int start_listener(void)
     memset(&address, 0, sizeof(address));
     address.sin_len = sizeof(address);
     address.sin_family = AF_INET;
-    address.sin_port = sceNetHtons(GS_PORT);
-    address.sin_addr.s_addr = sceNetHtonl(0x7f000001u);
+    // PS4 is little-endian; these fixed network-order values need no SPRX.
+    address.sin_port = __builtin_bswap16((uint16_t)GS_PORT);
+    address.sin_addr.s_addr = __builtin_bswap32(0x7f000001u);
     if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
         listen(listener, 8) != 0)
     {
@@ -459,25 +745,158 @@ static int start_listener(void)
     return listener;
 }
 
+/* Every worker announces its build once the storage root is final. A later
+ * build's record lets an older, already-mapped worker retire and free port
+ * 8742. The window is deliberately short: peers poll every loop second. */
+static void write_retire_record(void)
+{
+    char body[160], path[128];
+    int64_t ticks = DOTNET_EPOCH_TICKS + (int64_t)time(NULL) * 10000000LL;
+    int length = snprintf(body, sizeof(body), "format=1\nbuild=%s\npid=%d\nticks=%lld\n",
+        GS_BUILD_ID, getpid(), (long long)ticks);
+    if (length < 0 || length >= (int)sizeof(body)) return;
+    if (gs_ipc_path(path, sizeof(path), "/worker-retire.txt")) return;
+    write_atomic(path, body);
+}
+
+static int gs_worker_retire_requested(void)
+{
+    char path[128], body[256], build[64] = {0};
+    int64_t ticks = 0;
+    int have_format = 0, have_ticks = 0;
+    if (gs_ipc_path(path, sizeof(path), "/worker-retire.txt")) return 0;
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    size_t count = fread(body, 1, sizeof(body) - 1, file);
+    fclose(file);
+    body[count] = 0;
+    char *line = body;
+    while (line && *line) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        if (!strcmp(line, "format=1")) have_format = 1;
+        else if (!strncmp(line, "build=", 6)) snprintf(build, sizeof(build), "%s", line + 6);
+        else if (!strncmp(line, "ticks=", 6)) { ticks = strtoll(line + 6, NULL, 10); have_ticks = 1; }
+        line = next;
+    }
+    if (!have_format || !build[0] || !have_ticks) return 0;
+    int64_t now = DOTNET_EPOCH_TICKS + (int64_t)time(NULL) * 10000000LL;
+    if (ticks <= 0 || ticks > now + 20000000LL || now - ticks > 300000000LL) return 0;
+    if (!strcmp(build, GS_BUILD_ID)) return 0;
+    gs_log_write("resident", "retire-request build=%s self=%s", build, GS_BUILD_ID);
+    return 1;
+}
+
 static void *gs_main_loop(void *argument)
 {
     int listener;
-    int net_result;
     (void)argument;
 
-    ensure_directories();
-    net_result = sceNetInit();
+    g_epoch = sceKernelGetProcessTime();
+    // Never invoke GoldHEN recursively from the module-start callback that
+    // the named-process loader is still waiting to finish.
+    if (!gs_goldhen_is_shell()) {
+        write_boot("shell-host-rejected", -1);
+        g_started = 0; return NULL;
+    }
+    if (wait_for_storage()) { g_started = 0; return NULL; }
+    write_boot("plugin-entry", 0);
+    write_boot("shell-host-accepted-starting-thread", 0);
+    if (gs_legacy_worker_advancing()) {
+        write_boot("legacy-worker-active-restart-required", -8);
+        g_started = 0; return NULL;
+    }
+    int context_result = gs_filesystem_context_lock(&g_filesystem_context);
+    if (context_result) {
+        write_boot("filesystem-context-busy-restart-required", context_result);
+        g_started = 0; return NULL;
+    }
+    GsFilesystemProof proof;
+    int context_verified = gs_filesystem_context_unique_module((const void *)gs_main_loop, &proof);
+    gs_storage_context_unverified = 1;
+    if (!context_verified) {
+        gs_log_write("resident", "filesystem-context resident ownership unverified modules=%llu list=0x%08X info=0x%08X self=%d module=%s; original shell context preserved",
+            (unsigned long long)proof.count, (unsigned)proof.list_result, (unsigned)proof.info_result, proof.self, proof.module);
+        int release_result = gs_filesystem_context_unlock(&g_filesystem_context);
+        write_boot(release_result ? "filesystem-context-release-failed-restart-required" :
+            "filesystem-context-unverified-restart-required", -1);
+        g_started = 0; return NULL;
+    }
+    /* A pre-lease worker still using the port cannot overlap this owner. */
     listener = start_listener();
+    if (listener < 0) {
+        write_boot("filesystem-context-listener-busy-restart-required", -1);
+        gs_filesystem_context_unlock(&g_filesystem_context);
+        g_started = 0; return NULL;
+    }
+    gs_log_write("resident", "filesystem-context original shell context preserved lease=held modules=%llu self=%d module=%s",
+        (unsigned long long)proof.count, proof.self, proof.module);
+    // libSceNet/sceNetInit remains a best-effort prerequisite, but it must not
+    // gate liveness: sockets are imported from libkernel, so bind the listener
+    // first and let the loop below keep resolving optional capabilities.
+    (void)gs_net_runtime_init();
+    write_retire_record();
     g_listener = listener;
-    write_boot(listener >= 0 ? "active" : "passive", net_result);
+    write_boot(listener >= 0 ? "listening" : "listener-retry", listener >= 0 ? 0 : -1);
 
     while (!g_stop)
     {
-        if (listener < 0) { listener = start_listener(); g_listener = listener; }
+        gs_reap_clients(0);
+        /* A newer build's fresh retire record supersedes this worker. Exit the
+         * loop so the normal shutdown path closes the listener and joins the
+         * worker thread, freeing port 8742 for the replacement. */
+        if (gs_worker_retire_requested()) { g_stop = 1; break; }
+        static uint64_t listener_retry;
+        if (listener < 0 && sceKernelGetProcessTime() >= listener_retry) {
+            listener_retry = sceKernelGetProcessTime() + 10000000;
+            (void)gs_net_runtime_init();
+            listener = start_listener(); g_listener = listener;
+            if (listener >= 0) write_boot("listener-recovered", 0);
+        }
         if (listener >= 0)
         {
+            static uint64_t readiness_retry;
+            uint64_t now = sceKernelGetProcessTime();
+            // Publish liveness before a capability attempt can block on module
+            // resolution; the loader treats an advancing heartbeat as presence.
             write_heartbeat();
-            gs_worker_poll();
+            if ((!g_transfer_ready || !g_bgft_ready) && now >= readiness_retry) {
+                readiness_retry = now + 10000000;
+                if (!g_transfer_ready) {
+                    int network_rc = gs_network_init();
+                    // SceShellUI hides loaded system libraries from the module
+                    // list; hand the engine the handle we already resolved.
+                    if (!network_rc && gs_http_module >= 0) sspi_xfer_set_module(gs_http_module);
+                    int transfer_rc = network_rc ? network_rc : sspi_xfer_init(gs_http);
+                    if (!transfer_rc) g_transfer_ready = 1;
+                    g_capability_network_rc = network_rc;
+                    g_capability_transfer_rc = transfer_rc;
+                    g_capability_attempts++;
+                    gs_log_write("resident", "capability network=%d transfer=%d ready=%d", network_rc, transfer_rc, g_transfer_ready);
+                }
+                if (!g_bgft_ready) {
+                    int rc = gs_bgft_ready_probe();
+                    if (!rc) g_bgft_ready = 1;
+                    g_capability_bgft_rc = rc;
+                    g_capability_attempts++;
+                    gs_log_write("resident", "capability bgft=%d ready=%d", rc, g_bgft_ready);
+                }
+                if (g_transfer_ready && g_bgft_ready && !g_ready_boot_written) {
+                    g_ready_boot_written = 1;
+                    write_boot("active", 0);
+                }
+            }
+            if (access("/data/SSPI/.migration-active", F_OK) != 0) {
+                gs_stage_poll();
+                gs_worker_poll();
+            } else {
+                static uint64_t migration_log_at;
+                uint64_t now = sceKernelGetProcessTime();
+                if (!migration_log_at || now - migration_log_at >= 10000000) {
+                    migration_log_at = now;
+                    gs_log_write("resident", "intake state=blocked reason=data-migration marker=/data/SSPI/.migration-active");
+                }
+            }
         }
         if (listener >= 0)
         {
@@ -486,25 +905,7 @@ static void *gs_main_loop(void *argument)
             {
                 accepted = accept(listener, NULL, NULL);
                 if (accepted >= 0)
-                {
-                    int *client = g_client_count < 8 ? (int *)malloc(sizeof(*client)) : NULL;
-                    if (client)
-                    {
-                        OrbisPthread thread;
-                        *client = accepted;
-                        __sync_add_and_fetch(&g_client_count, 1);
-                        if (scePthreadCreate(&thread, NULL, client_thread, client,
-                            "gs-http") == 0)
-                            scePthreadDetach(thread);
-                        else
-                        {
-                            __sync_sub_and_fetch(&g_client_count, 1);
-                            free(client);
-                            close(accepted);
-                        }
-                    }
-                    else close(accepted);
-                }
+                    gs_start_client(accepted);
             }
             while (accepted >= 0 && !g_stop);
         }
@@ -517,7 +918,17 @@ static void *gs_main_loop(void *argument)
         close(listener);
     }
     if (gs_worker_created) { scePthreadJoin(gs_worker, NULL); gs_worker_created = 0; }
-    while (g_client_count > 0) sceKernelUsleep(10000);
+    gs_stage_shutdown();
+    gs_reap_clients(1);
+    sspi_xfer_shutdown();
+    int release_result;
+    if (gs_park_task()) {
+        g_filesystem_context.poisoned = 1;
+        release_result = g_filesystem_context.code = -1;
+        write_boot("filesystem-context-bgft-stop-unconfirmed-restart-required", -1);
+    } else release_result = gs_filesystem_context_unlock(&g_filesystem_context);
+    if (release_result) write_boot("filesystem-context-release-failed-restart-required", release_result);
+    else gs_log_write("resident", "filesystem-context original shell context preserved lease=released");
     g_listener = -1;
     g_started = 0;
     return NULL;
@@ -528,16 +939,20 @@ __attribute__((visibility("default"))) int32_t plugin_load(
 {
     (void)argc;
     (void)argv;
-    if (g_started) return 0;
-    // A game-owned socket cannot survive game suspension. Refuse that host.
-    if (!gs_goldhen_is_shell()) return -1;
+    if (g_filesystem_context.poisoned) return -1;
+    if (!__sync_bool_compare_and_swap(&g_started, 0, 1)) return 0;
+    if (g_main_thread_created) {
+        scePthreadJoin(g_main_thread, NULL);
+        g_main_thread_created = 0;
+    }
     g_stop = 0;
-    g_started = 1;
-    if (scePthreadCreate(&g_main_thread, NULL, gs_main_loop, NULL, "gs-resident") != 0)
+    int thread_result = scePthreadCreate(&g_main_thread, NULL, gs_main_loop, NULL, "gs-resident");
+    if (thread_result != 0)
     {
         g_started = 0;
-        return -1;
+        return thread_result;
     }
+    g_main_thread_created = 1;
     return 0;
 }
 
@@ -547,10 +962,11 @@ __attribute__((visibility("default"))) int32_t plugin_unload(
     int listener;
     (void)argc;
     (void)argv;
-    if (!g_started) return 0;
+    if (!g_main_thread_created) return g_filesystem_context.poisoned || g_filesystem_context.fd >= 0 ? -1 : 0;
     g_stop = 1;
     listener = g_listener;
     if (listener >= 0) shutdown(listener, SHUT_RDWR);
     scePthreadJoin(g_main_thread, NULL);
-    return 0;
+    g_main_thread_created = 0;
+    return g_filesystem_context.poisoned || g_filesystem_context.fd >= 0 ? -1 : 0;
 }

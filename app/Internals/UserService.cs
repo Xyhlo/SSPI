@@ -1,89 +1,85 @@
 ﻿using Orbis.String;
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Orbis.Internals
 {
     internal class UserService
     {
-        // Must match eboot main.c mono_add_internal_call names exactly:
-        // Initialize, Terminate, GetInitialUser, GetForegroundUser, HideSplashScreen, NativeLoadExec
         const int AlreadyInitialized = unchecked((int)0x80960004);
-
+        static readonly object InitLock = new object();
         static bool _triedInit;
-        static int _cachedUserId = -1;
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        public static extern bool HideSplashScreen();
+        // Older bootstrap binaries registered this symbol from UserService,
+        // although the export belongs to SystemService. Resolve it from its
+        // owning module so a missing alias is a catchable P/Invoke error.
+        public static bool HideSplashScreen() { int result; return TryHideSplashScreen(out result); }
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static bool TryHideSplashScreen(out int result)
+        {
+            result = HideSplashScreenNative();
+            return result == 0;
+        }
+
+        [DllImport("libSceSystemService", EntryPoint = "sceSystemServiceHideSplashScreen",
+            CallingConvention = CallingConvention.Cdecl)]
+        static extern int HideSplashScreenNative();
+
+        [DllImport("libSceUserService", EntryPoint = "sceUserServiceInitialize", CallingConvention = CallingConvention.Cdecl)]
         public static extern int Initialize(IntPtr parameters);
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
+        [DllImport("libSceUserService", EntryPoint = "sceUserServiceTerminate", CallingConvention = CallingConvention.Cdecl)]
         public static extern int Terminate();
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
+        [DllImport("libSceUserService", EntryPoint = "sceUserServiceGetInitialUser", CallingConvention = CallingConvention.Cdecl)]
         public static extern int GetInitialUser(out int userId);
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
+        [DllImport("libSceUserService", EntryPoint = "sceUserServiceGetForegroundUser", CallingConvention = CallingConvention.Cdecl)]
         public static extern int GetForegroundUser(out int userId);
 
-        /// <summary>Initialize UserService via eboot IC and resolve a user id for IME/pad.</summary>
+        /// <summary>Resolve an actual signed-in user; the old bootstrap did not register user-service calls.</summary>
         public static bool TryGetUserId(out int userId, out string error)
         {
-            userId = 0;
+            userId = -1;
             error = null;
-            try
+            lock (InitLock)
             {
                 if (!_triedInit)
                 {
-                    _triedInit = true;
                     try
                     {
                         int irc = Initialize(IntPtr.Zero);
-                        // 0 ok; already-init ok; other codes still probe
+                        _triedInit = irc == 0 || irc == AlreadyInitialized;
                         if (irc != 0 && irc != AlreadyInitialized)
                             error = "Initialize 0x" + unchecked((uint)irc).ToString("X8");
                     }
                     catch (Exception ex)
                     {
-                        error = "Initialize IC missing: " + ex.GetType().Name;
+                        error = "User service unavailable: " + ex.GetType().Name;
                     }
                 }
-
-                int rc = GetForegroundUser(out userId);
-                if (rc == 0 && userId != 0)
-                {
-                    _cachedUserId = userId;
-                    return true;
-                }
-
-                rc = GetInitialUser(out userId);
-                if (rc == 0 && userId != 0)
-                {
-                    _cachedUserId = userId;
-                    return true;
-                }
-
-                if (_cachedUserId > 0)
-                {
-                    userId = _cachedUserId;
-                    return true;
-                }
-
-                // Homebrew often still works with primary user = 1
-                userId = 1;
-                if (error == null)
-                    error = "probe fg/init failed; using userId=1";
-                return true;
             }
-            catch (Exception ex)
+            try
             {
-                userId = 1;
-                error = "UserService: " + ex.GetType().Name + " (fallback user=1)";
-                return true;
+                int rc = GetForegroundUser(out userId);
+                if (rc == 0 && IsValidUserId(userId)) { error = null; return true; }
             }
+            catch (Exception ex) { error = "Foreground user unavailable: " + ex.GetType().Name; }
+            // Some firmware does not expose the foreground-user query. Probe
+            // initial-user separately so a missing optional export cannot skip it.
+            try
+            {
+                int rc = GetInitialUser(out userId);
+                if (rc == 0 && IsValidUserId(userId)) { error = null; return true; }
+                error = "No signed-in user (0x" + unchecked((uint)rc).ToString("X8") + ")";
+            }
+            catch (Exception ex) { error = "Initial user unavailable: " + ex.GetType().Name; }
+            userId = -1;
+            return false;
         }
+
+        internal static bool IsValidUserId(int userId) { return userId >= 0 && userId != 0xFF; }
 
         public unsafe static bool LoadExec(string Path, params string[] Args)
         {

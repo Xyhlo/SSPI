@@ -14,19 +14,43 @@
 #include <orbis/libkernel.h>
 #include <sys/file.h>
 #include "goldhen_process.h"
+#include "shell_loader.h"
 #include "storage_space.h"
 
 __attribute__((visibility("default"))) int gs_resident_load_shell_worker(const char *path)
 {
-    int lock = open("/data/GameSearch/resident/shell-load.lock", O_CREAT | O_RDWR, 0600);
-    if (lock < 0) return -5;
-    if (flock(lock, LOCK_EX | LOCK_NB)) { close(lock); return -6; }
-    int result = gs_goldhen_load_shell(path);
-    flock(lock, LOCK_UN); close(lock);
-    return result;
+    return gs_shell_load_guarded(path, "/data/SSPI/resident/shell-load-app.txt");
+}
+
+__attribute__((visibility("default"))) int gs_resident_log(const char *category, const char *message)
+{
+    if (!category || !message) return -1;
+    gs_log_write(category, "%s", message); return 0;
 }
 
 #define GS_MNT_UPDATE 0x00010000
+
+__attribute__((visibility("default"))) int gs_resident_probe_shell_worker(const char *path)
+{
+    static int attempted;
+    const char prefix[] = "/data/SSPI/resident/gs_resident_shell_probe_";
+    if (!path || strncmp(path, prefix, sizeof(prefix) - 1)) return -2;
+    if (!__sync_bool_compare_and_swap(&attempted, 0, 1)) return -12;
+    int result = gs_data_prepare_root();
+    if (!result) result = gs_data_ensure_directory(GS_SHELL_IPC_ROOT, 0777);
+    if (result) return -11;
+    int lock = open(GS_SHELL_IPC_ROOT "/shell-load.lock", O_CREAT | O_RDWR, 0600);
+    if (lock < 0) return -5;
+    if (flock(lock, LOCK_EX | LOCK_NB)) { close(lock); return -6; }
+    gs_log_write("resident", "diagnostic-probe begin; real worker readiness unchanged");
+    /* Inert module only: use the same API gate, but never wait for or publish
+     * a worker heartbeat. The real worker's trace remains untouched. */
+    result = gs_goldhen_load_shell_traced(path, GS_SHELL_IPC_ROOT "/shell-load-probe.txt");
+    gs_log_write("resident", "diagnostic-probe result=0x%08x; real worker readiness unchanged", (unsigned)result);
+    flock(lock, LOCK_UN);
+    close(lock);
+    return result;
+}
 
 __attribute__((visibility("default"))) int64_t gs_resident_available_bytes(const char *path)
 {
@@ -203,8 +227,7 @@ __attribute__((visibility("default"))) int gs_resident_spawn_local(const char* e
 __attribute__((visibility("default"))) int gs_resident_mkdir(const char* path)
 {
     if (!path || !path[0]) return -22;
-    if (mkdir(path, 0777) == 0 || errno == EEXIST) return 0;
-    return -errno;
+    return gs_data_ensure_directory(path, 0777);
 }
 
 __attribute__((visibility("default"))) int gs_resident_chmod(const char* path, int mode)

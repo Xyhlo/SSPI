@@ -14,7 +14,7 @@ namespace Orbis
         {
             hits = null;
             string body;
-            if (!TryRead("s-" + Key(sourceStamp + "|" + query), out body)) return false;
+            if (!TryRead("s-" + Key(sourceStamp + "|" + (query ?? "").Trim().ToLowerInvariant()), out body)) return false;
             hits = new List<GameHit>();
             using (var reader = new StringReader(body))
             {
@@ -28,7 +28,8 @@ namespace Orbis
                         TitleId = p[0], Name = p[1], Region = p[2], ImageUrl = p[3], Source = p[4],
                         Rating = p.Length > 5 ? p[5] : "",
                         Genres = p.Length > 6 ? p[6] : "",
-                        Backport = p.Length > 7 ? p[7] : ""
+                        Backport = p.Length > 7 ? p[7] : "",
+                        SourceVersion = p.Length > 8 ? p[8] : "", CatalogUrl = p.Length > 9 ? p[9] : ""
                     });
                 }
             }
@@ -46,16 +47,17 @@ namespace Orbis
                 sb.Append(Esc(h.TitleId)).Append('\t').Append(Esc(h.Name)).Append('\t')
                     .Append(Esc(h.Region)).Append('\t').Append(Esc(h.ImageUrl)).Append('\t')
                     .Append(Esc(h.Source)).Append('\t').Append(Esc(h.Rating)).Append('\t')
-                    .Append(Esc(h.Genres)).Append('\t').Append(Esc(h.Backport)).Append('\n');
+                    .Append(Esc(h.Genres)).Append('\t').Append(Esc(h.Backport)).Append('\t')
+                    .Append(Esc(h.SourceVersion)).Append('\t').Append(Esc(h.CatalogUrl)).Append('\n');
             }
-            Write("s-" + Key(sourceStamp + "|" + query), sb.ToString());
+            Write("s-" + Key(sourceStamp + "|" + (query ?? "").Trim().ToLowerInvariant()), sb.ToString());
         }
 
-        public static bool TryResolve(string titleId, out List<PackageCandidate> candidates, string sourceStamp = "")
+        public static bool TryResolve(string titleId, out List<PackageCandidate> candidates, string sourceStamp = "", string region = "", string sourceId = "")
         {
             candidates = null;
             string body;
-            if (!TryRead("r-" + Key(sourceStamp + "|" + titleId), out body)) return false;
+            if (!TryRead("r-" + ResolveKey(titleId, sourceStamp, region, sourceId), out body)) return false;
             candidates = new List<PackageCandidate>();
             using (var reader = new StringReader(body))
             {
@@ -93,13 +95,16 @@ namespace Orbis
                         cand.ExpiresUtc = expires.ToUniversalTime();
                         if (cand.ExpiresUtc <= DateTime.UtcNow) continue;
                     }
+                    if (!string.IsNullOrEmpty(titleId) && !string.Equals(titleId, cand.TitleId, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!string.IsNullOrEmpty(region) && PackageSourceIdentity.NormalizeRegion(region) != PackageSourceIdentity.NormalizeRegion(cand.Region)) continue;
+                    if (!string.IsNullOrEmpty(sourceId) && sourceId != cand.SourceId) continue;
                     candidates.Add(cand);
                 }
             }
             return candidates.Count > 0;
         }
 
-        public static void PutResolve(string titleId, List<PackageCandidate> candidates, string sourceStamp = "")
+        public static void PutResolve(string titleId, List<PackageCandidate> candidates, string sourceStamp = "", string region = "", string sourceId = "")
         {
             if (candidates == null) return;
             var sb = new StringBuilder();
@@ -122,8 +127,11 @@ namespace Orbis
                     .Append(Esc(c.RequiredFirmware)).Append('\t').Append(Esc(c.ArchivePassword)).Append('\t')
                     .Append(Esc(c.ResolutionError)).Append('\n');
             }
-            Write("r-" + Key(sourceStamp + "|" + titleId), sb.ToString());
+            Write("r-" + ResolveKey(titleId, sourceStamp, region, sourceId), sb.ToString());
         }
+
+        static string ResolveKey(string titleId, string sourceStamp, string region, string sourceId)
+        { return Key(sourceStamp + "|" + sourceId + "|" + (titleId ?? "").ToUpperInvariant() + "|" + PackageSourceIdentity.NormalizeRegion(region)); }
 
         internal static bool TryUpdate(string titleId, string version, out bool update, out string info)
         { return TryUpdateKey(UpdateKey(titleId, version), out update, out info); }
@@ -205,7 +213,7 @@ namespace Orbis
             string registry = "";
             try { registry = File.ReadAllText(Path.Combine(AppSettings.DataDir, "sources/registry.json")); } catch { }
             using (var sha = System.Security.Cryptography.SHA256.Create())
-                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes("v5|" + registry + "|" + (value ?? "").Trim().ToLowerInvariant()))).Replace("-", "").ToLowerInvariant();
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes("v7|" + registry + "|" + (value ?? "").Trim()))).Replace("-", "").ToLowerInvariant();
         }
 
         static string Esc(string value)

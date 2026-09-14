@@ -18,13 +18,14 @@ namespace Orbis
 
     /// <summary>
     /// A completely materialized and validated .gssource archive. Materializing is intentional:
-    /// the expanded archive is capped at 16 MiB, so extraction never depends on a mutable input.
+    /// the expanded archive is capped at 32 MiB, so extraction never depends on a mutable input.
     /// This class only reads declarative data; it never loads an assembly or executes package data.
     /// </summary>
     internal sealed class PackageSourcePackage
     {
         public const int MaximumCompressedBytes = 4 * 1024 * 1024;
-        public const int MaximumExpandedBytes = 16 * 1024 * 1024;
+        public const int MaximumExpandedBytes = 32 * 1024 * 1024;
+        const int MaximumNonCatalogExpandedBytes = 16 * 1024 * 1024;
         public const int MaximumEntryBytes = 4 * 1024 * 1024;
         public const int MaximumEntries = 64;
 
@@ -71,6 +72,10 @@ namespace Orbis
             return (byte[])value.Clone();
         }
 
+        // Only the static validator consumes this view; it never mutates payload bytes.
+        internal byte[] ReadCatalogFile(string path)
+        { byte[] value; return path != null && _files.TryGetValue(path, out value) ? value : null; }
+
         public void ExtractTo(string destination)
         {
             if (string.IsNullOrEmpty(destination)) throw new ArgumentException("Destination is empty");
@@ -88,7 +93,7 @@ namespace Orbis
                 string dir = Path.GetDirectoryName(output);
                 if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
                 using (var stream = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    stream.Write(pair.Value, 0, pair.Value.Length);
+                { stream.Write(pair.Value, 0, pair.Value.Length); stream.Flush(true); }
             }
         }
 
@@ -117,7 +122,7 @@ namespace Orbis
                         {
                             string path = ValidatePath(entry.Name);
                             if (entry.IsCrypted) throw new InvalidDataException("Encrypted entries are not allowed: " + path);
-                            if (IsLink(entry)) throw new InvalidDataException("Links are not allowed in source packages");
+                            if (IsLink(entry)) throw new InvalidDataException("Only regular files and directories are allowed in source packages");
                             bool directory = entry.IsDirectory || path.EndsWith("/", StringComparison.Ordinal);
                             if (directory)
                             {
@@ -135,7 +140,7 @@ namespace Orbis
                                 throw new InvalidDataException("Entry compressed size is invalid: " + path);
                             expanded += entry.Size;
                             if (expanded > MaximumExpandedBytes)
-                                throw new InvalidDataException("Expanded package exceeds 16 MiB");
+                                throw new InvalidDataException("Expanded package exceeds 32 MiB");
                             if (entry.CompressedSize == 0 && entry.Size > 0)
                                 throw new InvalidDataException("Invalid compression ratio: " + path);
                             if (entry.CompressedSize > 0 && entry.Size > entry.CompressedSize * 20L)
@@ -164,6 +169,37 @@ namespace Orbis
             catch (InvalidDataException) { throw; }
             catch (Exception ex) { throw new InvalidDataException("Invalid .gssource ZIP: " + ex.Message, ex); }
 
+            ValidateContents();
+        }
+
+        internal static PackageSourcePackage OpenInstalled(string directory)
+        {
+            var package = new PackageSourcePackage();
+            string root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var pending = new Stack<string>(); pending.Push(directory); long total = 0; int visited = 0;
+            while (pending.Count > 0) {
+                string dir = pending.Pop();
+                if (++visited > MaximumEntries || (File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("Invalid source directory");
+                foreach (string file in Directory.EnumerateFileSystemEntries(dir)) {
+                    var attr = File.GetAttributes(file);
+                    if ((attr & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("Source links are not allowed");
+                    if ((attr & FileAttributes.Directory) != 0) { pending.Push(file); continue; }
+                    string name = ValidatePath(Path.GetFullPath(file).Substring(root.Length).Replace('\\','/'));
+                    var size = new FileInfo(file).Length; total += size;
+                    if (size > MaximumEntryBytes || total > MaximumExpandedBytes || package._files.Count >= MaximumEntries) throw new InvalidDataException("Source exceeds limits");
+                    RejectExecutablePath(name); byte[] data = File.ReadAllBytes(file); RejectExecutableMagic(name,data);
+                    package._files.Add(name,data);
+                    package.Entries.Add(new PackageSourcePackageEntry { Path=name, UncompressedSize=data.Length, CompressedSize=data.Length, Sha256=Hash(data) });
+                }
+            }
+            package.ValidateContents();
+            // The original ZIP is unavailable during registry recovery; this is the manifest identity.
+            package.PackageSha256 = Hash(Encoding.UTF8.GetBytes(package.SourceJson));
+            return package;
+        }
+
+        void ValidateContents()
+        {
             byte[] descriptorBytes;
             if (!_files.TryGetValue("source.json", out descriptorBytes))
                 throw new InvalidDataException("Package source is missing source.json");
@@ -174,9 +210,15 @@ namespace Orbis
             var root = rootValue as Dictionary<string, object>;
             if (root == null) throw new InvalidDataException("source.json must be a JSON object");
             Descriptor = ParseDescriptor(root);
+            if (Descriptor.Engine.Type != PackageSourceEngineStatic.EngineType) {
+                long expanded = 0; foreach (var file in _files.Values) expanded += file.Length;
+                if (expanded > MaximumNonCatalogExpandedBytes) throw new InvalidDataException("Expanded non-catalog package exceeds 16 MiB");
+            }
             if (Descriptor.Engine.EntryFile != "source.json" && !_files.ContainsKey(Descriptor.Engine.EntryFile))
                 throw new InvalidDataException("Engine entry file is missing: " + Descriptor.Engine.EntryFile);
             VerifyDeclaredFiles(root);
+            if (Descriptor.Engine.Type == PackageSourceEngineStatic.EngineType)
+                PackageSourceEngineStatic.ValidatePackage(this);
 
             // Wave 2 has no audited Ed25519 implementation. Never represent this as verified:
             // signed-unverified and unsigned-dev are explicit trust states consumed by the UI/store.
@@ -251,8 +293,8 @@ namespace Orbis
                 ? engineValue as Dictionary<string, object> : null;
             string engineType = engine != null ? FirstString(engine, "type") : (engineValue as string ?? "");
             if (engineType.Length == 0) engineType = FirstString(root, "engineType");
-            if (engineType != "remote-api-v1" && engineType != "recipe-v1" && engineType != "recipe-v2")
-                throw new InvalidDataException("Engine must be recipe-v2, recipe-v1 or remote-api-v1");
+            if (engineType != "remote-api-v1" && engineType != "recipe-v1" && engineType != "recipe-v2" && engineType != PackageSourceEngineStatic.EngineType)
+                throw new InvalidDataException("Unsupported source engine; update SSPI to use this source");
             string entry = engine != null ? FirstString(engine, "entryFile", "entry")
                                           : FirstString(root, "entryFile", "entry");
             if (entry.Length == 0) entry = "source.json"; // embedded remote-api configuration
@@ -374,7 +416,7 @@ namespace Orbis
         static bool IsLink(ZipEntry entry)
         {
             int unixType = (entry.ExternalFileAttributes >> 16) & 0xF000;
-            return unixType == 0xA000;
+            return unixType != 0 && unixType != 0x8000 && unixType != 0x4000;
         }
 
         static void RejectExecutablePath(string path)

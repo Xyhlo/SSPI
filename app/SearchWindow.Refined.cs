@@ -62,8 +62,14 @@ namespace Orbis
             if (duration < 10000) return;
             string report = "build=" + BuildIdentity.Label + " fps=" + (_frameSamples * 1000.0 / duration).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) +
                 " frames_over_20ms=" + _frameMisses + " longest_ms=" + _frameLongest + " renderer=software 1920x1080";
+            if (BuildIdentity.OwnerDebug)
+            {
+                try { report += " owner_debug=1 managed_heap_bytes=" + GC.GetTotalMemory(false) +
+                    " gc0=" + GC.CollectionCount(0) + " gc1=" + GC.CollectionCount(1) + " gc2=" + GC.CollectionCount(2); }
+                catch (Exception ex) { report += " owner_debug=1 managed_heap_probe_error=" + ex.GetType().Name; }
+            }
             _frameSamples = _frameMisses = _frameLongest = 0; _frameWindowStart = now;
-            ThreadPool.QueueUserWorkItem(_ => { try { File.WriteAllText(Path.Combine(AppSettings.DataDir, "frame-timing.log"), report + "\n"); } catch { } });
+            ThreadPool.QueueUserWorkItem(_ => SspiLog.Write("startup", "frame_sample " + report));
         }
 
         static DlItem PrimaryTransfer(DownloadGroup group)
@@ -85,18 +91,23 @@ namespace Orbis
                 frame = LoadBrandTexture(renderer, "ps4-case-" + frameKey + ".rgba", box.w, box.h);
                 _caseSizes[frameKey] = frame;
             }
-            if (frame != IntPtr.Zero) SDL_RenderCopy(renderer, frame, IntPtr.Zero, ref box);
-            else if (_caseFrame != IntPtr.Zero) SDL_RenderCopy(renderer, _caseFrame, IntPtr.Zero, ref box);
-            else Fill(renderer, box.x, box.y, box.w, box.h, C(20, 77, 157));
-            var art = new SDL_Rect { x = box.x + (int)Math.Round(box.w * .017), y = box.y + (int)Math.Round(box.h * .146), w = (int)Math.Round(box.w * .942), h = (int)Math.Round(box.h * .821) };
+            if (frame == IntPtr.Zero && _caseFrame == IntPtr.Zero) Fill(renderer, box.x, box.y, box.w, box.h, C(20, 77, 157));
+            var art = CaseArtworkBounds(box);
             IntPtr texture; int width, height;
             string key = game == null ? "" : _covers.RequestSized(game.TitleId, game.ImageUrl, art.w, art.h);
             if (_covers.TryGet(key, out texture, out width, out height)) CopyCoverFill(renderer, texture, width, height, art);
-            else if (game != null && _covers.TryGet(game.TitleId, out texture, out width, out height)) CopyCoverFill(renderer, texture, width, height, art);
-            else DrawCover(renderer, game, art);
+            else Fill(renderer, art.x, art.y, art.w, art.h, C(28, 30, 34));
+            if (frame != IntPtr.Zero) SDL_RenderCopy(renderer, frame, IntPtr.Zero, ref box);
+            else if (_caseFrame != IntPtr.Zero) SDL_RenderCopy(renderer, _caseFrame, IntPtr.Zero, ref box);
         }
 
-        static void CopyCoverFill(IntPtr renderer, IntPtr texture, int width, int height, SDL_Rect destination)
+        static SDL_Rect CaseArtworkBounds(SDL_Rect box)
+        {
+            return new SDL_Rect { x = box.x + (int)Math.Round(box.w * .017), y = box.y + (int)Math.Round(box.h * .146),
+                w = (int)Math.Round(box.w * .942), h = (int)Math.Round(box.h * .821) };
+        }
+
+        void CopyCoverFill(IntPtr renderer, IntPtr texture, int width, int height, SDL_Rect destination)
         {
             if (width <= 0 || height <= 0 || destination.w <= 0 || destination.h <= 0) return;
             double ratio = destination.w / (double)destination.h;
@@ -104,7 +115,7 @@ namespace Orbis
             if (width / (double)height > ratio) cropW = Math.Max(1, (int)Math.Round(height * ratio));
             else cropH = Math.Max(1, (int)Math.Round(width / ratio));
             var source = new SDL_Rect { x = (width - cropW) / 2, y = (height - cropH) / 2, w = cropW, h = cropH };
-            SDL_RenderCopy(renderer, texture, ref source, ref destination);
+            _covers.Draw(renderer, texture, ref source, ref destination);
         }
 
         void DrawGroupKinds(IntPtr renderer, DownloadGroup group, int x, int y, bool active)
@@ -158,15 +169,14 @@ namespace Orbis
                 }
                 if (focus)
                 {
-                    // Four cheap strokes keep focus visible without a blur pass.
-                    for (int ring = 4; ring >= 1; ring--)
-                    {
-                        var halo = new SDL_Rect { x = area.x - ring, y = area.y - ring,
-                            w = area.w + ring * 2, h = area.h + ring * 2 };
-                        byte light = (byte)(42 + (4 - ring) * 17);
-                        StrokeRect(renderer, halo, C(light, light, light), 1);
-                    }
-                    StrokeRect(renderer, area, Accent, 1);
+                    SDL_Color stateTone = DownloadRingColor(item);
+                    bool moving = item != null && (item.State == DlState.Downloading || item.State == DlState.Resolving ||
+                        item.State == DlState.Finalizing || item.State == DlState.Installing);
+                    double pulse = !_cfg.ReduceMotion && moving ? .65 + .35 * (.5 + .5 * Math.Sin(UiTick() * Math.PI / 1600.0)) : 1;
+                    var halo = new SDL_Rect { x = area.x - 2, y = area.y - 2,
+                        w = area.w + 4, h = area.h + 4 };
+                    StrokeRect(renderer, halo, C((byte)(stateTone.r * pulse / 3), (byte)(stateTone.g * pulse / 3), (byte)(stateTone.b * pulse / 3)), 1);
+                    StrokeRect(renderer, area, C((byte)(stateTone.r * pulse), (byte)(stateTone.g * pulse), (byte)(stateTone.b * pulse)), 2);
                 }
                 int coverW = focus ? 142 : 68, coverH = focus ? 184 : 88;
                 DrawCase(renderer, new GameHit { TitleId = group.TitleId, Name = group.Name, ImageUrl = group.ImageUrl },
@@ -199,9 +209,9 @@ namespace Orbis
                             }
                             TextFit(renderer, tx + 540, y + 205, 23, ContentWidth - 800, rate, White);
                         }
-                        if (_cfg.NerdStats) DrawFocusedSparkline(renderer, new SDL_Rect { x = tx, y = y + 133, w = ContentWidth - 258, h = 31 });
+                        if (_cfg.NerdStats) DrawFocusedSparkline(renderer, new SDL_Rect { x = tx, y = y + 133, w = ContentWidth - 258, h = 31 }, item);
                         if (item.State == DlState.Failed) TextFit(renderer, tx, y + 258, 19, tw - 180, FriendlyTransferFailure(item.Error), Danger);
-                        else if (item.State != DlState.Downloading) TextFit(renderer, tx, y + 258, 21, tw - 180, VisibleState(item), StateColor(item.State));
+                        else TextFit(renderer, tx, y + 258, 21, tw - 180, ActiveTransferOwnerText(item), StateColor(item.State));
                     }
                     TextFit(renderer, area.x + area.w - 185, y + 265, 20, 150, "Files  " + group.Items.Count + "  ›", White);
                 }
@@ -213,6 +223,23 @@ namespace Orbis
                 y += height + 20;
             }
             if (rows.Count > 4) DrawScrollBar(renderer, new SDL_Rect { x = ContentX + ContentWidth + 16, y = 224, w = 4, h = 716 }, rows.Count, 4, _dlScroll);
+        }
+
+        static SDL_Color DownloadRingColor(DlItem item)
+        {
+            if (item == null) return C(146, 153, 163);
+            switch (item.State)
+            {
+                case DlState.Downloading: return C(87, 196, 220);
+                case DlState.Resolving: return C(180, 155, 220);
+                case DlState.Finalizing:
+                case DlState.Installing:
+                case DlState.Submitted: return C(234, 191, 102);
+                case DlState.Failed: return C(229, 119, 134);
+                case DlState.Completed:
+                case DlState.Installed: return C(131, 207, 164);
+                default: return C(146, 153, 163);
+            }
         }
 
         void DrawTransferFiles(IntPtr renderer)

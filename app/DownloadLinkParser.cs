@@ -30,7 +30,9 @@ namespace Orbis
                 string path = uri.AbsolutePath ?? "";
                 bool package = path.EndsWith(".pkg", StringComparison.OrdinalIgnoreCase) ||
                     path.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) ||
-                    path.EndsWith(".rar", StringComparison.OrdinalIgnoreCase);
+                    path.EndsWith(".rar", StringComparison.OrdinalIgnoreCase) ||
+                    path.EndsWith(".7z", StringComparison.OrdinalIgnoreCase) ||
+                    path.EndsWith(".7zip", StringComparison.OrdinalIgnoreCase);
                 if (!package && !FreeHosterClient.IsSupportedHoster(uri)) continue;
                 if (path.EndsWith(".torrent", StringComparison.OrdinalIgnoreCase)) continue;
                 string absolute = uri.AbsoluteUri;

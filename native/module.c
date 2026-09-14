@@ -39,7 +39,7 @@ int sceKernelGetModuleInfoByName(const char* name, OrbisKernelModuleInfo* info)
     OrbisKernelModuleInfo tmpInfo;
 
     OrbisKernelModule handles[256];
-    size_t numModules;
+    size_t numModules = 0;
     int ret;
 
     if (!name || !info)
@@ -52,6 +52,7 @@ int sceKernelGetModuleInfoByName(const char* name, OrbisKernelModuleInfo* info)
         return ret;
     }
 
+    if (numModules > countof(handles)) numModules = countof(handles);
     for (size_t i = 0; i < numModules; ++i) {
         ret = _sceKernelGetModuleInfo(handles[i], &tmpInfo);
         if (ret)

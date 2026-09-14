@@ -57,6 +57,8 @@ namespace Orbis
         public List<SourceTitleResult> Search(SourceSearchRequest request)
         {
             if (request == null) request = new SourceSearchRequest();
+            if (_engineType == PackageSourceEngineStatic.EngineType)
+                return PackageSourceEngineStatic.Search(_source, _versionPath, request);
             if (string.Equals(_engineType, "remote-api-v1", StringComparison.OrdinalIgnoreCase))
                 return PackageSourceEngineRemote.Search(_source, _versionPath, request.Query ?? "");
             if ((string.Equals(_engineType, "recipe-v1", StringComparison.OrdinalIgnoreCase) || string.Equals(_engineType, "recipe-v2", StringComparison.OrdinalIgnoreCase)))
@@ -73,6 +75,8 @@ namespace Orbis
         public List<PackageCandidate> Resolve(SourceResolveRequest request)
         {
             if (request == null) request = new SourceResolveRequest();
+            if (_engineType == PackageSourceEngineStatic.EngineType)
+                return PackageSourceEngineStatic.Resolve(_source, _versionPath, request);
             if (string.Equals(_engineType, "remote-api-v1", StringComparison.OrdinalIgnoreCase))
                 return PackageSourceEngineRemote.Resolve(_source, _versionPath,
                     request.TitleId ?? "", request.Name ?? "");
@@ -94,6 +98,10 @@ namespace Orbis
         readonly object _gate = new object();
         readonly string _bundledSourcesDirectory;
         PackageSourceStore _store;
+        int _generation;
+        sealed class SearchSnapshot
+        { internal string Key, Fingerprint, Warning; internal int SavedTick; internal List<SourceTitleResult> Matches; }
+        readonly LinkedList<SearchSnapshot> _searchSnapshots = new LinkedList<SearchSnapshot>();
         internal string BundledSourceError { get; private set; }
 
         public PackageSourceRuntimeBridge() : this(ApplicationBaseDirectory()) { }
@@ -197,7 +205,13 @@ namespace Orbis
             error = null;
             try
             {
-                Store().Install(path);
+                // Materialize before first store initialization cleans abandoned staging.
+                var info = new FileInfo(path);
+                if (!info.Exists || info.Length < 1 || info.Length > PackageSourcePackage.MaximumCompressedBytes)
+                    throw new IOException("Source file is missing, empty or too large");
+                byte[] bytes = File.ReadAllBytes(path);
+                Store().Install(bytes);
+                InvalidateCatalogs();
                 return true;
             }
             catch (Exception ex) { error = RootMessage(ex); return false; }
@@ -213,6 +227,7 @@ namespace Orbis
                     error = "Source not found";
                     return false;
                 }
+                InvalidateCatalogs();
                 return true;
             }
             catch (Exception ex) { error = RootMessage(ex); return false; }
@@ -228,6 +243,7 @@ namespace Orbis
                     error = "Source not found";
                     return false;
                 }
+                InvalidateCatalogs();
                 return true;
             }
             catch (Exception ex) { error = RootMessage(ex); return false; }
@@ -235,15 +251,52 @@ namespace Orbis
 
         public List<SourceTitleResult> Search(string query, out string error)
         {
+            SourceSearchPage page = SearchPage(query, 0, 25, null, null, out error);
+            return page == null ? null : page.Results;
+        }
+
+        internal bool Install(byte[] bytes, out string error)
+        {
+            error = null;
+            try { Store().Install(bytes); InvalidateCatalogs(); return true; }
+            catch (Exception ex) { error = RootMessage(ex); return false; }
+        }
+
+        public SourceSearchPage SearchPage(string query, int offset, int limit,
+            Action<SourceSearchPage> progress, Func<bool> cancel, out string error, string region = "", bool freshSearch = false)
+        {
             error = null;
             try
             {
+                string fingerprint = CatalogFingerprint(); int generation = _generation;
+                Func<bool> canceled = () => generation != _generation || (cancel != null && cancel());
+                if (canceled()) throw new OperationCanceledException();
+                string snapshotKey = fingerprint + "\n" + (query ?? "").Trim() + "\n" + PackageSourceEngineStatic.NormalizeRegion(region);
+                SourceSearchPage cached = freshSearch ? null : CachedPage(snapshotKey, offset, limit);
+                if (cached != null)
+                {
+                    if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
+                    LastPartialWarning = cached.Warning;
+                    if (progress != null) progress(cached);
+                    if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
+                    return cached;
+                }
                 PackageSourceCoordinator coordinator = Coordinator();
-                List<SourceTitleResult> results = coordinator.Search(query, 25);
-                LastPartialWarning = results.Count > 0
+                Action<SourceSearchPage> publish = page => {
+                    if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
+                    page.Fingerprint = fingerprint; page.Warning = FailedSourceMessage(coordinator.LastReports);
+                    if (progress != null) progress(page);
+                };
+                SourceSearchPage results = coordinator.SearchPage(query, offset, limit, publish, canceled, region);
+                if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
+                results.Fingerprint = fingerprint;
+                LastPartialWarning = results.TotalMatches > 0
                     ? FailedSourceMessage(coordinator.LastReports) : null;
-                if (results.Count == 0)
+                results.Warning = LastPartialWarning;
+                if (results.TotalMatches == 0)
                     error = FailedSourceMessage(coordinator.LastReports);
+                if (string.IsNullOrEmpty(error)) SaveSnapshot(snapshotKey, results);
+                if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
                 return string.IsNullOrEmpty(error) ? results : null;
             }
             catch (Exception ex) { error = RootMessage(ex); return null; }
@@ -261,12 +314,26 @@ namespace Orbis
 
         public List<PackageCandidate> Resolve(string titleId, string name, string region,
             string catalogUrl, out string error)
+        { return Resolve(titleId, name, region, catalogUrl, "", "", out error); }
+
+        public List<PackageCandidate> Resolve(string titleId, string name, string region,
+            string catalogUrl, string sourceId, string sourceVersion, out string error)
         {
             error = null;
             try
             {
                 PackageSourceCoordinator coordinator = Coordinator();
-                List<PackageCandidate> results = coordinator.Resolve(titleId, name, region, catalogUrl, PackageSourceEngineRemote.MaxPackages);
+                string fingerprint = CatalogFingerprint(); int generation = _generation;
+                if (!string.IsNullOrEmpty(sourceId))
+                {
+                    bool found = false;
+                    foreach (var entry in Store().GetEnabledSources())
+                        if (entry.SourceId == sourceId && (string.IsNullOrEmpty(sourceVersion) || entry.Version == sourceVersion)) { found = true; break; }
+                    if (!found) throw new InvalidOperationException("The selected source changed or is disabled. Search again.");
+                }
+                List<PackageCandidate> results = coordinator.Resolve(titleId, name, region, catalogUrl, sourceId, sourceVersion,
+                    PackageSourceEngineRemote.MaxPackages, () => generation != _generation);
+                if (generation != _generation || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during package lookup");
                 LastPartialWarning = results.Count > 0
                     ? FailedSourceMessage(coordinator.LastReports) : null;
                 if (results.Count == 0)
@@ -274,6 +341,48 @@ namespace Orbis
                 return string.IsNullOrEmpty(error) ? results : null;
             }
             catch (Exception ex) { error = RootMessage(ex); return null; }
+        }
+
+        void InvalidateCatalogs()
+        { System.Threading.Interlocked.Increment(ref _generation); lock (_gate) _searchSnapshots.Clear(); PackageSourceEngineStatic.Invalidate(); }
+
+        SourceSearchPage CachedPage(string key, int offset, int limit)
+        {
+            offset = Math.Max(0, offset); limit = limit <= 0 ? 25 : Math.Min(250, limit);
+            lock (_gate)
+            {
+                for (var node = _searchSnapshots.First; node != null; node = node.Next)
+                {
+                    SearchSnapshot item = node.Value;
+                    if (item.Key != key) continue;
+                    int elapsed = unchecked(Environment.TickCount - item.SavedTick);
+                    if (offset == 0 && (elapsed < 0 || elapsed > (string.IsNullOrEmpty(item.Warning) ? 120000 : 15000))) { _searchSnapshots.Remove(node); return null; }
+                    _searchSnapshots.Remove(node); _searchSnapshots.AddFirst(item);
+                    var page = new SourceSearchPage { Offset = offset, PageSize = limit, TotalMatches = item.Matches.Count,
+                        Fingerprint = item.Fingerprint, Warning = item.Warning, IsComplete = true };
+                    for (int i = offset; i < item.Matches.Count && page.Results.Count < limit; i++) page.Results.Add(PackageSourceEngineStatic.CloneTitle(item.Matches[i]));
+                    if (offset + page.Results.Count < item.Matches.Count) page.NextCursor = (offset + page.Results.Count).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return page;
+                }
+            }
+            return null;
+        }
+
+        void SaveSnapshot(string key, SourceSearchPage page)
+        {
+            if (!page.IsComplete || page.AllMatches == null) return;
+            lock (_gate)
+            {
+                for (var node = _searchSnapshots.First; node != null; node = node.Next)
+                    if (node.Value.Key == key) { _searchSnapshots.Remove(node); break; }
+                var matches = new List<SourceTitleResult>(page.AllMatches.Count);
+                foreach (var title in page.AllMatches) matches.Add(PackageSourceEngineStatic.CloneTitle(title));
+                _searchSnapshots.AddFirst(new SearchSnapshot { Key = key, Fingerprint = page.Fingerprint,
+                    Warning = page.Warning, SavedTick = Environment.TickCount, Matches = matches });
+                int rows = 0; foreach (var item in _searchSnapshots) rows += item.Matches.Count;
+                while (_searchSnapshots.Count > 4 || rows > 60000)
+                { rows -= _searchSnapshots.Last.Value.Matches.Count; _searchSnapshots.RemoveLast(); }
+            }
         }
 
         /// <summary>Failure text from sources that failed while others succeeded.

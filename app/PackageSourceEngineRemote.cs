@@ -484,14 +484,26 @@ namespace Orbis
         {
             int start = _at;
             if (_at < _text.Length && _text[_at] == '-') _at++;
-            while (_at < _text.Length && char.IsDigit(_text[_at])) _at++;
+            if (_at >= _text.Length) { Fail("Invalid JSON number"); return null; }
+            if (_text[_at] == '0') _at++;
+            else
+            {
+                if (_text[_at] < '1' || _text[_at] > '9') { Fail("Invalid JSON number"); return null; }
+                while (_at < _text.Length && _text[_at] >= '0' && _text[_at] <= '9') _at++;
+            }
             if (_at < _text.Length && _text[_at] == '.')
-            { _at++; while (_at < _text.Length && char.IsDigit(_text[_at])) _at++; }
+            {
+                _at++; int digits = _at;
+                while (_at < _text.Length && _text[_at] >= '0' && _text[_at] <= '9') _at++;
+                if (_at == digits) Fail("Invalid JSON fraction");
+            }
             if (_at < _text.Length && (_text[_at] == 'e' || _text[_at] == 'E'))
             {
                 _at++;
                 if (_at < _text.Length && (_text[_at] == '+' || _text[_at] == '-')) _at++;
-                while (_at < _text.Length && char.IsDigit(_text[_at])) _at++;
+                int digits = _at;
+                while (_at < _text.Length && _text[_at] >= '0' && _text[_at] <= '9') _at++;
+                if (_at == digits) Fail("Invalid JSON exponent");
             }
             string token = _text.Substring(start, _at - start);
             long integer;

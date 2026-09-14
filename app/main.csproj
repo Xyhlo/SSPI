@@ -27,7 +27,8 @@
     <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x64' ">
-    <DebugType>pdbonly</DebugType>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
     <Deterministic>true</Deterministic>
     <Optimize>true</Optimize>
     <DefineConstants>TRACE</DefineConstants>
@@ -75,15 +76,23 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="AppSettings.cs" />
+    <Compile Include="CommunitySources.cs" />
+    <Compile Include="DistributionSettings.cs" />
+    <Compile Include="UsbVolumeLabel.cs" />
+    <Compile Include="SearchWindow.Community.cs" />
     <Compile Include="..\..\Build-Output\PS4\generated\BuildIdentity.cs" />
     <Compile Include="AtomicFile.cs" />
     <Compile Include="AllDebridClient.cs" />
+    <Compile Include="PremiumizeClient.cs" />
     <Compile Include="CoverCache.cs" />
+    <Compile Include="CoverImageDecoder.cs" />
+    <Compile Include="NativeJpegDecoder.cs" />
     <Compile Include="DeepbridClient.cs" />
 
     <Compile Include="DownloadManager.cs" />
     <Compile Include="DownloadLinkParser.cs" />
     <Compile Include="DownloadTransferSettings.cs" />
+    <Compile Include="DownloadLinkRecovery.cs" />
     <Compile Include="SequentialDownloadEngine.cs" />
     <Compile Include="FreeHosterClient.cs" />
     <Compile Include="FirmwareInfo.cs" />
@@ -97,8 +106,10 @@
     <Compile Include="LoopbackPkgServer.cs" />
     <Compile Include="LoopbackPkgFeeder.cs" />
     <Compile Include="NativeHttp.cs" />
+    <Compile Include="TransferClient.cs" />
     <Compile Include="NativeImeDialog.cs" />
     <Compile Include="NetHttp.cs" />
+    <Compile Include="ServiceHttpException.cs" />
     <Compile Include="OrbisClient.cs" />
     <Compile Include="PackageSourceCoordinator.cs" />
     <Compile Include="PackageSourceEngineRecipe.cs" />
@@ -106,6 +117,7 @@
     <Compile Include="ResolverPageCache.cs" />
     <Compile Include="SourceHttps.cs" />
     <Compile Include="PackageSourceEngineRemote.cs" />
+    <Compile Include="PackageSourceEngineStatic.cs" />
     <Compile Include="PackageSourceModels.cs" />
     <Compile Include="PackageSourcePackage.cs" />
     <Compile Include="PackageSourceRuntime.cs" />
@@ -114,7 +126,7 @@
     <Compile Include="ArchiveStorage.cs" />
     <Compile Include="ArchiveVolumeSet.cs" />
     <Compile Include="PairServer.cs" />
-    <Compile Include="PcGameApi.cs" />
+    <Compile Include="PairServer.Services.cs" />
     <Compile Include="PixelFont.cs" />
     <Compile Include="PkgInstaller.cs" />
     <Compile Include="BgftOwnershipJournal.cs" />
@@ -133,14 +145,18 @@
     <Compile Include="SearchWindow.cs" />
     <Compile Include="SearchWindow.Branding.cs" />
     <Compile Include="SearchWindow.Charcoal.cs" />
+    <Compile Include="SearchWindow.LinkStatus.cs" />
     <Compile Include="SearchWindow.Refined.cs" />
     <Compile Include="SearchWindow.Design.cs" />
     <Compile Include="SearchWindow.Release.cs" />
+    <Compile Include="CloudCatalog.cs" />
+    <Compile Include="SearchWindow.MyFiles.cs" />
+    <Compile Include="SearchWindow.UsbInstall.cs" />
+    <Compile Include="LocalInstallSource.cs" />
     <Compile Include="SearchWindow.Patterns.cs" />
     <Compile Include="BackdropPattern.cs" />
     <Compile Include="String\CString.cs" />
     <Compile Include="String\StringBufferA.cs" />
-    <Compile Include="TlsBootstrap.cs" />
     <Compile Include="ThemePalette.cs" />
     <Compile Include="TorBoxClient.cs" />
     <Compile Include="UiFont.cs" />
@@ -148,8 +164,13 @@
     <Compile Include="UiVisualPolicy.cs" />
     <Compile Include="UnlockProviders.cs" />
     <Compile Include="DebridHostSupport.cs" />
+    <Compile Include="DebridLinkStatus.cs" />
+    <Compile Include="DebridResolutionError.cs" />
+    <Compile Include="PackageMirrorFallback.cs" />
     <Compile Include="User.cs" />
     <Compile Include="Util.cs" />
+    <Compile Include="SspiLog.cs" />
+    <Compile Include="SspiDataMigration.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\SDK\managed\SDL2-CS\SDL2-CS.csproj">
@@ -161,6 +182,9 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
+    <EmbeddedResource Include="..\assets\distribution.local.config" Condition="Exists('..\assets\distribution.local.config')">
+      <LogicalName>Orbis.Distribution</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="..\assets\audio\*.pcm">
       <LogicalName>Orbis.Audio.%(Filename)%(Extension)</LogicalName>
     </EmbeddedResource>

@@ -19,9 +19,12 @@ static int gs_initialized;
 __attribute__((visibility("default"))) int32_t module_start(size_t argc, const void *argv)
 {
     (void)argc; (void)argv;
-    if (gs_initialized) return 0;
-    for (void (**entry)(void) = __init_array_start; entry != __init_array_end; entry++) (*entry)();
-    gs_initialized = 1;
+    if (!gs_initialized) {
+        for (void (**entry)(void) = __init_array_start; entry != __init_array_end; entry++) (*entry)();
+        gs_initialized = 1;
+    }
+    // Constructors being initialized is not proof that a prior worker started.
+    // plugin_load is idempotent and may retry a failed thread start safely.
     return plugin_load(0, NULL);
 }
 

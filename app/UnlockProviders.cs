@@ -12,77 +12,147 @@ namespace Orbis
         public const string DeepbridId = "deepbrid";
         public const string AllDebridId = "alldebrid";
         public const string TorBoxId = "torbox";
+        public const string PremiumizeId = "premiumize";
         public const string NoneId = "none";
+        static readonly string[] ProviderIds = { RealDebridId, TorBoxId, AllDebridId, PremiumizeId };
+
+        public static string NormalizeIds(string value)
+        {
+            var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string item in (value ?? "").Split(',')) found.Add(item.Trim());
+            var ids = new List<string>();
+            foreach (string id in ProviderIds) if (found.Contains(id)) ids.Add(id);
+            return string.Join(",", ids.ToArray());
+        }
+
+        public static string[] EnabledIds(AppSettings cfg)
+        {
+            var ids = new List<string>();
+            if (cfg == null || !cfg.UseUnlockProvider) return ids.ToArray();
+            string selected = cfg.EnabledUnlockProviders ?? cfg.UnlockProviderId ?? RealDebridId;
+            var enabled = new HashSet<string>(NormalizeIds(selected).Split(','), StringComparer.OrdinalIgnoreCase);
+            if (enabled.Contains(cfg.UnlockProviderId ?? "") && IsConfigured(cfg, cfg.UnlockProviderId)) ids.Add(cfg.UnlockProviderId);
+            foreach (string id in ProviderIds)
+                if (enabled.Contains(id) && IsConfigured(cfg, id) && !ids.Contains(id)) ids.Add(id);
+            return ids.ToArray();
+        }
+
+        public static bool IsEnabled(AppSettings cfg, string id) { return Array.IndexOf(EnabledIds(cfg), id) >= 0; }
+
+        public static string EnabledSummary(AppSettings cfg)
+        {
+            string[] ids = EnabledIds(cfg);
+            if (ids.Length == 0) return "Direct links";
+            if (ids.Length > 2) return ids.Length + " link services";
+            return DisplayName(ids[0]) + (ids.Length == 2 ? " + " + DisplayName(ids[1]) : "");
+        }
+
+        // Inventories rank choices; missing inventory entries never hide a link or block a request.
+        public static string[] RankedProviderIds(AppSettings cfg, string url)
+        {
+            var supported = new List<string>(); var unknown = new List<string>(); var unavailable = new List<string>();
+            foreach (string id in EnabledIds(cfg))
+            {
+                var hosts = DebridHostSupport.Load(cfg, id, false);
+                var state = hosts == null ? DebridHostState.Unknown : hosts.GetState(url);
+                if (state == DebridHostState.Supported) supported.Add(id);
+                else if (state == DebridHostState.Unknown) unknown.Add(id);
+                else unavailable.Add(id);
+            }
+            supported.AddRange(unknown); supported.AddRange(unavailable);
+            return supported.ToArray();
+        }
 
         public static string DisplayName(string id)
         {
             if (string.Equals(id, DeepbridId, StringComparison.OrdinalIgnoreCase)) return "Deepbrid";
             if (string.Equals(id, AllDebridId, StringComparison.OrdinalIgnoreCase)) return "AllDebrid";
             if (string.Equals(id, TorBoxId, StringComparison.OrdinalIgnoreCase)) return "TorBox";
+            if (string.Equals(id, PremiumizeId, StringComparison.OrdinalIgnoreCase)) return "Premiumize";
             if (string.Equals(id, NoneId, StringComparison.OrdinalIgnoreCase)) return "Direct links";
             return "Real-Debrid";
         }
 
         public static bool IsConfigured(AppSettings cfg, string id)
         {
-            if (cfg == null || id == DeepbridId || id == AllDebridId) return false;
+            if (cfg == null || id == DeepbridId) return false;
             if (string.Equals(id, DeepbridId, StringComparison.OrdinalIgnoreCase))
                 return cfg.HasDeepbrid;
             if (string.Equals(id, AllDebridId, StringComparison.OrdinalIgnoreCase))
                 return cfg.HasAllDebrid;
             if (string.Equals(id, TorBoxId, StringComparison.OrdinalIgnoreCase))
                 return cfg.HasTorBox;
+            if (string.Equals(id, PremiumizeId, StringComparison.OrdinalIgnoreCase))
+                return cfg.HasPremiumize;
             if (string.Equals(id, NoneId, StringComparison.OrdinalIgnoreCase))
                 return true;
-            return cfg.HasRealDebrid;
+            return string.Equals(id, RealDebridId, StringComparison.OrdinalIgnoreCase) && cfg.HasRealDebrid;
         }
 
-        public static string Unrestrict(AppSettings cfg, string hosterUrl, Action<string> progress = null, Func<bool> cancel = null)
+        public static bool IsSupported(string id)
+        {
+            return id == RealDebridId || id == TorBoxId || id == AllDebridId || id == PremiumizeId;
+        }
+
+        public static string ApiKey(AppSettings cfg, string id)
+        {
+            if (cfg == null) return "";
+            return (id == RealDebridId ? cfg.RealDebridToken : id == TorBoxId ? cfg.TorBoxApiKey :
+                id == AllDebridId ? cfg.AllDebridApiKey : id == PremiumizeId ? cfg.PremiumizeApiKey : "") ?? "";
+        }
+
+        public static string Unrestrict(AppSettings cfg, string hosterUrl, Action<string> progress = null, Func<bool> cancel = null, Action<string> providerSelected = null, string preferredProviderId = null, ISet<string> unavailableProviders = null)
         {
             if (cfg == null) throw new Exception("No settings");
-            if (!cfg.UseUnlockProvider || cfg.UnlockProviderId == NoneId) return hosterUrl;
-            string selected = cfg.UnlockProviderId ?? RealDebridId;
-            if (selected != RealDebridId && selected != TorBoxId) throw new Exception("Select Real-Debrid or TorBox in Connections");
-            string status = CachedProbe(cfg, selected);
-            // A failed account-status request is not evidence that a subscription expired.
-            if (!status.StartsWith("EXPIRED:", StringComparison.Ordinal)) return UnrestrictWith(cfg, hosterUrl, selected, progress, cancel);
-            foreach (string id in new[] { RealDebridId, TorBoxId })
+            if (!cfg.UseUnlockProvider || (cfg.EnabledUnlockProviders == null && cfg.UnlockProviderId == NoneId)) return hosterUrl;
+            string[] ids = RankedProviderIds(cfg, hosterUrl);
+            int preferred = Array.IndexOf(ids, preferredProviderId ?? "");
+            if (preferred > 0)
             {
-                if (id == selected || !IsConfigured(cfg, id)) continue;
-                if (Probe(cfg, id).StartsWith("EXPIRED:", StringComparison.Ordinal)) continue;
-                try { return UnrestrictWith(cfg, hosterUrl, id, progress, cancel); }
-                catch (OperationCanceledException) { throw; }
-                catch { }
+                string first = ids[preferred];
+                Array.Copy(ids, 0, ids, 1, preferred);
+                ids[0] = first;
             }
-            throw new Exception(DisplayName(selected) + " subscription expired. Renew it or select another Link Service in Settings.");
+            if (ids.Length == 0) throw new Exception("Connect and enable a link service in Connections");
+            Exception last = null;
+            DebridResolutionError mirrorFailure = null;
+            foreach (string selected in ids)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                if (unavailableProviders != null && unavailableProviders.Contains(selected)) continue;
+                try
+                {
+                    if (progress != null) progress("Resolving with " + DisplayName(selected));
+                    string resolved = UnrestrictWith(cfg, hosterUrl, selected, progress, cancel);
+                    if (providerSelected != null) providerSelected(selected);
+                    return resolved;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    var rejection = ex as DebridResolutionError;
+                    // A timed-out create request may already have succeeded remotely.
+                    // Only a definite provider rejection authorizes another provider attempt.
+                    if (rejection == null || !rejection.CanTryProvider) throw;
+                    last = ex;
+                    // An account rejection from a second service must not mask a
+                    // usable service's host-specific failure. Do not ask the
+                    // rejected service again for every mirror in this attempt.
+                    if (rejection.CanTryMirror) mirrorFailure = rejection;
+                    else if (unavailableProviders != null) unavailableProviders.Add(selected);
+                }
+            }
+            if (mirrorFailure != null) throw mirrorFailure;
+            if (last != null) throw last;
+            throw new Exception("No enabled link service could resolve this mirror");
         }
 
         sealed class AccountCache { public string Status; public DateTime Until; }
         static readonly Dictionary<string, AccountCache> Accounts = new Dictionary<string, AccountCache>();
-        static string CachedProbe(AppSettings cfg, string id)
-        {
-            string token = id == TorBoxId ? cfg.TorBoxApiKey : cfg.RealDebridToken;
-            string key;
-            using (var sha = SHA256.Create()) key = id + BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(token ?? "")));
-            lock (Accounts) {
-                AccountCache cached;
-                if (Accounts.TryGetValue(key, out cached) && cached.Until > DateTime.UtcNow) return cached.Status;
-                Accounts[key] = new AccountCache { Status = "Status check pending", Until = DateTime.UtcNow.AddSeconds(15) };
-            }
-            System.Threading.ThreadPool.QueueUserWorkItem(_ => {
-                string result;
-                try { result = id == TorBoxId ? TorBoxClient.ProbeUser(token) : RealDebridClient.ProbeUser(token); } catch { result = "Status unavailable"; }
-                lock (Accounts) {
-                    if (Accounts.Count > 16) Accounts.Clear();
-                    Accounts[key] = new AccountCache { Status = result, Until = DateTime.UtcNow.AddSeconds(result.StartsWith("ERROR") || result.StartsWith("Status unavailable") ? 30 : 300) };
-                }
-            });
-            return "Status check pending";
-        }
         public static string Probe(AppSettings cfg, string id)
         {
             if (cfg == null) return "Not connected";
-            string token = id == DeepbridId ? cfg.DeepbridApiKey : id == AllDebridId ? cfg.AllDebridApiKey : id == TorBoxId ? cfg.TorBoxApiKey : cfg.RealDebridToken;
+            string token = ApiKey(cfg, id);
             string key;
             using (var sha = SHA256.Create()) key = id + BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(token ?? "")));
             lock (Accounts) { AccountCache cached; if (Accounts.TryGetValue(key, out cached) && cached.Until > DateTime.UtcNow) return cached.Status; }
@@ -92,12 +162,58 @@ namespace Orbis
             return status;
         }
 
-        static string UnrestrictWith(AppSettings cfg, string hosterUrl, string id, Action<string> progress, Func<bool> cancel)
+        sealed class ResolveGate
+        {
+            internal bool Busy;
+            internal long Next, BlockedUntil;
+            internal Exception Rejection;
+        }
+        static readonly Dictionary<string, ResolveGate> ResolveGates = new Dictionary<string, ResolveGate>();
+        static readonly System.Diagnostics.Stopwatch ResolveClock = System.Diagnostics.Stopwatch.StartNew();
+
+        public static string UnrestrictWith(AppSettings cfg, string hosterUrl, string id, Action<string> progress = null, Func<bool> cancel = null)
+        {
+            if (cfg == null || !IsSupported(id)) throw new Exception("No enabled link service");
+            ResolveGate admission;
+            lock (ResolveGates)
+            {
+                if (!ResolveGates.TryGetValue(id, out admission))
+                    ResolveGates[id] = admission = new ResolveGate();
+            }
+            // A queued download must not start another create/unrestrict operation
+            // while the same provider is preparing a link or asking us to back off.
+            for (;;)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                lock (admission)
+                {
+                    long now = ResolveClock.ElapsedMilliseconds;
+                    if (now < admission.BlockedUntil) throw admission.Rejection;
+                    if (!admission.Busy && now >= admission.Next) { admission.Busy = true; break; }
+                }
+                System.Threading.Thread.Sleep(50);
+            }
+            try { return UnrestrictAdmitted(cfg, hosterUrl, id, progress, cancel); }
+            catch (DebridResolutionError ex)
+            {
+                if (ex.IsRateLimited)
+                    lock (admission) {
+                        admission.Rejection = ex;
+                        admission.BlockedUntil = Math.Max(admission.BlockedUntil,
+                            ResolveClock.ElapsedMilliseconds + Math.Max(15L, ex.RetryAfterSeconds) * 1000L);
+                    }
+                throw;
+            }
+            finally
+            {
+                lock (admission) { admission.Next = ResolveClock.ElapsedMilliseconds + 1000; admission.Busy = false; }
+            }
+        }
+
+        static string UnrestrictAdmitted(AppSettings cfg, string hosterUrl, string id, Action<string> progress, Func<bool> cancel)
         {
             if (cfg == null) throw new Exception("No settings");
-            if (!cfg.UseUnlockProvider ||
-                string.Equals(cfg.UnlockProviderId, NoneId, StringComparison.OrdinalIgnoreCase))
-                return hosterUrl;
+            if (!IsSupported(id) || !IsEnabled(cfg, id)) throw new Exception("This link service is not enabled in Connections");
             if (cancel != null && cancel()) throw new OperationCanceledException();
             // Host inventories can lag behind aliases and provider support. Let the
             // selected provider resolve the actual URL and report its own result.
@@ -109,7 +225,12 @@ namespace Orbis
             if (string.Equals(id, AllDebridId, StringComparison.OrdinalIgnoreCase))
             {
                 if (!cfg.HasAllDebrid) throw new Exception("Connect AllDebrid in Settings");
-                return AllDebridClient.Unrestrict(cfg.AllDebridApiKey, hosterUrl);
+                return AllDebridClient.Unrestrict(cfg.AllDebridApiKey, hosterUrl, progress, cancel);
+            }
+            if (string.Equals(id, PremiumizeId, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!cfg.HasPremiumize) throw new Exception("Connect Premiumize in Settings");
+                return PremiumizeClient.Unrestrict(cfg.PremiumizeApiKey, hosterUrl, progress, cancel);
             }
             if (string.Equals(id, TorBoxId, StringComparison.OrdinalIgnoreCase))
             {
@@ -124,6 +245,11 @@ namespace Orbis
 
         static string ProbeUncached(AppSettings cfg, string id)
         {
+            if (string.Equals(id, PremiumizeId, StringComparison.OrdinalIgnoreCase))
+            {
+                if (cfg == null || !cfg.HasPremiumize) return "Not connected";
+                return PremiumizeClient.ProbeUser(cfg.PremiumizeApiKey);
+            }
             if (string.Equals(id, DeepbridId, StringComparison.OrdinalIgnoreCase))
             {
                 if (cfg == null || !cfg.HasDeepbrid) return "Not connected";

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../../native/sspi_log.h"
 
 int gs_resident_mount_system_data(void);
 
@@ -11,19 +12,10 @@ int gs_resident_mount_system_data(void);
 #define GS_DAEMON_TID "SRCHD0001"
 #define GS_DONOR_TID "NPXS20119"
 #define GS_HOST_TID "SRCH00001"
-#define GS_APPDB_LOG "/data/GameSearch/resident/appdb.txt"
 
 static void appdb_log(const char* line)
 {
-    FILE* fp;
-    mkdir("/data", 0777);
-    mkdir("/data/GameSearch", 0777);
-    mkdir("/data/GameSearch/resident", 0777);
-    fp = fopen(GS_APPDB_LOG, "a");
-    if (!fp) return;
-    fputs(line ? line : "?", fp);
-    fputc('\n', fp);
-    fclose(fp);
+    gs_log_write("startup", "appdb %s", line ? line : "?");
 }
 
 static int ident_ok(const char* s)
@@ -218,7 +210,6 @@ __attribute__((visibility("default"))) int gs_resident_register_in_appdb(void)
     const char* source;
     char line[160];
 
-    unlink(GS_APPDB_LOG);
     appdb_log("register begin");
     rc = gs_resident_mount_system_data();
     snprintf(line, sizeof(line), "system_data remount=%d errno=%d", rc, errno);

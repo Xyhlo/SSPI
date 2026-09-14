@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -36,6 +36,11 @@ namespace Orbis
         private int _dlFocus;
         private int _dlScroll;
         private bool _splashHidden;
+        private bool _splashHideAttempted, _frameAwaitingPresentation, _firstFramePresented;
+        private uint _splashHideAttemptAt;
+        private string _splashLastFailure;
+        private bool _residentLaunchStarted;
+        private uint _residentLaunchReadyAt;
         private uint _frameTime;
         private uint _lastUiRefresh;
         private enum BusyKind { None, Searching, Resolving }
@@ -96,12 +101,10 @@ namespace Orbis
         private readonly HashSet<string> _libraryHasUpdate =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private int _libraryScanGen;
-        private bool _libraryScanBusy;
+        private volatile bool _libraryScanBusy;
         private uint _consoleScanAt;
         private readonly List<GameHit> _consoleInstalled = new List<GameHit>(12);
         private readonly List<GameHit> _cloudPool = new List<GameHit>(18);
-        private readonly HashSet<string> _landingCoverRequested =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private uint _landingModelAt;
         private string _firmwareVersion = "unknown";
         private string _freeStorageLabel = "— GB";
@@ -165,7 +168,7 @@ namespace Orbis
         private uint _toastStartedAt;
         private bool _toastActive;
         private const uint ToastEnterMs = 160;
-        private const uint ToastHoldMs = 4400;
+        private const uint ToastHoldMs = 3000;
         private const uint ToastExitMs = 160;
 
         private List<GameHit> _results = new List<GameHit>();
@@ -189,6 +192,7 @@ namespace Orbis
 
         private sealed class DownloadGroup
         {
+            public string Key;
             public string TitleId;
             public string Name;
             public string ImageUrl;
@@ -244,6 +248,8 @@ namespace Orbis
 
         public SearchWindow() : base(W, H)
         {
+            RequireStartupRenderer(Renderer == null ? IntPtr.Zero : Renderer.Handler);
+            Program.StartupStage("window-renderer-ready");
             FPS = 60;
             ClearR = Bg.r; ClearG = Bg.g; ClearB = Bg.b;
             // Continue the branded PS4 launch screen while managed services initialize.
@@ -255,44 +261,89 @@ namespace Orbis
                     PaintLaunchBranding(Renderer.Handler, 0);
                     if (SDL_UpdateWindowSurface(Handler) == 0)
                     {
-                        try { UserService.HideSplashScreen(); _splashHidden = true; } catch { }
+                        EnsureSplashHidden();
                     }
                 }
             }
             catch { }
-            _firmwareVersion = FirmwareInfo.Probe();
-
+            Program.StartupStage("settings-load");
             _cfg.Load();
-            if (_cfg.UnlockProviderId == UnlockProviders.DeepbridId || _cfg.UnlockProviderId == UnlockProviders.AllDebridId) { _cfg.UnlockProviderId = _cfg.HasTorBox ? UnlockProviders.TorBoxId : UnlockProviders.RealDebridId; _cfg.DeepbridApiKey = ""; _cfg.AllDebridApiKey = ""; _cfg.Save(); }
-            _dlMgr = new DownloadManager(_cfg);
-            _covers = new CoverCache();
+            if (_cfg.UnlockProviderId == UnlockProviders.DeepbridId) { _cfg.UnlockProviderId = _cfg.HasTorBox ? UnlockProviders.TorBoxId : UnlockProviders.RealDebridId; _cfg.DeepbridApiKey = ""; _cfg.Save(); }
             _proxyDraft = _cfg.ProxyBaseUrl ?? "";
             _deepbridDraft = _cfg.DeepbridApiKey ?? "";
             _allDebridDraft = _cfg.AllDebridApiKey ?? "";
             _torBoxDraft = _cfg.TorBoxApiKey ?? "";
-            RefreshSourceUi();
-            LoadRecentQueries();
-            RefreshLandingModel();
-            StartLibraryUpdateScan();
-            _freeStorageLabel = ReadFreeStorageLabel();
             _lastInputAt = UiTick();
+            Program.StartupStage("controller-open");
             if (Joystick.Online > 0) Joystick.Open(0);
 
+            Program.StartupStage("font-load");
             try { UiFont.Ensure(); } catch { }
 
-            // NativeHttp init is background/lazy — don't block first paint.
-            string https = NativeHttp.Available ? "HTTPS OK" : "HTTPS INIT...";
+            // NativeHttp.Available initializes the native transport. Leave it
+            // untouched until a network request, so opening the UI works offline.
             if (_cfg.HasActiveUnlock)
-                SetStatus(https + " | " + UnlockProviders.DisplayName(_cfg.UnlockProviderId) + " ready");
+                SetStatus(UnlockProviders.DisplayName(_cfg.UnlockProviderId) + " ready");
             else
-                SetStatus(https + " | Options = pair Real-Debrid");
+                SetStatus("Options = connect a download service");
             Invalidated = true;
+        }
+
+        internal static void RequireStartupRenderer(IntPtr renderer)
+        {
+            if (renderer == IntPtr.Zero)
+                throw new SDL2.Exceptions.SDLException("SDL_CreateSoftwareRenderer failed: " + SDL_GetError(), -1);
+        }
+
+        internal static bool SplashRetryDue(bool attempted, uint lastAttempt, uint now)
+        {
+            return !attempted || unchecked(now - lastAttempt) >= 1000;
+        }
+
+        void ObservePresentedFrame()
+        {
+            // Window.Run calls the next cycle only after SDL_UpdateWindowSurface
+            // succeeded. A drawn frame alone is not proof it reached the screen.
+            if (!_frameAwaitingPresentation) return;
+            _frameAwaitingPresentation = false;
+            if (!_firstFramePresented)
+            {
+                _firstFramePresented = true;
+                Program.StartupStage("first-frame-presented");
+            }
+            EnsureSplashHidden();
         }
 
         void EnsureSplashHidden()
         {
             if (_splashHidden) return;
-            try { UserService.HideSplashScreen(); _splashHidden = true; } catch { }
+            uint now = UiTick();
+            if (!SplashRetryDue(_splashHideAttempted, _splashHideAttemptAt, now)) return;
+            _splashHideAttempted = true;
+            _splashHideAttemptAt = now;
+            try
+            {
+                int result;
+                _splashHidden = UserService.TryHideSplashScreen(out result);
+                if (_splashHidden) Program.StartupStage("system-splash-hidden");
+                else
+                {
+                    string failure = "code=0x" + unchecked((uint)result).ToString("X8");
+                    if (_splashLastFailure != failure)
+                        SspiLog.Write("startup", "stage=system-splash-hide-pending " + failure);
+                    _splashLastFailure = failure;
+                }
+            }
+            catch (Exception ex)
+            {
+                string failure = ex.GetType().FullName;
+                if (_splashLastFailure != failure)
+                {
+                    Program.RecordFailure(ex);
+                    Program.StartupStage("system-splash-hide-unavailable");
+                }
+                _splashLastFailure = failure;
+            }
         }
 
         void SetStatus(string s) { lock (_lock) { _status = s ?? ""; } }
@@ -454,8 +505,7 @@ namespace Orbis
             }
             _libraryGames.Clear();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            // Full library: cover textures stay bounded inside CoverCache (32
-            // with eviction); update scans run over the whole list.
+            // Keep library metadata complete; only visible rows request artwork.
             for (int i = 0; i < _consoleInstalled.Count && _libraryGames.Count < 256; i++)
             {
                 GameHit hit = _consoleInstalled[i];
@@ -468,8 +518,6 @@ namespace Orbis
                         if (string.Equals(saved.TitleId, hit.TitleId, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(saved.Name) && !string.Equals(saved.Name, hit.TitleId, StringComparison.OrdinalIgnoreCase)) { hit.Name = saved.Name; break; }
                 }
                 _libraryGames.Add(hit);
-                if (!string.IsNullOrEmpty(hit.ImageUrl))
-                    _covers.Request(hit.TitleId, hit.ImageUrl);
             }
             if (items == null) return;
             for (int i = 0; i < items.Count && _libraryGames.Count < 256; i++)
@@ -493,16 +541,18 @@ namespace Orbis
                     Source = item.SourceAttribution
                 };
                 _libraryGames.Add(hit);
-                if (!string.IsNullOrEmpty(hit.ImageUrl))
-                    _covers.Request(hit.TitleId, hit.ImageUrl);
             }
         }
 
         string _libraryScanKey = "";
         readonly Dictionary<string, string> _libraryUpdateInfo = new Dictionary<string, string>();
+        readonly Dictionary<string, OrbisTitleMetadata> _libraryMetadata =
+            new Dictionary<string, OrbisTitleMetadata>(StringComparer.OrdinalIgnoreCase);
+        int _libraryMetadataCursor;
         void StartLibraryUpdateScan()
         {
-            if (_libraryScanBusy || _libraryGames.Count == 0) return;
+            if (!_startupServicesReady || !_launchFinished || _libraryScanBusy || _libraryGames.Count == 0) return;
+            if (_dlMgr != null && _dlMgr.IsPipelineActive) return;
             var keys = new List<string>();
             foreach (var game in _libraryGames) keys.Add(game.TitleId + ":" + game.Version);
             keys.Sort(StringComparer.Ordinal);
@@ -512,72 +562,39 @@ namespace Orbis
             _nextUpdateScan = DateTime.UtcNow.AddMinutes(15).Ticks;
             GameHit[] copy = _libraryGames.ToArray();
             int gen = ++_libraryScanGen;
+            int first = _libraryMetadataCursor % copy.Length;
             _libraryScanBusy = true;
             new Thread(() =>
             {
                 try
                 {
-                    string err;
-                    if (!_packageSources.HasEnabled(out err)) { _nextUpdateScan = DateTime.UtcNow.AddSeconds(30).Ticks; return; }
+                    int unavailable = 0;
                     for (int i = 0; i < copy.Length; i++)
                     {
                         if (gen != _libraryScanGen) return;
-                        GameHit hit = copy[i];
+                        if (_dlMgr != null && _dlMgr.IsPipelineActive)
+                        { _nextUpdateScan = DateTime.UtcNow.Ticks; return; }
+                        int index = (first + i) % copy.Length;
+                        GameHit hit = copy[index];
                         if (hit == null) continue;
-                        bool cachedUpdate; string cachedInfo;
-                        string updateCacheKey = QueryCache.UpdateKey(hit.TitleId, hit.Version);
-                        if (QueryCache.TryUpdateKey(updateCacheKey, out cachedUpdate, out cachedInfo))
-                        { lock (_lock) { if (gen != _libraryScanGen) return; if (cachedUpdate) { _libraryHasUpdate.Add(hit.TitleId); _libraryUpdateInfo[hit.TitleId] = cachedInfo; } else { _libraryHasUpdate.Remove(hit.TitleId); _libraryUpdateInfo.Remove(hit.TitleId); } } continue; }
-                        List<PackageCandidate> cands = _packageSources.Resolve(hit.TitleId, hit.Name, hit.Region, out err);
+                        OrbisTitleMetadata metadata = OrbisClient.GetTitleMetadata(hit.TitleId);
                         if (gen != _libraryScanGen) return;
-                        bool update = false; string updateInfo = "", newestVersion = hit.Version;
-                        if (cands != null)
-                        {
-                            for (int c = 0; c < cands.Count; c++)
-                            {
-                                PackageCandidate cand = cands[c];
-                                if (cand == null) continue;
-                                // Same classifier as the results page (hint + label fallback),
-                                // so a badge shown in results always matches library detection.
-                                string kind = PackageCandidatePresentation.EffectiveKind(cand);
-                                if (kind != "update" && kind != "backport")
-                                    continue;
-                                bool remoteKnown = HasVersionDigits(cand.PackageVersion);
-                                if (remoteKnown && VersionNewer(cand.PackageVersion, newestVersion))
-                                {
-                                    update = true;
-                                    newestVersion = cand.PackageVersion;
-                                    updateInfo = (kind == "backport" ? "Backport" : "Update") + " v" + cand.PackageVersion + " · " + (string.IsNullOrEmpty(cand.SourceAttribution) ? cand.SourceId : cand.SourceAttribution);
-                                }
-                                else if (!remoteKnown && !update)
-                                {
-                                    // Unparseable remote version is never a confirmed newer
-                                    // badge; surface it as inspect-only without moving the baseline.
-                                    update = true;
-                                    updateInfo = "Update available to inspect · " + (string.IsNullOrEmpty(cand.SourceAttribution) ? cand.SourceId : cand.SourceAttribution);
-                                }
-                            }
-                        }
-                        if (!string.IsNullOrEmpty(err)) { _nextUpdateScan = DateTime.UtcNow.AddSeconds(30).Ticks; continue; } // Retry transient failures without caching a negative result.
-                        string partial = _packageSources.LastPartialWarning;
                         lock (_lock)
                         {
                             if (gen != _libraryScanGen) return;
-                            // Retain the source configuration from before the network request.
-                            if (!update && !string.IsNullOrEmpty(partial))
-                            {
-                                // Partial coverage: useful results stand, but never cache
-                                // a negative result — the failed source may hold the update.
-                                _libraryHasUpdate.Remove(hit.TitleId);
-                                _libraryUpdateInfo.Remove(hit.TitleId);
-                            }
-                            else
-                            {
-                                QueryCache.PutUpdateKey(updateCacheKey, update, updateInfo);
-                                if (update) { _libraryHasUpdate.Add(hit.TitleId); _libraryUpdateInfo[hit.TitleId] = updateInfo; }
-                                else { _libraryHasUpdate.Remove(hit.TitleId); _libraryUpdateInfo.Remove(hit.TitleId); }
-                            }
+                            _libraryMetadataCursor = (index + 1) % copy.Length;
+                            _libraryMetadata[hit.TitleId] = metadata;
+                            _libraryUpdateInfo[hit.TitleId] = metadata.UpdateLabel(hit.Version);
+                            if (metadata.HasNewerUpdate(hit.Version)) _libraryHasUpdate.Add(hit.TitleId);
+                            else _libraryHasUpdate.Remove(hit.TitleId);
                         }
+                        // One worker and a short failure retry avoid flooding an offline service.
+                        if (!metadata.Known)
+                        {
+                            _nextUpdateScan = DateTime.UtcNow.AddMinutes(2).Ticks;
+                            if (++unavailable >= 3) return;
+                        }
+                        else unavailable = 0;
                     }
                 }
                 catch { }
@@ -586,23 +603,58 @@ namespace Orbis
                     _libraryScanBusy = false;
                     Invalidated = true;
                 }
-            }) { IsBackground = true, Name = "SSPI update scanner" }.Start();
+            }) { IsBackground = true, Name = "SSPI library metadata" }.Start();
+        }
+
+        string LibraryUpdateStatus(GameHit hit, out bool newer)
+        {
+            newer = false;
+            OrbisTitleMetadata metadata;
+            if (hit == null || !_libraryMetadata.TryGetValue(hit.TitleId ?? "", out metadata))
+                return _libraryScanBusy ? "Checking updates…" : "Update info unknown";
+            if (metadata.ExpiresUtc <= DateTime.UtcNow) return "Update info unknown";
+            newer = metadata.HasNewerUpdate(hit.Version);
+            return metadata.UpdateLabel(hit.Version);
+        }
+
+        static string LibraryInstalledVersion(GameHit hit)
+        {
+            Version version;
+            return hit != null && OrbisClient.TryAppVersion(hit.Version, out version)
+                ? "Installed v" + hit.Version.Trim() : "Installed · version unknown";
         }
 
         int _pairRevision;
+        readonly Queue<string> _pairToastNotices = new Queue<string>();
         volatile bool _pairSourcesChanged;
         void PollPairState()
         {
+            var sourceCompletion = Interlocked.Exchange(ref _sourceBrowserComplete, null);
+            if (sourceCompletion != null) sourceCompletion();
             if (!_pairSessionActive) return;
             if (_pairSourcesChanged) { _pairSourcesChanged = false; SourcesChanged(); }
             if (_pairRevision != _pair.Revision)
             {
                 _pairRevision = _pair.Revision;
                 _torBoxDraft = _cfg.TorBoxApiKey ?? "";
+                _allDebridDraft = _cfg.AllDebridApiKey ?? "";
                 CaptureAppearanceDraft(); _settingsDirty = false;
                 SetStatus("Configuration saved · " + UnlockProviders.DisplayName(_cfg.UnlockProviderId));
                 Invalidated = true;
             }
+            PairServer.ServiceNotice serviceNotice;
+            while (_pair.TryTakeServiceNotice(out serviceNotice))
+            {
+                if (serviceNotice.Saved) _pairToastNotices.Clear();
+                if (serviceNotice.Saved && _uiOverlay == UiOverlay.QrPair && !_pairDownloadMode)
+                { _uiOverlay = UiOverlay.None; _pairUiStage = PairUiStage.Complete; }
+                SetStatus(serviceNotice.Message);
+                if (_pairToastNotices.Count >= 12) _pairToastNotices.Dequeue();
+                _pairToastNotices.Enqueue(serviceNotice.Message);
+                Invalidated = true;
+            }
+            if (!_toastActive && (!_settingsOpen || _sourceInstallStage == SourceInstallStage.Idle) &&
+                _pairToastNotices.Count > 0) User.NotifyToast(_pairToastNotices.Dequeue());
             if (!string.IsNullOrEmpty(_pair.PendingSource) && !SourceInstallActive(GetSourceInstallView().Stage))
             { _sourceUrlDraft = _pair.PendingSource; _pair.PendingSource = null; StartSourceInstall(); }
             _pair.InstalledSources = string.Join("\n", _sourceUi.ConvertAll(x => x.Name + " · v" + x.Version + (x.Enabled ? " · Enabled" : " · Disabled")).ToArray());
@@ -719,7 +771,11 @@ namespace Orbis
         void HandleButtonCore(DS4Button button)
         {
             _lastInputAt = UiTick();
-            if (!_launchFinished) { FinishLaunchBranding(); Invalidated = true; return; }
+            if (!_launchFinished) { HandleStartupButton(button); Invalidated = true; return; }
+            if (!_settingsOpen && !_softKbOpen && _uiOverlay == UiOverlay.None && _tab == TopTab.Downloads && button == DS4Button.SCE_PAD_BUTTON_TOUCH_PAD)
+            { _settingsOpen=true; _settingsPage=6; _settingsFocus=0; _cloudFolder=""; _cloudMenu=false; _cloudMessage=""; return; }
+            if (_settingsOpen && _settingsPage==6 && !_softKbOpen && _uiOverlay == UiOverlay.None)
+            { HandleSettings(button); Invalidated=true; return; }
             if (_uiOverlay != UiOverlay.None)
             {
                 HandleUiOverlay(button);
@@ -782,13 +838,20 @@ namespace Orbis
                 _tab == TopTab.Search && _screen != BrowseScreen.Search &&
                 _screen != BrowseScreen.Detail)
             {
+                lock (_lock)
+                {
+                    ++_searchGeneration;
+                    _browseBusy = false;
+                    _busyKind = BusyKind.None;
+                }
                 _screen = BrowseScreen.Search;
                 SetStatus("Search");
                 return;
             }
 
             bool busy;
-            lock (_lock) busy = _browseBusy;
+            lock (_lock) busy = _browseBusy && !(_busyKind == BusyKind.Searching &&
+                _screen == BrowseScreen.Results && _results.Count > 0);
             if (busy && _tab == TopTab.Search && button != DS4Button.SCE_PAD_BUTTON_CIRCLE &&
                 button != DS4Button.SCE_PAD_BUTTON_L1 && button != DS4Button.SCE_PAD_BUTTON_R1)
             {
@@ -858,7 +921,13 @@ namespace Orbis
             _cfg.AllDebridApiKey = (_allDebridDraft ?? "").Trim();
             _cfg.TorBoxApiKey = (_torBoxDraft ?? "").Trim();
             _cfg.ValidateAppearance(true);
-            _cfg.Save();
+            if (!_cfg.Save())
+            {
+                _settingsDirty = true;
+                SetStatus("Settings could not be saved. Check free storage and retry.");
+                Invalidated = true;
+                return;
+            }
             CaptureAppearanceDraft();
             _settingsDirty = false;
             CloseSettings();
@@ -884,11 +953,29 @@ namespace Orbis
                 : "Link Service not set");
         }
 
-        void StartPairSession()
+        internal static string PairingStorageError()
         {
+            return AppSettings.DataDirWritable ? null :
+                "Pairing cannot start because SSPI storage is unavailable: " +
+                (AppSettings.DataDirError ?? AppSettings.DataDir) + ". See logs/startup.log";
+        }
+
+        void StartPairSession(bool downloadMode = false)
+        {
+            _pairDownloadMode = downloadMode;
             try
             {
+                string storageError = PairingStorageError();
+                if (storageError != null) throw new IOException(storageError);
                 _pair.Settings = _cfg;
+                _pair.QueueDownloadLink = url => {
+                    string name = Uri.UnescapeDataString(Path.GetFileName(new Uri(url).AbsolutePath));
+                    if (string.IsNullOrWhiteSpace(name) || name.Length > 180 || name.IndexOf('.') < 0) name = "Resolving package";
+                    string message;
+                    return _dlMgr.Enqueue(new GameHit { TitleId = "", Name = name, ImageUrl = "" },
+                        new PkgLink { Kind = "package", Label = "Personal file", Url = url },
+                        "personal", "1", "", "Personal", "", "", out message);
+                };
                 _pair.SetSourceEnabled = (id, enabled) => {
                     string error;
                     if (!_packageSources.SetEnabled(id, enabled, out error)) return error ?? "Source update failed";
@@ -903,6 +990,7 @@ namespace Orbis
                     _pairUiDetail = string.IsNullOrEmpty(_pair.Status)
                         ? "Could not start pairing." : _pair.Status;
                     SetStatus("Pair server fail: " + _pairUiDetail);
+                    SspiLog.Write("network", "pairing startup failed: " + _pairUiDetail);
                     _pairUrlShown = "";
                     _qr = null;
                     _qrSize = 0;
@@ -912,13 +1000,15 @@ namespace Orbis
                 _pairSuccessConsumed = false;
                 _pairUiStage = PairUiStage.Waiting;
                 _pairUiDetail = "Waiting for an API key from the pairing page.";
-                _pairUrlShown = _pair.PairUrl;
+                _pairUrlShown = _pair.PairUrl + (_pairDownloadMode ? "#downloads" : "");
                 try { _qr = QrCode.Encode(_pairUrlShown, out _qrSize); }
                 catch { _qr = null; _qrSize = 0; }
                 SetStatus("Pair: " + _pairUrlShown);
             }
             catch (Exception ex)
             {
+                SspiLog.Write("network", "pairing startup path=" + AppSettings.DataDir +
+                    " exception=" + ex.GetType().FullName + " hresult=0x" + ex.HResult.ToString("X8") + " " + ex);
                 _pairSessionActive = false;
                 _pairUiStage = PairUiStage.Failed;
                 _pairUiDetail = "Could not start pairing: " + ex.Message;
@@ -933,51 +1023,53 @@ namespace Orbis
         {
             if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE)
             {
-                if (_settingsPage == 2) { _settingsPage = 1; _settingsFocus = 3; return; }
+                if (_settingsPage == 4 && StorageBack()) return;
+                if (_settingsPage == 6 && CloudBack()) return;
+                if (_settingsPage == 2 && SourceBrowserBack()) return;
+                if (_settingsPage == 2) { _settingsPage = 1; _settingsFocus = 5; return; }
                 TryCloseSettings();
                 return;
             }
             if (_settingsPage == 0) HandleSettingsGeneral(b);
             else if (_settingsPage == 1) HandleSettingsUnlock(b);
             else if (_settingsPage == 2) HandleSettingsPackageSources(b);
-            else if (_settingsPage == 4) HandleStorage(b);
+            else if (_settingsPage == 4) StorageMenu(b);
+            else if (_settingsPage == 6) HandleMyFiles(b);
             else if (_settingsPage == 5) HandleSettingsSound(b);
             else HandleSettingsAppearance(b);
         }
 
         void HandleSettingsGeneral(DS4Button b)
         {
-            const int n = 6;
+            const int n = 7;
             if (b == DS4Button.SCE_PAD_BUTTON_UP) { _settingsFocus = (_settingsFocus + n - 1) % n; return; }
             if (b == DS4Button.SCE_PAD_BUTTON_DOWN) { _settingsFocus = (_settingsFocus + 1) % n; return; }
-            if (_settingsFocus == 0 && (b == DS4Button.SCE_PAD_BUTTON_LEFT || b == DS4Button.SCE_PAD_BUTTON_RIGHT))
-            { SetDownloadRangeCount(_cfg.DownloadLimitMBps + (b == DS4Button.SCE_PAD_BUTTON_LEFT ? -5 : 5)); return; }
             if (b != DS4Button.SCE_PAD_BUTTON_CROSS) return;
-            if (_settingsFocus == 0) SetDownloadRangeCount(_cfg.DownloadLimitMBps >= 100 ? 0 : _cfg.DownloadLimitMBps + 5);
-            else if (_settingsFocus == 1) { _cfg.DownloadStatsMode = (_cfg.DownloadStatsMode + 1) % 4; MarkSettingsDirty(); }
-            else if (_settingsFocus == 2) { _cfg.NerdStats = !_cfg.NerdStats; MarkSettingsDirty(); }
-            else if (_settingsFocus == 3) { _cfg.ShowFirmwareHints = !_cfg.ShowFirmwareHints; MarkSettingsDirty(); }
-            else if (_settingsFocus == 4) { _uiOverlay = UiOverlay.ConfirmClearHistory; _overlayTitle = "Clear removable history?"; }
+            if (_settingsFocus == 0)
+            {
+                _cfg.UseBgftDirect = !_cfg.UseBgftDirect; MarkSettingsDirty();
+                if (_cfg.UseBgftDirect) ResidentDownloadService.RetryActivation();
+                SetStatus(_cfg.UseBgftDirect ? "Background selected; an active In-app transfer finishes its current file before handoff" : "In-app selected; keep SSPI open");
+            }
+            else if (_settingsFocus == 1) { ResidentDownloadService.RetryActivation(); SetStatus("Checking background worker; queued downloads will resume when ready"); }
+            else if (_settingsFocus == 2) { _cfg.DownloadStatsMode = (_cfg.DownloadStatsMode + 1) % 4; MarkSettingsDirty(); }
+            else if (_settingsFocus == 3) { _cfg.NerdStats = !_cfg.NerdStats; MarkSettingsDirty(); }
+            else if (_settingsFocus == 4) { _cfg.ShowFirmwareHints = !_cfg.ShowFirmwareHints; MarkSettingsDirty(); }
+            else if (_settingsFocus == 5) { _uiOverlay = UiOverlay.ConfirmClearHistory; _overlayTitle = "Clear removable history?"; }
             else SaveSettingsAndClose();
-        }
-
-        void SetDownloadRangeCount(int value)
-        {
-            _cfg.DownloadLimitMBps = Math.Max(0, Math.Min(1000, value));
-            MarkSettingsDirty();
-            SetStatus(_cfg.DownloadLimitMBps == 0 ? "Download bandwidth: unlimited" : "Download limit: " + _cfg.DownloadLimitMBps + " MB/s");
         }
 
         void HandleSettingsUnlock(DS4Button b)
         {
-            if (b == DS4Button.SCE_PAD_BUTTON_UP) { _settingsFocus = (_settingsFocus + 3) % 4; return; }
-            if (b == DS4Button.SCE_PAD_BUTTON_DOWN) { _settingsFocus = (_settingsFocus + 1) % 4; return; }
+            if (b == DS4Button.SCE_PAD_BUTTON_UP) { _settingsFocus = (_settingsFocus + 5) % 6; return; }
+            if (b == DS4Button.SCE_PAD_BUTTON_DOWN) { _settingsFocus = (_settingsFocus + 1) % 6; return; }
             if (b == DS4Button.SCE_PAD_BUTTON_SQUARE) { StartPairSession(); _uiOverlay = UiOverlay.QrPair; return; }
             if (b != DS4Button.SCE_PAD_BUTTON_CROSS && b != DS4Button.SCE_PAD_BUTTON_LEFT && b != DS4Button.SCE_PAD_BUTTON_RIGHT) return;
-            if (_settingsFocus == 3) { _settingsPage = 2; _settingsFocus = 0; RefreshSourceUi(); return; }
-            string id = _settingsFocus == 0 ? UnlockProviders.RealDebridId : _settingsFocus == 1 ? UnlockProviders.TorBoxId : UnlockProviders.NoneId;
+            if (_settingsFocus == 5) { _settingsPage = 2; _settingsFocus = 0; RefreshSourceUi(); return; }
+            string id = ConnectionProviderIds[Math.Max(0, Math.Min(_settingsFocus, ConnectionProviderIds.Length - 1))];
             string error;
-            if (_cfg.TrySelectDownloadService(id, out error)) SetStatus(UnlockProviders.DisplayName(id) + " selected for new downloads");
+            if (_cfg.TryToggleDownloadService(id, out error)) SetStatus(id == UnlockProviders.NoneId ? "Direct links selected" :
+                UnlockProviders.DisplayName(id) + (UnlockProviders.IsEnabled(_cfg, id) ? " enabled for new downloads" : " disabled for new downloads"));
             else {
                 if (!UnlockProviders.IsConfigured(_cfg, id)) { StartPairSession(); _uiOverlay = UiOverlay.QrPair; }
                 SetStatus(error);
@@ -993,8 +1085,9 @@ namespace Orbis
 
         void HandleSettingsPackageSources(DS4Button b)
         {
+            if (_sourceBrowseMode != 0) { HandleSourceBrowser(b); return; }
             RefreshSourceUi();
-            int n = 1 + _sourceUi.Count; // Install, then one row per installed source.
+            int n = 3 + _sourceUi.Count;
             if (b == DS4Button.SCE_PAD_BUTTON_UP) { _settingsFocus = (_settingsFocus + n - 1) % n; return; }
             if (b == DS4Button.SCE_PAD_BUTTON_DOWN) { _settingsFocus = (_settingsFocus + 1) % n; return; }
             if (SourceInstallActive(GetSourceInstallView().Stage) &&
@@ -1003,9 +1096,9 @@ namespace Orbis
                 SetStatus("Package Source install is still working");
                 return;
             }
-            if (b == DS4Button.SCE_PAD_BUTTON_SQUARE && _settingsFocus > 0)
+            if (b == DS4Button.SCE_PAD_BUTTON_SQUARE && _settingsFocus >= 3)
             {
-                SourceUiEntry remove = _sourceUi[_settingsFocus - 1];
+                SourceUiEntry remove = _sourceUi[_settingsFocus - 3];
                 string error;
                 if (_packageSources.Remove(remove.Id, out error))
                 {
@@ -1016,8 +1109,10 @@ namespace Orbis
                 return;
             }
             if (b != DS4Button.SCE_PAD_BUTTON_CROSS) return;
-            if (_settingsFocus == 0) { StartPairSession(); _uiOverlay = UiOverlay.QrPair; return; }
-            SourceUiEntry item = _sourceUi[_settingsFocus - 1];
+            if (_settingsFocus == 0) { BrowseSourceUsb(null); return; }
+            if (_settingsFocus == 1) { _communityPages.Clear(); BrowseCommunity(""); return; }
+            if (_settingsFocus == 2) { StartPairSession(); _uiOverlay = UiOverlay.QrPair; return; }
+            SourceUiEntry item = _sourceUi[_settingsFocus - 3];
             string toggleError;
             if (_packageSources.SetEnabled(item.Id, !item.Enabled, out toggleError))
             {
@@ -1091,8 +1186,8 @@ namespace Orbis
                     .Append("\",\"enabled\":").Append(source.Enabled ? "true" : "false").Append('}');
             }
             _pair.SourceChoicesJson = choices.Append(']').ToString();
-            int max = Math.Max(0, _sourceUi.Count);
-            if (_settingsPage == 2 && _settingsFocus > max) _settingsFocus = max;
+            int max = 2 + _sourceUi.Count;
+            if (_settingsPage == 2 && _sourceBrowseMode == 0 && _settingsFocus > max) _settingsFocus = max;
         }
 
         void OpenSourceUrlKeyboard()
@@ -1428,7 +1523,7 @@ namespace Orbis
             switch (b)
             {
                 case DS4Button.SCE_PAD_BUTTON_UP:
-                    if (!_softKbForProxy && !_softKbForDeepbrid && !_softKbForAllDebrid &&
+                    if (_settingsPage!=6 && !_softKbForProxy && !_softKbForDeepbrid && !_softKbForAllDebrid &&
                         !_softKbForTorBox && !_softKbForSourceUrl &&
                         _kbRow == 0 && _kbSuggestionCount > 0)
                     {
@@ -1437,11 +1532,11 @@ namespace Orbis
                     }
                     else if (_kbSuggestionFocus >= 0)
                         _kbSuggestionFocus = (_kbSuggestionFocus + _kbSuggestionCount - 1) % _kbSuggestionCount;
-                    else if (_kbRow > 0) { _kbRow--; ClampKb(); }
+                    else if (_kbRow > 0) MoveKeyboardRow(-1);
                     break;
                 case DS4Button.SCE_PAD_BUTTON_DOWN:
                     if (_kbSuggestionFocus >= 0) { _kbSuggestionFocus = -1; _kbRow = 0; ClampKb(); }
-                    else if (_kbRow < KbRows.Length - 1) { _kbRow++; ClampKb(); }
+                    else if (_kbRow < KbRows.Length - 1) MoveKeyboardRow(1);
                     break;
                 case DS4Button.SCE_PAD_BUTTON_LEFT:
                     if (_kbSuggestionFocus >= 0)
@@ -1500,6 +1595,16 @@ namespace Orbis
         }
 
         int KeysInRow(int r) { return r == 4 ? 5 : KbRows[r].Length; }
+        internal static int KeyboardColumn(int oldRow, int oldCol, int newRow)
+        {
+            int oldCount=oldRow==4?5:KbRows[oldRow].Length, newCount=newRow==4?5:KbRows[newRow].Length;
+            int oldWidth=oldRow==4?244:oldRow==3?84:112, newWidth=newRow==4?244:newRow==3?84:112;
+            double center=-(oldCount*(oldWidth+12)-12)/2.0+oldCol*(oldWidth+12)+oldWidth/2.0;
+            double start=-(newCount*(newWidth+12)-12)/2.0+newWidth/2.0;
+            return Math.Max(0,Math.Min(newCount-1,(int)Math.Round((center-start)/(newWidth+12))));
+        }
+        void MoveKeyboardRow(int direction)
+        { int row=Math.Max(0,Math.Min(4,_kbRow+direction));_kbCol=KeyboardColumn(_kbRow,_kbCol,row);_kbRow=row; }
         void ClampKb()
         {
             int n = KeysInRow(_kbRow);
@@ -1510,6 +1615,7 @@ namespace Orbis
         void SoftKbBackspace()
         {
             _typingPulseAt = UiTick();
+            if (_settingsPage==6 && _settingsOpen) { if(_directDraft.Length>0)_directDraft=_directDraft.Substring(0,_directDraft.Length-1); return; }
             if (_softKbForSourceUrl)
             {
                 if (_sourceUrlDraft.Length > 0)
@@ -1545,6 +1651,7 @@ namespace Orbis
         void SoftKbSubmit()
         {
             _softKbOpen = false;
+            if(_settingsPage==6 && _settingsOpen){try{QueuePersonalLink("My package",_directDraft.Trim(),false);}catch(Exception ex){_cloudMessage=ex.Message;}return;}
             if (_softKbForSourceUrl)
             {
                 _softKbForSourceUrl = false;
@@ -1593,12 +1700,7 @@ namespace Orbis
                 return;
             }
             _query = (_query ?? "").Trim();
-            if (_query.Length >= 1) StartSearchJob();
-            else
-            {
-                _screen = BrowseScreen.Search;
-                SetStatus("Search");
-            }
+            StartSearchJob();
         }
 
         void SoftKbPress()
@@ -1620,7 +1722,8 @@ namespace Orbis
                 case 1: SoftKbBackspace(); break;
                 case 2:
                     _typingPulseAt = UiTick();
-                    if (_softKbForSourceUrl) _sourceUrlDraft = "";
+                    if(_settingsPage==6 && _settingsOpen) _directDraft="";
+                    else if (_softKbForSourceUrl) _sourceUrlDraft = "";
                     else if (_softKbForDeepbrid) _deepbridDraft = "";
                     else if (_softKbForAllDebrid) _allDebridDraft = "";
                     else if (_softKbForTorBox) _torBoxDraft = "";
@@ -1788,7 +1891,13 @@ namespace Orbis
             if (i < 0) i += n;
             _tab = (TopTab)i;
             if (_screen == BrowseScreen.Detail && _tab != TopTab.Search)
+            {
+                _resolveGeneration++;
+                _browseBusy = false;
+                _busyKind = BusyKind.None;
+                _resolveError = null;
                 _screen = BrowseScreen.Search;
+            }
             SetStatus(_tab == TopTab.Search ? "Search" : "Downloads");
         }
 
@@ -1820,10 +1929,10 @@ namespace Orbis
             }
             ClampDownloadFocus(rows);
             DownloadTreeRow current = rows[_dlFocus];
-            string titleId = current.Group.TitleId ?? "";
+            string groupKey = current.Group.Key ?? "";
             if (b == DS4Button.SCE_PAD_BUTTON_R2)
             {
-                if (_downloadFilesTitle == null) { _downloadFilesTitle = current.Group.TitleId; _dlFocus = _dlScroll = 0; _queueModelReady = false; }
+                if (_downloadFilesTitle == null) { _downloadFilesTitle = groupKey; _dlFocus = _dlScroll = 0; _queueModelReady = false; }
                 else OpenFileDetails(current.Item);
                 return;
             }
@@ -1832,14 +1941,14 @@ namespace Orbis
             {
                 case DS4Button.SCE_PAD_BUTTON_LEFT:
                     if (!current.IsRoot)
-                        _dlFocus = FindDownloadRoot(rows, titleId);
+                        _dlFocus = FindDownloadRoot(rows, groupKey);
                     else if (current.HasChildren)
-                        _collapsedDownloadGroups.Add(titleId);
+                        _collapsedDownloadGroups.Add(groupKey);
                     return;
                 case DS4Button.SCE_PAD_BUTTON_RIGHT:
                     if (current.IsRoot && current.HasChildren)
                     {
-                        if (_collapsedDownloadGroups.Remove(titleId)) return;
+                        if (_collapsedDownloadGroups.Remove(groupKey)) return;
                         if (_dlFocus + 1 < rows.Count && !rows[_dlFocus + 1].IsRoot)
                             _dlFocus++;
                     }
@@ -1858,7 +1967,7 @@ namespace Orbis
                     }
                     else if (current.HasChildren)
                     {
-                        if (_collapsedDownloadGroups.Remove(titleId)) return;
+                        if (_collapsedDownloadGroups.Remove(groupKey)) return;
                         if (_dlFocus + 1 < rows.Count && !rows[_dlFocus + 1].IsRoot)
                             _dlFocus++;
                     }
@@ -1985,6 +2094,8 @@ namespace Orbis
                 { _cfg.AllDebridApiKey = ""; _allDebridDraft = ""; }
                 else if (string.Equals(_cfg.UnlockProviderId, UnlockProviders.TorBoxId, StringComparison.OrdinalIgnoreCase))
                 { _cfg.TorBoxApiKey = ""; _torBoxDraft = ""; }
+                else if (string.Equals(_cfg.UnlockProviderId, UnlockProviders.PremiumizeId, StringComparison.OrdinalIgnoreCase))
+                    _cfg.PremiumizeApiKey = "";
                 else _cfg.RealDebridToken = "";
                 _cfg.Save(); _pairUiStage = PairUiStage.Idle; _pairUiDetail = "";
                 _uiOverlay = UiOverlay.None; User.NotifyToast("Token cleared");
@@ -2061,7 +2172,7 @@ namespace Orbis
             }
             if (item.State == DlState.Finalizing)
             {
-                SetStatus(item.StatusText ?? "Finalizing package — please wait");
+                SetStatus(item.StatusText ?? "Download complete · waiting to install");
                 return;
             }
             if (item.State == DlState.Completed)
@@ -2097,12 +2208,14 @@ namespace Orbis
             foreach (var item in items)
             {
                 string key = item.TitleId ?? "";
+                if (key.Length == 0 && item.LocalSource && !string.IsNullOrEmpty(item.Id)) key = item.Id;
                 DownloadGroup group;
                 if (!byTitle.TryGetValue(key, out group))
                 {
                     group = new DownloadGroup
                     {
-                        TitleId = key,
+                        Key = key,
+                        TitleId = item.TitleId ?? "",
                         Name = item.Name ?? key,
                         ImageUrl = item.ImageUrl ?? ""
                     };
@@ -2125,7 +2238,7 @@ namespace Orbis
             {
                 if (_downloadFilesTitle != null)
                 {
-                    if (group.TitleId != _downloadFilesTitle) continue;
+                    if (group.Key != _downloadFilesTitle) continue;
                     foreach (var item in group.Items) rows.Add(new DownloadTreeRow { Group = group, Item = item });
                 }
                 else if (QueueGroupMatches(group))
@@ -2134,10 +2247,10 @@ namespace Orbis
             return rows;
         }
 
-        static int FindDownloadRoot(List<DownloadTreeRow> rows, string titleId)
+        static int FindDownloadRoot(List<DownloadTreeRow> rows, string groupKey)
         {
             for (int i = 0; i < rows.Count; i++)
-                if (rows[i].IsRoot && string.Equals(rows[i].Group.TitleId, titleId, StringComparison.OrdinalIgnoreCase))
+                if (rows[i].IsRoot && string.Equals(rows[i].Group.Key, groupKey, StringComparison.OrdinalIgnoreCase))
                     return i;
             return 0;
         }
@@ -2162,18 +2275,22 @@ namespace Orbis
         void StartSearchJob()
         {
             string q = (_query ?? "").Trim();
-            if (q.Length < 1) { SetStatus("Search"); return; }
-            RememberQuery(q);
+            if (q.Length > 0) RememberQuery(q);
             string sourceStamp = _packageSources.CatalogFingerprint();
             List<GameHit> cached;
             if (QueryCache.TrySearch(q, out cached, sourceStamp) && cached != null && cached.Count > 0)
             {
                 _covers.BumpGeneration();
-                _results = cached;
-                _focus = 0;
-                _listScroll = 0;
-                _suggestionPool = new List<GameHit>(cached);
-                _searchError = null;
+                lock (_lock)
+                {
+                    ++_searchGeneration;
+                    _results = cached;
+                    _focus = 0;
+                    _listScroll = 0;
+                    _suggestionPool = new List<GameHit>(cached);
+                    _searchError = null;
+                    _browseBusy = false; _busyKind = BusyKind.None;
+                }
                 _screen = BrowseScreen.Results;
                 _tab = TopTab.Search;
                 PrefetchSearchCovers(cached);
@@ -2209,40 +2326,49 @@ namespace Orbis
                             ? "Install and enable a Package Source in Settings"
                             : sourceError);
                     }
-                    var sourceHits = _packageSources.Search(qCopy, out sourceError);
-                    if (sourceHits == null)
-                        throw new Exception(string.IsNullOrEmpty(sourceError) ? "Package Source search failed" : sourceError);
-                    var hits = new List<GameHit>();
-                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var result in sourceHits)
+                    Func<bool> canceled = () => { lock (_lock) return gen != _searchGeneration; };
+                    var page = _packageSources.SearchPage(qCopy, 0, 250, partial =>
                     {
-                        string key = (result.TitleId ?? "") + "\n" + (result.Region ?? "");
-                        if (string.IsNullOrEmpty(result.TitleId) || !seen.Add(key)) continue;
-                        hits.Add(new GameHit
+                        if (partial.Results.Count == 0) return;
+                        var earlyHits = ConvertSearchHits(partial.Results);
+                        lock (_lock)
                         {
-                            TitleId = result.TitleId,
-                            Name = string.IsNullOrEmpty(result.DisplayName) ? result.TitleId : result.DisplayName,
-                            Region = string.IsNullOrEmpty(result.Region) ? "?" : result.Region,
-                            ImageUrl = result.ImageUrl,
-                            Source = result.SourceId,
-                            Rating = result.Rating,
-                            Genres = result.Genres,
-                            Backport = result.Backport
-                        });
-                        if (hits.Count >= 100) break;
+                            if (gen != _searchGeneration) return;
+                            _results = earlyHits;
+                            _status = "Found " + earlyHits.Count + " titles · checking remaining sources";
+                        }
+                        PrefetchSearchCovers(earlyHits);
+                    }, canceled, out sourceError);
+                    if (page == null)
+                        throw new Exception(string.IsNullOrEmpty(sourceError) ? "Package Source search failed" : sourceError);
+                    var sourceHits = new List<SourceTitleResult>(page.Results);
+                    string warning = page.Warning;
+                    // The coordinator searches the complete index before slicing it.
+                    // Fetch the remaining cached pages so region filters see every match.
+                    while (!string.IsNullOrEmpty(page.NextCursor))
+                    {
+                        int offset;
+                        if (!int.TryParse(page.NextCursor, out offset) || offset <= page.Offset)
+                            throw new InvalidOperationException("Source returned an invalid search cursor");
+                        page = _packageSources.SearchPage(qCopy, offset, 250, null, canceled, out sourceError);
+                        if (page == null) throw new InvalidOperationException(sourceError ?? "Search page unavailable");
+                        sourceHits.AddRange(page.Results);
                     }
+                    var hits = ConvertSearchHits(sourceHits);
                     lock (_lock)
                     {
                         if (gen != _searchGeneration) return;
-                        _results = hits; _focus = 0; _listScroll = 0;
+                        _results = hits;
                         _suggestionPool = new List<GameHit>(hits);
                         _browseBusy = false; _busyKind = BusyKind.None;
                         // An empty successful response is a result state, not a source error.
                         _searchError = null;
-                        _status = "Found " + hits.Count + " titles";
+                        _status = "Found " + hits.Count + " titles" +
+                            (string.IsNullOrEmpty(warning) ? "" : " · " + warning);
                     }
                     PrefetchSearchCovers(hits);
-                    if (hits.Count > 0) QueryCache.PutSearch(qCopy, hits, sourceStamp);
+                    if (hits.Count > 0 && string.IsNullOrEmpty(warning))
+                        QueryCache.PutSearch(qCopy, hits, sourceStamp);
                 }
                 catch (Exception ex)
                 {
@@ -2250,26 +2376,93 @@ namespace Orbis
                     {
                         if (gen != _searchGeneration) return;
                         _browseBusy = false; _busyKind = BusyKind.None;
-                        _searchError = "Package Source search failed: " + Clip(ex.Message, 60);
-                        _status = _searchError;
+                        _searchError = _results.Count == 0 ? "Package Source search failed: " + Clip(ex.Message, 60) : null;
+                        _status = _searchError ?? "Some sources failed; available results are shown";
                     }
                 }
             });
         }
 
+        static List<GameHit> ConvertSearchHits(IEnumerable<SourceTitleResult> results)
+        {
+            var hits = new List<GameHit>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var result in results)
+            {
+                string key = result.SourceId + "\n" + result.SourceVersion + "\n" + result.TitleId + "\n" + result.Region + "\n" + result.CatalogUrl;
+                if ((string.IsNullOrEmpty(result.TitleId) && string.IsNullOrEmpty(result.CatalogUrl)) || !seen.Add(key)) continue;
+                hits.Add(new GameHit {
+                    TitleId = result.TitleId,
+                    Name = string.IsNullOrEmpty(result.DisplayName) ? result.TitleId : result.DisplayName,
+                    Region = result.Region ?? "",
+                    ImageUrl = result.ImageUrl, Source = result.SourceId, SourceVersion = result.SourceVersion,
+                    CatalogUrl = result.CatalogUrl, Rating = result.Rating, Genres = result.Genres, Backport = result.Backport
+                });
+            }
+            return hits;
+        }
+
+        static string ResolveSelectionRegion(string region)
+        {
+            string value = PackageSourceIdentity.NormalizeRegion(region);
+            return value == "?" || value == "UNKNOWN" || value == "N/A" ? "" : value;
+        }
+
+        static GameHit MatchResolveSelection(GameHit selection, IEnumerable<SourceTitleResult> results)
+        {
+            if (selection == null || results == null || string.IsNullOrEmpty(selection.TitleId)) return null;
+            string region = ResolveSelectionRegion(selection.Region);
+            foreach (var result in results)
+            {
+                if (!string.Equals(selection.TitleId, result.TitleId, StringComparison.OrdinalIgnoreCase)) continue;
+                string sourceRegion = ResolveSelectionRegion(result.Region);
+                if (region.Length > 0 && region != sourceRegion) continue;
+                return new GameHit {
+                    TitleId = selection.TitleId, Version = selection.Version,
+                    Name = string.IsNullOrEmpty(result.DisplayName) ? selection.Name : result.DisplayName,
+                    Region = sourceRegion, ImageUrl = string.IsNullOrEmpty(result.ImageUrl) ? selection.ImageUrl : result.ImageUrl,
+                    Source = result.SourceId, SourceVersion = result.SourceVersion, CatalogUrl = result.CatalogUrl,
+                    Rating = result.Rating, Genres = result.Genres, Backport = result.Backport
+                };
+            }
+            return null;
+        }
+
+        GameHit HydrateResolveSelection(GameHit selection, Func<bool> cancel)
+        {
+            if (!string.IsNullOrEmpty(selection.SourceVersion)) return selection;
+            // Installed and official-metadata rows do not carry source aliases or
+            // catalog URLs. Resolve their exact CUSA through current source search.
+            string error;
+            string region = ResolveSelectionRegion(selection.Region);
+            var page = _packageSources.SearchPage(selection.TitleId, 0, 250, null, cancel, out error, region, true);
+            if (cancel()) throw new OperationCanceledException();
+            var match = MatchResolveSelection(selection, page == null ? null : page.Results);
+            if (match != null) return match;
+            if (!string.IsNullOrEmpty(selection.Name) && selection.Name != selection.TitleId)
+            {
+                page = _packageSources.SearchPage(selection.Name, 0, 250, null, cancel, out error, region, true);
+                if (cancel()) throw new OperationCanceledException();
+                match = MatchResolveSelection(selection, page == null ? null : page.Results);
+                if (match != null) return match;
+            }
+            return selection;
+        }
+
         void StartResolveJob(bool focusFirstUpdate = false)
         {
             if (_selected == null) return;
+            Program.StartupStage("detail-enter");
             int gen;
-            string selId;
             lock (_lock)
             {
+                if (_browseBusy && _busyKind == BusyKind.Searching && _results.Count > 0)
+                { ++_searchGeneration; _browseBusy = false; }
                 if (_browseBusy) return;
                 _browseBusy = true;
                 _busyKind = BusyKind.Resolving;
                 _resolveError = null;
                 gen = ++_resolveGeneration;
-                selId = _selected.TitleId;
                 _links = new List<PkgLink>();
                 _linkCandidates = new List<PackageCandidate>();
                 _linkPresentation = new List<PackageCandidatePresentation>();
@@ -2292,9 +2485,12 @@ namespace Orbis
                 return;
             }
             List<PackageCandidate> cachedCands;
-            string sourceStamp = _packageSources.CatalogFingerprint();
-            if (QueryCache.TryResolve(_selected.TitleId, out cachedCands, sourceStamp) && cachedCands != null &&
-                cachedCands.Count > 0)
+            string sourceStamp = _packageSources.CatalogFingerprint() + "|" + _selected.CatalogUrl;
+            string selectedSourceId = string.IsNullOrEmpty(_selected.SourceVersion) ? "" : _selected.Source;
+            if (!string.IsNullOrEmpty(_selected.SourceVersion) &&
+                QueryCache.TryResolve(_selected.TitleId, out cachedCands, sourceStamp, ResolveSelectionRegion(_selected.Region), selectedSourceId) && cachedCands != null &&
+                cachedCands.Count > 0 && (string.IsNullOrEmpty(_selected.SourceVersion) ||
+                cachedCands.TrueForAll(c => c.SourceVersion == _selected.SourceVersion)))
             {
                 var cachedLinks = new List<PkgLink>();
                 for (int i = 0; i < cachedCands.Count; i++)
@@ -2315,8 +2511,8 @@ namespace Orbis
                 return;
             }
             SetStatus("Resolving Package Sources " + _selected.TitleId);
-            if (!string.IsNullOrEmpty(_selected.ImageUrl))
-                _covers.Request(_selected.TitleId, _selected.ImageUrl);
+            // DrawCase requests the actual poster size; do not decode a second
+            // full-size copy just because package resolution is starting.
             // Enter detail immediately for resolving chrome (worker must not force-nav later).
             _screen = BrowseScreen.Detail;
             var sel = _selected;
@@ -2324,39 +2520,32 @@ namespace Orbis
             {
                 try
                 {
+                    Program.StartupStage("detail-resolve-start");
+                    var resolvedSelection = HydrateResolveSelection(sel, () => !OwnsDetailResolve(gen, sel));
+                    string resolvedRegion = ResolveSelectionRegion(resolvedSelection.Region);
+                    string resolvedSourceId = string.IsNullOrEmpty(resolvedSelection.SourceVersion) ? "" : resolvedSelection.Source;
+                    string resolvedStamp = _packageSources.CatalogFingerprint() + "|" + resolvedSelection.CatalogUrl;
                     string sourceError;
-                    var candidates = _packageSources.Resolve(sel.TitleId, sel.Name, sel.Region, out sourceError);
+                    var candidates = _packageSources.Resolve(resolvedSelection.TitleId, resolvedSelection.Name, resolvedRegion,
+                        resolvedSelection.CatalogUrl, resolvedSourceId, resolvedSelection.SourceVersion, out sourceError);
                     if (candidates == null)
                         throw new Exception(string.IsNullOrEmpty(sourceError) ? "Package Source resolve failed" : sourceError);
-                    if (candidates.Count > 0) QueryCache.PutResolve(sel.TitleId, candidates, sourceStamp);
+                    Program.StartupStage("detail-resolve-ready");
+                    if (candidates.Count > 0) QueryCache.PutResolve(sel.TitleId, candidates, resolvedStamp, resolvedRegion, resolvedSourceId);
                     var links = new List<PkgLink>();
                     foreach (var candidate in candidates)
                         links.Add(PackageCandidateAdapter.ToPkgLink(candidate));
                     var presentation = PackageCandidatePresentation.Build(
-                        candidates, sel.TitleId, sel.Region);
-                    lock (_lock)
-                    {
-                        if (gen != _resolveGeneration) return;
-                        if (_selected == null ||
-                            !string.Equals(_selected.TitleId, selId, StringComparison.OrdinalIgnoreCase))
-                            return;
-                        _links = links; _linkCandidates = candidates;
-                        _linkPresentation = presentation; _focus = 0; _linkScroll = 0;
-                        // Mirrors start collapsed; Triangle expands deliberately.
-                        _expandedPackageGroups.Clear();
-                        RebuildDetailRows();
-                        _detailFocus = _detailScroll = 0;
-                        if (focusFirstUpdate) FocusFirstUpdateRow();
-                        _browseBusy = false; _busyKind = BusyKind.None;
-                        _resolveError = links.Count == 0 ? "No matching package links" : null;
-                        _status = links.Count + " links (Package Sources)";
-                    }
+                        candidates, sel.TitleId, resolvedRegion);
+                    bool applied = ApplyResolvedPackageLookup(gen, sel, links, candidates, presentation, focusFirstUpdate, resolvedSelection);
+                    Program.StartupStage(applied ? "detail-resolve-applied" : "detail-resolve-discarded");
                 }
                 catch (Exception ex)
                 {
+                    Program.StartupStage("detail-resolve-failed");
                     lock (_lock)
                     {
-                        if (gen != _resolveGeneration) return;
+                        if (!OwnsDetailResolve(gen, sel)) return;
                         _browseBusy = false; _busyKind = BusyKind.None;
                         _links = new List<PkgLink>();
                         _linkCandidates = new List<PackageCandidate>();
@@ -2371,12 +2560,54 @@ namespace Orbis
             });
         }
 
+        bool OwnsDetailResolve(int generation, GameHit selection)
+        {
+            return generation == _resolveGeneration && _screen == BrowseScreen.Detail &&
+                selection != null && object.ReferenceEquals(_selected, selection);
+        }
+
+        bool ApplyResolvedPackageLookup(int generation, GameHit selection, List<PkgLink> links,
+            List<PackageCandidate> candidates, List<PackageCandidatePresentation> presentation, bool focusFirstUpdate, GameHit resolvedSelection = null)
+        {
+            lock (_lock)
+            {
+                if (!OwnsDetailResolve(generation, selection)) return false;
+                if (resolvedSelection != null) _selected = resolvedSelection;
+                _links = links; _linkCandidates = candidates;
+                _linkPresentation = presentation; _focus = 0; _linkScroll = 0;
+                _expandedPackageGroups.Clear();
+                RebuildDetailRows();
+                _detailFocus = _detailScroll = 0;
+                if (focusFirstUpdate) FocusFirstUpdateRow();
+                _browseBusy = false; _busyKind = BusyKind.None;
+                _resolveError = null;
+                _status = links.Count == 0 ? "No packages published for this title and region" :
+                    links.Count + " links (Package Sources)";
+                return true;
+            }
+        }
+
+        string ResolveEmptyHeading()
+        {
+            return !string.IsNullOrEmpty(_resolveError) ? "Packages unavailable" :
+                _links.Count == 0 ? "No packages published" : "No matching packages";
+        }
+
+        string ResolveEmptyDescription()
+        {
+            if (!string.IsNullOrEmpty(_resolveError)) return _resolveError;
+            if (_links.Count > 0) return "Choose another package type, host or version.";
+            return "This source has no published packages for the selected title and region. Try another title or region.";
+        }
+
         void StartRecommendedResolve(GameHit game)
         {
             if (game == null) return;
             int gen;
             lock (_lock)
             {
+                if (_browseBusy && _busyKind == BusyKind.Searching && _results.Count > 0)
+                { ++_searchGeneration; _browseBusy = false; }
                 if (_browseBusy) return;
                 _browseBusy = true;
                 _busyKind = BusyKind.Resolving;
@@ -2388,7 +2619,9 @@ namespace Orbis
                 try
                 {
                     string sourceError;
-                    var candidates = _packageSources.Resolve(game.TitleId, game.Name, game.Region, out sourceError);
+                    var candidates = _packageSources.Resolve(game.TitleId, game.Name, game.Region,
+                        game.CatalogUrl, string.IsNullOrEmpty(game.SourceVersion) ? "" : game.Source,
+                        game.SourceVersion, out sourceError);
                     if (candidates == null)
                         throw new Exception(string.IsNullOrEmpty(sourceError)
                             ? "Package Source resolve failed" : sourceError);
@@ -2402,7 +2635,7 @@ namespace Orbis
                         _status = queued > 0 ? "Recommended queued" : "No recommended packages found";
                     }
                     if (queued > 0)
-                        User.NotifyToast(game.Name + " · " + RecommendedToastSuffix(candidates) + " queued");
+                        User.NotifyToast(game.Name + " · " + RecommendedToastSuffix(queued) + " queued");
                     else
                         User.NotifyToast("No recommended packages");
                 }
@@ -2425,11 +2658,11 @@ namespace Orbis
             int queued = QueueRecommendedCandidates(game, _linkCandidates);
             if (queued <= 0)
             {
-                SetStatus("No base or update package is available");
+                SetStatus("No recommended package is available");
                 if (notify) User.NotifyToast("No recommended packages");
                 return;
             }
-            string suffix = RecommendedToastSuffix(_linkCandidates);
+            string suffix = RecommendedToastSuffix(queued);
             SetStatus("Recommended queued · R1 Downloads");
             if (notify) User.NotifyToast((game == null ? "Title" : game.Name) + " · " + suffix + " queued");
         }
@@ -2438,14 +2671,14 @@ namespace Orbis
         {
             if (game == null || candidates == null || candidates.Count == 0) return 0;
             int baseIndex = PreferredCandidate(candidates, "base", false);
-            int updateIndex = PreferredCandidate(candidates, "update", true);
+            int updateIndex = PreferredRecommendedPatch(candidates, _firmwareVersion);
             int queued = 0;
-            if (baseIndex >= 0 && QueueCandidate(game, candidates[baseIndex])) queued++;
-            if (updateIndex >= 0 && updateIndex != baseIndex && QueueCandidate(game, candidates[updateIndex])) queued++;
+            if (baseIndex >= 0 && QueueCandidate(game, candidates[baseIndex], candidates)) queued++;
+            if (updateIndex >= 0 && updateIndex != baseIndex && QueueCandidate(game, candidates[updateIndex], candidates)) queued++;
             return queued;
         }
 
-        bool QueueCandidate(GameHit game, PackageCandidate candidate)
+        bool QueueCandidate(GameHit game, PackageCandidate candidate, IList<PackageCandidate> mirrors)
         {
             if (candidate == null) return false;
             bool needsLinkService = candidate.AccessType != PackageAccessType.Direct;
@@ -2459,7 +2692,7 @@ namespace Orbis
             try
             {
                 string message;
-                _dlMgr.Enqueue(game, candidate, out message);
+                _dlMgr.Enqueue(game, candidate, mirrors, out message);
                 return true;
             }
             catch (Exception ex)
@@ -2486,6 +2719,48 @@ namespace Orbis
             return best;
         }
 
+        static int PreferredRecommendedPatch(IList<PackageCandidate> candidates, string firmware)
+        {
+            Version installed;
+            if (candidates == null || !TryRecommendationFirmware(firmware, out installed)) return -1;
+            int best = -1;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                PackageCandidate candidate = candidates[i];
+                if (candidate == null || !string.IsNullOrWhiteSpace(candidate.ResolutionError)) continue;
+                string kind = PackageCandidatePresentation.EffectiveKind(candidate);
+                if (kind != "update" && kind != "backport") continue;
+                Version required;
+                // Unknown requirements remain manually selectable, but cannot prove an automatic choice safe.
+                if (!TryRecommendationFirmware(candidate.RequiredFirmware, out required) ||
+                    required.CompareTo(installed) > 0) continue;
+                if (best < 0) { best = i; continue; }
+                int version = ComparePackageVersions(candidate.PackageVersion, candidates[best].PackageVersion);
+                if (version > 0) { best = i; continue; }
+                if (version != 0) continue;
+                string bestKind = PackageCandidatePresentation.EffectiveKind(candidates[best]);
+                if (kind != bestKind)
+                {
+                    if (kind == "update") best = i;
+                }
+                else if (IsPreferredHost(candidate) && !IsPreferredHost(candidates[best])) best = i;
+            }
+            return best;
+        }
+
+        static bool TryRecommendationFirmware(string value, out Version version)
+        {
+            version = null;
+            string text = (value ?? "").Trim();
+            if (!System.Text.RegularExpressions.Regex.IsMatch(text,
+                @"^[0-9]{1,2}\.[0-9]{2}(?:\.[0-9]{1,3}){0,2}\+?$")) return false;
+            Version parsed;
+            if (!Version.TryParse(text.TrimEnd('+'), out parsed)) return false;
+            version = new Version(parsed.Major, parsed.Minor,
+                Math.Max(0, parsed.Build), Math.Max(0, parsed.Revision));
+            return true;
+        }
+
         static bool SamePackageKind(string value, string kind)
         {
             string normalized = (value ?? "").Trim().ToLowerInvariant();
@@ -2495,8 +2770,7 @@ namespace Orbis
 
         static bool IsPreferredHost(PackageCandidate candidate)
         {
-            string host = candidate == null ? "" : (candidate.HosterName ?? candidate.Label ?? "");
-            return host.IndexOf("onefile", StringComparison.OrdinalIgnoreCase) >= 0;
+            return PackageCandidatePresentation.IsPreferredMirror(candidate);
         }
 
         static int ComparePackageVersions(string left, string right)
@@ -2514,12 +2788,9 @@ namespace Orbis
             return 0;
         }
 
-        static string RecommendedToastSuffix(IList<PackageCandidate> candidates)
+        static string RecommendedToastSuffix(int queued)
         {
-            int update = PreferredCandidate(candidates, "update", true);
-            if (update >= 0 && !string.IsNullOrWhiteSpace(candidates[update].PackageVersion))
-                return "base + v" + candidates[update].PackageVersion.TrimStart('v', 'V');
-            return update >= 0 ? "base + update" : "base";
+            return queued + (queued == 1 ? " package" : " packages");
         }
 
         static string DetailGroupKey(PackageCandidatePresentation meta)
@@ -2644,7 +2915,7 @@ namespace Orbis
             try
             {
                 string queueMessage;
-                _dlMgr.Enqueue(_selected, candidate, out queueMessage);
+                _dlMgr.Enqueue(_selected, candidate, _linkCandidates, out queueMessage);
                 SetStatus(queueMessage + " · R1 Downloads");
                 User.NotifyToast(PackageTitle(candidate.PackageKindHint) + " added · R1 Downloads");
                 Invalidated = true;
@@ -2658,6 +2929,13 @@ namespace Orbis
         void StartInstall(DlItem item, bool uninstallFirst)
         {
             if (item == null || string.IsNullOrEmpty(item.DestPath)) return;
+            if (_cfg.UseBgftDirect)
+            {
+                if (uninstallFirst) { SetStatus("Force reinstall requires In-app mode in General settings"); return; }
+                _dlMgr.QueueLocalInstall(item.Id);
+                SetStatus("Queued for background installation · " + ResidentDownloadService.ReadinessDetail);
+                return;
+            }
             if (uninstallFirst && !IsBasePackage(item))
             {
                 SetStatus("Force reinstall is only available for base games");
@@ -2686,7 +2964,13 @@ namespace Orbis
                 }
                 _installingTitles.Add(exp);
             }
-            _dlMgr.MarkInstalling(item.Id, uninstallFirst ? "Uninstall+install..." : "Installing...");
+            int installAttempt = _dlMgr.MarkInstalling(item.Id, uninstallFirst ? "Uninstall+install..." : "Installing...");
+            if (installAttempt < 0)
+            {
+                lock (_lock) _installingTitles.Remove(exp);
+                SetStatus("Download was removed before installation started");
+                return;
+            }
             SetStatus((uninstallFirst ? "Reinstall " : "Install ") + item.TitleId + "...");
             string path = item.DestPath;
             string id = item.Id;
@@ -2710,7 +2994,7 @@ namespace Orbis
                             {
                                 // AppInstUtil/duplicate BGFT acceptance exposes no task to verify.
                                 _dlMgr.MarkInstallAccepted(id,
-                                    "Sent to PS4 — verification pending · PKG kept; SQUARE resets status");
+                                    "Sent to PS4 — verification pending · PKG kept; SQUARE resets status", -1, installAttempt);
                                 SetStatus("Sent to PS4 — verification pending · PKG kept");
                                 User.NotifyToast("Sent to PS4");
                                 break;
@@ -2722,7 +3006,7 @@ namespace Orbis
                             string checkId = !string.IsNullOrEmpty(tid) ? tid : exp;
                             bool completed = PkgInstaller.WaitForInstall(taskId, checkId, packageKind, percent =>
                             {
-                                _dlMgr.UpdateInstallProgress(id, percent);
+                                _dlMgr.UpdateInstallProgress(id, percent, installAttempt);
                                 if (percent >= 0) SetStatus("Installing " + checkId + "  " + percent + "%");
                             }, out localCopyComplete, out waitError);
                             if (completed)
@@ -2739,7 +3023,7 @@ namespace Orbis
                                 if (confirmedBase)
                                 {
                                     _dlMgr.MarkInstalled(id,
-                                        "Installed " + checkId + " — PKG kept (SQUARE removes)", false);
+                                        "Installed " + checkId + " — PKG kept (SQUARE removes)", false, installAttempt);
                                     SetStatus("Install complete: " + checkId + " — PKG kept");
                                     User.NotifyToast("Install complete");
                                 }
@@ -2749,7 +3033,7 @@ namespace Orbis
                                                  packageKind == PkgContentKind.AddOn
                                         ? "Sent to PS4 — verify update/DLC · PKG kept"
                                         : "Sent to PS4 — verification pending · PKG kept";
-                                    _dlMgr.MarkInstallAccepted(id, msg, taskId);
+                                    _dlMgr.MarkInstallAccepted(id, msg, taskId, installAttempt);
                                     SetStatus("Sent to PS4: " + checkId + " — verification pending · PKG kept");
                                     User.NotifyToast("Sent to PS4");
                                 }
@@ -2758,30 +3042,30 @@ namespace Orbis
                             {
                                 string combined = waitError ?? "BGFT install failed";
                                 if (combined.StartsWith("BGFT progress") || combined.IndexOf("timeout", StringComparison.OrdinalIgnoreCase) >= 0)
-                                { _dlMgr.MarkInstallAccepted(id, "PS4 install status unavailable · task and PKG retained", taskId); break; }
-                                _dlMgr.MarkInstallFailed(id, combined);
+                                { _dlMgr.MarkInstallAccepted(id, "PS4 install status unavailable · task and PKG retained", taskId, installAttempt); break; }
+                                _dlMgr.MarkInstallFailed(id, combined, installAttempt);
                                 SetStatus("Install failed: " + Clip(combined, 44) + " — PKG kept");
                                 User.NotifyToast("Install failed; PKG kept");
                             }
                             break;
                         case InstallOutcome.AlreadyInstalled:
                             _dlMgr.MarkAlreadyInstalled(id,
-                                "Already installed; TRIANGLE force-reinstalls base games");
+                                "Already installed; TRIANGLE force-reinstalls base games", installAttempt);
                             SetStatus("Already installed " + exp + " — PKG kept for force reinstall");
                             User.NotifyToast("Already installed");
                             break;
                         case InstallOutcome.InvalidPackage:
-                            _dlMgr.MarkPackageInvalid(id, err);
+                            _dlMgr.MarkPackageInvalid(id, err, installAttempt);
                             SetStatus("Bad PKG: " + Clip(err, 48) + " — re-download");
                             User.NotifyToast("Bad PKG");
                             break;
                         case InstallOutcome.UninstallFailed:
-                            _dlMgr.MarkInstallFailed(id, err);
+                            _dlMgr.MarkInstallFailed(id, err, installAttempt);
                             SetStatus("Uninstall fail: " + Clip(err, 40));
                             User.NotifyToast("Uninstall fail");
                             break;
                         default:
-                            _dlMgr.MarkInstallFailed(id, err);
+                            _dlMgr.MarkInstallFailed(id, err, installAttempt);
                             SetStatus("Install fail: " + Clip(err, 48));
                             User.NotifyToast("Install fail");
                             break;
@@ -2789,7 +3073,7 @@ namespace Orbis
                 }
                 catch (Exception ex)
                 {
-                    _dlMgr.MarkInstallFailed(id, ex.Message);
+                    _dlMgr.MarkInstallFailed(id, ex.Message, installAttempt);
                     SetStatus("Install fail: " + Clip(ex.Message, 48));
                     User.NotifyToast("Install fail");
                 }
@@ -2816,9 +3100,13 @@ namespace Orbis
         public override void OnCycleBegin(uint FrameTime, uint NextFrameTime)
         {
             _frameTime = FrameTime;
+            ObservePresentedFrame();
+            PollResidentLaunchMaintenance();
+            if (!_startupServicesReady) { Invalidated = true; return; }
             if (_launchFinished && !_audioStarted)
             {
                 _audioStarted = true;
+                Program.StartupStage("first-screen-ready");
                 UiAudio.Init(_cfg.BackgroundMusic, _cfg.InterfaceSounds);
                 ApplyAudioSettings();
             }
@@ -2827,6 +3115,7 @@ namespace Orbis
                 SetStatus(nextStatus);
             // Pair completion/expiry is network-driven; never wait for another button press.
             PollPairState();
+            RefreshLinkStatusLookup();
             if (UiElapsed(_landingModelAt) >= 1000)
                 RefreshLandingModel();
             uint toastAge = _toastActive ? UiElapsed(_toastStartedAt) : 0;
@@ -2861,11 +3150,19 @@ namespace Orbis
             RecordFrameTiming(FrameTime);
         }
 
+        void PollResidentLaunchMaintenance()
+        {
+            PollStartup();
+            if (_startupServicesReady && _cfg.UseBgftDirect)
+                ResidentDownloadService.StartLaunchMaintenance(true);
+        }
+
         public override void OnBackground(uint FrameTime)
         {
             // Source workers publish several related lists under this gate. Keep
             // one consistent model for the entire frame, including footer hints.
             lock (_lock) DrawFrame(FrameTime);
+            _frameAwaitingPresentation = true;
         }
 
         void DrawFrame(uint FrameTime)
@@ -2886,8 +3183,8 @@ namespace Orbis
                 // Exclusive full-screen settings — never draw Search/Downloads under it.
                 DrawSettingsOverlay(r);
                 DrawFooter(r);
-                DrawToast(r);
                 if (_uiOverlay != UiOverlay.None) DrawUiOverlay(r);
+                DrawToast(r);
                 return;
             }
 
@@ -2907,8 +3204,8 @@ namespace Orbis
 
             // No center modal — busy state is footer text + skeleton/panel animation.
             DrawFooter(r);
-            DrawToast(r);
             if (_uiOverlay != UiOverlay.None) DrawUiOverlay(r);
+            DrawToast(r);
         }
 
         bool UsesImageBackground()
@@ -2961,6 +3258,19 @@ namespace Orbis
             SDL_SetTextureAlphaMod(_dimTex, 255);
         }
 
+        static string ActiveTransferOwnerText(DlItem item)
+        {
+            if (item == null) return "Queued";
+            if (item.State == DlState.Queued && (item.StatusText ?? "").StartsWith("Background mode waiting:", StringComparison.Ordinal))
+                return item.StatusText;
+            if (item.State != DlState.Downloading && item.State != DlState.Finalizing &&
+                item.State != DlState.Installing && item.State != DlState.Submitted) return VisibleState(item);
+            string state = VisibleState(item);
+            if (item.Background && item.BgftResident) return "Resident owns this job · " + state;
+            if (item.Background && !item.BgftLocalInstall) return "PS4 system task · " + state;
+            return "In-app · keep SSPI open · " + state;
+        }
+
         void DrawHeader(IntPtr r)
         {
             Fill(r, 0, 0, W, 106, C(25, 25, 25));
@@ -2980,6 +3290,8 @@ namespace Orbis
             DrawHeaderStatusChips(r);
         }
 
+        const int StatusRightInset = 48;
+
         void DrawHeaderStatusChips(IntPtr r)
         {
             int enabledSources = 0;
@@ -2988,12 +3300,13 @@ namespace Orbis
             bool linkActive = _cfg.HasActiveUnlock;
             bool linkSaved = _cfg.HasRealDebrid || _cfg.HasDeepbrid || _cfg.HasAllDebrid || _cfg.HasTorBox;
 
-            string link = linkActive ? UnlockProviders.DisplayName(_cfg.UnlockProviderId) :
+            string link = linkActive ? UnlockProviders.EnabledSummary(_cfg) :
                 (!_cfg.UseUnlockProvider || _cfg.UnlockProviderId == UnlockProviders.NoneId ? "Direct links" : linkSaved ? "Link service saved" : "No link service");
             string sources = enabledSources + (enabledSources == 1 ? " source" : " sources");
             string line = link + " · " + sources;
-            int statusWidth = Math.Min(520, UiFont.MeasurePx(16, line));
-            TextFit(r, W - 142 - statusWidth, 43, 16, statusWidth + 1, line, C(132, 132, 132));
+            string fitted = UiFont.EllipsizePx(line, 16, 590);
+            int width = UiFont.MeasurePx(16, fitted);
+            TextPx(r, W - StatusRightInset - width, 44, 16, fitted, C(132, 132, 132));
         }
 
         string EnabledSourceName()
@@ -3055,10 +3368,10 @@ namespace Orbis
             else
                 TextFit(r, 72, 1014, 20, 310, context, White);
             DrawFooterHints(r, 1017);
-            // Product version v5.10: footer displays BuildIdentity.Label (beta/hash) bottom-right.
+            // Product version v5.11: footer displays BuildIdentity.Label (beta/hash) bottom-right.
             string buildLabel = BuildIdentity.Label;
             int buildW = UiFont.MeasurePx(15, buildLabel);
-            TextPx(r, W - 48 - buildW, 1016, 15, buildLabel, Muted);
+            TextPx(r, W - StatusRightInset - buildW, 1016, 15, buildLabel, Muted);
         }
 
         string FooterContextLabel(string status, bool busy, BusyKind kind,
@@ -3087,24 +3400,34 @@ namespace Orbis
             if (_settingsOpen && _sourceInstallStage != SourceInstallStage.Idle) return;
             uint age = UiElapsed(_toastStartedAt), total = ToastEnterMs + ToastHoldMs + ToastExitMs;
             if (age >= total) return;
-            int y = 800;
-            if (!_cfg.ReduceMotion && age < ToastEnterMs) { double t = age / (double)ToastEnterMs; y += (int)(18 * Math.Pow(1 - t, 3)); }
-            else if (!_cfg.ReduceMotion && age > ToastEnterMs + ToastHoldMs) { double t = (age - ToastEnterMs - ToastHoldMs) / (double)ToastExitMs; y += (int)(30 * t * t); }
+            string message = _toastText == "DL fail" ? "Download failed. Open Files for details." : _toastText;
+            const int width = 400, textWidth = width - 62, font = 17;
+            bool twoLines = UiFont.MeasurePx(font, message) > textWidth;
+            int height = twoLines ? 68 : 46;
+            int y = H - 112 - height;
+            if (!_cfg.ReduceMotion && age < ToastEnterMs) { double t = age / (double)ToastEnterMs; y += (int)(6 * Math.Pow(1 - t, 3)); }
+            else if (!_cfg.ReduceMotion && age > ToastEnterMs + ToastHoldMs) { double t = (age - ToastEnterMs - ToastHoldMs) / (double)ToastExitMs; y += (int)(6 * t * t); }
             string lower = _toastText.ToLowerInvariant();
-            bool bad = lower.Contains("fail") || lower.Contains("error") || lower.Contains("corrupt") || lower.Contains("could not");
+            bool bad = lower.Contains("fail") || lower.Contains("error") || lower.Contains("corrupt") || lower.Contains("could not") || lower.Contains("not saved");
+            bool restricted = lower.Contains("validation unavailable") || lower.Contains("plan restricts") || lower.Contains("plan status unverified");
             bool queued = lower.Contains("queued") || lower.Contains("added");
             bool good = queued || lower.Contains("complete") || lower.Contains("installed") || lower.Contains("saved") || lower.Contains("ready");
-            string heading = bad ? "Needs attention" : queued ? "Added to downloads" : lower.Contains("saved") ? "Settings saved" : good ? "Complete" : "SSPI";
-            SDL_Color tone = bad ? Danger : good ? Ok : White;
-            var box = new SDL_Rect { x = W - 72 - 540, y = y, w = 540, h = 146 };
-            SoftRect(r, new SDL_Rect { x = box.x, y = box.y + 5, w = box.w, h = box.h }, C(10, 10, 10));
-            SoftRect(r, box, C(39, 39, 39)); StrokeRect(r, box, C(85, 85, 85), 1);
-            var symbol = new SDL_Rect { x = box.x + 21, y = box.y + 24, w = 44, h = 44 };
-            SoftRect(r, symbol, Raised); DesignIcon(r, bad ? "error" : good ? "check" : "download", symbol.x + 11, symbol.y + 10, 23, tone);
-            TextPx(r, box.x + 84, box.y + 18, 22, heading, White);
-            TextWrapped(r, box.x + 84, box.y + 59, 17, box.w - 110, _toastText, Muted);
-            int remaining = (int)((box.w - 16) * (1 - age / (double)total));
-            Fill(r, box.x + 8, box.y + box.h - 2, Math.Max(0, remaining), 2, tone);
+            SDL_Color tone = bad ? Danger : restricted ? Warning : good ? Ok : White;
+            var box = new SDL_Rect { x = W - 72 - width, y = y, w = width, h = height };
+            SoftRect(r, box, C(32, 32, 32)); StrokeRect(r, box, C(70, 70, 70), 1);
+            DesignIcon(r, bad || restricted ? "error" : good ? "check" : "download", box.x + 16, box.y + (height - 20) / 2, 20, tone);
+            int split = message.Length;
+            if (twoLines)
+            {
+                do { split = message.LastIndexOf(' ', Math.Max(0, split - 1)); }
+                while (split > 0 && UiFont.MeasurePx(font, message.Substring(0, split)) > textWidth);
+            }
+            if (split > 0 && split < message.Length)
+            {
+                TextPx(r, box.x + 44, box.y + 8, font, message.Substring(0, split), White);
+                TextFit(r, box.x + 44, box.y + 32, font, textWidth, message.Substring(split + 1), White);
+            }
+            else TextFit(r, box.x + 48, box.y + (height - 30) / 2, font, textWidth, message, White);
         }
 
         void DrawFooterHints(IntPtr r, int y)
@@ -3134,8 +3457,9 @@ namespace Orbis
                 if (_settingsPage == 4) { if (_storageDelete != null) { add("cross", "Confirm delete"); add("square", "Keep file"); } else { add("triangle", "Refresh"); if (_storageFiles.Count > 0) add("square", "Delete file"); } add("circle", "Back"); }
                 else if (_settingsPage == 2)
                 {
-                    add("cross", _settingsFocus == 0 ? "Add source" : "Toggle");
-                    if (_settingsFocus > 0) add("square", "Remove");
+                    add("cross", _sourceBrowseMode != 0 || _settingsFocus < 3 ? "Select" : "Toggle");
+                    if (_sourceBrowseMode != 0) add("triangle", "Refresh");
+                    else if (_settingsFocus >= 3) add("square", "Remove");
                     add("circle", "Back");
                 }
                 else if (_settingsPage == 1) { add("cross", "Select"); add("square", "QR setup"); add("circle", "Close"); }
@@ -3143,7 +3467,7 @@ namespace Orbis
                 else if (_settingsPage == 5) { add("cross", _settingsFocus == 2 ? "Volume" : "Toggle"); add("circle", "Close"); }
                 else if (_settingsPage == 0 && _settingsFocus == 0)
                 {
-                    add("cross", "Bandwidth limit");
+                    add("cross", "Download mode");
                     add("circle", "Close");
                 }
                 else
@@ -3155,6 +3479,7 @@ namespace Orbis
             }
             else if (_tab == TopTab.Downloads)
             {
+                add("touchpad", "Add links");
                 // Contextual hints from focused download row (matches actual PKG UX).
                 RefreshQueueModel();
                 var rows = _queueRows;
@@ -3234,7 +3559,7 @@ namespace Orbis
                         add("options", "Settings");
                         break;
                     case BrowseScreen.Results:
-                        if (_browseBusy) { add("circle", "Cancel search"); break; }
+                        if (_browseBusy && _results.Count == 0) { add("circle", "Cancel search"); break; }
                         if (FilteredResults().Count == 0)
                             add("cross", string.IsNullOrEmpty(_searchError) ? "Edit search" : "Retry");
                         else
@@ -3271,6 +3596,7 @@ namespace Orbis
         void DrawSettingsOverlay(IntPtr r)
         {
             DrawHeader(r);
+            if (_settingsPage==6) { DrawMyFiles(r,new SDL_Rect{x=300,y=210,w=1320,h=714}); if(_softKbOpen)DrawSoftKeyboardModal(r,"Paste a download link",_directDraft,"R2 QUEUE"); return; }
             string[] pages = { "General", "Connections", "Appearance", "Sound", "Storage" };
             int[] ids = { 0, 1, 3, 5, 4 };
             var tabGroup = new SDL_Rect { x = (W - 1128) / 2, y = 140, w = 1128, h = 56 };
@@ -3279,14 +3605,15 @@ namespace Orbis
             GamepadIcons.Draw(r, "r1", tabGroup.x + tabGroup.w + 24, tabGroup.y + 10, 36);
             for (int i = 0; i < pages.Length; i++)
             {
-                bool on = _settingsPage == ids[i] || (_settingsPage == 2 && i == 1);
+                bool on = _settingsPage == ids[i] || ((_settingsPage == 2 || _settingsPage == 6) && i == 1);
                 FilterChip(r, tabGroup.x + 4 + i * 224, tabGroup.y + 4, 220, pages[i], on);
             }
             var sheet = new SDL_Rect { x = 210, y = 222, w = 1500, h = 714 };
             if (_settingsPage == 1) DrawSettingsUnlockPage(r, sheet);
             else if (_settingsPage == 2) DrawSettingsPackageSourcesPage(r, sheet);
             else if (_settingsPage == 3) DrawSettingsAppearancePage(r, sheet);
-            else if (_settingsPage == 4) DrawStorage(r, sheet);
+            else if (_settingsPage == 4) DrawStorageMenu(r, sheet);
+            else if (_settingsPage == 6) DrawMyFiles(r, sheet);
             else if (_settingsPage == 5) DrawSettingsSound(r, sheet);
             else DrawSettingsGeneralPage(r, sheet);
             DrawSourceInstallNotification(r, sheet);
@@ -3296,6 +3623,9 @@ namespace Orbis
                 DrawSoftKeyboardModal(r, _softKbForSourceUrl ? "Install package source" : "Connection settings", draft, "R2 SAVE");
             }
         }
+
+        static readonly string[] ConnectionProviderIds = { UnlockProviders.RealDebridId, UnlockProviders.TorBoxId,
+            UnlockProviders.AllDebridId, UnlockProviders.PremiumizeId, UnlockProviders.NoneId };
 
         void DrawSettingsUnlockPage(IntPtr r, SDL_Rect sheet)
         {
@@ -3319,33 +3649,53 @@ namespace Orbis
             TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 540, w = left.w - 40, h = 34 }, 17, "Your settings stay on this PS4.", Dim);
             int rx = sheet.x + 524, rw = sheet.w - 524;
             TextPx(r, rx, left.y + 8, 28, "Your connections", White);
-            DrawSettingsRow(r, rx, left.y + 72, rw, 88, 0, "Real-Debrid", _cfg.HasRealDebrid ? "API key saved" : "Link from your phone", _cfg.UnlockProviderId == UnlockProviders.RealDebridId && _cfg.HasActiveUnlock ? "Active" : _cfg.HasRealDebrid ? "Select" : "Set up");
-            DrawSettingsRow(r, rx, left.y + 174, rw, 88, 1, "TorBox", _cfg.HasTorBox ? "API key saved" : "Link from your phone", _cfg.UnlockProviderId == UnlockProviders.TorBoxId && _cfg.HasActiveUnlock ? "Active" : _cfg.HasTorBox ? "Select" : "Set up");
-            DrawSettingsRow(r, rx, left.y + 276, rw, 88, 2, "Direct links", "Use the package source URL directly", !_cfg.UseUnlockProvider || _cfg.UnlockProviderId == UnlockProviders.NoneId ? "Active" : "Select");
-            TextPx(r, rx, left.y + 405, 24, "Package sources", White);
+            for (int i = 0; i < ConnectionProviderIds.Length; i++)
+            {
+                string id = ConnectionProviderIds[i];
+                bool direct = id == UnlockProviders.NoneId;
+                bool configured = UnlockProviders.IsConfigured(_cfg, id);
+                bool active = direct ? !_cfg.HasActiveUnlock : UnlockProviders.IsEnabled(_cfg, id);
+                DrawSettingsRow(r, rx, left.y + 64 + i * 78, rw, 68, i, UnlockProviders.DisplayName(id),
+                    direct ? "Use the package source URL directly" : _pair.ServiceSummary(id, configured),
+                    !configured ? "Set up" : "");
+                if (configured)
+                {
+                    int boxX = rx + rw - 50, boxY = left.y + 90 + i * 78;
+                    SDL_SetRenderDrawColor(r, active ? Ok.r : Muted.r, active ? Ok.g : Muted.g, active ? Ok.b : Muted.b, 255);
+                    var box = new SDL_Rect { x = boxX, y = boxY, w = 24, h = 24 };
+                    SDL_RenderDrawRect(r, ref box);
+                    if (active)
+                    {
+                        SDL_RenderDrawLine(r, boxX + 5, boxY + 12, boxX + 10, boxY + 18);
+                        SDL_RenderDrawLine(r, boxX + 10, boxY + 18, boxX + 20, boxY + 5);
+                    }
+                }
+            }
             int enabled = 0; foreach (var source in _sourceUi) if (source.Enabled) enabled++;
-            DrawSettingsRow(r, rx, left.y + 457, rw, 88, 3, "Manage sources", enabled + " of " + _sourceUi.Count + " enabled", "Open");
-            TextFit(r, rx, left.y + 587, 18, rw, "Both service keys stay saved when you switch.", Dim);
+            DrawSettingsRow(r, rx, left.y + 454, rw, 68, 5, "Manage sources", enabled + " of " + _sourceUi.Count + " enabled", "Open");
+            TextFit(r, rx, left.y + 609, 18, rw, "Check each service to use. All keys stay saved.", Dim);
         }
 
         void DrawSettingsPackageSourcesPage(IntPtr r, SDL_Rect sheet)
         {
+            if (_sourceBrowseMode != 0) { DrawSourceBrowser(r, sheet); return; }
             int x = sheet.x, w = sheet.w;
             TextPx(r, x, sheet.y + 15, 28, "Package sources", White);
             TextPx(r, x, sheet.y + 57, 18, "Choose which catalogs appear in search.", Muted);
-            DrawSettingsRow(r, x, sheet.y + 112, w, 86, 0, "Add a source", "Scan the QR code and add a source link from your phone", "Connect");
+            DrawSettingsRow(r, x, sheet.y + 105, w, 78, 0, "Install from USB", "Choose a connected drive and a .gssource file", "Open");
+            DrawSettingsRow(r, x, sheet.y + 193, w, 78, 1, "Browse community sources", "Shared sources · names, tags and descriptions", "Browse");
+            DrawSettingsRow(r, x, sheet.y + 281, w, 78, 2, "Add a source link", "Scan the QR code and send a source URL from your phone", "Connect");
             int start = Math.Max(0, _settingsFocus - 5);
-            for (int i = 0; i < 5 && start + i < _sourceUi.Count; i++)
+            for (int i = 0; i < 3 && start + i < _sourceUi.Count; i++)
             {
                 int n = start + i; var source = _sourceUi[n];
-                DrawSettingsRow(r, x, sheet.y + 218 + i * 92, w, 80, n + 1, source.Name,
+                DrawSettingsRow(r, x, sheet.y + 395 + i * 92, w, 80, n + 3, source.Name,
                     "Version " + source.Version + " · " + (source.Enabled ? "Included in search" : "Paused"), source.Enabled ? "ON" : "OFF");
             }
             if (_sourceUi.Count == 0)
             {
-                DesignIcon(r, "library", x + w / 2 - 20, sheet.y + 300, 40, Dim);
-                TextCentered(r, new SDL_Rect { x = x, y = sheet.y + 368, w = w, h = 48 }, 28, "No sources yet", White);
-                TextCentered(r, new SDL_Rect { x = x, y = sheet.y + 425, w = w, h = 34 }, 18, "Add your first source to search its catalog.", Muted);
+                TextCentered(r, new SDL_Rect { x = x, y = sheet.y + 450, w = w, h = 48 }, 28, "No sources yet", White);
+                TextCentered(r, new SDL_Rect { x = x, y = sheet.y + 510, w = w, h = 34 }, 18, "Choose USB, community browsing or your own source link.", Muted);
             }
         }
 
@@ -3353,14 +3703,15 @@ namespace Orbis
         {
             int x = sheet.x, w = sheet.w, y = sheet.y + 18;
             TextPx(r, x, y, 27, "Downloads and compatibility", White);
-            TextPx(r, x, y + 45, 19, "PS4 " + _firmwareVersion + " · System background downloads enabled", Muted);
-            y += 100;
-            DrawSettingsRow(r, x, y, w, 83, 0, "Bandwidth limit", "LEFT / RIGHT adjusts the limit", _cfg.DownloadLimitMBps == 0 ? "Unlimited" : _cfg.DownloadLimitMBps + " MB/s");
-            DrawSettingsRow(r, x, y + 97, w, 83, 1, "Download statistics", "Size, speed and estimated time", DlStatsLabel(_cfg.DownloadStatsMode));
-            DrawSettingsRow(r, x, y + 194, w, 83, 2, "Stats for nerds", "Show a speed graph on the selected download", _cfg.NerdStats ? "ON" : "OFF");
-            DrawSettingsRow(r, x, y + 291, w, 83, 3, "Firmware and backport hints", "Show package requirements when available", _cfg.ShowFirmwareHints ? "ON" : "OFF");
-            DrawSettingsRow(r, x, y + 388, w, 83, 4, "Clear removable history", "Installed content and retry files stay protected", "CLEAR");
-            DrawSettingsSave(r, sheet, 5);
+            TextFit(r, x, y + 43, 18, w, "PS4 " + _firmwareVersion + " · " + ResidentDownloadService.ModeStatus(_cfg.UseBgftDirect), Muted);
+            y += 84;
+            DrawSettingsRow(r, x, y, w, 67, 0, "Download mode", "Background waits for the resident; In-app requires SSPI to stay open", _cfg.UseBgftDirect ? "Background" : "In-app");
+            DrawSettingsRow(r, x, y + 77, w, 67, 1, "Background worker", ResidentDownloadService.ReadinessDetail, "RETRY");
+            DrawSettingsRow(r, x, y + 154, w, 67, 2, "Download statistics", "Size, speed and estimated time", DlStatsLabel(_cfg.DownloadStatsMode));
+            DrawSettingsRow(r, x, y + 231, w, 67, 3, "Stats for nerds", "Show a speed graph on the selected download", _cfg.NerdStats ? "ON" : "OFF");
+            DrawSettingsRow(r, x, y + 308, w, 67, 4, "Firmware and backport hints", "Show package requirements when available", _cfg.ShowFirmwareHints ? "ON" : "OFF");
+            DrawSettingsRow(r, x, y + 385, w, 67, 5, "Clear removable history", "Installed content and retry files stay protected", "CLEAR");
+            DrawSettingsSave(r, sheet, 6);
         }
 
         void DrawSettingsAppearancePage(IntPtr r, SDL_Rect sheet)
@@ -3406,6 +3757,7 @@ namespace Orbis
         void SoftKbAppend(char ch)
         {
             _typingPulseAt = UiTick();
+            if(_settingsPage==6 && _settingsOpen){if(_directDraft.Length<8192)_directDraft+=ch;return;}
             int maxLen = _softKbForSourceUrl ? 256 :
                 ((_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? 96 : MaxQuery);
             if (_softKbForSourceUrl)
@@ -3439,7 +3791,7 @@ namespace Orbis
         {
             var view = GetSourceInstallView(); if (view.Stage == SourceInstallStage.Idle) return;
             uint terminalAge = view.TerminalAt == 0 ? 0 : UiElapsed(view.TerminalAt);
-            const uint hold = 4400, exit = 160;
+            const uint hold = 2800, exit = 160;
             if (view.TerminalAt != 0 && terminalAge >= hold + exit)
             {
                 lock (_lock) { if (_sourceInstallTerminalAt == view.TerminalAt) { _sourceInstallStage = SourceInstallStage.Idle; _sourceInstallTerminalAt = 0; } }
@@ -3454,12 +3806,11 @@ namespace Orbis
                 if (age < 160) offset = (int)(35 * Math.Pow(1 - age / 160.0, 3));
                 if (terminalAge > hold) offset = (int)(600 * Math.Pow((terminalAge - hold) / (double)exit, 2));
             }
-            var card = new SDL_Rect { x = W - 588 + offset, y = 800, w = 540, h = 148 };
-            SoftRect(r, new SDL_Rect { x = card.x + 4, y = card.y + 6, w = card.w, h = card.h }, Shadow);
+            var card = new SDL_Rect { x = W - 448 + offset, y = H - 194, w = 400, h = 78 };
             DesignCard(r, card, false);
-            DesignIcon(r, active ? "download" : view.Stage == SourceInstallStage.Complete ? "check" : "error", card.x + 24, card.y + 30, 30, tone);
-            TextFit(r, card.x + 76, card.y + 22, 23, card.w - 100, active ? "Adding source" : view.Stage == SourceInstallStage.Complete ? "Source installed" : "Source couldn't be added", White);
-            TextWrapped(r, card.x + 76, card.y + 62, 17, card.w - 100, view.Detail ?? view.Target ?? "", Muted);
+            DesignIcon(r, active ? "download" : view.Stage == SourceInstallStage.Complete ? "check" : "error", card.x + 14, card.y + 15, 20, tone);
+            TextFit(r, card.x + 44, card.y + 10, 18, card.w - 60, active ? "Adding source" : view.Stage == SourceInstallStage.Complete ? "Source installed" : "Source couldn't be added", White);
+            TextFit(r, card.x + 44, card.y + 39, 15, card.w - 60, view.Detail ?? view.Target ?? "", Muted);
             var track = new SDL_Rect { x = card.x + 12, y = card.y + card.h - 5, w = card.w - 24, h = 2 };
             if (active && view.Total <= 0) DrawActivityRail(r, track);
             else {
@@ -3581,11 +3932,9 @@ namespace Orbis
             {
                 if (item != null && !string.IsNullOrEmpty(item.ImageUrl))
                 {
-                    // Bounded request ledger: a full clear only risks re-requesting
-                    // a cover, which CoverCache deduplicates.
-                    if (_landingCoverRequested.Count >= 2048) _landingCoverRequested.Clear();
-                    if (_landingCoverRequested.Add((item.TitleId ?? "") + "\n" + item.ImageUrl))
-                        _covers.Request(item.TitleId, item.ImageUrl);
+                    // CoverCache deduplicates and backs off errors. A declined or
+                    // evicted request must be retried when the row is visible again.
+                    _covers.Request(item.TitleId, item.ImageUrl);
                 }
                 TextCentered(r, destination, 11, titleId, Dim);
             }
@@ -3608,7 +3957,7 @@ namespace Orbis
             TextFit(r, pebble.x + 64, pebble.y + 10, 18, colW - 280,
                 item.Name ?? item.TitleId, White);
             string rate = item.BytesPerSec > 0
-                ? (item.BytesPerSec / (1024.0 * 1024.0)).ToString("0.0") + " MB/s"
+                ? (item.BytesPerSec / 1000000.0).ToString("0.0") + " MB/s"
                 : StateLabel(item);
             TextPx(r, pebble.x + 64, pebble.y + 36, 15, rate + "  ·  " + pct + "%", Muted);
             int trackX = pebble.x + colW - 220;
@@ -3660,7 +4009,7 @@ namespace Orbis
                     TextCentered(r, box, 29, ch.ToString(), on || pressed ? PrimaryInk : White);
                 }
             }
-            string[] special = { "Space", "Delete", "Clear", _kbLower ? "ABC" : "abc", (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? "Save" : _softKbForSourceUrl ? "Install" : "Search" };
+            string[] special = { "Space", "Delete", "Clear", _kbLower ? "ABC" : "abc", _settingsPage==6 && _settingsOpen ? "Queue" : (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? "Save" : _softKbForSourceUrl ? "Install" : "Search" };
             const int sw = 244; int sx = (W - (5 * (sw + gap) - gap)) / 2;
             for (int i = 0; i < 5; i++)
             {
@@ -3710,12 +4059,13 @@ namespace Orbis
         void PrefetchSearchCovers(IList<GameHit> hits)
         {
             if (hits == null) return;
+            SDL_Rect art = CaseArtworkBounds(new SDL_Rect { w = 74, h = 94 });
             int count = Math.Min(6, hits.Count);
             for (int i = 0; i < count; i++)
             {
                 GameHit hit = hits[i];
                 if (hit != null && !string.IsNullOrEmpty(hit.ImageUrl))
-                    _covers.Request(hit.TitleId, hit.ImageUrl);
+                    _covers.RequestSized(hit.TitleId, hit.ImageUrl, art.w, art.h);
             }
         }
 
@@ -3939,7 +4289,7 @@ namespace Orbis
         {
             List<DlItem> items = _dlMgr.Snapshot();
             int baseIndex = PreferredCandidate(_linkCandidates, "base", false);
-            int updateIndex = PreferredCandidate(_linkCandidates, "update", true);
+            int updateIndex = PreferredRecommendedPatch(_linkCandidates, _firmwareVersion);
             if (baseIndex < 0 && updateIndex < 0) return false;
             return (baseIndex < 0 || IsCandidateQueued(_linkCandidates[baseIndex], items)) &&
                 (updateIndex < 0 || IsCandidateQueued(_linkCandidates[updateIndex], items));
@@ -3959,20 +4309,20 @@ namespace Orbis
             DrawRefinedDownloads(r);
         }
 
-        void DrawFocusedSparkline(IntPtr r, SDL_Rect rect)
+        void DrawFocusedSparkline(IntPtr r, SDL_Rect rect, DlItem item)
         {
             Fill(r, rect.x, rect.y, rect.w, rect.h, C(12, 13, 16));
-            NerdTelemetry n = _dlMgr.Nerd;
-            int samples = Math.Min(n.Count, 64);
+            double[] history = item.RateSamples;
+            int samples = history == null ? 0 : history.Length;
             double peak = 1;
-            for (int i = 0; i < samples; i++) peak = Math.Max(peak, n.SampleAt(i));
+            for (int i = 0; i < samples; i++) peak = Math.Max(peak, history[i]);
             int step = Math.Max(2, (rect.w - 150) / Math.Max(1, samples));
             for (int i = 0; i < samples; i++)
             {
-                int h = (int)Math.Max(1, n.SampleAt(samples - i - 1) * (rect.h - 6) / peak);
+                int h = (int)Math.Max(1, history[i] * (rect.h - 6) / peak);
                 Fill(r, rect.x + i * step, rect.y + rect.h - h, Math.Max(1, step - 1), h, Accent);
             }
-            string speed = n.MbpsInstant.ToString("0.0") + " Mbps";
+            string speed = (item.BytesPerSec / 1000000.0).ToString("0.00") + " MB/s";
             TextPx(r, rect.x + rect.w - UiFont.MeasurePx(15, speed) - 12, rect.y + 10, 15, speed, Muted);
         }
 
@@ -4049,7 +4399,7 @@ namespace Orbis
             if (n.Total > 0)
             {
                 if (n.Finalizing)
-                    lineAt("xfer complete  ·  finalizing", Violet, 15);
+                    lineAt("xfer complete  ·  awaiting install", Violet, 15);
                 else
                 {
                     int pct = (int)Math.Min(100, n.Done * 100.0 / Math.Max(1, n.Total));
@@ -4098,17 +4448,17 @@ namespace Orbis
                 if (Extracting(item)) return "Extracting";
                 if (item.State == DlState.Installing || (item.StatusText ?? "").StartsWith("Installing packages")) return "Installing in order";
                 if (item.State == DlState.Downloading) return "Downloading";
-                if (item.State == DlState.Finalizing) return "Verifying files";
+                if (item.State == DlState.Finalizing) return "Waiting to install";
                 if (item.State == DlState.Resolving) return "Resolving links";
                 if (item.State == DlState.Installed) installed++;
                 if (item.State == DlState.Submitted) submitted++;
                 if (item.State == DlState.Paused) paused++;
             }
             if (installed == group.Items.Count) return "Installed";
-            if (submitted > 0) return "Submitted to BGFT";
+            if (submitted > 0) return "Installing";
             if (paused > 0) return "Paused";
             foreach (DlItem item in group.Items)
-                if (!string.IsNullOrEmpty(item.InstallAfterId)) return "Waiting for dependency";
+                if (item.State == DlState.Queued && !item.InstallAfterConfirmed && !string.IsNullOrEmpty(item.InstallAfterId)) return "Waiting for dependency";
             foreach (DlItem item in group.Items) if (item.State == DlState.Completed) return "Ready to install";
             return "Queued";
         }
@@ -4128,7 +4478,7 @@ namespace Orbis
             double speed = 0; int eta = 0;
             foreach (DlItem item in group.Items) { speed += Math.Max(0, item.BytesPerSec); eta = Math.Max(eta, item.EtaSeconds); }
             string sizes = total > 0 ? (DownloadManager.Human(done) + " / " + DownloadManager.Human(total)) : group.Items.Count + " packages";
-            string rate = speed > 0 ? "   " + DownloadManager.Human((long)speed) + "/s" : "";
+            string rate = speed > 0 ? "   " + (speed / 1000000.0).ToString("0.0") + " MB/s" : "";
             string etaText = "";
             if (eta > 0)
             {
@@ -4216,7 +4566,7 @@ namespace Orbis
             TextPx(r, x + 28, y, 15, label ?? "", color);
         }
 
-        void DrawCover(IntPtr r, GameHit game, SDL_Rect destination)
+        void DrawCover(IntPtr r, GameHit game, SDL_Rect destination, bool requestIfMissing = true)
         {
             Fill(r, destination.x, destination.y, destination.w, destination.h, Panel);
 
@@ -4239,10 +4589,10 @@ namespace Orbis
                     w = dw,
                     h = dh
                 };
-                SDL_RenderCopy(r, texture, IntPtr.Zero, ref dest);
+                _covers.Draw(r, texture, ref dest);
                 return;
             }
-            if (game != null && !string.IsNullOrEmpty(game.ImageUrl))
+            if (requestIfMissing && game != null && !string.IsNullOrEmpty(game.ImageUrl))
                 _covers.Request(game.TitleId, game.ImageUrl);
             var inner = new SDL_Rect
             {
@@ -4646,8 +4996,8 @@ namespace Orbis
             if (state == DlState.Completed) return "Ready";
             if (state == DlState.Installed) return "Installed";
             if (state == DlState.Downloading) return "Downloading";
-            if (state == DlState.Finalizing) return "Finalizing";
-            if (state == DlState.Resolving) return "Preparing";
+            if (state == DlState.Finalizing) return "Waiting to install";
+            if (state == DlState.Resolving) return "Connecting";
             if (state == DlState.Installing) return "Installing";
             if (state == DlState.Submitted) return "Sent to PS4";
             if (state == DlState.Paused) return "Paused";
@@ -4669,9 +5019,9 @@ namespace Orbis
             if (item.State == DlState.Completed)
                 return "100%   Ready to install  ·  CROSS";
             if (item.State == DlState.Finalizing)
-                return item.StatusText ?? "Finalizing and verifying package...";
+                return item.StatusText ?? "Download complete · waiting to install";
             if (item.State == DlState.Submitted)
-                return item.StatusText ?? "Sent to PS4 — verification pending · PKG kept";
+                return item.StatusText ?? "Installing on PS4 · PKG kept until confirmed";
             if (item.State == DlState.Downloading || item.State == DlState.Paused ||
                 item.State == DlState.Resolving)
             {

@@ -22,6 +22,7 @@ namespace Orbis
         List<GameHit> _filteredResults = new List<GameHit>();
         List<GameHit> _filteredSource;
         int _filteredRegion = -1;
+        int _filteredSearchGeneration = -1;
         static readonly string[] RegionFilters = { "All regions", "EU", "US", "JP", "Other" };
         int _queueFilter;
         static readonly string[] QueueFilters = { "All", "Active", "Attention" };
@@ -111,17 +112,31 @@ namespace Orbis
 
         List<GameHit> FilteredResults()
         {
-            if (object.ReferenceEquals(_filteredSource, _results) && _filteredRegion == _regionFilter) return _filteredResults;
-            _filteredSource = _results; _filteredRegion = _regionFilter;
-            _filteredResults = new List<GameHit>();
-            foreach (var hit in _results)
+            lock (_lock)
             {
-                string region = (hit.Region ?? "").ToUpperInvariant();
-                bool known = region == "EU" || region == "US" || region == "JP";
-                if (_regionFilter == 0 || (_regionFilter == 4 ? !known : region == RegionFilters[_regionFilter])) _filteredResults.Add(hit);
+                if (object.ReferenceEquals(_filteredSource, _results) && _filteredRegion == _regionFilter) return _filteredResults;
+                GameHit focused = _filteredRegion == _regionFilter && _filteredSearchGeneration == _searchGeneration &&
+                    _focus >= 0 && _focus < _filteredResults.Count ? _filteredResults[_focus] : null;
+                _filteredSource = _results; _filteredRegion = _regionFilter;
+                _filteredSearchGeneration = _searchGeneration;
+                _filteredResults = new List<GameHit>();
+                foreach (var hit in _results)
+                {
+                    string region = (hit.Region ?? "").ToUpperInvariant();
+                    bool known = region == "EU" || region == "US" || region == "JP";
+                    if (_regionFilter == 0 || (_regionFilter == 4 ? !known : region == RegionFilters[_regionFilter])) _filteredResults.Add(hit);
+                }
+                int nextFocus = -1;
+                if (focused != null)
+                    nextFocus = _filteredResults.FindIndex(hit => hit.TitleId == focused.TitleId &&
+                        hit.Region == focused.Region && hit.Source == focused.Source &&
+                        hit.SourceVersion == focused.SourceVersion && hit.CatalogUrl == focused.CatalogUrl);
+                _focus = nextFocus < 0 ? 0 : nextFocus;
+                _listScroll = nextFocus < 0 ? 0 : Math.Min(_listScroll, Math.Max(0, _filteredResults.Count - 5));
+                if (_focus < _listScroll) _listScroll = _focus;
+                if (_focus >= _listScroll + 5) _listScroll = _focus - 4;
+                return _filteredResults;
             }
-            _focus = _listScroll = 0;
-            return _filteredResults;
         }
 
         bool PackageMatches(int index)
@@ -141,13 +156,22 @@ namespace Orbis
             _detailHosts.Clear(); _expandedPackageGroups.Clear();
         }
 
+        IList<DlItem> _queuedGroupItems;
+        IList<PackageCandidatePresentation> _queuedGroupPresentation;
+        readonly HashSet<string> _queuedGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         bool PackageGroupQueued(int index, IList<DlItem> items)
         {
             if (index < 0 || index >= _linkPresentation.Count) return false;
-            string group = DetailGroupKey(_linkPresentation[index]);
-            for (int i = 0; i < _linkPresentation.Count && i < _linkCandidates.Count; i++)
-                if (string.Equals(DetailGroupKey(_linkPresentation[i]), group, StringComparison.OrdinalIgnoreCase) && IsCandidateQueued(_linkCandidates[i], items)) return true;
-            return false;
+            if (!object.ReferenceEquals(items, _queuedGroupItems) ||
+                !object.ReferenceEquals(_linkPresentation, _queuedGroupPresentation))
+            {
+                _queuedGroupItems = items; _queuedGroupPresentation = _linkPresentation;
+                _queuedGroups.Clear();
+                foreach (var meta in _linkPresentation)
+                    if (IsCandidateQueued(meta.Candidate, items)) _queuedGroups.Add(DetailGroupKey(meta));
+            }
+            return _queuedGroups.Contains(DetailGroupKey(_linkPresentation[index]));
         }
 
         void RefreshQueueModel(bool force = false)
@@ -187,8 +211,9 @@ namespace Orbis
         {
             if (item == null) return "Queued";
             if (Extracting(item)) return "Extracting";
+            if (item.State == DlState.Submitted && !item.Background && PkgValidator.BgftSubTypeForKind(item.Kind) == 7) return "Installing";
             if ((item.StatusText ?? "").StartsWith("Installing packages", StringComparison.OrdinalIgnoreCase)) return "Installing in order";
-            if (item.State == DlState.Queued && !string.IsNullOrEmpty(item.InstallAfterId)) return "Waiting for dependency";
+            if (item.State == DlState.Queued && !item.InstallAfterConfirmed && !string.IsNullOrEmpty(item.InstallAfterId)) return "Waiting for dependency";
             return StateLabel(item.State);
         }
 
@@ -243,15 +268,17 @@ namespace Orbis
                     DrawCase(r, hit, art);
                     if (focused) StrokeRect(r, new SDL_Rect { x = x - 6, y = art.y - 6, w = posterW + 12, h = art.h + 12 }, Accent, 2);
                     TextFit(r, x, 693, 22, posterW, LibraryTitle(hit), White);
-                    TextFit(r, x, 731, 17, posterW, hit.TitleId ?? "", Muted);
-                    lock (_lock) if (_libraryHasUpdate.Contains(hit.TitleId ?? "")) SoftRect(r, new SDL_Rect { x = x + posterW - 21, y = art.y + 14, w = 9, h = 9 }, Warning);
+                    TextFit(r, x, 731, 17, posterW, LibraryInstalledVersion(hit), Muted);
+                    bool newer; string updateStatus = LibraryUpdateStatus(hit, out newer);
+                    TextFit(r, x, 760, 16, posterW, updateStatus, newer ? Warning : Dim);
+                    if (newer) SoftRect(r, new SDL_Rect { x = x + posterW - 21, y = art.y + 14, w = 9, h = 9 }, Warning);
                 }
                 Fill(r, ContentX, 794, ContentWidth, 1, Border);
                 var chosen = _libraryGames[selected];
                 TextFit(r, ContentX, 818, 22, 1050, LibraryTitle(chosen), White);
-                string updateInfo; bool hasUpdate;
-                lock (_lock) { hasUpdate = _libraryUpdateInfo.TryGetValue(chosen.TitleId ?? "", out updateInfo); }
-                TextFit(r, ContentX, 858, 18, 1100, hasUpdate ? updateInfo : chosen.TitleId, hasUpdate ? Warning : Muted);
+                bool hasUpdate; string updateInfo = LibraryUpdateStatus(chosen, out hasUpdate);
+                TextFit(r, ContentX, 858, 18, 1100, chosen.TitleId + " · " + LibraryInstalledVersion(chosen) + " · " + updateInfo, hasUpdate ? Warning : Muted);
+                TextFit(r, ContentX, 888, 16, 1100, "Official update metadata · DLC and backport availability unknown", Dim);
                 string page = (selected + 1) + " / " + count;
                 TextPx(r, ContentX + ContentWidth - UiFont.MeasurePx(18, page), 822, 18, page, Muted);
                 if (count > visible) { TextPx(r, ContentX - 36, 520, 32, _libraryScroll > 0 ? "‹" : "", Muted); TextPx(r, ContentX + ContentWidth + 16, 520, 32, _libraryScroll + visible < count ? "›" : "", Muted); }
@@ -268,10 +295,11 @@ namespace Orbis
         void DrawCharcoalResults(IntPtr r)
         {
             bool busy; lock (_lock) busy = _browseBusy && _busyKind == BusyKind.Searching;
-            if (busy) { DrawCharcoalLoading(r, false); return; }
+            if (busy && _results.Count == 0) { DrawCharcoalLoading(r, false); return; }
             var list = FilteredResults();
             string count = list.Count + (list.Count == 1 ? " title" : " titles");
-            string queryLine = "“" + (_query ?? "") + "”  ·  " + count;
+            string queryLine = (string.IsNullOrWhiteSpace(_query) ? "All titles" : "“" + _query + "”") + "  ·  " + count;
+            if (busy) queryLine += "  ·  Checking remaining sources…";
             TextFit(r, ContentX, 150, 22, ContentWidth, queryLine, White);
             int chipW = 138, chipGap = 8;
             int chipsTotal = RegionFilters.Length * chipW + (RegionFilters.Length - 1) * chipGap;
@@ -309,7 +337,8 @@ namespace Orbis
         void DrawCharcoalLoading(IntPtr r, bool resolving)
         {
             if (resolving && _selected != null) { DrawGamePackagePage(r, true); return; }
-            TextCentered(r, new SDL_Rect { x = ContentX, y = 385, w = ContentWidth, h = 58 }, 32, "Searching for “" + (_query ?? "") + "”", White);
+            TextCentered(r, new SDL_Rect { x = ContentX, y = 385, w = ContentWidth, h = 58 }, 32,
+                string.IsNullOrWhiteSpace(_query) ? "Browsing titles" : "Searching for “" + _query + "”", White);
             TextCentered(r, new SDL_Rect { x = ContentX, y = 455, w = ContentWidth, h = 42 }, 21, "Checking titles and regions from your enabled sources.", Muted);
             DrawActivityRail(r, new SDL_Rect { x = 610, y = 529, w = 700, h = 5 });
         }
@@ -375,14 +404,17 @@ namespace Orbis
             int versionX = rightX + rightW - UiFont.MeasurePx(18, versions);
             GamepadIcons.Draw(r, "r2", versionX - 36, 350, 26);
             TextPx(r, versionX, 352, 18, versions, Muted);
+            if (ShowsProviderStatus)
+                TextCentered(r, new SDL_Rect { x = rightX + (rightW - 300) / 2, y = 350, w = 300, h = 28 }, 16,
+                    UnlockProviders.EnabledSummary(_cfg), Muted);
 
             if (_detailRows.Count == 0)
             {
                 DesignIcon(r, string.IsNullOrEmpty(_resolveError) ? "download" : "error", rightX + rightW / 2 - 20, 503, 40, Dim);
                 TextCentered(r, new SDL_Rect { x = rightX, y = 574, w = rightW, h = 45 }, 27,
-                    string.IsNullOrEmpty(_resolveError) ? "No matching packages" : "Packages unavailable", White);
+                    ResolveEmptyHeading(), White);
                 TextWrappedCentered(r, rightX + 90, 633, 19, rightW - 180,
-                    string.IsNullOrEmpty(_resolveError) ? "Choose another package type, host or version." : _resolveError, Muted);
+                    ResolveEmptyDescription(), Muted);
                 return;
             }
 
@@ -406,6 +438,14 @@ namespace Orbis
                 var rect = new SDL_Rect { x = x, y = y, w = width, h = 88 };
                 if (on) DesignCard(r, rect, true);
                 else Fill(r, x + 20, y + 87, width - 40, 1, Border);
+                if (ShowsProviderStatus)
+                {
+                    DebridHostState support = PackageLinkState(index, child);
+                    SDL_Color tone = LinkHostTone(support);
+                    if (support == DebridHostState.Supported)
+                        Fill(r, x + 8, y + 22, 7, 44, C((byte)(tone.r / 5), (byte)(tone.g / 5), (byte)(tone.b / 5)));
+                    Fill(r, x + 10, y + 24, 3, 40, tone);
+                }
                 bool queued = PackageGroupQueued(index, _queueSnapshot);
                 bool blocked = meta.Candidate != null && !string.IsNullOrEmpty(meta.Candidate.ResolutionError);
                 string title = child ? meta.Hoster : PackageRowTitle(meta);
@@ -421,7 +461,9 @@ namespace Orbis
             }
             DrawScrollBar(r, new SDL_Rect { x = rightX + rightW + 13, y = top, w = 4, h = 480 }, _detailRows.Count, visible, _detailScroll);
             Fill(r, rightX, 910, rightW, 1, Border);
-            TextPx(r, rightX, 930, 16, "Base  →  Update / Backport  →  DLC", Dim);
+            if (ShowsProviderStatus)
+                DrawSelectedLinkGuidance(r, rightX + 70, 914, rightW - 140, _linkPresentation[_detailRows[focused]].Candidate);
+            else TextPx(r, rightX, 930, 16, "Base  →  Update / Backport  →  DLC", Dim);
             string position = (focused + 1) + " / " + _detailRows.Count;
             TextPx(r, rightX + rightW - UiFont.MeasurePx(16, position), 930, 16, position, Dim);
         }
@@ -435,14 +477,20 @@ namespace Orbis
 
         PackageCandidate _inspectorCandidate;
         string _inspectorArchive = "Package file";
+        string _inspectorFirmware = "Not supplied", _inspectorFirmwareVersion;
 
         void DrawSelectedPackageInfo(IntPtr r, int x, PackageCandidatePresentation meta)
         {
             const int width = 328;
             var candidate = meta.Candidate;
-            if (!object.ReferenceEquals(_inspectorCandidate, candidate))
+            if (!object.ReferenceEquals(_inspectorCandidate, candidate) || _inspectorFirmwareVersion != _firmwareVersion)
             {
                 _inspectorCandidate = candidate;
+                _inspectorFirmwareVersion = _firmwareVersion;
+                string required = candidate == null ? "" : candidate.RequiredFirmware;
+                if (candidate != null && string.IsNullOrEmpty(required))
+                    required = PkgIntegrity.FirmwareRequirement(candidate.Label + " " + candidate.DisplayName);
+                _inspectorFirmware = string.IsNullOrEmpty(required) ? "Not supplied" : PkgIntegrity.FirmwareLabel(required, _firmwareVersion);
                 _inspectorArchive = "Package file";
                 if (candidate != null && !string.IsNullOrEmpty(candidate.ArchiveVolumes))
                 {
@@ -463,10 +511,7 @@ namespace Orbis
             string size = candidate != null && candidate.ExpectedByteSize.GetValueOrDefault() > 0
                 ? DownloadManager.Human(candidate.ExpectedByteSize.Value) : "Not supplied";
             DrawPackageFact(r, x, 669, "Size", size, Muted);
-            string required = candidate == null ? "" : candidate.RequiredFirmware;
-            if (candidate != null && string.IsNullOrEmpty(required))
-                required = PkgIntegrity.FirmwareRequirement(candidate.Label + " " + candidate.DisplayName);
-            string firmware = string.IsNullOrEmpty(required) ? "Not supplied" : PkgIntegrity.FirmwareLabel(required, _firmwareVersion);
+            string firmware = _inspectorFirmware;
             DrawPackageFact(r, x, 701, "Firmware", firmware, firmware.StartsWith("Needs backport", StringComparison.Ordinal) ? Warning : Muted);
             DrawPackageFact(r, x, 733, "Host", meta.Hoster ?? "Unknown", Muted);
             DrawPackageFact(r, x, 765, "Mirrors", meta.MirrorIndex + " of " + meta.MirrorCount, Muted);
@@ -542,21 +587,21 @@ namespace Orbis
                 TextFit(r, x + width - 315, y + 14, 20, 290, state, child ? StateColor(item.State) : DownloadGroupColor(group));
                 if (child)
                 {
-                    if (_cfg.NerdStats && index == _dlFocus) DrawFocusedSparkline(r, new SDL_Rect { x = tx, y = y + 79, w = textW, h = 21 });
+                    if (_cfg.NerdStats && index == _dlFocus) DrawFocusedSparkline(r, new SDL_Rect { x = tx, y = y + 79, w = textW, h = 21 }, item);
                     else DrawProgress(r, new SDL_Rect { x = tx, y = y + 84, w = textW, h = 6 }, item);
                     TextFit(r, x + width - 315, y + 49, 18, 290, TransferSizeLine(item), Muted);
                 }
                 else
                 {
                     long done, total; DownloadGroupProgress(group, out done, out total);
-                    if (_collapsedDownloadGroups.Contains(group.TitleId ?? ""))
+                    if (_collapsedDownloadGroups.Contains(group.Key ?? ""))
                     {
                         Fill(r, tx, y + 84, textW, 6, Raised);
                         if (total > 0) Fill(r, tx, y + 84, (int)Math.Min(textW, Math.Max(0, done * (double)textW / total)), 6, Accent);
                     }
                     TextFit(r, x + width - 315, y + 48, 18, 290, DownloadManager.Human(done) + (total > 0 ? " / " + DownloadManager.Human(total) : ""), Muted);
-                    if (_collapsedDownloadGroups.Contains(group.TitleId ?? "")) TextFit(r, tx, y + 49, 18, textW, GroupProgressLine(group, done, total), Muted);
-                    TextFit(r, x + width - 315, y + 77, 18, 290, (_collapsedDownloadGroups.Contains(group.TitleId ?? "") ? "+ Expand · " : "− Collapse · ") + group.Items.Count + (group.Items.Count == 1 ? " package" : " packages"), Muted);
+                    if (_collapsedDownloadGroups.Contains(group.Key ?? "")) TextFit(r, tx, y + 49, 18, textW, GroupProgressLine(group, done, total), Muted);
+                    TextFit(r, x + width - 315, y + 77, 18, 290, (_collapsedDownloadGroups.Contains(group.Key ?? "") ? "+ Expand · " : "− Collapse · ") + group.Items.Count + (group.Items.Count == 1 ? " package" : " packages"), Muted);
                 }
             }
             DrawScrollBar(r, new SDL_Rect { x = ContentX + ContentWidth + 16, y = top, w = 5, h = 586 }, rows.Count, visible, _dlScroll);
@@ -572,6 +617,16 @@ namespace Orbis
             catch { _fileVolumes = new List<ArchiveVolume>(); }
         }
 
+        static string JournalFileState(string value, bool failed, string error)
+        {
+            string[] record = (value ?? "").Split(new[] { ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            int task;
+            if ((record.Length != 4 && record.Length != 5) || !int.TryParse(record[1], out task)) return "Waiting for dependency";
+            if (record.Length == 5 && record[4] == "6" && record[2] == "1") return "Installed";
+            if (failed) return "Failed · " + (error ?? "Installation not confirmed");
+            return task >= 0 || record[3] == "2" ? "Installing" : "Waiting to install";
+        }
+
         void RefreshFileOutputs(DlItem item)
         {
             if (_fileReadBusy || (_fileReadAt != 0 && UiElapsed(_fileReadAt) < 1000)) return;
@@ -584,7 +639,11 @@ namespace Orbis
                 var rows = new List<FileOutput>();
                 try
                 {
-                    string directory = Path.Combine(AppSettings.DataDir, "resident", "archives", id);
+                    string directory = ResidentDownloadService.ArchiveJournalDirectory(id);
+                    if (!string.IsNullOrEmpty(item.DestPath)) {
+                        string staged = Path.Combine(Path.GetDirectoryName(item.DestPath), "extract-" + id);
+                        if (Directory.Exists(staged)) directory = staged;
+                    }
                     string marker = Path.Combine(directory, "packages.txt");
                     if (File.Exists(marker) && new FileInfo(marker).Length <= 32768)
                     {
@@ -595,13 +654,11 @@ namespace Orbis
                             long size;
                             if (fields.Length != 2 || !long.TryParse(fields[1], out size) || size < 0 || fields[0].Length != 11 || !fields[0].StartsWith("pkg-") || !fields[0].EndsWith(".pkg")) continue;
                             int ordinal; if (!int.TryParse(fields[0].Substring(4, 3), out ordinal) || ordinal < 1 || ordinal > 256) continue;
-                            string state = "Extracted · waiting";
+                            string state = "Waiting for dependency";
                             string journal = Path.Combine(directory, "install-" + (i + 1).ToString("000") + ".txt");
                             if (File.Exists(journal) && new FileInfo(journal).Length < 1024)
                             {
-                                string[] record = File.ReadAllText(journal).Split(new[] { ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                                int task;
-                                if (record.Length == 4 && int.TryParse(record[1], out task)) state = record[2] == "1" ? "BGFT transfer complete" : task >= 0 ? "Submitted to BGFT" : "Preparing installation";
+                                state = JournalFileState(File.ReadAllText(journal), item.State == DlState.Failed, item.Error);
                             }
                             rows.Add(new FileOutput { Name = fields[0], Size = size, State = state });
                         }
@@ -631,27 +688,44 @@ namespace Orbis
             if (item == null) { _fileDetailId = null; return; }
             RefreshFileOutputs(item);
             List<FileOutput> outputs; lock (_lock) outputs = _fileOutputs;
-            bool extracting = Extracting(item), archive = _fileVolumes.Count > 0 || extracting || outputs.Count > 0;
-            int stage = item.State == DlState.Submitted || item.State == DlState.Installed || item.State == DlState.Installing || (item.StatusText ?? "").StartsWith("Installing packages") ? 3 : extracting ? 1 : item.State == DlState.Finalizing || item.State == DlState.Completed ? 2 : 0;
+            bool extracting = Extracting(item), archive = item.Kind == "archive" || _fileVolumes.Count > 0 || extracting || outputs.Count > 0;
+            int installStage = archive ? 2 : 1;
+            bool downloadComplete = item.Total > 0 && item.Done >= item.Total;
+            int stage = extracting ? 1 : item.State == DlState.Submitted || item.State == DlState.Installed ||
+                item.State == DlState.Installing || item.State == DlState.Completed ||
+                (item.StatusText ?? "").StartsWith("Installing packages") ||
+                (!archive && downloadComplete) ? installStage : 0;
+            if (item.State == DlState.Failed && outputs.Count > 0) stage = installStage;
             TextFit(r, ContentX, 132, 38, ContentWidth, item.Name ?? item.TitleId, White);
-            TextFit(r, ContentX, 191, 22, ContentWidth, item.TitleId + " · " + (archive ? _fileVolumes.Count + " archive volumes" : "Direct package · extraction skipped"), Muted);
-            string[] stages = { "Download", archive ? "Extract PKGs" : "Direct PKG", "Verify files", "Install in order" };
-            for (int i = 0; i < 4; i++) FilterChip(r, ContentX + i * 364, 246, 344, (i + 1) + "  " + stages[i], stage == i);
+            TextFit(r, ContentX, 191, 22, ContentWidth, (string.IsNullOrEmpty(item.TitleId) ? "" : item.TitleId + " · ") +
+                (archive ? (_fileVolumes.Count > 1 ? _fileVolumes.Count + " archive volumes" : "Archive · extract packages before installation") : "Direct package · extraction skipped"), Muted);
+            string firstStage = item.LocalSource ? "USB file" : "Download";
+            string[] stages = archive ? new[] { firstStage, "Extract PKGs", "Install" } : new[] { firstStage, "Install" };
+            int stageWidth = (ContentWidth - (stages.Length - 1) * 20) / stages.Length;
+            for (int i = 0; i < stages.Length; i++) FilterChip(r, ContentX + i * (stageWidth + 20), 246, stageWidth, (i + 1) + "  " + stages[i], stage == i);
             Card(r, new SDL_Rect { x = ContentX, y = 320, w = ContentWidth, h = 172 }, false, Panel, Border);
             TextFit(r, ContentX + 26, 340, 30, ContentWidth - 52, VisibleState(item), White);
-            TextFit(r, ContentX + 26, 389, 22, ContentWidth - 52, !string.IsNullOrEmpty(item.Error) ? item.Error : item.StatusText ?? "Waiting for progress", Muted);
-            DrawProgress(r, new SDL_Rect { x = ContentX + 26, y = 439, w = 800, h = 8 }, item);
-            TextFit(r, ContentX + 860, 430, 21, 550, item.State == DlState.Installed ? "Installation confirmed" : stage == 3 ? "Waiting for install confirmation" : FormatDlLine(item), Muted);
+            string detail = !string.IsNullOrEmpty(item.Error) ? item.Error : item.StatusText ?? "Waiting for progress";
+            int apiAt = detail.IndexOf("API=", StringComparison.Ordinal);
+            TextFit(r, ContentX + 26, 389, 22, ContentWidth - 52, apiAt >= 0 ? detail.Substring(0, apiAt).Trim() : detail, Muted);
+            if (apiAt >= 0)
+                TextFit(r, ContentX + 26, 435, 18, ContentWidth - 52, detail.Substring(apiAt), Danger);
+            else {
+                DrawProgress(r, new SDL_Rect { x = ContentX + 26, y = 439, w = 800, h = 8 }, item);
+                TextFit(r, ContentX + 860, 430, 21, 550, item.State == DlState.Installed ? "Installation confirmed" :
+                    item.State == DlState.Installing || item.State == DlState.Submitted ? "Waiting for install confirmation" : FormatDlLine(item), Muted);
+            }
             TextPx(r, ContentX, 522, 26, archive && stage == 0 ? "Archive volumes" : "Package files", White);
             var related = new List<DlItem>();
             foreach (var child in _queueSnapshot) if (child.Id == item.Id || (!string.IsNullOrEmpty(item.TitleId) && child.TitleId == item.TitleId)) related.Add(child);
-            int count = archive && stage == 0 ? _fileVolumes.Count : outputs.Count > 0 ? outputs.Count : related.Count;
+            bool showVolumes = archive && stage == 0 && _fileVolumes.Count > 0;
+            int count = showVolumes ? _fileVolumes.Count : outputs.Count > 0 ? outputs.Count : related.Count;
             _fileScroll = Math.Max(0, Math.Min(_fileScroll, Math.Max(0, count - 4)));
             long volumeTotal = 0, offset = 0; foreach (var v in _fileVolumes) volumeTotal += v.Size;
             for (int i = 0; i < count; i++)
             {
                 string name, state, size;
-                if (archive && stage == 0)
+                if (showVolumes)
                 {
                     var volume = _fileVolumes[i]; name = volume.Name; size = volume.Size > 0 ? FileBytes(volume.Size) : "Size pending";
                     bool known = volumeTotal > 0 && item.Total == volumeTotal && volume.Size > 0;
@@ -675,7 +749,7 @@ namespace Orbis
         void DrawCharcoalPair(IntPtr r)
         {
             Fill(r, 0, 0, W, H, Bg);
-            TextPx(r, ContentX, 135, 42, "Configure your PS4", White);
+            TextPx(r, ContentX, 135, 42, _pairDownloadMode ? "Send download links" : "Configure your PS4", White);
             TextPx(r, ContentX, 198, 23, "Scan with your phone on the same local network", Muted);
             Card(r, new SDL_Rect { x = ContentX, y = 284, w = 624, h = 600 }, false, Panel, Border);
             Card(r, new SDL_Rect { x = 908, y = 284, w = 772, h = 600 }, false, Panel, Border);
@@ -689,7 +763,9 @@ namespace Orbis
             }
             else TextCentered(r, new SDL_Rect { x = ContentX + 24, y = 510, w = 576, h = 80 }, 32, _pairUiStage == PairUiStage.Complete ? "Connected" : "Session closed", _pairUiStage == PairUiStage.Complete ? Ok : Muted);
             TextPx(r, 946, 323, 30, waiting ? "Waiting for your phone" : _pairUiStage == PairUiStage.Complete ? "Service connected" : "Pairing ended", White);
-            string[] steps = { "1  Scan the QR code", "2  Link services and add sources", "3  Customize and save to your PS4" };
+            string[] steps = _pairDownloadMode
+                ? new[] { "1  Scan the QR code", "2  Paste links, one per line", "3  Queue downloads on your PS4" }
+                : new[] { "1  Scan the QR code", "2  Link services and add sources", "3  Customize and save to your PS4" };
             for (int i = 0; i < steps.Length; i++)
             {
                 int y = 411 + i * 89;

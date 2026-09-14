@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Text;
 using SharpCompress.Archives.Rar;
 using SharpCompress.Readers;
@@ -15,7 +15,8 @@ namespace Orbis
         Pkg,
         Zip,
         Rar4,
-        Rar5
+        Rar5,
+        SevenZip
     }
 
     internal sealed class PackageArchiveEntry
@@ -33,7 +34,69 @@ namespace Orbis
         const long MaximumExpandedBytes = 512L * 1024 * 1024 * 1024;
         static readonly byte[] Rar4Magic = { 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00 };
         static readonly byte[] Rar5Magic = { 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00 };
+        static readonly byte[] SevenZipMagic = { 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C };
         static readonly uint[] CrcTable = BuildCrcTable();
+
+        internal static bool IsSevenZipHeader(byte[] header)
+        { return header != null && StartsWith(header, header.Length, SevenZipMagic); }
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        delegate int NativeArchiveProgress(long done, long total);
+        [DllImport("libGameSearchResident.prx", CallingConvention = CallingConvention.Cdecl)]
+        static extern int gs_7z_extract_local_ex([MarshalAs(UnmanagedType.LPStr)] string input,
+            [MarshalAs(UnmanagedType.LPStr)] string destination, IntPtr packages, int capacity,
+            NativeArchiveProgress progress, [Out] byte[] error, int errorCapacity);
+
+        static List<PackageArchiveEntry> ReadSevenZip(string input, string destination,
+            Func<bool> cancel = null, Action<long, long> progress = null, string password = null)
+        {
+            if (!string.IsNullOrEmpty(password))
+                throw new NotSupportedException("Encrypted 7z archives are not supported; the archive is kept.");
+            CheckCancel(cancel);
+            const int stride = 1032;
+            IntPtr entries = Marshal.AllocHGlobal(MaximumPackageEntries * stride);
+            Exception callbackError = null;
+            NativeArchiveProgress callback = (done, total) => {
+                try { CheckCancel(cancel); if (progress != null) progress(done, total); return 0; }
+                catch (Exception ex) { callbackError = ex; return 1; }
+            };
+            try
+            {
+                byte[] error = new byte[1024];
+                int count = gs_7z_extract_local_ex(input, destination, entries, MaximumPackageEntries, callback, error, error.Length);
+                if (callbackError != null) throw callbackError;
+                if (count <= 0 || count > MaximumPackageEntries)
+                {
+                    int end = Array.IndexOf(error, (byte)0);
+                    string detail = Encoding.UTF8.GetString(error, 0, end < 0 ? error.Length : end);
+                    throw new InvalidDataException("7z extraction failed (" + count + "): " + detail + ". Archive retained.");
+                }
+                var result = new List<PackageArchiveEntry>();
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr entry = IntPtr.Add(entries, i * stride);
+                    string path = NativeArchiveText(entry);
+                    result.Add(new PackageArchiveEntry { Name = Path.GetFileName(path),
+                        Size = Marshal.ReadInt64(entry, 1024), ExtractedPath = destination == null ? "" : path });
+                }
+                return result;
+            }
+            catch (DllNotFoundException)
+            { throw new IOException("The 7z extractor is unavailable in this installation; reinstall the current SSPI package. Archive retained."); }
+            catch (EntryPointNotFoundException)
+            { throw new IOException("The loaded extractor is from an older SSPI build; restart SSPI after updating. Archive retained."); }
+            finally { GC.KeepAlive(callback); Marshal.FreeHGlobal(entries); }
+        }
+
+        static string NativeArchiveText(IntPtr value)
+        {
+            if (value == IntPtr.Zero) return "No decoder detail";
+            int length = 0;
+            while (length < 1024 && Marshal.ReadByte(value, length) != 0) length++;
+            byte[] bytes = new byte[length];
+            Marshal.Copy(value, bytes, 0, length);
+            return Encoding.UTF8.GetString(bytes);
+        }
 
         public static PackageObjectKind Detect(string path)
         {
@@ -50,13 +113,14 @@ namespace Orbis
                  (header[2] == 0x07 && header[3] == 0x08))) return PackageObjectKind.Zip;
             if (StartsWith(header, read, Rar5Magic)) return PackageObjectKind.Rar5;
             if (StartsWith(header, read, Rar4Magic)) return PackageObjectKind.Rar4;
+            if (StartsWith(header, read, SevenZipMagic)) return PackageObjectKind.SevenZip;
             return PackageObjectKind.Unknown;
         }
 
         public static List<PackageArchiveEntry> ListPackages(string archivePath)
         {
             PackageObjectKind kind = Detect(archivePath);
-            
+            if (kind == PackageObjectKind.SevenZip) return ReadSevenZip(archivePath, null);
             if (kind == PackageObjectKind.Zip) return ReadZip(archivePath, null);
             if (kind == PackageObjectKind.Rar4 || kind == PackageObjectKind.Rar5)
                 return ReadRar(new[] { archivePath }, null, null, null);
@@ -71,7 +135,7 @@ namespace Orbis
             string destination = Path.GetFullPath(destinationDirectory);
             Directory.CreateDirectory(destination);
             PackageObjectKind kind = Detect(archivePath);
-            
+            if (kind == PackageObjectKind.SevenZip) return ReadSevenZip(archivePath, destination);
             if (kind == PackageObjectKind.Zip) return ReadZip(archivePath, destination);
             if (kind == PackageObjectKind.Rar4 || kind == PackageObjectKind.Rar5)
                 return ReadRar(new[] { archivePath }, destination, null, null);
@@ -84,40 +148,53 @@ namespace Orbis
             var result = new List<PackageArchiveEntry>();
             var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var created = new List<string>();
-            long expanded = 0;
+            long expanded = 0, total = 0, writtenTotal = 0;
             int archiveEntries = 0;
             try
             {
                 using (var input = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                using (var archive = new ZipArchive(input, ZipArchiveMode.Read, false))
+                using (var archive = SharpCompress.Archives.Zip.ZipArchive.OpenArchive(input))
                 {
-                    foreach (ZipArchiveEntry item in archive.Entries)
+                    int preflightEntries = 0;
+                    foreach (var item in archive.Entries)
+                    {
+                        CheckCancel(cancel);
+                        if (++preflightEntries > MaximumArchiveEntries)
+                            throw new InvalidDataException("Archive contains too many entries");
+                        if (!item.IsDirectory && (item.Key ?? "").EndsWith(".pkg", StringComparison.OrdinalIgnoreCase))
+                            AddExpanded(ref total, item.Size);
+                    }
+                    if (destination != null) ArchiveStorage.RequireFreeSpace(destination, checked(total + 64L * 1024 * 1024));
+                    if (progress != null) progress(0, total);
+                    foreach (var item in archive.Entries)
                     {
                         CheckCancel(cancel);
                         if (++archiveEntries > MaximumArchiveEntries)
                             throw new InvalidDataException("Archive contains too many entries");
-                        string name = ValidateEntryName(item.FullName);
-                        if (name.EndsWith("/", StringComparison.Ordinal) ||
+                        string name = ValidateEntryName(item.Key);
+                        if (item.IsDirectory || name.EndsWith("/", StringComparison.Ordinal) ||
                             !name.EndsWith(".pkg", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (item.IsEncrypted) throw new InvalidDataException("Encrypted ZIP packages are not supported; choose another mirror");
                         if (!names.Add(name))
                             throw new InvalidDataException("Duplicate PKG archive entry: " + name);
                         if (result.Count >= MaximumPackageEntries)
                             throw new InvalidDataException("Archive contains too many PKG files");
-                        AddExpanded(ref expanded, item.Length);
+                        AddExpanded(ref expanded, item.Size);
                         var entry = new PackageArchiveEntry
                         {
                             Name = name,
-                            CompressedSize = item.CompressedLength,
-                            Size = item.Length
+                            CompressedSize = item.CompressedSize,
+                            Size = item.Size
                         };
                         if (destination != null)
                         {
-                            ArchiveStorage.RequireFreeSpace(destination, checked(item.Length + 64L * 1024 * 1024));
+                            ArchiveStorage.RequireFreeSpace(destination, checked(item.Size + 64L * 1024 * 1024));
                             string output = OutputPath(destination, result.Count + 1);
                             string partial = output + ".part";
                             created.Add(partial);
                             long written = 0;
-                            using (Stream source = item.Open())
+                            uint crc = 0xFFFFFFFF;
+                            using (Stream source = item.OpenEntryStream())
                             using (var target = new FileStream(partial, FileMode.CreateNew,
                                 FileAccess.Write, FileShare.None))
                             {
@@ -126,15 +203,19 @@ namespace Orbis
                                 while ((count = source.Read(buffer, 0, buffer.Length)) > 0)
                                 {
                                     CheckCancel(cancel);
-                                    target.Write(buffer, 0, count);
-                                    written += count;
-                                    if (progress != null) progress(written, item.Length);
-                                    if (written > item.Length)
+                                    if (count > item.Size - written)
                                         throw new InvalidDataException("ZIP entry exceeds its declared size: " + name);
+                                    target.Write(buffer, 0, count);
+                                    crc = UpdateCrc(crc, buffer, 0, count);
+                                    written += count;
+                                    writtenTotal += count;
+                                    if (progress != null) progress(writtenTotal, total);
                                 }
                             }
-                            if (written != item.Length)
+                            if (written != item.Size)
                                 throw new InvalidDataException("ZIP entry is truncated: " + name);
+                            if (~crc != unchecked((uint)item.Crc))
+                                throw new InvalidDataException("ZIP entry CRC mismatch: " + name);
                             RequirePkgMagic(partial, name);
                             File.Move(partial, output);
                             created.Remove(partial);
@@ -161,6 +242,11 @@ namespace Orbis
             CheckCancel(cancel);
             Directory.CreateDirectory(destination);
             PackageObjectKind kind = Detect(paths[0]);
+            if (kind == PackageObjectKind.SevenZip)
+            {
+                if (paths.Count != 1) throw new InvalidDataException("Split 7z archives are not supported; select one complete 7z file.");
+                return ReadSevenZip(paths[0], Path.GetFullPath(destination), cancel, progress, password);
+            }
             if (kind == PackageObjectKind.Rar4 || kind == PackageObjectKind.Rar5)
                 return ReadRar(paths, Path.GetFullPath(destination), cancel, progress, password);
             if (paths.Count == 1 && kind == PackageObjectKind.Zip)
@@ -217,6 +303,7 @@ namespace Orbis
                     foreach (var entry in result) required = checked(required + entry.Size);
                     ArchiveStorage.RequireFreeSpace(destination, checked(required + 64L * 1024 * 1024));
                     long writtenTotal = 0;
+                    if (progress != null) progress(0, expanded);
                     int extracted = 0;
                     // Sequential extraction preserves the RAR solid dictionary across entries/volumes.
                     foreach (var stream in streams) stream.Position = 0;
@@ -226,8 +313,27 @@ namespace Orbis
                         {
                             CheckCancel(cancel);
                             PackageArchiveEntry entry;
-                            if (reader.Entry.IsDirectory || !selected.TryGetValue(
-                                ValidateEntryName(reader.Entry.Key), out entry)) continue;
+                            if (reader.Entry.IsDirectory) continue;
+                            if (!selected.TryGetValue(ValidateEntryName(reader.Entry.Key), out entry))
+                            {
+                                // Solid archives must decode preceding files before reaching a PKG.
+                                // Drain explicitly so cancellation/progress stay responsive during that work.
+                                using (Stream skipped = reader.OpenEntryStream())
+                                {
+                                    byte[] buffer = new byte[128 * 1024];
+                                    long consumed = 0; int count;
+                                    while ((count = skipped.Read(buffer, 0, buffer.Length)) > 0)
+                                    {
+                                        CheckCancel(cancel);
+                                        if (count > reader.Entry.Size - consumed || count > expanded - writtenTotal)
+                                            throw new InvalidDataException("RAR entry exceeds declared size");
+                                        consumed += count; writtenTotal += count;
+                                        if (progress != null) progress(writtenTotal, expanded);
+                                    }
+                                    if (consumed != reader.Entry.Size) throw new InvalidDataException("Truncated RAR entry");
+                                }
+                                continue;
+                            }
                             string output = OutputPath(destination, ++extracted);
                             string partial = output + ".part";
                             created.Add(partial);
@@ -246,7 +352,7 @@ namespace Orbis
                                     crc = UpdateCrc(crc, buffer, 0, count);
                                     written += count;
                                     writtenTotal += count;
-                                    if (progress != null) progress(writtenTotal, required);
+                                    if (progress != null) progress(writtenTotal, expanded);
                                 }
                             }
                             if (written != entry.Size) throw new InvalidDataException("Truncated RAR entry: " + entry.Name);
@@ -316,51 +422,6 @@ namespace Orbis
             total += size;
         }
 
-        static long CheckedEnd(long start, ulong count, long fileLength)
-        {
-            if (count > (ulong)long.MaxValue || start < 0 || (ulong)start + count > (ulong)fileLength)
-                throw new InvalidDataException("RAR4 entry is truncated");
-            return start + (long)count;
-        }
-
-        static void CopyExactly(Stream input, Stream output, long count, ref uint crc)
-        {
-            byte[] buffer = new byte[128 * 1024];
-            while (count > 0)
-            {
-                int wanted = (int)Math.Min(buffer.Length, count);
-                int read = input.Read(buffer, 0, wanted);
-                if (read <= 0) throw new EndOfStreamException("RAR4 entry is truncated");
-                output.Write(buffer, 0, read);
-                crc = UpdateCrc(crc, buffer, 0, read);
-                count -= read;
-            }
-        }
-
-        static byte[] ReadExactly(Stream input, int count)
-        {
-            byte[] data = new byte[count];
-            int offset = 0;
-            while (offset < count)
-            {
-                int read = input.Read(data, offset, count - offset);
-                if (read <= 0) throw new EndOfStreamException("Archive is truncated");
-                offset += read;
-            }
-            return data;
-        }
-
-        static ushort U16(byte[] value, int offset)
-        {
-            return (ushort)(value[offset] | value[offset + 1] << 8);
-        }
-
-        static uint U32(byte[] value, int offset)
-        {
-            return (uint)(value[offset] | value[offset + 1] << 8 |
-                value[offset + 2] << 16 | value[offset + 3] << 24);
-        }
-
         static bool StartsWith(byte[] value, int length, byte[] prefix)
         {
             if (length < prefix.Length) return false;
@@ -395,9 +456,5 @@ namespace Orbis
                 try { if (File.Exists(path)) File.Delete(path); } catch { }
         }
 
-        static NotSupportedException RarNotSupported()
-        {
-            return new NotSupportedException("RAR not supported");
-        }
     }
 }

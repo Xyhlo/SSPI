@@ -29,17 +29,52 @@ namespace Orbis
             }
             catch (Exception ex)
             {
-                throw new Exception("RD unrestrict failed: " + ex.Message);
+                throw DebridResolutionError.FromTransport("Real-Debrid", hostUrl, ex);
             }
 
             string err = JsonLite.GetString(json, "error");
             if (!string.IsNullOrEmpty(err))
-                throw new Exception("RD: " + err + " " + (JsonLite.GetString(json, "error_code") ?? ""));
+                throw DebridResolutionError.FromResponse("Real-Debrid", hostUrl, json);
 
             var downloads = DownloadCandidates(json);
             if (downloads.Count == 0)
                 throw new Exception("RD returned no download URL");
-            return SelectByLocation(downloads, preferredLocation);
+            string selected = SelectByLocation(downloads, preferredLocation);
+            DownloadTransferSettings.RememberProviderLimit(selected, ConnectionLimit(json, selected));
+            return selected;
+        }
+
+        internal static int ConnectionLimit(string json, string selected)
+        {
+            try
+            {
+                int limit = FindConnectionLimit(PackageSourceJson.Parse(json), selected, 1);
+                return limit > 0 ? DownloadTransferSettings.ClampRangeCount(limit) : 1;
+            }
+            catch { return 1; }
+        }
+
+        static int FindConnectionLimit(object value, string selected, int inherited)
+        {
+            var row = value as Dictionary<string, object>;
+            if (row != null)
+            {
+                object chunks, link, alternatives;
+                int maximum = inherited, parsed;
+                if (row.TryGetValue("chunks", out chunks))
+                    maximum = int.TryParse(Convert.ToString(chunks), out parsed)
+                        ? (parsed == 0 ? DownloadTransferSettings.MaxRangeCount : Math.Max(1, parsed)) : 1;
+                if (row.TryGetValue("download", out link) && string.Equals(link as string, selected, StringComparison.Ordinal)) return maximum;
+                if (row.TryGetValue("alternative", out alternatives)) return FindConnectionLimit(alternatives, selected, maximum);
+            }
+            var items = value as System.Collections.IList;
+            if (items != null)
+                foreach (object item in items)
+                {
+                    int found = FindConnectionLimit(item, selected, inherited);
+                    if (found > 0) return found;
+                }
+            return 0;
         }
 
         // RD's documented response contains one `download` URL. Keep support for
@@ -196,7 +231,8 @@ namespace Orbis
                 string user = JsonLite.GetString(json, "username") ?? "?";
                 string prem = JsonLite.GetString(json, "type") ?? "?";
                 string exp = JsonLite.GetString(json, "expiration") ?? "";
-                return (string.Equals(prem, "free", StringComparison.OrdinalIgnoreCase) ? "EXPIRED: " : "OK ") + "@" + user + " (" + prem + ") " + exp;
+                if (prem != "free" && prem != "premium") return "ERROR: Real-Debrid returned no recognized account tier";
+                return (string.Equals(prem, "free", StringComparison.OrdinalIgnoreCase) ? "FREE: " : "OK ") + "@" + user + " (" + prem + ") " + exp;
             }
             catch (Exception ex)
             {

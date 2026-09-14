@@ -73,7 +73,7 @@ namespace Orbis
     public static class Program
     {
         const string Version = "4.43";
-        const string DataRoot = "/data/GameSearch";
+        const string DataRoot = "/data/SSPI";
         static readonly string IpcRoot = Path.Combine(DataRoot, "resident");
         static readonly string JobPath = Path.Combine(IpcRoot, "job.txt");
         static readonly string StatusPath = Path.Combine(IpcRoot, "status.txt");
@@ -145,7 +145,7 @@ namespace Orbis
             {
                 "2", encoded,
                 Convert.ToBase64String(Encoding.UTF8.GetBytes("https://example.invalid/a.pkg")),
-                Convert.ToBase64String(Encoding.UTF8.GetBytes("/data/GameSearch/downloads/a.pkg")),
+                Convert.ToBase64String(Encoding.UTF8.GetBytes("/data/SSPI/downloads/a.pkg")),
                 Convert.ToBase64String(Encoding.UTF8.GetBytes("CUSA00001")), "", "", "1072", "7"
             });
             ResidentBgftAttachment attachment = ResidentBgftAttachment.Parse(new[]
@@ -153,7 +153,7 @@ namespace Orbis
                 "1", encoded, "42"
             });
             return parsed != null && parsed.Id == "queue one" && parsed.Total == 1072 &&
-                parsed.RangeCount == 7 && attachment != null && attachment.TaskId == 42 &&
+                parsed.RangeCount == DownloadTransferSettings.ClampRangeCount(7) && attachment != null && attachment.TaskId == 42 &&
                 OwnedDestination(parsed.Destination) ? 0 : 1;
         }
 
@@ -228,7 +228,6 @@ namespace Orbis
             {
                 _state = "feeding";
                 NetHttp.DownloadRangeCount = 1;
-                SequentialDownloadEngine.LoadLimit(Path.Combine(AppSettings.DataDir, "settings.ini"));
                 string part = job.Destination + ".part";
                 if (offset == LoopbackPkgFeeder.HeaderBytes)
                 {

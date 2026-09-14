@@ -15,49 +15,23 @@ uint8_t JumpInstructions[] = {
 };
 
 //stolen from https://github.com/OSM-Made/Mono-Test/blob/af84e1dec5f02612bfc3f4634a4cc8f2474e5a1b/MonoTest/Detour.cpp
-void WriteJump(void* Address, void* Destination, char* OriInstructions)
+int WriteJump(void* Address, void* Destination, char* OriInstructions)
 {
+    if (!Address || !Destination) return 0;
     //Write the address of our hook to the instruction.
     *(uint64_t*)(JumpInstructions + 6) = (uint64_t)Destination;
 
-    sceKernelMprotect((void*)Address, sizeof(JumpInstructions), PROT_READ | PROT_WRITE | PROT_EXEC);
+    uintptr_t page = (uintptr_t)Address & ~(uintptr_t)(PAGE_SIZE - 1);
+    size_t length = (((uintptr_t)Address + sizeof(JumpInstructions) + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1)) - page;
+    if (sceKernelMprotect((void*)page, length, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return 0;
 
     if (OriInstructions) {
         memcpy(OriInstructions, Address, sizeof(JumpInstructions));
     }
 
     memcpy(Address, JumpInstructions, sizeof(JumpInstructions));
-}
-
-//The KernelLoadStartModule export is just a check if you didn't set
-//flags arguments, if not, it jump for the real function,
-//we will use that to be able to keep the hook allways enabled,
-//by calling the real LoadStartModule function directly
-void* FindInternalFunction(void* Address){
-	
-	//Since is just reading maybe this isn't required, but in any case, better be sure.
-    sceKernelMprotect((void*)Address, 0x20, PROT_READ | PROT_WRITE | PROT_EXEC);
-	
-	for (int i = 0; i < 0x20; i++){
-		uint32_t* pDWORD = (uint32_t*)(Address+i);
-		
-		//find the function end (end with NOPs)
-		if (*pDWORD == 0x90909090){
-			
-			//The last instruction is a jmp to the real LoadStartModule function
-			uint8_t* pJmp = ((uint8_t*)pDWORD) - 5;
-			
-			if (*pJmp != 0xE9)
-				return 0;//Whatever if fails, we still can do the dirty way disabling the hook temporally
-			
-			//Get the Jmp Offset
-			pDWORD = (uint32_t*)(pJmp+1);
-			
-			//Calculate the jump offset
-			return pJmp + 5 + *pDWORD;
-		}
-	}
-	return 0;
+    return memcmp(Address, JumpInstructions, sizeof(JumpInstructions)) == 0;
 }
 
 void remove_extension(const char* path, char* new_path)
@@ -77,7 +51,7 @@ char* extract_file_name(char* path)
     int len = strlen(path);
 
     for (int i = len - 1; i > 0; i--) {
-        if (path[i] == '\\' || path[i] == '//' || path[i] == '/') {
+        if (path[i] == '\\' || path[i] == '/') {
             return path + i + 1;
         }
     }
@@ -120,7 +94,14 @@ char* ApplyRemap(char* AssemblyName){
 }
 
 void* hookLoadSprxAssembly(const char* AssemblyName, int* OpenStatus, int UnkBool, int RefOnly)
-{	
+{
+    // MonoImageOpenStatus: ERRNO=1, IMAGE_INVALID=3. Every failure must set it;
+    // leaving the caller's previous OK value describes a null image as success.
+    if (OpenStatus) *OpenStatus = 1;
+    if (!AssemblyName || !*AssemblyName || strlen(AssemblyName) >= 0x280) {
+        if (OpenStatus) *OpenStatus = 3;
+        return 0;
+    }
     LOGF("Loading Assembly: %s", AssemblyName);
 	
 	int IsGAC = strstr(AssemblyName, "mono/gac/") != NULL;
@@ -129,8 +110,9 @@ void* hookLoadSprxAssembly(const char* AssemblyName, int* OpenStatus, int UnkBoo
 	AssemblyName = ApplyRemap(AssemblyName);
 
     char* finalPath = AssemblyName;
+    char hintPath[0x300] = "\x0";
 
-    void* fp = fopen(AssemblyName, "r");
+    FILE* fp = fopen(AssemblyName, "rb");
     if (fp == 0) {
         LOG("Error opening file");
 		
@@ -139,7 +121,6 @@ void* hookLoadSprxAssembly(const char* AssemblyName, int* OpenStatus, int UnkBoo
 			return 0;
 		}
 
-        char hintPath[0x300] = "\x0";
         char fnameNoExt[0x300] = "\x0";
         char* fname = extract_file_name(AssemblyName);
         char* extension = extract_extension(fname);
@@ -171,24 +152,24 @@ void* hookLoadSprxAssembly(const char* AssemblyName, int* OpenStatus, int UnkBoo
         };
 
         for (int i = 0; i < countof(hints); i++) {
-            sprintf(&hintPath, hints[i], "/app0", fname);
-            fp = fopen(hintPath, "r");
+            snprintf(hintPath, sizeof(hintPath), hints[i], "/app0", fname);
+            fp = fopen(hintPath, "rb");
             if (fp != 0)
                 break;
 
-            sprintf(&hintPath, hints[i], baseDir, fname);
-            fp = fopen(hintPath, "r");
+            snprintf(hintPath, sizeof(hintPath), hints[i], baseDir, fname);
+            fp = fopen(hintPath, "rb");
             if (fp != 0)
                 break;
 			
 			if (ValidExt){
-				sprintf(&hintPath, hintsExt[i], "/app0", fnameNoExt);
-				fp = fopen(hintPath, "r");
+				snprintf(hintPath, sizeof(hintPath), hintsExt[i], "/app0", fnameNoExt);
+				fp = fopen(hintPath, "rb");
 				if (fp != 0)
 					break;
 
-				sprintf(&hintPath, hintsExt[i], baseDir, fnameNoExt);
-				fp = fopen(hintPath, "r");
+				snprintf(hintPath, sizeof(hintPath), hintsExt[i], baseDir, fnameNoExt);
+				fp = fopen(hintPath, "rb");
 				if (fp != 0)
 					break;
 			}
@@ -203,22 +184,29 @@ void* hookLoadSprxAssembly(const char* AssemblyName, int* OpenStatus, int UnkBoo
         LOGF("Hint path matched: %s", hintPath);
     }
 		
-    fseek(fp, 0, SEEK_END);
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return 0; }
     long int size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return 0; }
 
+    if (size == 0 || (unsigned long)size > 128UL * 1024 * 1024) {
+        if (OpenStatus) *OpenStatus = 3;
+        fclose(fp); return 0;
+    }
     char* data = malloc(size);
-    int readed = fread(data, 1, size, fp);
+    if (!data) { fclose(fp); return 0; }
+    size_t readed = fread(data, 1, (size_t)size, fp);
 
     fclose(fp);
 
     if (readed != size) {
         LOG("Error reading the file");
+        free(data);
         return 0;
     }
 	
-    int status = 0;
+    int status = 3;
     void* Image = mono_image_open_from_data_with_name(data, size, 0, &status, RefOnly, AssemblyName);
+    if (!Image) { free(data); if (!status) status = 3; }
 
 #ifdef DEBUG
     if (Image)
@@ -255,6 +243,7 @@ void* hookLoadSprxAssembly(const char* AssemblyName, int* OpenStatus, int UnkBoo
 }
 
 void* hinted_dlopen(char* name) {
+	if (!name || !*name || strlen(name) >= 0x280) return NULL;
 	char altPath[0x300];
 	char tmp[0x300];
 	char hintPath[0x300] = "\x0";
@@ -305,7 +294,8 @@ void* hinted_dlopen(char* name) {
 		"%s/system/common/lib/%s.sprx",
 	};	
 	
-	snprintf(rndWordRoot, sizeof(rndWordRoot), "/%s", sceKernelGetFsSandboxRandomWord());
+    const char* sandbox = sceKernelGetFsSandboxRandomWord();
+    if (sandbox && *sandbox) snprintf(rndWordRoot, sizeof(rndWordRoot), "/%s", sandbox);
 	
 	char* roots[4];
 	roots[0] = rootDir;
@@ -345,7 +335,7 @@ void* MonoDlLoad(const char *name, int flags, char **err, void *user_data) {
 void* MonoDlSymbol(void *handle, const char *name, char **err, void *user_data){
 	LOGF("MonoDlFallbackSymbol: %s", name);
 	(void)err; (void)user_data;
-	if (!name || !*name) return NULL;
+	if (!name || !*name || (intptr_t)handle < 0) return NULL;
 	void* result = NULL;
 	int rst = sceKernelDlsym((int)(intptr_t)handle, name, &result);
 	if (rst){
@@ -362,7 +352,7 @@ void* MonoDlClose(void *handle, void *user_data) {
 	return (void*)(intptr_t)sceKernelStopUnloadModule((int)(intptr_t)handle, 0, NULL, 0, NULL, &status);
 }
 
-void InstallHooks()
+int InstallHooks()
 {
     LOG("Installing hooks...");
 
@@ -372,7 +362,7 @@ void InstallHooks()
 
     if (MonoAddr == 0) {
         LOG("Refusing hook: libmonosgen-2.0.sprx address not found");
-        return;
+        return 0;
     }
 
     //MUST UPDATE
@@ -382,24 +372,25 @@ void InstallHooks()
     static const U64 kJumpSize = sizeof(JumpInstructions);
     if (MonoSize <= kHookOffset + kJumpSize) {
         LOG("Refusing hook: offset outside reported module range");
-        return;
+        return 0;
     }
 
     void* loadSprxAssembly = ((void*)MonoAddr) + kHookOffset;
 
-    // Signature gate: refuse to patch anything that does not look like code.
-    // A valid x86-64 function entry here starts with a prologue, jump, or push;
-    // zeros or unexpected bytes mean a different runtime binary.
+    // Exact entry from the hash-pinned runtime supplied with this application.
+    // Firmware's own Mono and arbitrary other function prologues are not accepted.
     {
-        uint8_t first = *(volatile uint8_t*)loadSprxAssembly;
-        if (first == 0x00 || (first != 0x55 && first != 0x48 && first != 0x53 &&
-                              first != 0xE9 && first != 0xFF && first != 0x56)) {
+        static const uint8_t expected[] = {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x28,0x44,0x89,0x4d,0xc4,0x44,0x89,0x45,0xcc,0x89,0x4d,0xbc,0x89,0x55,0xc0,0x48};
+        if (MonoSize < kHookOffset + sizeof(expected) || memcmp(loadSprxAssembly, expected, sizeof(expected)) != 0) {
             LOG("Refusing hook: instruction signature mismatch (unknown runtime)");
-            return;
+            return 0;
         }
     }
 
-    WriteJump(loadSprxAssembly, hookLoadSprxAssembly, 0);
+    if (!WriteJump(loadSprxAssembly, hookLoadSprxAssembly, 0)) {
+        LOG("Refusing hook: cannot write runtime hook");
+        return 0;
+    }
     LOG("Hooks installed.");
 	
 	//Fix Internal Call in Debug Mode
@@ -407,4 +398,5 @@ void InstallHooks()
 	//Hint: The only one function that references the string "Microsoft.Win32.NativeMethods"
 	//void* mono_icall_table_init = ((void*)MonoAddr) + 0x17A0F0;
 	//((void(*)())mono_icall_table_init)();
+    return 1;
 }

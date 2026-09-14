@@ -11,15 +11,18 @@ static int64_t gs_storage_available_bytes(const char *path)
     if (!path || !*path) { errno = EINVAL; return -1; }
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
-    struct statfs info = {0};
+    /* Kernel variants differ in the trailing pathname fields. Reserve enough
+     * space for those layouts; the free-space counters share a stable prefix. */
+    union { struct statfs info; unsigned char kernel_space[4096]; } storage = {0};
+    struct statfs *info = &storage.info;
     // The bundled OpenOrbis statfs(path) returns fd, discarding fstatfs's result.
-    int result = fstatfs(fd, &info);
+    int result = fstatfs(fd, info);
     int saved_errno = errno;
     close(fd);
     if (result != 0) { errno = saved_errno; return -1; }
-    if (info.f_bavail < 0) return 0;
-    if (info.f_bsize == 0 || (uint64_t)info.f_bavail > INT64_MAX / info.f_bsize)
+    if (info->f_bavail < 0) return 0;
+    if (info->f_bsize == 0 || (uint64_t)info->f_bavail > INT64_MAX / info->f_bsize)
     { errno = EOVERFLOW; return -1; }
-    return (int64_t)((uint64_t)info.f_bavail * info.f_bsize);
+    return (int64_t)((uint64_t)info->f_bavail * info->f_bsize);
 }
 #endif
