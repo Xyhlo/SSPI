@@ -181,8 +181,3 @@
 !/resident/plugin/gs_storage_policy.h
 !/resident/plugin/gs_zip.cpp
 !/app/DistributionSettings.cs
-!/app/PcGameApi.cs
-!/app/TlsBootstrap.cs
-!/https/mbedtls_user_config.h
-!/https/source_https.c
-!/resident/plugin/gs_sequential_transfer.inc
