@@ -77,9 +77,13 @@ namespace Orbis
                 if (File.Exists(marker)) continue;
                 // Commit the replacement before retiring the old source. A failed
                 // install leaves the current registry and sources usable.
-                var installed = Install(bytes);
+                PackageSourcePackage package = PackageSourcePackage.Open(bytes);
+                bool existed = false;
+                foreach (var previous in GetInstalledSources())
+                    if (previous.SourceId == package.Descriptor.SourceId) { existed = true; break; }
+                var installed = Commit(package);
                 object enable;
-                if (row.TryGetValue("enable", out enable) && Equals(enable, true))
+                if (!existed && row.TryGetValue("enable", out enable) && Equals(enable, true))
                     SetEnabled(installed.SourceId, true);
                 object replacements;
                 if (row.TryGetValue("replaces", out replacements) && replacements is System.Collections.IList)
@@ -157,6 +161,7 @@ namespace Orbis
                     replacement.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
                     SaveRegistry(replacement);
                     _entries = replacement;
+                    PackageSourceEngineStatic.Invalidate();
                     return Clone(entry);
                 }
             }
@@ -182,6 +187,7 @@ namespace Orbis
                 found.Enabled = enabled;
                 SaveRegistry(replacement);
                 _entries = replacement;
+                PackageSourceEngineStatic.Invalidate();
                 return true;
             }
         }
@@ -207,6 +213,7 @@ namespace Orbis
                 // never a registry reference to a half-removed source.
                 SaveRegistry(replacement);
                 _entries = replacement;
+                PackageSourceEngineStatic.Invalidate();
                 string ownedSourceRoot = OwnedChild(_installedRoot, found.SourceId);
                 TryDeleteDirectory(ownedSourceRoot);
                 return true;
@@ -233,19 +240,20 @@ namespace Orbis
 
         List<PackageSourceRegistryEntry> LoadRegistry()
         {
-            if (!File.Exists(_registryPath))
-            {
-                string recovery = _registryPath + ".bak";
-                if (!File.Exists(recovery)) return new List<PackageSourceRegistryEntry>();
-                return ParseRegistry(File.ReadAllText(recovery, Encoding.UTF8));
+            try { if (File.Exists(_registryPath)) return ParseRegistry(File.ReadAllText(_registryPath, Encoding.UTF8)); } catch { }
+            var recovered = new Dictionary<string, PackageSourceRegistryEntry>(StringComparer.Ordinal);
+            try { foreach (var entry in ParseRegistry(File.ReadAllText(_registryPath+".bak",Encoding.UTF8))) recovered[entry.SourceId]=entry; } catch { }
+            foreach (string source in Directory.GetDirectories(_installedRoot)) {
+                if ((File.GetAttributes(source)&FileAttributes.ReparsePoint)!=0) continue;
+                foreach (string version in Directory.GetDirectories(source)) try {
+                    var package=PackageSourcePackage.OpenInstalled(version);
+                    if (Path.GetFileName(source)!=package.Descriptor.SourceId || Path.GetFileName(version)!=package.Descriptor.Version) continue;
+                    if (!recovered.ContainsKey(package.Descriptor.SourceId)) recovered.Add(package.Descriptor.SourceId,FromPackage(package,version,false));
+                } catch { /* One broken source must not disable every other catalog. */ }
             }
-            try { return ParseRegistry(File.ReadAllText(_registryPath, Encoding.UTF8)); }
-            catch
-            {
-                string backup = _registryPath + ".bak";
-                if (!File.Exists(backup)) throw;
-                return ParseRegistry(File.ReadAllText(backup, Encoding.UTF8));
-            }
+            var result=new List<PackageSourceRegistryEntry>(recovered.Values);
+            if (File.Exists(_registryPath)) File.Copy(_registryPath,_registryPath+".corrupt",true);
+            SaveRegistry(result);return result;
         }
 
         List<PackageSourceRegistryEntry> ParseRegistry(string json)
@@ -326,12 +334,12 @@ namespace Orbis
             text.Append("]}");
 
             Directory.CreateDirectory(_root);
-            string temp = _registryPath + ".tmp";
             string backup = _registryPath + ".bak";
-            File.WriteAllText(temp, text.ToString(), new UTF8Encoding(false));
-            if (File.Exists(_registryPath)) File.Copy(_registryPath, backup, true);
-            if (File.Exists(_registryPath)) File.Delete(_registryPath);
-            File.Move(temp, _registryPath);
+            string json=text.ToString();ParseRegistry(json);
+            if (File.Exists(_registryPath)) try {
+                string previous=File.ReadAllText(_registryPath,Encoding.UTF8);ParseRegistry(previous);AtomicFile.WriteText(backup,previous);
+            } catch (InvalidDataException) { }
+            AtomicFile.WriteText(_registryPath,json);
         }
 
         static PackageSourceRegistryEntry FromPackage(PackageSourcePackage package, string path, bool enabled)

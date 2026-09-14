@@ -7,8 +7,7 @@ using Orbis.Internals;
 namespace Orbis
 {
     /// <summary>
-    /// System PS4 IME keyboard. Uses eboot UserService InternalCalls for user id
-    /// (DllImport UserService fails with 0x80960002 on this Mono host).
+    /// System PS4 IME keyboard, bound to the current signed-in console user.
     /// </summary>
     internal static class NativeImeDialog
     {
@@ -16,7 +15,7 @@ namespace Orbis
         const int CommonDialogAlreadyInitialized = unchecked((int)0x80B80002);
         static bool _ready;
         static string _initError;
-        static int _userId = 1;
+        static int _userId = -1;
 
         public static string LastInitError { get { return _initError; } }
 
@@ -42,8 +41,12 @@ namespace Orbis
                 // refresh user each open
                 string uerr;
                 int uid;
-                if (UserService.TryGetUserId(out uid, out uerr) && uid != 0)
-                    _userId = uid;
+                if (!UserService.TryGetUserId(out uid, out uerr))
+                {
+                    error = "User " + (uerr ?? "unavailable");
+                    return false;
+                }
+                _userId = uid;
 
                 input = AllocUtf16(text, maxLength + 1);
                 titlePtr = AllocUtf16(title ?? "", (title ?? "").Length + 1);
@@ -72,8 +75,13 @@ namespace Orbis
                 {
                     // retry once after re-init common dialog + user
                     try { sceCommonDialogInitialize(); } catch { }
-                    UserService.TryGetUserId(out uid, out uerr);
-                    if (uid != 0) { _userId = uid; setting.UserId = uid; }
+                    if (!UserService.TryGetUserId(out uid, out uerr))
+                    {
+                        error = "User " + (uerr ?? "unavailable");
+                        return false;
+                    }
+                    _userId = uid;
+                    setting.UserId = uid;
                     rc = sceImeDialogInit(ref setting, IntPtr.Zero);
                 }
                 if (rc != 0)
@@ -151,7 +159,7 @@ namespace Orbis
                     _initError = "User " + (uerr ?? "fail");
                     return false;
                 }
-                _userId = uid != 0 ? uid : 1;
+                _userId = uid;
 
                 int rc = 0;
                 try { rc = sceCommonDialogInitialize(); }

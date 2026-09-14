@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 
@@ -113,6 +113,28 @@ namespace Orbis
         public string Region = "";
         public int Limit;
         public string Cursor = "";
+        public Func<bool> Cancel;
+    }
+
+    internal sealed class SourceSearchPage
+    {
+        public List<SourceTitleResult> Results = new List<SourceTitleResult>();
+        public int TotalMatches, Offset, PageSize;
+        public string NextCursor = "", Fingerprint = "", Warning = "";
+        public bool IsComplete;
+        internal List<SourceTitleResult> AllMatches;
+    }
+
+    internal static class PackageSourceIdentity
+    {
+        internal static string NormalizeRegion(string region)
+        {
+            string value = (region ?? "").Trim().ToUpperInvariant();
+            if (value == "USA") return "US";
+            if (value == "EUR") return "EU";
+            if (value == "JPN" || value == "JAP") return "JP";
+            return value;
+        }
     }
 
     internal sealed class SourceResolveRequest
@@ -123,10 +145,12 @@ namespace Orbis
         public string CatalogUrl = "";
         public int Limit;
         public string Cursor = "";
+        public Func<bool> Cancel;
     }
 
     internal sealed class SourceTitleResult
     {
+        internal int SearchRankHint = -1;
         public string SourceId = "";
         public string SourceVersion = "";
         public string StableResultId = "";
@@ -195,6 +219,17 @@ namespace Orbis
         public string GroupId = "";
         public int MirrorIndex = 1;
         public int MirrorCount = 1;
+
+        internal static bool IsPreferredMirror(PackageCandidate candidate)
+        {
+            if (candidate == null || !string.IsNullOrWhiteSpace(candidate.ResolutionError)) return false;
+            // Prefer the URL's host so a misleading label cannot change the selection.
+            Uri uri;
+            string host = Uri.TryCreate(candidate.Url, UriKind.Absolute, out uri)
+                ? uri.DnsSafeHost.TrimEnd('.') : (candidate.HosterName ?? "").Trim();
+            return DistributionSettings.IsPreferredHost(host) ||
+                host.Equals("OneFile", StringComparison.OrdinalIgnoreCase);
+        }
 
         public static List<PackageCandidatePresentation> Build(
             IList<PackageCandidate> candidates, string fallbackTitleId, string fallbackRegion)

@@ -2,7 +2,7 @@ namespace Orbis
 {
     internal static class AppSettings
     {
-        public const string DataDir = "/data/GameSearch";
+        public const string DataDir = "/data/SSPI";
     }
 
     internal static class PkgInstaller

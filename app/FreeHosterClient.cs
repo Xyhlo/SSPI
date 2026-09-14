@@ -41,19 +41,29 @@ public static bool IsSupportedHoster(Uri uri)
         /// <summary>Returns a byte-stream URL or throws a short user-facing reason.</summary>
         public static string ResolveDirect(string hosterUrl)
         {
+            return ResolveDirect(hosterUrl, false);
+        }
+
+        public static string ResolveDirect(string hosterUrl, bool sourceDeclaresLanding)
+        {
             if (string.IsNullOrEmpty(hosterUrl))
                 throw new Exception("Empty hoster URL");
 
             Uri u;
             try { u = new Uri(hosterUrl); }
             catch { throw new Exception("Bad hoster URL"); }
+            if ((u.Scheme != Uri.UriSchemeHttp && u.Scheme != Uri.UriSchemeHttps) || !string.IsNullOrEmpty(u.UserInfo))
+                throw new Exception("Bad hoster URL");
 
             string host = (u.Host ?? "").ToLowerInvariant();
             if (host.StartsWith("www.")) host = host.Substring(4);
 
             // Already looks like a CDN file path — keep as-is.
-            if (LooksLikeDirectFile(u))
+            if (!sourceDeclaresLanding && LooksLikeDirectFile(u))
                 return hosterUrl;
+
+            if (sourceDeclaresLanding && !IsSupportedHoster(u))
+                throw new Exception(host + " needs a link service. Select Real-Debrid or TorBox in Connections.");
 
             if (host == "pixeldrain.com" || host.EndsWith(".pixeldrain.com"))
                 return ResolvePixeldrain(u);
@@ -65,7 +75,7 @@ public static bool IsSupportedHoster(Uri uri)
                 return ResolveGofile(u);
 
             if (host == "1fichier.com" || host.EndsWith(".1fichier.com"))
-                throw new Exception("1fichier free needs wait/captcha — use Real-Debrid or Deepbrid");
+                throw new Exception("This host needs wait/captcha — select a supported service in Connections");
 
             if (host.Contains("rapidgator") || host.Contains("uploaded") || host == "ul.to" ||
                 host.Contains("katfile") || host.Contains("nitroflare") || host.Contains("turbobit"))
@@ -81,10 +91,6 @@ public static bool IsSupportedHoster(Uri uri)
                 string html = NetHttp.GetString(hosterUrl, 25000, hosterUrl);
                 if (string.IsNullOrEmpty(html))
                     throw new Exception("Empty hoster page");
-                if (html.IndexOf("<html", StringComparison.OrdinalIgnoreCase) < 0 &&
-                    html.Length > 1024)
-                    return hosterUrl; // body might already be binary mislabeled
-
                 string found = FindDirectInHtml(html, hosterUrl);
                 if (!string.IsNullOrEmpty(found))
                     return found;
@@ -96,7 +102,7 @@ public static bool IsSupportedHoster(Uri uri)
                 throw new Exception("Free link unresolved: " + Clip(ex.Message, 48));
             }
 
-            throw new Exception("Free download page needs browser/wait — use RD/Deepbrid");
+            throw new Exception("Free download page needs browser/wait — select Real-Debrid or TorBox in Connections");
         }
 
         static string ResolvePixeldrain(Uri u)
@@ -149,7 +155,7 @@ public static bool IsSupportedHoster(Uri uri)
         {
             string path = (u.AbsolutePath ?? "").ToLowerInvariant();
             if (path.EndsWith(".pkg") || path.EndsWith(".zip") || path.EndsWith(".rar") ||
-                path.EndsWith(".7z") || path.EndsWith(".iso"))
+                path.EndsWith(".7z") || path.EndsWith(".7zip") || path.EndsWith(".iso"))
                 return true;
             // Pixeldrain API already direct
             if (path.IndexOf("/api/file/", StringComparison.OrdinalIgnoreCase) >= 0)

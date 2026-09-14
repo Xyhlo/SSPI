@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -29,6 +29,14 @@ namespace Orbis
         public bool InstallComplete;
         public int LocalCopyPercent;
         public int EtaSeconds;
+        public ulong RawLength;
+        public ulong RawTransferred;
+        public ulong RawLengthTotal;
+        public ulong RawTransferredTotal;
+        public uint NumIndex;
+        public uint NumTotal;
+        public uint Bits;
+        public int PreparingPercent;
     }
 
     /// <summary>Validated local PKG install through BGFT with an AppInstUtil fallback.</summary>
@@ -113,7 +121,6 @@ namespace Orbis
         static bool _bgftReady;
         static IntPtr _bgftHeap;
         const int BgftHeapSize = 1024 * 1024;
-        const uint BgftForceUpdate = 0x8;
         const uint BgftDisableCdnQueryParam = 0x10000;
         const int BgftAlreadyInitialized = unchecked((int)0x80990001);
         const int BgftTaskDuplicated = unchecked((int)0x80990015);
@@ -121,7 +128,6 @@ namespace Orbis
         const int BgftContentAlreadyDownloading = unchecked((int)0x80990086);
         const int BgftSameApplicationInstalled = unchecked((int)0x80990088);
         const int AppSlotNotFound = unchecked((int)0x80A3000E);
-        const int UserServiceNotInitialized = unchecked((int)0x80960002);
 
         public static string LastError { get { return _lastError; } }
 
@@ -210,7 +216,7 @@ namespace Orbis
             try
             {
                 long pkgSize = new FileInfo(pkgPath).Length;
-                ArchiveStorage.RequireFreeSpace(AppSettings.DownloadDir,
+                ArchiveStorage.RequireFreeSpace(AppSettings.DataDir,
                     checked(pkgSize + (512L * 1024 * 1024)));
             }
             catch (Exception spaceEx)
@@ -267,12 +273,9 @@ namespace Orbis
                 }
                 if (contentKind == PkgContentKind.BaseGame && exists != 0)
                 {
-                    if (!uninstallFirst)
-                    {
-                        error = "ALREADY_INSTALLED:" + titleId;
-                        return InstallOutcome.AlreadyInstalled;
-                    }
-                    if (!UninstallAndWait(titleId, out error))
+                    // AppExists includes incomplete dashboard placeholders. Only
+                    // the owned task's completion path may certify installation.
+                    if (uninstallFirst && !UninstallAndWait(titleId, out error))
                         return InstallOutcome.UninstallFailed;
                 }
                 else if (PkgInstallPolicy.RequiresInstalledBase(contentKind) && exists == 0)
@@ -284,9 +287,14 @@ namespace Orbis
 
                 lock (InstallRegisterGate)
                 {
+                    if (contentKind == PkgContentKind.AddOn)
+                    {
+                        if (IsAddonInstalled(pkgPath, true)) return InstallOutcome.AlreadyInstalled;
+                        return TryInstallWithAppInstUtil(pkgPath, out error) ? InstallOutcome.Started : InstallOutcome.InstallFailed;
+                    }
                     bool bgftAttempted;
-                    if (contentKind == PkgContentKind.Patch && !PkgIntegrity.CheckInstalledBase(pkgPath, titleId, out error))
-                        return InstallOutcome.InvalidPackage;
+                    if (contentKind == PkgContentKind.Patch && !PkgIntegrity.WaitForInstalledBase(pkgPath, titleId, null, null, out error))
+                        return PkgIntegrity.IsInstalledBaseUnavailable(error) ? InstallOutcome.NotReady : InstallOutcome.InvalidPackage;
                     string bgftError;
                     if (TryStartBgftInstall(pkgPath, titleId, contentKind,
                         out bgftAttempted, out bgftError, out taskId))
@@ -397,7 +405,7 @@ namespace Orbis
 
                     if (state.ErrorResult != 0)
                     {
-                        error = "BGFT install 0x" + state.ErrorResult.ToString("X");
+                        error = "BGFT install " + PkgInstallPolicy.DescribeBgftError(state.ErrorResult);
                         return false;
                     }
 
@@ -498,39 +506,21 @@ namespace Orbis
             try
             {
                 BgftTaskProgress state = new BgftTaskProgress();
-                int activeTask = taskId;
-                int rc = activeTask >= 0 ? sceBgftServiceDownloadGetProgress(activeTask, out state) : -1;
-                if (rc != 0 && !string.IsNullOrEmpty(contentId) && subType > 0)
-                {
-                    rc = sceBgftServiceDownloadFindTaskByContentId(contentId, subType, out activeTask);
-                    if (rc == 0)
-                        rc = sceBgftServiceDownloadGetProgress(activeTask, out state);
-                }
+                int activeTask;
+                if (!BgftCancellation.ResolveOwned(contentId, subType,
+                    sceBgftServiceDownloadFindTaskByContentId,
+                    id => IsOwnedBackgroundTask(id, contentId, subType), out activeTask, out error)) return false;
+                int rc = activeTask >= 0 ? sceBgftServiceDownloadGetProgress(activeTask, out state) : BgftTaskNotFound;
+                if (rc != 0 || state.ErrorResult != 0)
+                    LogInstall("api=sceBgftServiceDownloadGetProgress rc=" + Hex(rc) + " error=" + Hex(state.ErrorResult) +
+                        " task=" + activeTask + " content=" + contentId + " subtype=" + subType);
                 if (rc != 0)
                 {
-                    error = "BGFT progress " + Hex(rc);
+                    error = "sceBgftServiceDownloadGetProgress " + PkgInstallPolicy.DescribeBgftError(rc);
                     return false;
                 }
 
-                ulong total = state.LengthTotal != 0 ? state.LengthTotal : state.Length;
-                ulong done = state.TransferredTotal != 0 ? state.TransferredTotal : state.Transferred;
-                // Candidate flags only — callers must require stable polls + expected size.
-                // Never treat LocalCopyPercent==100 alone as terminal (fires early on web BGFT).
-                bool downloadComplete = total > 0 && done >= total && done > 0;
-                bool copyInRange = state.LocalCopyPercent >= 0 && state.LocalCopyPercent <= 100;
-                bool installComplete = downloadComplete && copyInRange && state.LocalCopyPercent >= 100;
-                progress = new BgftProgress
-                {
-                    TaskId = activeTask,
-                    Done = ToLong(done),
-                    Total = ToLong(total),
-                    ErrorResult = state.ErrorResult,
-                    DownloadComplete = downloadComplete,
-                    InstallComplete = installComplete,
-                    LocalCopyPercent = state.LocalCopyPercent,
-                    EtaSeconds = ValidBgftEta(state.RestSecTotal, state.RestSec),
-                    Finished = installComplete
-                };
+                progress = MapBackgroundProgress(activeTask, state);
                 return true;
             }
             catch (Exception ex)
@@ -538,6 +528,50 @@ namespace Orbis
                 error = "BGFT progress " + ex.GetType().Name + ": " + ex.Message;
                 return false;
             }
+        }
+
+        static BgftProgress MapBackgroundProgress(int taskId, BgftTaskProgress state)
+        {
+            ulong total = state.LengthTotal != 0 ? state.LengthTotal : state.Length;
+            ulong done = state.TransferredTotal != 0 ? state.TransferredTotal : state.Transferred;
+            // Candidate flags only — callers must require stable polls + expected size.
+            // Never treat LocalCopyPercent==100 alone as terminal (fires early on web BGFT).
+            bool downloadComplete = total > 0 && done >= total && done > 0;
+            bool copyInRange = state.LocalCopyPercent >= 0 && state.LocalCopyPercent <= 100;
+            bool installComplete = downloadComplete && copyInRange && state.LocalCopyPercent >= 100;
+            return new BgftProgress
+            {
+                TaskId = taskId,
+                Done = ToLong(done),
+                Total = ToLong(total),
+                ErrorResult = state.ErrorResult,
+                DownloadComplete = downloadComplete,
+                InstallComplete = installComplete,
+                LocalCopyPercent = state.LocalCopyPercent,
+                EtaSeconds = ValidBgftEta(state.RestSecTotal, state.RestSec),
+                Finished = installComplete,
+                RawLength = state.Length,
+                RawTransferred = state.Transferred,
+                RawLengthTotal = state.LengthTotal,
+                RawTransferredTotal = state.TransferredTotal,
+                NumIndex = state.NumIndex,
+                NumTotal = state.NumTotal,
+                Bits = state.Bits,
+                PreparingPercent = state.PreparingPercent
+            };
+        }
+
+        internal static string FormatBackgroundProgress(BgftProgress progress)
+        {
+            if (progress == null) return "";
+            return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "bgft_raw task={0} length={1} transferred={2} length_total={3} transferred_total={4}" +
+                " index={5} count={6} bits=0x{7:X8} preparing={8} copy={9} error=0x{10:X8}",
+                progress.TaskId, progress.RawLength, progress.RawTransferred,
+                progress.RawLengthTotal, progress.RawTransferredTotal,
+                progress.NumIndex, progress.NumTotal, progress.Bits,
+                progress.PreparingPercent, progress.LocalCopyPercent,
+                unchecked((uint)progress.ErrorResult));
         }
 
         internal static int ValidBgftEta(uint total, uint current)
@@ -566,6 +600,14 @@ namespace Orbis
         {
             activeTaskId = taskId;
             error = null;
+            if (taskId < 0 && (string.IsNullOrWhiteSpace(contentId) || subType <= 0))
+            {
+                lock (InstallRegisterGate)
+                {
+                    LoadOwnedJournal();
+                    if (OwnedWebTasks.Count == 0) { activeTaskId = -1; return true; }
+                }
+            }
             string initError;
             if (!EnsureBgftReady(out initError))
             {
@@ -589,13 +631,51 @@ namespace Orbis
 
         public static bool IsTitleInstalled(string titleId)
         {
+            bool exists;
+            return TryIsTitleInstalled(titleId, out exists) && exists;
+        }
+
+        public static bool TryIsTitleInstalled(string titleId, out bool installed)
+        {
+            installed = false;
             try
             {
                 if (!EnsureReady()) return false;
                 int exists;
-                return sceAppInstUtilAppExists(titleId ?? "", out exists) == 0 && exists != 0;
+                if (sceAppInstUtilAppExists(titleId ?? "", out exists) != 0) return false;
+                installed = exists != 0;
+                return true;
             }
             catch { return false; }
+        }
+
+        internal static bool IsAddonInstalled(string source, bool full)
+        {
+            string content;
+            if (!PkgValidator.TryGetContentId(source, out content) || content == null || content.Length != 36) return false;
+            string title = content.Substring(7, 9), label = content.Substring(20);
+            if (!System.Text.RegularExpressions.Regex.IsMatch(title, "^CUSA[0-9]{5}$") ||
+                !System.Text.RegularExpressions.Regex.IsMatch(label, "^[A-Za-z0-9_-]{16}$")) return false;
+            foreach (string root in new[] { "/user/addcont/", "/mnt/ext0/user/addcont/" })
+            {
+                string path = root + title + "/" + label + "/ac.pkg";
+                if (!PkgInstallPolicy.MatchesInstalledContainer(source, path)) continue;
+                if (!full) return true;
+                try {
+                    using (var a = File.OpenRead(source))
+                    using (var b = File.OpenRead(path)) {
+                        byte[] left = new byte[65536], right = new byte[65536]; long remaining = a.Length;
+                        while (remaining > 0) {
+                            int n = (int)Math.Min(remaining, left.Length);
+                            if (a.Read(left, 0, n) != n || b.Read(right, 0, n) != n) return false;
+                            for (int i = 0; i < n; i++) if (left[i] != right[i]) return false;
+                            remaining -= n;
+                        }
+                        return true;
+                    }
+                } catch { }
+            }
+            return false;
         }
 
         public static bool TryInstallWithAppInstUtil(string pkgPath, out string error)
@@ -624,9 +704,11 @@ namespace Orbis
                 lock (InstallRegisterGate)
                 {
                     int rc = sceAppInstUtilAppInstallPkg(nativePath, IntPtr.Zero);
+                    LogInstall("api=sceAppInstUtilAppInstallPkg rc=" + Hex(rc) + " task=-1 title=" + nativeTitleId +
+                        " subtype=" + (kind == PkgContentKind.AddOn ? 7 : 6) + " path=" + nativePath + " file={" + nativeState + "}");
                     if (rc != 0)
                     {
-                        error = DescribeInstallError("InstallPkg fallback", rc) +
+                        error = DescribeInstallError("sceAppInstUtilAppInstallPkg", rc) +
                             " path=" + nativePath + " file={" + nativeState + "}";
                         LogInstall(error);
                         return false;
@@ -661,16 +743,10 @@ namespace Orbis
             }
             try
             {
-                int rc = activeTaskId >= 0 ? control(activeTaskId) : -1;
-                if (rc != 0 && TryFindBackgroundTask(contentId, subType, out activeTaskId))
-                {
-                    if (!IsOwnedBackgroundTask(activeTaskId, contentId, subType))
-                    {
-                        error = "BGFT task " + activeTaskId + " is not owned by Game Search; " + operation + " refused";
-                        return false;
-                    }
-                    rc = control(activeTaskId);
-                }
+                if (!BgftCancellation.ResolveOwned(contentId, subType,
+                    sceBgftServiceDownloadFindTaskByContentId,
+                    id => IsOwnedBackgroundTask(id, contentId, subType), out activeTaskId, out error)) return false;
+                int rc = activeTaskId >= 0 ? control(activeTaskId) : BgftTaskNotFound;
                 if (rc != 0)
                 {
                     error = "BGFT " + operation + " " + Hex(rc);
@@ -718,7 +794,7 @@ namespace Orbis
                     return true;
                 }
                 taskId = -1;
-                if (rc == BgftTaskNotFound) return true;
+                if (rc == BgftTaskNotFound || (rc == 0 && taskId < 0)) return true;
                 error = "BGFT find " + Hex(rc);
                 return false;
             }
@@ -914,11 +990,21 @@ namespace Orbis
                 var ex = new BgftDownloadParamEx { Params = p, Slot = slot };
                 attempted = true; // register mutates system state
                 int rc = sceBgftServiceIntDownloadRegisterTaskByStorageEx(ref ex, out taskId);
-                if (rc != 0)
+                LogInstall("api=sceBgftServiceIntDownloadRegisterTaskByStorageEx rc=" + Hex(rc) + " task=" + taskId +
+                    " content=" + contentId + " subtype=6 bytes=" + packageSize + " path=" + contentUrl);
+                string recovery;
+                if (taskId < 0 && PkgInstallPolicy.IsBgftDuplicate(rc) &&
+                    TryRetireFailedDuplicate(contentId, 6, out recovery))
+                {
+                    rc = sceBgftServiceIntDownloadRegisterTaskByStorageEx(ref ex, out taskId);
+                    LogInstall("BGFT storage retry after owned recovery rc=" + Hex(rc) + " task=" + taskId);
+                }
+                if (rc != 0 || taskId < 0)
                 {
                     if (taskId >= 0)
                     {
                         registered = true;
+                        ClaimWebTask(taskId, contentId, 6);
                         error = "BGFT_UNRESOLVED:Registration returned " + Hex(rc) +
                             " with task " + taskId + "; task and PKG retained";
                         LogInstall(error);
@@ -926,58 +1012,41 @@ namespace Orbis
                     }
                     if (rc == BgftTaskDuplicated || rc == BgftContentAlreadyDownloading)
                     {
-                        // Do not FindTaskByContentId → resume/start: contentId+subtype is not
-                        // proof of ownership. Keep PKG; user retries or clears PS4 notification.
                         taskId = -1;
-                        error = "duplicate BGFT task already active for this content — finish or cancel it on PS4, PKG kept";
+                        error = "BGFT_UNRESOLVED:An existing PS4 download conflicts with this package. Open PS4 Notifications > Downloads, finish or cancel the matching title, then retry. PKG retained.";
                         LogInstall("BGFT duplicate ambiguous content=" + contentId + " rc=" + Hex(rc));
                         return false;
                     }
                     if (rc == BgftSameApplicationInstalled)
                     {
-                        error = "ALREADY_INSTALLED:" + titleId;
+                        error = "BGFT_UNRESOLVED:PS4 reports existing content, but this installation is not confirmed. Check PS4 Downloads; PKG retained.";
                         LogInstall(error);
                         return false;
                     }
-                    error = "BGFT register 0x" + rc.ToString("X") + " path=" + contentUrl +
+                    error = (rc == 0 ? "BGFT register returned no task" : "BGFT register " + PkgInstallPolicy.DescribeBgftError(rc)) + " path=" + contentUrl +
                         " source={path=" + pkgPath + " " + DescribeManagedFile(pkgPath) + "}";
                     LogInstall(error);
                     return false;
                 }
                 registered = true;
-                rc = sceBgftServiceDownloadStartTask(taskId);
-                if (rc != 0)
+                ClaimWebTask(taskId, contentId, 6);
+                string startDetail;
+                if (!TryStartOwnedBgftTask(taskId, out startDetail))
                 {
-                    // Accept auto-start only if progress is readable AND (error-free) with
-                    // either completion signals or advancing counters on a second probe.
-                    BgftTaskProgress probe1;
-                    if (sceBgftServiceDownloadGetProgress(taskId, out probe1) == 0 &&
-                        probe1.ErrorResult == 0)
-                    {
-                        Thread.Sleep(400);
-                        BgftTaskProgress probe2;
-                        if (sceBgftServiceDownloadGetProgress(taskId, out probe2) == 0 &&
-                            probe2.ErrorResult == 0 &&
-                            (IsBgftProgressComplete(probe2) || IsBgftProgressAdvanced(probe1, probe2)))
-                        {
-                            LogInstall("BGFT local already active task=" + taskId +
-                                " content=" + contentId + " size=" + packageSize);
-                            return true;
-                        }
-                    }
                     int stopRc = -1, unregisterRc = -1;
                     try { stopRc = sceBgftServiceDownloadStopTask(taskId); } catch { }
                     try { unregisterRc = sceBgftServiceIntDownloadUnregisterTask(taskId); }
                     catch { unregisterRc = -1; }
                     bool stillOwned = unregisterRc != 0;
                     registered = stillOwned;
+                    if (!stillOwned) ReleaseWebTask(taskId);
                     taskId = stillOwned ? taskId : -1;
-                    error = (stillOwned ? "BGFT_UNRESOLVED:" : "") + "BGFT start 0x" +
-                        rc.ToString("X") + " stop " + Hex(stopRc) + " unregister " + Hex(unregisterRc);
+                    error = (stillOwned ? "BGFT_UNRESOLVED:" : "") + "BGFT " +
+                        startDetail + " stop " + Hex(stopRc) + " unregister " + Hex(unregisterRc);
                     LogInstall(error);
                     return false;
                 }
-                LogInstall("BGFT local started task=" + taskId + " content=" + contentId +
+                LogInstall("BGFT local started task=" + taskId + " " + startDetail + " content=" + contentId +
                     " path=" + contentUrl + " size=" + packageSize);
                 return true;
             }
@@ -994,8 +1063,20 @@ namespace Orbis
             }
         }
 
+        static bool TryRetireFailedDuplicate(string contentId, int subType, out string detail)
+        {
+            bool recovered = PkgInstallPolicy.TryRetireFailedBgftTask(
+                () => { int found; return TryFindBackgroundTask(contentId, subType, out found) ? found : -1; },
+                id => IsOwnedBackgroundTask(id, contentId, subType),
+                id => { BgftTaskProgress state; int rc = sceBgftServiceDownloadGetProgress(id, out state);
+                    return new PkgInstallPolicy.BgftStartProgress { Readable = rc == 0, Error = state.ErrorResult }; },
+                sceBgftServiceDownloadStopTask, sceBgftServiceIntDownloadUnregisterTask, ReleaseWebTask, out detail);
+            LogInstall("BGFT duplicate recovery content=" + contentId + " subtype=" + subType + " " + detail);
+            return recovered;
+        }
+
         static bool TryRegisterBgftWebDownload(string contentUrl, string titleId, string contentId,
-            string contentName, int subType, long expectedSize, bool startTask, out int taskId,
+            string contentName, int subType, long expectedSize, out int taskId,
             out string error, string packageType = null)
         {
             taskId = -1;
@@ -1076,17 +1157,28 @@ namespace Orbis
                 };
 
                 bool debugRegistration = !PkgInstallPolicy.IsBaseBgftSubType(subType);
-                string registerApi = debugRegistration ? "debug" : "notification";
+                string registerApi = debugRegistration ? "sceBgftServiceIntDebugDownloadRegisterPkg" : "sceBgftServiceIntDownloadRegisterTask";
                 lock (InstallRegisterGate)
                 {
                     int rc = debugRegistration
                         ? sceBgftServiceIntDebugDownloadRegisterPkg(ref p, out taskId)
-                        : sceBgftServiceDownloadRegisterTask(ref p, out taskId);
-                    if (!debugRegistration && taskId < 0 && rc != BgftTaskDuplicated && rc != BgftContentAlreadyDownloading && rc != BgftSameApplicationInstalled)
+                        : sceBgftServiceIntDownloadRegisterTask(ref p, out taskId);
+                    LogBgftRegistration(registerApi, rc, taskId, contentId, subType, expectedSize, contentUrl);
+                    if (!debugRegistration && taskId < 0 && rc == unchecked((int)0x80F00633))
                     {
-                        registerApi = "debug-fallback";
+                        registerApi = "sceBgftServiceIntDebugDownloadRegisterPkg";
                         taskId = -1;
                         rc = sceBgftServiceIntDebugDownloadRegisterPkg(ref p, out taskId);
+                        LogBgftRegistration(registerApi, rc, taskId, contentId, subType, expectedSize, contentUrl);
+                    }
+                    string recovery;
+                    if (taskId < 0 && PkgInstallPolicy.IsBgftDuplicate(rc) &&
+                        TryRetireFailedDuplicate(contentId, subType, out recovery))
+                    {
+                        rc = registerApi == "sceBgftServiceIntDebugDownloadRegisterPkg"
+                            ? sceBgftServiceIntDebugDownloadRegisterPkg(ref p, out taskId)
+                            : sceBgftServiceIntDownloadRegisterTask(ref p, out taskId);
+                        LogBgftRegistration(registerApi, rc, taskId, contentId, subType, expectedSize, contentUrl);
                     }
                     if (rc != 0 || taskId < 0)
                     {
@@ -1099,18 +1191,18 @@ namespace Orbis
                         }
                         if (rc == BgftTaskDuplicated || rc == BgftContentAlreadyDownloading)
                         {
-                            error = "BGFT_UNRESOLVED:BGFT web: package already downloading on PS4";
+                            error = "BGFT_UNRESOLVED:An existing PS4 download conflicts with this package. Open PS4 Notifications > Downloads, finish or cancel the matching title, then retry. PKG retained.";
                             LogInstall(error + " content=" + (contentId ?? ""));
                             return false;
                         }
                         if (rc == BgftSameApplicationInstalled)
                         {
                             error = PkgInstallPolicy.IsBaseBgftSubType(subType)
-                                ? ("ALREADY_INSTALLED:" + titleId)
+                                ? "BGFT_UNRESOLVED:PS4 reports existing content, but this installation is not confirmed. Check PS4 Downloads; PKG retained."
                                 : "PS4 rejected this update/add-on identity; matching package required";
                             return false;
                         }
-                        error = rc != 0 ? "BGFT web register 0x" + rc.ToString("X") :
+                        error = rc != 0 ? registerApi + " " + PkgInstallPolicy.DescribeBgftError(rc) :
                             "BGFT web register returned no task";
                         LogInstall(error);
                         return false;
@@ -1118,40 +1210,9 @@ namespace Orbis
                     registered = true;
                     ClaimWebTask(taskId, contentId, subType);
 
-                    if (!startTask)
+                    string startDetail;
+                    if (!TryStartOwnedBgftTask(taskId, out startDetail))
                     {
-                        LogInstall("BGFT web registered task=" + taskId + " register=" + registerApi +
-                            " title=" + titleId + " content=" + (contentId ?? "") +
-                            " sub=" + subType + " sizeHint=" + expectedSize);
-                        return true;
-                    }
-
-                    int publicStartRc = sceBgftServiceDownloadStartTask(taskId);
-                    rc = publicStartRc;
-                    if (rc != 0)
-                    {
-                        try { rc = sceBgftServiceIntDownloadStartTask(taskId); }
-                        catch { rc = publicStartRc; }
-                    }
-                    if (rc != 0)
-                    {
-                        BgftTaskProgress probe1;
-                        if (sceBgftServiceDownloadGetProgress(taskId, out probe1) == 0 &&
-                            probe1.ErrorResult == 0)
-                        {
-                            Thread.Sleep(400);
-                            BgftTaskProgress probe2;
-                            if (sceBgftServiceDownloadGetProgress(taskId, out probe2) == 0 &&
-                                probe2.ErrorResult == 0 &&
-                                (IsBgftProgressComplete(probe2) || IsBgftProgressAdvanced(probe1, probe2) ||
-                                 probe2.Transferred > 0 || probe2.TransferredTotal > 0 ||
-                                 probe2.PreparingPercent > 0 || probe2.LocalCopyPercent > 0))
-                            {
-                                LogInstall("BGFT web already active task=" + taskId +
-                                    " title=" + titleId + " content=" + (contentId ?? ""));
-                                return true;
-                            }
-                        }
                         int stopRc = -1, unregRc = -1;
                         try { stopRc = sceBgftServiceDownloadStopTask(taskId); } catch { }
                         try { unregRc = sceBgftServiceIntDownloadUnregisterTask(taskId); } catch { }
@@ -1159,11 +1220,12 @@ namespace Orbis
                         if (!registered) ReleaseWebTask(taskId);
                         taskId = registered ? taskId : -1;
                         error = (registered ? "BGFT_UNRESOLVED:" : "") +
-                            "BGFT web start public " + Hex(publicStartRc) + " internal " + Hex(rc) +
+                            "BGFT web " + startDetail +
                             " stop " + Hex(stopRc) + " unreg " + Hex(unregRc);
                         LogInstall(error);
                         return false;
                     }
+                    LogInstall("BGFT web task=" + taskId + " " + startDetail);
                 }
 
                 LogInstall("BGFT web started task=" + taskId + " register=" + registerApi + " title=" + titleId +
@@ -1210,45 +1272,7 @@ namespace Orbis
                 return false;
             }
             return TryRegisterBgftWebDownload(contentUrl + ".json", titleId, contentId, contentName,
-                subType, expectedSize, true, out taskId, out error, packageType);
-        }
-
-        public static bool TryRegisterLoopbackBgftDownload(string contentUrl, string titleId,
-            string contentId, string contentName, int subType, long expectedSize, out int taskId,
-            out string error)
-        {
-            taskId = -1;
-            error = null;
-            Uri route;
-            if (!Uri.TryCreate(contentUrl, UriKind.Absolute, out route) || !IsAppLoopbackUrl(route))
-            {
-                error = "BGFT loopback: invalid stable URL";
-                return false;
-            }
-            return TryRegisterBgftWebDownload(contentUrl + ".json", titleId, contentId, contentName,
-                subType, expectedSize, false, out taskId, out error);
-        }
-
-        public static bool TryStartDirectBgftWebDownload(string contentUrl, string titleId,
-            string contentId, string contentName, int subType, long expectedSize,
-            out int taskId, out string error)
-        {
-            taskId = -1;
-            error = null;
-            Uri uri;
-            if (!Uri.TryCreate(contentUrl ?? "", UriKind.Absolute, out uri) ||
-                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
-            {
-                error = "BGFT direct: invalid URL";
-                return false;
-            }
-            if (Encoding.UTF8.GetByteCount(contentUrl) + 1 > 0x800)
-            {
-                error = "BGFT direct: URL too long for BGFT";
-                return false;
-            }
-            return TryRegisterBgftWebDownload(contentUrl, titleId, contentId, contentName,
-                subType, expectedSize, true, out taskId, out error);
+                subType, expectedSize, out taskId, out error, packageType);
         }
 
         static string BackgroundIdentity(string contentId, int subType)
@@ -1270,7 +1294,7 @@ namespace Orbis
                 error = "BGFT: unsafe package path";
                 return false;
             }
-            // App-owned downloads live under /data/GameSearch/...
+            // App-owned downloads live under /data/SSPI/...
             string norm = pkgPath.Replace('\\', '/');
             if (!norm.StartsWith("/data/", StringComparison.OrdinalIgnoreCase) &&
                 !norm.StartsWith("/user/data/", StringComparison.OrdinalIgnoreCase) &&
@@ -1303,22 +1327,22 @@ namespace Orbis
             return true;
         }
 
-        static bool IsBgftProgressComplete(BgftTaskProgress state)
+        static bool TryStartOwnedBgftTask(int taskId, out string detail)
         {
-            if (state.LocalCopyPercent >= 100) return true;
-            if (state.PreparingPercent >= 100 && state.LocalCopyPercent >= 100) return true;
-            ulong total = state.LengthTotal != 0 ? state.LengthTotal : state.Length;
-            ulong done = state.TransferredTotal != 0 ? state.TransferredTotal : state.Transferred;
-            return total > 0 && done >= total && state.LocalCopyPercent >= 100;
-        }
-
-        static bool IsBgftProgressAdvanced(BgftTaskProgress a, BgftTaskProgress b)
-        {
-            if (b.LocalCopyPercent > a.LocalCopyPercent) return true;
-            if (b.PreparingPercent > a.PreparingPercent) return true;
-            ulong aDone = a.TransferredTotal != 0 ? a.TransferredTotal : a.Transferred;
-            ulong bDone = b.TransferredTotal != 0 ? b.TransferredTotal : b.Transferred;
-            return bDone > aDone;
+            return PkgInstallPolicy.TryStartBgftTask(
+                () => { int rc = sceBgftServiceDownloadStartTask(taskId); LogInstall("api=sceBgftServiceDownloadStartTask rc=" + Hex(rc) + " task=" + taskId); return rc; },
+                () => { int rc = sceBgftServiceIntDownloadStartTask(taskId); LogInstall("api=sceBgftServiceIntDownloadStartTask rc=" + Hex(rc) + " task=" + taskId); return rc; },
+                () => {
+                    BgftTaskProgress state;
+                    int rc = sceBgftServiceDownloadGetProgress(taskId, out state);
+                    LogInstall("api=sceBgftServiceDownloadGetProgress rc=" + Hex(rc) + " task=" + taskId + " error=" + Hex(state.ErrorResult));
+                    return new PkgInstallPolicy.BgftStartProgress {
+                        Readable = rc == 0, Error = state.ErrorResult,
+                        Preparing = state.PreparingPercent, Copy = state.LocalCopyPercent,
+                        Total = state.LengthTotal != 0 ? state.LengthTotal : state.Length,
+                        Done = state.TransferredTotal != 0 ? state.TransferredTotal : state.Transferred
+                    };
+                }, Thread.Sleep, out detail);
         }
 
         static bool EnsureBgftReady(out string error)
@@ -1352,7 +1376,7 @@ namespace Orbis
                     int rc = sceBgftServiceIntInit(ref init);
                     if (rc != 0 && rc != BgftAlreadyInitialized)
                     {
-                        error = "BGFT init 0x" + rc.ToString("X");
+                        error = "BGFT init " + PkgInstallPolicy.DescribeBgftError(rc);
                         Marshal.FreeHGlobal(_bgftHeap);
                         _bgftHeap = IntPtr.Zero;
                         return false;
@@ -1420,6 +1444,14 @@ namespace Orbis
 
         static string DescribeInstallError(string operation, int rc)
         {
+            string reason = null;
+            switch (unchecked((uint)rc)) {
+                case 0x80A3000B: reason = "The PS4 rejected the add-on package (ADDCONT_BROKEN). Local metadata passed; retry with a matching add-on. File retained."; break;
+                case 0x80A30006: reason = "PS4 rejected the package DRM type. Use a compatible package; file retained."; break;
+                case 0x80A30004: case 0x80A3000A: reason = "Required base game is not fully installed. Finish the base, then retry; file retained."; break;
+                case 0x80A3000C: reason = "Close the running game before installing this package; file retained."; break;
+            }
+            if (reason != null) return reason + " API=" + operation + " rc=" + Hex(rc);
             if (rc == unchecked((int)0x80020012))
                 return operation + " EXDEV 0x80020012 (storage path rejected)";
             return operation + " 0x" + rc.ToString("X");
@@ -1429,10 +1461,18 @@ namespace Orbis
         {
             try
             {
-                File.AppendAllText(Path.Combine(AppSettings.DataDir, "download-install.log"),
-                    DateTime.UtcNow.ToString("o") + " " + (message ?? "") + "\n");
+                SspiLog.Write("download", "install " + (message ?? ""));
             }
             catch { }
+        }
+
+        static void LogBgftRegistration(string api, int rc, int task, string content, int subtype, long size, string url)
+        {
+            Uri parsed; string endpoint = "remote-url-redacted";
+            if (Uri.TryCreate(url, UriKind.Absolute, out parsed) && parsed.IsLoopback)
+                endpoint = parsed.Authority + parsed.AbsolutePath;
+            LogInstall("api=" + api + " rc=" + Hex(rc) + " task=" + task + " content=" + content +
+                " subtype=" + subtype + " bytes=" + size + " local_http_endpoint=" + endpoint);
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1524,9 +1564,6 @@ namespace Orbis
         [DllImport("libSceBgft", EntryPoint = "sceBgftServiceIntDownloadRegisterTask", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceBgftServiceIntDownloadRegisterTask(ref BgftDownloadParam downloadParams, out int taskId);
 
-        [DllImport("libSceBgft", EntryPoint = "sceBgftServiceDownloadRegisterTask", CallingConvention = CallingConvention.Cdecl)]
-        static extern int sceBgftServiceDownloadRegisterTask(ref BgftDownloadParam downloadParams, out int taskId);
-
         [DllImport("libSceBgft", EntryPoint = "sceBgftServiceIntDebugDownloadRegisterPkg", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceBgftServiceIntDebugDownloadRegisterPkg(ref BgftDownloadParam downloadParams, out int taskId);
 
@@ -1554,12 +1591,6 @@ namespace Orbis
         [DllImport("libSceBgft", EntryPoint = "sceBgftServiceDownloadFindTaskByContentId", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceBgftServiceDownloadFindTaskByContentId(
             [MarshalAs(UnmanagedType.LPStr)] string contentId, int subType, out int taskId);
-
-        [DllImport("libSceUserService", EntryPoint = "sceUserServiceGetForegroundUser", CallingConvention = CallingConvention.Cdecl)]
-        static extern int sceUserServiceGetForegroundUser(out int userId);
-
-        [DllImport("libSceUserService", EntryPoint = "sceUserServiceInitialize", CallingConvention = CallingConvention.Cdecl)]
-        static extern int sceUserServiceInitialize(IntPtr priority);
 
         [DllImport("libSceSystemService", EntryPoint = "sceSystemServicePowerTick", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceSystemServicePowerTick();

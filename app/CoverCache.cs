@@ -1,13 +1,10 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using static SDL2.SDL;
 
 namespace Orbis
@@ -16,9 +13,9 @@ namespace Orbis
     internal sealed class CoverCache
     {
         const int MaxEncodedBytes = 8 * 1024 * 1024;
-        const int MaxPixels = 4 * 1024 * 1024;
-        const int MaxTextureDimension = 512;
         const int MaxTextures = 24;
+        const int MaxTextureBytes = 16 * 1024 * 1024;
+        const int MaxPendingRequests = 24;
         const int FirstRetrySeconds = 6;
 
         readonly object _lock = new object();
@@ -31,10 +28,12 @@ namespace Orbis
         readonly Dictionary<string, long> _lastUse = new Dictionary<string, long>();
         readonly HashSet<string> _inflight = new HashSet<string>();
         readonly HashSet<string> _uploading = new HashSet<string>();
+        readonly HashSet<IntPtr> _firstDraw = new HashSet<IntPtr>();
         readonly Thread _worker;
         volatile bool _run = true;
         int _viewGen;
         long _useClock;
+        long _textureBytes;
 
         struct Req
         {
@@ -50,6 +49,7 @@ namespace Orbis
             public int Width;
             public int Height;
             public bool Opaque;
+            public int Generation;
         }
 
         struct TextureSize
@@ -62,9 +62,6 @@ namespace Orbis
         {
             try
             {
-                string log = LogPath;
-                if (File.Exists(log) && new FileInfo(log).Length > 256 * 1024)
-                    File.Delete(log);
                 AppendLog("cover session started");
             }
             catch { }
@@ -83,6 +80,8 @@ namespace Orbis
                     Req stale = _q.Dequeue();
                     if (stale.Key != null) _inflight.Remove(stale.Key);
                 }
+                // An old view's ready buffers do not need to occupy the next view's budget.
+                _ready.Clear();
             }
         }
 
@@ -114,7 +113,7 @@ namespace Orbis
 
         public string RequestSized(string titleId, string url, int width, int height)
         {
-            string key = (titleId ?? "").ToUpperInvariant() + "@" + width + "x" + height;
+            string key = ((titleId ?? "") + "@" + width + "x" + height + "-" + (url ?? "").GetHashCode().ToString("x8")).ToUpperInvariant();
             lock (_lock) if (_tex.ContainsKey(key) || _inflight.Contains(key) || _ready.ContainsKey(key) || _uploading.Contains(key)) return key;
             if (string.IsNullOrEmpty(url)) return key;
             bool local = url.IndexOf("://", StringComparison.Ordinal) < 0 && (url.StartsWith("/") || url.IndexOf('\\') >= 0);
@@ -129,6 +128,7 @@ namespace Orbis
             {
                 if (_tex.ContainsKey(key) || _ready.ContainsKey(key) || _inflight.Contains(key) ||
                     _uploading.Contains(key)) return;
+                if (_q.Count >= MaxPendingRequests) return; // Visible rows retry on their next draw.
                 long until;
                 if (_failUntil.TryGetValue(key, out until) && until > DateTime.UtcNow.Ticks) return;
                 _inflight.Add(key);
@@ -164,12 +164,18 @@ namespace Orbis
                 GCHandle pin = default(GCHandle);
                 try
                 {
+                    if (image.Generation != _viewGen) continue;
+                    if (image.Width <= 0 || image.Height <= 0 || image.Pixels == null ||
+                        (long)image.Width * image.Height * 4 != image.Pixels.Length)
+                        throw new InvalidDataException("Invalid cover pixel buffer");
+                    AppendLog(key + " texture-create begin " + image.Width + "x" + image.Height);
                     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
                         (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, image.Width, image.Height);
                     if (texture == IntPtr.Zero)
                         throw new Exception("SDL_CreateTexture: " + SDL_GetError());
 
                     pin = GCHandle.Alloc(image.Pixels, GCHandleType.Pinned);
+                    AppendLog(key + " texture-upload begin");
                     int rc = SDL_UpdateTexture(texture, IntPtr.Zero, pin.AddrOfPinnedObject(), image.Width * 4);
                     if (rc != 0)
                         throw new Exception("SDL_UpdateTexture: " + SDL_GetError());
@@ -177,10 +183,16 @@ namespace Orbis
 
                     lock (_lock)
                     {
-                        if (_tex.Count >= MaxTextures) EvictOne();
+                        while (_tex.Count > 0 && (_tex.Count >= MaxTextures ||
+                            _textureBytes + image.Pixels.Length > MaxTextureBytes)) EvictOne();
                         IntPtr old;
                         if (_tex.TryGetValue(key, out old) && old != IntPtr.Zero)
+                        {
+                            TextureSize oldSize;
+                            if (_texSize.TryGetValue(key, out oldSize)) _textureBytes -= (long)oldSize.Width * oldSize.Height * 4;
+                            _firstDraw.Remove(old);
                             SDL_DestroyTexture(old);
+                        }
                         _tex[key] = texture;
                         _texSize[key] = new TextureSize
                         {
@@ -188,10 +200,13 @@ namespace Orbis
                             Height = image.Height
                         };
                         _lastUse[key] = ++_useClock;
+                        _textureBytes += image.Pixels.Length;
+                        _firstDraw.Add(texture);
                         _failUntil.Remove(key);
                         _failCount.Remove(key);
                     }
                     texture = IntPtr.Zero;
+                    AppendLog(key + " texture-ready");
                 }
                 catch (Exception ex)
                 {
@@ -250,6 +265,9 @@ namespace Orbis
             }
             if (key == null) return;
             IntPtr texture = _tex[key];
+            TextureSize size;
+            if (_texSize.TryGetValue(key, out size)) _textureBytes -= (long)size.Width * size.Height * 4;
+            _firstDraw.Remove(texture);
             _tex.Remove(key);
             _texSize.Remove(key);
             _lastUse.Remove(key);
@@ -262,7 +280,7 @@ namespace Orbis
             {
                 Req request;
                 lock (_lock)
-                    request = _q.Count == 0 || _ready.Count >= 4 ? default(Req) : _q.Dequeue();
+                    request = _q.Count == 0 || _ready.Count >= 2 ? default(Req) : _q.Dequeue();
                 if (request.Key == null)
                 {
                     Thread.Sleep(100);
@@ -270,27 +288,27 @@ namespace Orbis
                 }
                 bool local = request.Url != null &&
                     request.Url.StartsWith("local|", StringComparison.Ordinal);
-                string path = local ? DiskPath(request.Key, request.Url) : DiskPath(request.Key, request.Url);
+                string path = null;
+                bool ownsCacheFile = true;
                 try
                 {
+                    path = DiskPath(request.Key, request.Url);
+                    AppendLog(request.Key + " request begin gen=" + request.Gen);
                     if (local)
                     {
                         string sourcePath = request.Url.Substring(6);
                         if (!File.Exists(path) || new FileInfo(path).Length < 100)
                         {
                             try { File.Copy(sourcePath, path, true); }
-                            catch { path = sourcePath; }
+                            catch { path = sourcePath; ownsCacheFile = false; }
                         }
                     }
                     else if (!File.Exists(path) || new FileInfo(path).Length < 100)
                     {
                         DownloadResumeInfo.DeletePartial(path + ".part");
-                        NetHttp.DownloadFileResumable(request.Url, path, 0, (done, total) =>
-                            {
-                                if (done > MaxEncodedBytes || total > MaxEncodedBytes)
-                                    throw new Exception("encoded response exceeds " + MaxEncodedBytes);
-                            }, () => request.Gen != _viewGen, 30000, null, null);
-                        AppendLog(request.Key + " HTTP OK " + SafeUrl(request.Url));
+                        AppendLog(request.Key + " artwork-http begin");
+                        NetHttp.DownloadArtwork(request.Url, path, () => request.Gen != _viewGen, MaxEncodedBytes);
+                        AppendLog(request.Key + " artwork-http complete");
                     }
 
                     if (request.Gen != _viewGen)
@@ -300,47 +318,15 @@ namespace Orbis
                     if (encodedSize < 100 || encodedSize > MaxEncodedBytes)
                         throw new Exception("encoded size " + encodedSize);
 
-                    IImageInfo info = Image.Identify(path);
-                    long identifiedPixels = info == null ? 0 : (long)info.Width * info.Height;
-                    if (info == null || info.Width < 16 || info.Height < 16 || identifiedPixels > MaxPixels)
-                        throw new Exception("bad dimensions " +
-                            (info == null ? "unknown" : info.Width + "x" + info.Height));
-
-                    ReadyImage decoded;
-                    // Auto-detect format (Orbis icons may be WebP/JPEG/PNG).
-                    using (Image<Rgba32> image = Image.Load<Rgba32>(path))
-                    {
-                        if (request.Key.EndsWith("-BACKDROP", StringComparison.Ordinal))
-                        {
-                            // Prepare the soft pocket backdrop once on the cover worker; no frame-time blur.
-                            image.Mutate(x => x.Resize(new ResizeOptions { Size = new Size(1440, 320), Mode = ResizeMode.Crop }).GaussianBlur(5f));
-                            for (int yy = 0; yy < image.Height; yy++)
-                                for (int xx = 0; xx < image.Width; xx++)
-                                {
-                                    var pixel = image[xx, yy];
-                                    double shade = .07 + .30 * xx / (double)image.Width;
-                                    image[xx, yy] = new Rgba32((byte)(24 + pixel.R * shade), (byte)(24 + pixel.G * shade), (byte)(24 + pixel.B * shade), 255);
-                                }
-                        }
-                        else if (request.Width > 0 && request.Height > 0)
-                        {
-                            image.Mutate(x => x.Resize(new ResizeOptions { Size = new Size(request.Width, request.Height), Mode = ResizeMode.Crop, Sampler = KnownResamplers.Lanczos3 }));
-                        }
-                        else if (image.Width > MaxTextureDimension || image.Height > MaxTextureDimension)
-                        {
-                            double scale = Math.Min((double)MaxTextureDimension / image.Width,
-                                (double)MaxTextureDimension / image.Height);
-                            int width = Math.Max(1, (int)Math.Round(image.Width * scale));
-                            int height = Math.Max(1, (int)Math.Round(image.Height * scale));
-                            image.Mutate(x => x.Resize(width, height));
-                        }
-                        long pixels = (long)image.Width * image.Height;
-                        byte[] rgba = new byte[checked((int)pixels * 4)];
-                        image.CopyPixelDataTo(rgba);
-                        bool opaque = true;
-                        for (int alpha = 3; alpha < rgba.Length; alpha += 4) if (rgba[alpha] != 255) { opaque = false; break; }
-                        decoded = new ReadyImage { Pixels = rgba, Width = image.Width, Height = image.Height, Opaque = opaque };
-                    }
+                    var pixels = CoverImageDecoder.Decode(path, request.Width, request.Height,
+                        request.Key.EndsWith("-BACKDROP", StringComparison.Ordinal),
+                        stage => AppendLog(request.Key + " " + stage), request.Width > 0);
+                    var decoded = new ReadyImage { Pixels = pixels.Pixels, Width = pixels.Width,
+                        Height = pixels.Height, Opaque = pixels.Opaque, Generation = request.Gen };
+                    string digest;
+                    using (var sha = SHA256.Create())
+                        digest = BitConverter.ToString(sha.ComputeHash(decoded.Pixels)).Replace("-", "").ToLowerInvariant();
+                    AppendLog(request.Key + " pixels sha256=" + digest + " managed_bytes=" + GC.GetTotalMemory(false));
 
                     lock (_lock)
                     {
@@ -354,16 +340,17 @@ namespace Orbis
                 }
                 catch (OperationCanceledException)
                 {
-                    DownloadResumeInfo.DeletePartial(path + ".part");
+                    if (!string.IsNullOrEmpty(path) && ownsCacheFile) DownloadResumeInfo.DeletePartial(path + ".part");
                     AppendLog(request.Key + " cancelled stale cover");
                 }
                 catch (Exception ex)
                 {
-                    try { if (File.Exists(path)) File.Delete(path); } catch { }
-                    DownloadResumeInfo.DeletePartial(path + ".part");
+                    string file = DescribeFile(path);
+                    try { if (ownsCacheFile && File.Exists(path)) File.Delete(path); } catch { }
+                    if (!string.IsNullOrEmpty(path) && ownsCacheFile) DownloadResumeInfo.DeletePartial(path + ".part");
                     lock (_lock) RecordFailure(request.Key);
                     AppendLog(request.Key + " FAIL " + ex.GetType().Name + ": " + ex.Message +
-                              " url=" + SafeUrl(request.Url) + " file=" + DescribeFile(path));
+                              " file=" + file);
                 }
                 finally
                 {
@@ -381,6 +368,25 @@ namespace Orbis
             // Retry transient CDN/TLS failures quickly once, then back off persistent bad URLs.
             int seconds = count == 1 ? FirstRetrySeconds : (count == 2 ? 30 : 120);
             _failUntil[key] = DateTime.UtcNow.AddSeconds(seconds).Ticks;
+        }
+
+        public void Draw(IntPtr renderer, IntPtr texture, ref SDL_Rect destination)
+        {
+            bool first;
+            lock (_lock) first = _firstDraw.Remove(texture);
+            if (first) AppendLog("texture-first-draw begin " + destination.w + "x" + destination.h);
+            int result = SDL_RenderCopy(renderer, texture, IntPtr.Zero, ref destination);
+            if (first || result != 0) AppendLog("texture-first-draw result=" + result);
+        }
+
+        public void Draw(IntPtr renderer, IntPtr texture, ref SDL_Rect source, ref SDL_Rect destination)
+        {
+            bool first;
+            lock (_lock) first = _firstDraw.Remove(texture);
+            if (first) AppendLog("texture-first-draw begin " + source.w + "x" + source.h +
+                " to=" + destination.w + "x" + destination.h);
+            int result = SDL_RenderCopy(renderer, texture, ref source, ref destination);
+            if (first || result != 0) AppendLog("texture-first-draw result=" + result);
         }
 
         static string NormalizeUrl(string value)
@@ -430,17 +436,9 @@ namespace Orbis
             catch { return value ?? ""; }
         }
 
-        static string LogPath { get { return Path.Combine(AppSettings.DataDir, "covers.log"); } }
-
-        static readonly object LogGate = new object();
         static void AppendLog(string message)
         {
-            try
-            {
-                lock (LogGate)
-                    File.AppendAllText(LogPath, DateTime.UtcNow.ToString("s") + " " + message + "\n");
-            }
-            catch { }
+            SspiLog.Write("startup", "cover " + message);
         }
     }
 }

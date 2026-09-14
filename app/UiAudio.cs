@@ -28,24 +28,27 @@ namespace Orbis
             lock (Gate)
             {
                 _music = musicEnabled; _effects = effectsEnabled;
-                if (_started) return;
+                if (_started || (!_music && !_effects)) return;
                 _started = true; _stop = false;
                 try
                 {
                     _thread = new Thread(Run) { IsBackground = true, Name = "SSPI UI audio" };
                     _thread.Start();
                 }
-                catch { _thread = null; _stop = true; }
+                catch { _thread = null; _stop = true; Program.StartupStage("audio-thread-unavailable"); }
             }
         }
 
         internal static void SetEnabled(bool musicEnabled, bool effectsEnabled)
         {
+            bool start;
             lock (Gate)
             {
                 _music = musicEnabled; _effects = effectsEnabled;
                 if (!effectsEnabled) _head = _count = 0;
+                start = !_started && (_music || _effects);
             }
+            if (start) Init(musicEnabled, effectsEnabled);
         }
 
         internal static void SetVolume(float music, float effects)
@@ -110,12 +113,14 @@ namespace Orbis
             GCHandle pinned = default(GCHandle);
             try
             {
-                if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) return;
+                Program.StartupStage("audio-start");
+                if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) { Program.StartupStage("audio-subsystem-unavailable"); return; }
                 initialized = true;
                 var desired = new SDL_AudioSpec { freq = Rate, format = AUDIO_S16LSB, channels = 2, samples = 512, callback = null };
                 SDL_AudioSpec obtained;
                 device = SDL_OpenAudioDevice(null, 0, ref desired, out obtained, 0);
-                if (device == 0 || obtained.freq != Rate || obtained.format != AUDIO_S16LSB || obtained.channels != 2) return;
+                if (device == 0 || obtained.freq != Rate || obtained.format != AUDIO_S16LSB || obtained.channels != 2)
+                { Program.StartupStage("audio-device-unavailable"); return; }
                 short[] ambient = ReadPcm("ambient");
                 string[] names = { "navigate", "confirm", "back", "queued", "installed", "error" };
                 short[][] effects = new short[names.Length][];
@@ -129,6 +134,7 @@ namespace Orbis
                 float musicGain = 0, effectsGain = 0;
                 bool playing = false;
                 Available = true;
+                Program.StartupStage("audio-ready");
                 while (!_stop)
                 {
                     uint queued = SDL_GetQueuedAudioSize(device);
@@ -165,12 +171,12 @@ namespace Orbis
                         output[n] = (short)Math.Max(-24575, Math.Min(24575, left));
                         output[n + 1] = (short)Math.Max(-24575, Math.Min(24575, right));
                     }
-                    if (SDL_QueueAudio(device, buffer, BlockSamples * 2) != 0) break;
+                    if (SDL_QueueAudio(device, buffer, BlockSamples * 2) != 0) { Program.StartupStage("audio-queue-failed"); break; }
                     if (!playing && SDL_GetQueuedAudioSize(device) >= TargetBytes)
                     { SDL_PauseAudioDevice(device, 0); playing = true; }
                 }
             }
-            catch { /* Audio is optional; missing drivers/exports must not interrupt the UI. */ }
+            catch { Program.StartupStage("audio-unavailable"); }
             finally
             {
                 Available = false;

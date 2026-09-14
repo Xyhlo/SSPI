@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Security.Cryptography;
@@ -21,8 +22,10 @@ namespace Orbis
     /// </summary>
     internal static class NetHttp
     {
+        internal const int DefaultResponseBytes = 2 * 1024 * 1024;
+
         public static string UserAgent =
-            "Mozilla/5.0 (PlayStation 4) AppleWebKit/537.36 SSPI/5.10";
+            "Mozilla/5.0 (PlayStation 4) AppleWebKit/537.36 SSPI/5.11";
 
         /// <summary>Desktop Chrome UA for standards-compatible sources that reject console user agents.</summary>
         public const string BrowserUserAgent =
@@ -32,6 +35,75 @@ namespace Orbis
         public static string ProxyBase = "";
         public static string ProxyKey = "game-search-lan";
         static int _downloadRangeCount = DownloadTransferSettings.DefaultRangeCount;
+
+        internal enum DownloadDecision
+        {
+            UserSingle, ProxySingle, ProviderLimit, ResumeSingle,
+            ParallelBusy, ProbeRange, ProbeValidator, ProbeEncoding, ProbeLength,
+            ProbeError, ProbeAccepted, ParallelSelected, RangeRejected, SingleSelected,
+            NativeUnavailable, ResidentSelected, BgftSelected,
+            ProbeTitleMissing, ProbeHeaderRead, ProbeHeaderSize, ProbeHeaderIntegrity
+        }
+        static readonly object DownloadTraceLock = new object();
+        static readonly System.Diagnostics.Stopwatch DownloadTraceClock = System.Diagnostics.Stopwatch.StartNew();
+
+        static readonly string DownloadTraceSession = Guid.NewGuid().ToString("N").Substring(0, 12);
+        static string _downloadTraceBuild = "unknown";
+        internal enum BackgroundRoute
+        {
+            Disabled, ForegroundBusy, LegacyWorkerBusy, ExistingLocalFile, ExistingPartial,
+            WorkerReady, WorkerRestartRequired, WorkerUnavailable, HeaderRejected,
+            Published, PublicationBusy, PublicationFailed, ForegroundSelected
+        }
+
+        internal static void ConfigureDownloadTrace(string buildHash)
+        {
+            _downloadTraceBuild = !string.IsNullOrEmpty(buildHash) &&
+                System.Text.RegularExpressions.Regex.IsMatch(buildHash, "\\A[0-9a-fA-F]{12,64}\\z")
+                ? buildHash.Substring(0, 12).ToLowerInvariant() : "unknown";
+        }
+
+        internal static void TraceBackgroundRoute(BackgroundRoute reason, string worker)
+        {
+            string version = !string.IsNullOrEmpty(worker) &&
+                System.Text.RegularExpressions.Regex.IsMatch(worker, "\\A5[.]10-r[0-9]{1,3}\\z") ? worker : "unavailable";
+            WriteTransferTrace("event=background_route reason=" + reason + " worker=" + version);
+        }
+
+        static void WriteTransferTrace(string fields)
+        {
+            SspiLog.Write("download", "mono_ms=" + DownloadTraceClock.ElapsedMilliseconds + " build=" + _downloadTraceBuild +
+                " session=" + DownloadTraceSession + " " + fields);
+        }
+
+        internal static void TraceDownloadProbe(bool native, int status, string tag, string modified,
+            string range, string encoding)
+        {
+            // Raw headers can contain arbitrary server data. Persist only classifications and parsed numbers.
+            long start, end, total; bool unsatisfied;
+            bool valid = DownloadResumeInfo.TryParseContentRange(range, out start, out end, out total, out unsatisfied);
+            string validator = string.IsNullOrEmpty(tag) ? "missing" :
+                DownloadTransferSettings.StrongEtag(tag) ? "strong" :
+                tag.StartsWith("W/", StringComparison.OrdinalIgnoreCase) ? "weak" : "invalid";
+            WriteTransferTrace("event=probe transport=" + (native ? "native" : "managed") +
+                " http=" + status + " etag=" + validator + " modified_present=" + (!string.IsNullOrEmpty(modified) ? 1 : 0) +
+                " identity_encoding=" + (DownloadTransferSettings.IdentityEncoding(encoding) ? 1 : 0) +
+                " range_valid=" + (valid ? 1 : 0) + " range_start=" + (valid ? start : -1) +
+                " range_end=" + (valid ? end : -1) + " range_total=" + (valid ? total : -1));
+        }
+
+        internal static void RecordDownloadMetrics(bool native, string transport, string metrics)
+        {
+            // Callers supply generated numeric metrics, never provider responses or exception messages.
+            string label = transport == "libcurl-managed-writer" ? transport : native ? "sceHttp-managed-writer" : "managed-http";
+            WriteTransferTrace("event=sample transport=" + label + " " + metrics.Replace("\r", "").Replace("\n", " "));
+        }
+
+        internal static void TraceDownloadDecision(bool native, DownloadDecision reason, int connections = 1)
+        {
+            WriteTransferTrace("event=decision transport=" + (native ? "native" : "managed") +
+                " reason=" + reason + " connections=" + DownloadTransferSettings.ClampRangeCount(connections));
+        }
 
         public static int DownloadRangeCount
         {
@@ -85,9 +157,11 @@ namespace Orbis
         }
 
         public static string GetStringDirect(string url, int timeoutMs = 45000, string referer = null,
-            string bearer = null, string userAgent = null)
+            string bearer = null, string userAgent = null, int maxBytes = DefaultResponseBytes)
         {
-            return GetStringInternal(url, timeoutMs, referer, bearer, allowProxy: false, userAgent: userAgent);
+            ProviderCooldown.Check(url);
+            try { return GetStringInternal(url, timeoutMs, referer, bearer, allowProxy: false, userAgent: userAgent, maxBytes: maxBytes); }
+            catch (Exception ex) { ProviderCooldown.NoteException(url, ex); throw; }
         }
 
         public static string GetString(string url, int timeoutMs = 45000, string referer = null,
@@ -106,19 +180,20 @@ namespace Orbis
         }
 
         static string GetStringInternal(string url, int timeoutMs, string referer, string bearer,
-            bool allowProxy, string userAgent)
+            bool allowProxy, string userAgent, int maxBytes = DefaultResponseBytes)
         {
             if (string.IsNullOrEmpty(url)) throw new Exception("Empty URL");
+            if (maxBytes <= 0) throw new ArgumentOutOfRangeException("maxBytes");
             bool https = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
             bool proxyOk = allowProxy && UseProxy;
 
             // Emergency proxy: rewrite https → http://PC/p/... then managed plain HTTP
             if (https && proxyOk)
-                return ManagedGet(ResolveUrl(url), timeoutMs, referer, bearer, addProxyKey: true, userAgent: userAgent);
+                return ManagedGet(ResolveUrl(url), timeoutMs, referer, bearer, addProxyKey: true, userAgent: userAgent, maxBytes: maxBytes);
 
             // Plain HTTP always managed
             if (!https)
-                return ManagedGet(url, timeoutMs, referer, bearer, addProxyKey: false, userAgent: userAgent);
+                return ManagedGet(url, timeoutMs, referer, bearer, addProxyKey: false, userAgent: userAgent, maxBytes: maxBytes);
 
             // HTTPS without proxy: native only — never MonoBTLS
             NativeHttp.EnsureInit();
@@ -127,11 +202,11 @@ namespace Orbis
 
             try
             {
-                return NativeHttp.GetString(url, timeoutMs, referer, bearer, 2 * 1024 * 1024, userAgent);
+                return NativeHttp.GetString(url, timeoutMs, referer, bearer, maxBytes, userAgent);
             }
             catch (Exception nex)
             {
-                throw new Exception("Native HTTPS: " + nex.Message);
+                throw new Exception("Native HTTPS: " + nex.Message, nex);
             }
         }
 
@@ -160,7 +235,7 @@ namespace Orbis
                 }
                 catch (Exception nex)
                 {
-                    throw new Exception("Native HTTPS POST: " + nex.Message);
+                    throw new Exception("Native HTTPS POST: " + nex.Message, nex);
                 }
             }
             catch (Exception ex)
@@ -189,39 +264,140 @@ namespace Orbis
             return NativeHttp.ReadRange(url, start, count, timeoutMs);
         }
 
+        internal static bool CanUseParallelDownload(string url, string expectedTitleId = null)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            bool native = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) && !UseProxy;
+            if (UseProxy) { TraceDownloadDecision(false, DownloadDecision.ProxySingle); return false; }
+            if (DownloadTransferSettings.ConnectionsFor(url, DownloadRangeCount) < 2)
+            { TraceDownloadDecision(native, DownloadRangeCount < 2 ? DownloadDecision.UserSingle : DownloadDecision.ProviderLimit); return false; }
+            if (DownloadTransferSettings.HasProbe(url, expectedTitleId)) return true;
+            long total = -1; string etag = null, effective = null; bool valid;
+            if (url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                NativeHttp.EnsureInit();
+                if (!NativeHttp.Available)
+                { TraceDownloadDecision(true, DownloadDecision.NativeUnavailable); return false; }
+                valid = NativeHttp.TryProbeContentLength(url, null, 8000, out total, out etag, out effective);
+                if (!valid) return false;
+            }
+            else valid = TryProbeManagedContentLength(url, 8000, null, false, out total, out etag, out effective);
+            if (!valid) return false;
+            if (total < 8L * 1024 * 1024)
+            { TraceDownloadDecision(native, DownloadDecision.ProbeLength); return false; }
+            byte[] header = null;
+            if (!DownloadTransferSettings.StrongEtag(etag))
+            {
+                if (string.IsNullOrEmpty(expectedTitleId))
+                { TraceDownloadDecision(native, DownloadDecision.ProbeTitleMissing); return false; }
+                HttpRangeResult result;
+                try
+                {
+                    result = native ? ReadRangeDirect(effective, 0, 0x1000, 8000) :
+                        new HttpRangeResult { Data = ReadManagedIntegrityHeader(effective, total, 8000, null, false, null), Total = total };
+                }
+                catch { TraceDownloadDecision(native, DownloadDecision.ProbeHeaderRead); return false; }
+                if (result.Total != total)
+                { TraceDownloadDecision(native, DownloadDecision.ProbeHeaderSize); return false; }
+                try
+                {
+                    PkgIntegrity.TransferHeaderIdentity(result.Data, total, expectedTitleId);
+                    header = result.Data;
+                }
+                catch { TraceDownloadDecision(native, DownloadDecision.ProbeHeaderIntegrity); return false; }
+                etag = null;
+            }
+            DownloadTransferSettings.RememberProbe(url, total, etag, effective, header, expectedTitleId);
+            return true;
+        }
+
         public static long DownloadFileResumable(string url, string destPath, long existingBytes,
             Action<long, long> progress, Func<bool> cancel, int timeoutMs = 0, string bearer = null,
-            string expectedTitleId = null, string expectedPackageId = null)
+            string expectedTitleId = null, string expectedPackageId = null, string expectedSha256 = null,
+            Action<long, long, long> telemetry = null, Action<string> phase = null)
         {
-            if (string.IsNullOrEmpty(url)) throw new Exception("Empty URL");
-            bool https = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
-            int to = timeoutMs <= 0 ? 600000 : timeoutMs;
-            int rangeCount = 1; // Sequential engine; legacy range maps are recovered before resuming.
+            return TransferClient.Download(url, destPath, progress, cancel, bearer,
+                expectedTitleId, expectedPackageId, expectedSha256, DownloadRangeCount, telemetry, phase);
+        }
 
-            if (https && UseProxy)
-                return ManagedDownloadResumable(ResolveUrl(url), destPath, existingBytes, progress,
-                    cancel, to, bearer, true, expectedTitleId, rangeCount, expectedPackageId);
+        // Artwork is disposable, bounded data. It must not start package writer,
+        // checkpoint or diagnostic threads for each small cover request.
+        internal static long DownloadArtwork(string url, string path, Func<bool> cancel,
+            int maxBytes, int timeoutMs = 30000)
+        {
+            var current = new Uri(url, UriKind.Absolute);
+            bool proxy = current.Scheme == Uri.UriSchemeHttps && UseProxy;
+            if (proxy) current = new Uri(ResolveUrl(url), UriKind.Absolute);
+            for (int hop = 0; hop < 8; hop++)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                if (!string.IsNullOrEmpty(current.UserInfo)) throw new IOException("Artwork URL contains user info");
+                if (current.Scheme == Uri.UriSchemeHttps && !proxy)
+                    return NativeHttp.DownloadArtwork(current.AbsoluteUri, path, cancel, maxBytes, timeoutMs);
+                if (current.Scheme != Uri.UriSchemeHttp && !(proxy && current.Scheme == Uri.UriSchemeHttps))
+                    throw new IOException("Unsupported artwork URL scheme");
+                var request = (HttpWebRequest)WebRequest.Create(current);
+                request.AllowAutoRedirect = false;
+                request.UserAgent = UserAgent;
+                request.Timeout = timeoutMs;
+                request.ReadWriteTimeout = timeoutMs;
+                request.Headers["Accept-Encoding"] = "identity";
+                if (proxy) request.Headers["X-GS-Proxy-Key"] = ProxyKey ?? "";
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    int status = (int)response.StatusCode;
+                    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308)
+                    {
+                        if (proxy) throw new IOException("Artwork proxy redirect rejected");
+                        string location = response.Headers["Location"];
+                        if (string.IsNullOrEmpty(location)) throw new IOException("Artwork redirect has no Location");
+                        current = new Uri(current, location);
+                        continue;
+                    }
+                    if (status != 200) throw new IOException("Artwork HTTP " + status);
+                    using (var input = response.GetResponseStream())
+                        return WriteArtwork(path, (buffer, count) => input.Read(buffer, 0, count),
+                            response.ContentLength, cancel, maxBytes);
+                }
+            }
+            throw new IOException("Too many artwork redirects");
+        }
 
-            if (!https)
-                return ManagedDownloadResumable(url, destPath, existingBytes, progress, cancel, to,
-                    bearer, false, expectedTitleId, rangeCount, expectedPackageId);
-
-            NativeHttp.EnsureInit();
-            if (!NativeHttp.Available)
-                throw new Exception("HTTPS DL needs native sceHttp (" + NativeHttp.InitDetail + ")");
-
+        internal static long WriteArtwork(string path, Func<byte[], int, int> read,
+            long expected, Func<bool> cancel, int maxBytes)
+        {
+            if (maxBytes < 1 || maxBytes > 8 * 1024 * 1024 || expected > maxBytes)
+                throw new IOException("Artwork exceeds byte limit");
+            string part = path + ".part";
             try
             {
-                return NativeHttp.DownloadFileResumable(url, destPath, existingBytes, progress,
-                    cancel, to, bearer, expectedTitleId, rangeCount, expectedPackageId);
+                byte[] buffer = new byte[32 * 1024];
+                long received = 0;
+                using (var output = new FileStream(part, FileMode.Create, FileAccess.Write,
+                    FileShare.None, 32 * 1024, FileOptions.SequentialScan))
+                {
+                    for (;;)
+                    {
+                        if (cancel != null && cancel()) throw new OperationCanceledException();
+                        int count = read(buffer, buffer.Length);
+                        if (count < 0 || count > buffer.Length) throw new IOException("Invalid artwork read length");
+                        if (count == 0) break;
+                        received += count;
+                        if (received > maxBytes || (expected >= 0 && received > expected))
+                            throw new IOException("Artwork exceeds response length");
+                        output.Write(buffer, 0, count);
+                    }
+                    if (expected >= 0 && received != expected) throw new IOException("Truncated artwork response");
+                }
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(part, path);
+                return received;
             }
-            catch (OperationCanceledException)
+            catch
             {
+                try { if (File.Exists(part)) File.Delete(part); } catch { }
                 throw;
-            }
-            catch (Exception nex)
-            {
-                throw new Exception("Native HTTPS DL: " + nex.Message);
             }
         }
 
@@ -285,8 +461,10 @@ namespace Orbis
     internal static class ProviderCooldown
     {
         static readonly object _lock = new object();
-        static readonly Dictionary<string, DateTime> _until =
-            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        sealed class Delay { internal long Until; internal int Status; }
+        static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+        static readonly Dictionary<string, Delay> _until =
+            new Dictionary<string, Delay>(StringComparer.OrdinalIgnoreCase);
 
         public static void Check(string url)
         {
@@ -294,39 +472,45 @@ namespace Orbis
             if (string.IsNullOrEmpty(host)) return;
             lock (_lock)
             {
-                DateTime until;
-                if (_until.TryGetValue(host, out until) && until > DateTime.UtcNow)
-                    throw new Exception("Provider cooling down: " + host + " retry in " +
-                        Math.Max(1, (int)(until - DateTime.UtcNow).TotalSeconds) + "s (HTTP 429)");
+                Delay delay;
+                if (_until.TryGetValue(host, out delay) && delay.Until > Clock.ElapsedMilliseconds)
+                    throw new ServiceHttpException(delay.Status,
+                        Math.Max(1, (delay.Until - Clock.ElapsedMilliseconds + 999) / 1000).ToString(CultureInfo.InvariantCulture), "");
+                _until.Remove(host);
             }
         }
 
         public static bool NoteResponse(string url, int status, string retryAfter)
         {
-            if (status != 429) return false;
-            int wait = 60;
-            if (!string.IsNullOrEmpty(retryAfter))
-            {
-                int seconds;
-                if (int.TryParse(retryAfter.Trim(), out seconds) && seconds >= 0)
-                    wait = Math.Min(300, seconds);
-                else
-                {
-                    DateTime date;
-                    if (DateTime.TryParse(retryAfter, out date))
-                        wait = Math.Max(0, Math.Min(300,
-                            (int)(date.ToUniversalTime() - DateTime.UtcNow).TotalSeconds));
-                }
-            }
+            if (status != 429 && status != 503) return false;
+            int wait = ServiceHttpException.ParseRetryAfter(retryAfter, DateTime.UtcNow);
+            if (wait <= 0) wait = status == 429 ? 60 : 15;
             string host = Host(url);
             if (string.IsNullOrEmpty(host)) return true;
-            lock (_lock) _until[host] = DateTime.UtcNow.AddSeconds(wait);
+            lock (_lock)
+            {
+                long until = Clock.ElapsedMilliseconds + (long)wait * 1000;
+                Delay previous;
+                if (!_until.TryGetValue(host, out previous) || until > previous.Until)
+                    _until[host] = new Delay { Until = until, Status = status };
+            }
             return true;
         }
 
         public static void NoteException(string url, Exception ex)
         {
             if (ex == null) return;
+            for (int depth = 0; ex.InnerException != null && depth < 8; depth++)
+            {
+                if (ex is WebException || ex is ServiceHttpException) break;
+                ex = ex.InnerException;
+            }
+            var native = ex as ServiceHttpException;
+            if (native != null)
+            {
+                NoteResponse(url, native.StatusCode, native.RetryAfterSeconds.ToString(CultureInfo.InvariantCulture));
+                return;
+            }
             var web = ex as WebException;
             if (web != null)
             {
@@ -355,14 +539,14 @@ namespace Orbis
     }
 
         static string ManagedGet(string finalUrl, int timeoutMs, string referer, string bearer, bool addProxyKey,
-            string userAgent = null)
+            string userAgent = null, int maxBytes = DefaultResponseBytes)
         {
             var req = (HttpWebRequest)WebRequest.Create(finalUrl);
             req.Method = "GET";
             req.UserAgent = string.IsNullOrEmpty(userAgent) ? UserAgent : userAgent;
             req.Timeout = timeoutMs;
             req.ReadWriteTimeout = timeoutMs;
-            req.AllowAutoRedirect = true;
+            req.AllowAutoRedirect = !addProxyKey;
             req.KeepAlive = false;
             if (!string.IsNullOrEmpty(referer)) req.Referer = referer;
             req.Accept = "text/html,application/json,*/*";
@@ -373,19 +557,22 @@ namespace Orbis
                 req.Headers["X-GS-Proxy-Key"] = ProxyKey ?? "";
 
             HttpWebResponse getResp;
-            try { getResp = (HttpWebResponse)req.GetResponse(); }
+            try { getResp = RejectProxyRedirect((HttpWebResponse)req.GetResponse(), addProxyKey); }
             catch (WebException webEx) { throw CooldownOrRethrow(finalUrl, webEx); }
             using (var resp = getResp)
             using (var stream = resp.GetResponseStream())
-            using (var reader = new StreamReader(stream ?? Stream.Null, Encoding.UTF8))
-                {
-                    var text = new StringBuilder(); var block = new char[8192]; int count;
-                    while ((count = reader.Read(block, 0, block.Length)) > 0) {
-                        if (text.Length + count > 2 * 1024 * 1024) throw new IOException("HTTP response exceeds 2 MiB");
-                        text.Append(block, 0, count);
-                    }
-                    return text.ToString();
+            using (var body = new MemoryStream())
+            {
+                if (resp.ContentLength > maxBytes) throw new IOException("HTTP response exceeds byte limit");
+                var input = stream ?? Stream.Null;
+                var block = new byte[8192]; int count;
+                while ((count = input.Read(block, 0, block.Length)) > 0) {
+                    if (body.Length + count > maxBytes) throw new IOException("HTTP response exceeds byte limit");
+                    body.Write(block, 0, count);
                 }
+                body.Position = 0;
+                using (var reader = new StreamReader(body, Encoding.UTF8)) return reader.ReadToEnd();
+            }
         }
 
         static string ManagedPost(string finalUrl, string formBody, int timeoutMs, string referer,
@@ -397,7 +584,7 @@ namespace Orbis
             req.UserAgent = UserAgent;
             req.Timeout = timeoutMs;
             req.ReadWriteTimeout = timeoutMs;
-            req.AllowAutoRedirect = true;
+            req.AllowAutoRedirect = !addProxyKey;
             req.KeepAlive = false;
             req.ContentType = contentType ?? "application/x-www-form-urlencoded; charset=UTF-8";
             req.ContentLength = data.Length;
@@ -412,7 +599,7 @@ namespace Orbis
                 rs.Write(data, 0, data.Length);
 
             HttpWebResponse postResp;
-            try { postResp = (HttpWebResponse)req.GetResponse(); }
+            try { postResp = RejectProxyRedirect((HttpWebResponse)req.GetResponse(), addProxyKey); }
             catch (WebException webEx) { throw CooldownOrRethrow(finalUrl, webEx); }
             using (var resp = postResp)
             using (var stream = resp.GetResponseStream())
@@ -427,13 +614,25 @@ namespace Orbis
                 }
         }
 
+        static HttpWebResponse RejectProxyRedirect(HttpWebResponse response, bool authenticatedProxy)
+        {
+            // The proxy must follow upstream redirects itself. Never forward its custom key,
+            // or accept a redirect page as JSON/file data, from this client connection.
+            int status = (int)response.StatusCode;
+            if (authenticatedProxy && status >= 300 && status < 400)
+            {
+                response.Dispose();
+                throw new IOException("LAN proxy returned a redirect; check the configured proxy address");
+            }
+            return response;
+        }
+
         static Exception CooldownOrRethrow(string url, WebException webEx)
         {
             var http = webEx != null ? webEx.Response as HttpWebResponse : null;
-            if (http != null && (int)http.StatusCode == 429)
+            if (http != null && ((int)http.StatusCode == 429 || (int)http.StatusCode == 503))
             {
-                ProviderCooldown.NoteResponse(url, 429, http.Headers["Retry-After"]);
-                return new Exception("Provider cooling down: request throttled (HTTP 429)");
+                ProviderCooldown.NoteResponse(url, (int)http.StatusCode, http.Headers["Retry-After"]);
             }
             return webEx;
         }
@@ -489,7 +688,7 @@ namespace Orbis
 
         static long ManagedDownloadResumable(string finalUrl, string destPath, long existingBytes,
             Action<long, long> progress, Func<bool> cancel, int timeoutMs, string bearer, bool addProxyKey,
-            string expectedTitleId, int rangeCount, string expectedPackageId = null)
+            string expectedTitleId, int rangeCount, string expectedPackageId = null, string expectedSha256 = null)
         {
             string dir = Path.GetDirectoryName(destPath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
@@ -504,32 +703,9 @@ namespace Orbis
                 existingBytes = 0;
 
             DownloadResumeInfo resume = existingBytes > 0 ? DownloadResumeInfo.Load(part) : null;
-            if (existingBytes > 0 && resume == null)
+            if (existingBytes > 0 && File.Exists(ParallelDownloadCheckpoint.RangeMapPath(part)))
             {
-                // Crash residue from positioned parallel writes: a range map without
-                // usable metadata. Adopt the verified contiguous prefix, drop the
-                // sparse tail, and continue under the identity rule.
-                long mapTotal; int mapN;
-                if (ParallelDownloadCheckpoint.TryPeekRangeMap(part, out mapTotal, out mapN))
-                {
-                    long[] mapDone = ParallelDownloadCheckpoint.LoadRangeMap(part, mapTotal, mapN);
-                    long[] mapNeeds = ParallelDownloadCheckpoint.SpanNeeds(mapTotal, mapN);
-                    long keep = ParallelDownloadCheckpoint.RetainedBytes(mapDone, mapNeeds);
-                    try
-                    {
-                        using (var fs = new FileStream(part, FileMode.Open, FileAccess.Write, FileShare.None))
-                            if (fs.Length != keep) fs.SetLength(keep);
-                    }
-                    catch { }
-                    ParallelDownloadCheckpoint.DeleteRangeMap(part);
-                    existingBytes = File.Exists(part) ? new FileInfo(part).Length : 0;
-                    if (keep > 0 && existingBytes == keep)
-                    {
-                        resume = DownloadResumeInfo.Create(finalUrl, finalUrl, null, null,
-                            mapTotal, expectedTitleId, expectedPackageId);
-                        resume.Save(part);
-                    }
-                }
+                existingBytes = ParallelDownloadCheckpoint.RecoverPositionedPart(part, resume);
             }
             if (existingBytes > 0 && resume != null && !resume.CanResume(finalUrl, expectedTitleId, existingBytes, expectedPackageId))
                 throw new Exception(DownloadResumeInfo.RestartRequired(
@@ -538,17 +714,87 @@ namespace Orbis
                 throw new Exception(DownloadResumeInfo.RestartRequired(
                     "saved partial metadata is missing"));
 
+            // Strict resume previously trusted canonical origin/path, package
+            // identity, strong ETag and exact total. A swapped package behind
+            // those values would splice foreign bytes after the durable prefix,
+            // so re-read the production PKG header and require it to match the
+            // durable prefix before either the parallel or the single path runs.
+            // Non-strict (rotating-URL) resumes keep their Content-Range behavior.
+            if (existingBytes > 0 && resume != null && resume.StrictIdentity)
+                RequirePkgHeaderMatch(finalUrl, part, existingBytes, resume, bearer, addProxyKey,
+                    timeoutMs, cancel);
+
+            if (rangeCount > 1)
+            {
+                    long total; string etag, effective, verifiedTitle = null; byte[] header = null;
+                    if (((bearer == null && !addProxyKey && DownloadTransferSettings.TakeProbe(finalUrl, out total, out etag, out effective, out header, out verifiedTitle)) ||
+                        TryProbeManagedContentLength(finalUrl, Math.Min(timeoutMs, 8000), bearer, addProxyKey, out total, out etag, out effective)) && total >= 8L * 1024 * 1024)
+                    {
+                        if (string.IsNullOrEmpty(expectedTitleId) && header != null) expectedTitleId = verifiedTitle;
+                        string headerIdentity = resume == null ? null : resume.IntegrityHeader;
+                        if (!DownloadTransferSettings.StrongEtag(etag))
+                        {
+                            if (string.IsNullOrEmpty(expectedTitleId))
+                            { TraceDownloadDecision(false, DownloadDecision.ProbeValidator); goto single; }
+                            if (header == null)
+                            {
+                                var probe = ReadManagedIntegrityHeader(effective, total, timeoutMs,
+                                    DownloadTransferSettings.SameOrigin(finalUrl, effective) ? bearer : null,
+                                    addProxyKey && DownloadTransferSettings.SameOrigin(finalUrl, effective), cancel);
+                                header = probe;
+                            }
+                            headerIdentity = PkgIntegrity.TransferHeaderIdentity(header, total, expectedTitleId);
+                            if (resume != null && !string.IsNullOrEmpty(resume.IntegrityHeader) && headerIdentity != resume.IntegrityHeader)
+                                throw new IOException(DownloadResumeInfo.RestartRequired("package integrity header changed"));
+                            etag = null;
+                        }
+                        if (existingBytes > 0 && (resume == null || total != resume.Total ||
+                            !resume.MatchesResponse(effective, etag, null)))
+                            throw new IOException(DownloadResumeInfo.RestartRequired("range resume identity changed"));
+                        try
+                        {
+                            TraceDownloadDecision(false, DownloadDecision.ParallelSelected, rangeCount);
+                            ValidatedParallelDownload.Run(finalUrl, effective, part, total, etag, rangeCount, expectedTitleId,
+                                expectedPackageId, progress, cancel, (start, end, stopped, report) =>
+                                    ManagedDownloadExactRangeTo(part, start, end, total, effective, Math.Min(timeoutMs, 30000),
+                                        DownloadTransferSettings.SameOrigin(finalUrl, effective) ? bearer : null,
+                                        addProxyKey && DownloadTransferSettings.SameOrigin(finalUrl, effective), stopped, report, etag), existingBytes, headerIdentity);
+                            PkgIntegrity.VerifyTransfer(part, headerIdentity, expectedTitleId, expectedSha256, cancel);
+                            long completed = FinishManagedPart(part, finalPath, expectedTitleId);
+                            if (!string.IsNullOrEmpty(expectedSha256))
+                                PkgIntegrity.RememberVerifiedSha256(finalPath, expectedSha256);
+                            return completed;
+                        }
+                        catch (DownloadRangeRejectedException)
+                        {
+                            TraceDownloadDecision(false, DownloadDecision.RangeRejected, rangeCount);
+                            ParallelDownloadCheckpoint.DeleteAll(part);
+                            existingBytes = 0; resume = null;
+                        }
+                    }
+                    else if (total > 0 && total < 8L * 1024 * 1024)
+                        TraceDownloadDecision(false, DownloadDecision.ProbeLength);
+            }
+            else if (existingBytes > 0) TraceDownloadDecision(false, DownloadDecision.ResumeSingle);
+            else if (rangeCount > 1) TraceDownloadDecision(false, DownloadDecision.ParallelBusy);
+            single:
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+
+            using (TransferLaneBudget.AcquireSingle(cancel))
+            {
+            TraceDownloadDecision(false, DownloadDecision.SingleSelected);
             var req = (HttpWebRequest)WebRequest.Create(finalUrl);
             req.Method = "GET";
             req.UserAgent = UserAgent;
             req.Timeout = timeoutMs;
             req.ReadWriteTimeout = 600000;
-            req.AllowAutoRedirect = true;
+            req.AllowAutoRedirect = !addProxyKey;
             req.KeepAlive = false;
             req.Headers["Accept-Encoding"] = "identity";
             if (existingBytes > 0)
             {
                 req.AddRange(existingBytes);
+                if (resume != null && resume.StrictIdentity) req.Headers["If-Range"] = resume.IfRange;
                 // Skip If-Range for RD — CDN ETags rotate and would force full restart
             }
             if (!string.IsNullOrEmpty(bearer))
@@ -556,23 +802,7 @@ namespace Orbis
             if (addProxyKey)
                 req.Headers["X-GS-Proxy-Key"] = ProxyKey ?? "";
 
-            var requestDone = new ManualResetEvent(false);
-            Thread abortThread = null;
-            if (cancel != null)
-            {
-                abortThread = new Thread(() =>
-                {
-                    while (!requestDone.WaitOne(100))
-                    {
-                        bool stop = false;
-                        try { stop = cancel(); } catch { }
-                        if (!stop) continue;
-                        try { req.Abort(); } catch { }
-                        return;
-                    }
-                }) { IsBackground = true, Name = "HTTP cancel" };
-                abortThread.Start();
-            }
+            var cancellation = new TransferCancellation(cancel, () => req.Abort());
             try
             {
             long bytesReadThis = 0;
@@ -582,14 +812,16 @@ namespace Orbis
             HttpWebResponse response;
             try
             {
-                response = (HttpWebResponse)req.GetResponse();
+                response = RejectProxyRedirect((HttpWebResponse)req.GetResponse(), addProxyKey);
             }
             catch (WebException ex)
             {
                 response = ex.Response as HttpWebResponse;
                 if (response == null || response.StatusCode != HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
+                    var failure = DownloadHttpException.Find(ex);
                     if (response != null) response.Dispose();
+                    if (failure != null) throw failure;
                     throw;
                 }
             }
@@ -599,6 +831,9 @@ namespace Orbis
                 string effectiveUrl = resp.ResponseUri != null ? resp.ResponseUri.AbsoluteUri : finalUrl;
                 string etag = resp.Headers["ETag"];
                 string lastModified = resp.Headers["Last-Modified"];
+
+                if (resume != null && resume.StrictIdentity && !DownloadTransferSettings.IdentityEncoding(resp.Headers["Content-Encoding"]))
+                    throw new Exception(DownloadResumeInfo.RestartRequired("saved range representation encoding changed"));
 
                 if (resp.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
@@ -617,7 +852,7 @@ namespace Orbis
                 else
                 {
                     if (resp.StatusCode != HttpStatusCode.OK && resp.StatusCode != HttpStatusCode.PartialContent)
-                        throw new Exception("HTTP " + (int)resp.StatusCode + " downloading");
+                        throw new DownloadHttpException((int)resp.StatusCode, resp.Headers["Retry-After"]);
 
                     bool append = resp.StatusCode == HttpStatusCode.PartialContent && existingBytes > 0;
                     if (resp.StatusCode == HttpStatusCode.PartialContent)
@@ -668,7 +903,7 @@ namespace Orbis
                         if (input == null) throw new IOException("Empty download stream");
                         bytesReadThis = SequentialDownloadEngine.Copy((buffer, start, count) => input.Read(buffer, start, count),
                             output, expectedResponse, done, totalUi, progress, cancel,
-                            metrics => File.WriteAllText(Path.Combine(AppSettings.DataDir, "managed-download-metrics.txt"), "transport=managed-http\n" + metrics));
+                            metrics => RecordDownloadMetrics(false, "managed-http", metrics));
                     }
                 }
             }
@@ -684,6 +919,7 @@ namespace Orbis
             if (expectedFinal >= 0 && finalLen != expectedFinal)
                 throw new Exception("final size " + finalLen + " != expected " + expectedFinal);
 
+            PkgIntegrity.VerifyTransfer(part, resume == null ? null : resume.IntegrityHeader, expectedTitleId, expectedSha256, cancel);
             PkgValResult vr;
             string vdetail;
             if (!string.IsNullOrEmpty(expectedTitleId) &&
@@ -698,260 +934,104 @@ namespace Orbis
 
             if (File.Exists(finalPath)) File.Delete(finalPath);
             File.Move(part, finalPath);
+            if (!string.IsNullOrEmpty(expectedSha256)) PkgIntegrity.RememberVerifiedSha256(finalPath, expectedSha256);
             DownloadResumeInfo.Delete(part);
             return new FileInfo(finalPath).Length;
             }
             finally
             {
-                requestDone.Set();
-                if (abortThread == null || abortThread.Join(1000)) requestDone.Close();
+                cancellation.Dispose();
+            }
+            }
+        }
+
+        // Re-reads the production PKG header and requires it to match the durable
+        // local prefix. A changed header is a different package: restart from zero
+        // with the partial kept on disk. A failed or truncated probe cannot prove
+        // identity, so it fails the attempt without deleting anything; the next
+        // retry re-probes and a transient outage keeps its resume.
+        static void RequirePkgHeaderMatch(string url, string part, long existingBytes,
+            DownloadResumeInfo resume, string bearer, bool addProxyKey, int timeoutMs, Func<bool> cancel)
+        {
+            int count = string.IsNullOrEmpty(resume.IntegrityHeader) ? DownloadResumeInfo.PkgHeaderLength : 0x1000;
+            byte[] fresh;
+            try { fresh = ReadManagedIntegrityHeader(url, resume.Total, timeoutMs, bearer, addProxyKey, cancel, count); }
+            catch (WebException error)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                var http = DownloadHttpException.Find(error);
+                if (error.Response != null) error.Response.Close();
+                if (http != null) throw new DownloadHttpException(http.StatusCode,
+                    http.RetryAfterSeconds > 0 ? http.RetryAfterSeconds.ToString() : null, "reading package header");
+                throw;
+            }
+            resume.RequireHeaderMatch(part, existingBytes, fresh);
+        }
+
+        static byte[] ReadManagedIntegrityHeader(string url, long total, int timeoutMs, string bearer,
+            bool addProxyKey, Func<bool> cancel, int count = 0x1000)
+        {
+            var request = CreateManagedRangeRequest(url, 0, count - 1,
+                timeoutMs <= 0 ? 8000 : Math.Min(timeoutMs, 8000), bearer, addProxyKey);
+            using (var cancellation = new TransferCancellation(cancel, () => request.Abort()))
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                if (!DownloadTransferSettings.IdentityEncoding(response.Headers["Content-Encoding"]))
+                    throw new IOException(DownloadResumeInfo.RestartRequired("package header representation encoding changed"));
+                long start, end, size; bool unsatisfied;
+                if (response.StatusCode != HttpStatusCode.PartialContent ||
+                    !DownloadResumeInfo.TryParseContentRange(response.Headers["Content-Range"], out start, out end, out size, out unsatisfied) ||
+                    unsatisfied || start != 0 || end != count - 1 || size != total ||
+                    (response.ContentLength >= 0 && response.ContentLength != count))
+                    throw new IOException("Package header probe returned an unexpected range");
+                using (var input = response.GetResponseStream())
+                using (var output = new MemoryStream(count))
+                {
+                    ExactRangeTransfer.Copy((buffer, offset, length) => input == null ? 0 : input.Read(buffer, offset, length),
+                        output, count, cancel, null);
+                    return output.ToArray();
+                }
             }
         }
 
         static bool TryProbeManagedContentLength(string url, int timeoutMs, string bearer,
-            bool addProxyKey, out long length)
+            bool addProxyKey, out long length, out string etag, out string effective)
         {
             length = -1;
+            etag = effective = null;
             try
             {
                 var req = CreateManagedRangeRequest(url, 0, 0, timeoutMs, bearer, addProxyKey);
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 {
+                    TraceDownloadProbe(false, (int)resp.StatusCode, resp.Headers["ETag"], resp.Headers["Last-Modified"],
+                        resp.Headers["Content-Range"], resp.Headers["Content-Encoding"]);
                     long start, end, total;
                     bool unsatisfied;
-                    if (resp.StatusCode != HttpStatusCode.PartialContent ||
-                        !DownloadResumeInfo.TryParseContentRange(resp.Headers["Content-Range"],
+                    if (resp.StatusCode != HttpStatusCode.PartialContent)
+                    { TraceDownloadDecision(false, DownloadDecision.ProbeRange); return false; }
+                    if (!DownloadTransferSettings.IdentityEncoding(resp.Headers["Content-Encoding"]))
+                    { TraceDownloadDecision(false, DownloadDecision.ProbeEncoding); return false; }
+                    if (!DownloadResumeInfo.TryParseContentRange(resp.Headers["Content-Range"],
                             out start, out end, out total, out unsatisfied) ||
-                        unsatisfied || start != 0 || end != 0 || total <= 0 ||
-                        (resp.ContentLength >= 0 && resp.ContentLength != 1))
-                        return false;
+                        unsatisfied || start != 0 || total <= 0)
+                    { TraceDownloadDecision(false, DownloadDecision.ProbeLength); return false; }
                     length = total;
+                    etag = resp.Headers["ETag"]; effective = resp.ResponseUri.AbsoluteUri;
+                    TraceDownloadDecision(false, DownloadDecision.ProbeAccepted);
                     return true;
                 }
             }
-            catch { return false; }
-        }
-
-        static long ManagedDownloadParallelN(string url, string part, string finalPath, long total,
-            int rangeCount, Action<long, long> progress, Func<bool> cancel, int timeoutMs,
-            string bearer, bool addProxyKey, string expectedTitleId, string expectedPackageId = null)
-        {
-            int n = DownloadTransferSettings.ClampRangeCount(rangeCount);
-            if (n < 2 || total < 8L * 1024 * 1024)
-                throw new Exception("too small for parallel");
-            if (cancel != null && cancel())
-                throw new OperationCanceledException("paused");
-
-            // Positioned writes into one preallocated .part: no merge copy, and the
-            // range map keeps completed spans across pause/restart (SSPI-11/12).
-            var starts = new long[n];
-            var ends = new long[n];
-            var needs = new long[n];
-            for (int i = 0; i < n; i++)
-            {
-                starts[i] = total * i / n;
-                ends[i] = (total * (i + 1) / n) - 1;
-                needs[i] = ends[i] - starts[i] + 1;
-            }
-            try
-            {
-                using (var pre = new FileStream(part, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
-                    if (pre.Length != total) pre.SetLength(total);
-            }
-            catch (Exception ex) { throw new IOException("Cannot preallocate partial file: " + ex.Message); }
-            long[] done = ParallelDownloadCheckpoint.LoadRangeMap(part, total, n);
-            for (int i = 0; i < n; i++) done[i] = Math.Min(done[i], needs[i]);
-
-            var errors = new Exception[n];
-            var progressLock = new object();
-            long lastReport = -1;
-            long lastMapSave = 0;
-            int failed = 0;
-            Func<bool> cancelOrFail = () =>
-                (cancel != null && cancel()) || Interlocked.CompareExchange(ref failed, 0, 0) != 0;
-            Action report = () =>
-            {
-                if (progress == null) return;
-                long sum = 0;
-                bool save = false;
-                lock (progressLock)
-                {
-                    for (int i = 0; i < n; i++) sum += done[i];
-                    if (sum == lastReport) return;
-                    lastReport = sum;
-                    long now = DateTime.UtcNow.Ticks;
-                    if (now - lastMapSave > TimeSpan.TicksPerSecond * 5)
-                    {
-                        lastMapSave = now;
-                        save = true;
-                    }
-                }
-                // Crash-recovery map (throttled); exit paths consolidate anyway.
-                if (save) ParallelDownloadCheckpoint.SaveRangeMap(part, total, done);
-                progress(sum, total);
-            };
-            report();
-
-            var threads = new Thread[n];
-            for (int i = 0; i < n; i++)
-            {
-                int index = i;
-                threads[i] = new Thread(() =>
-                {
-                    try
-                    {
-                        if (done[index] >= needs[index]) return;
-                        ManagedDownloadExactRangeTo(part, starts[index] + done[index], ends[index], total,
-                            url, timeoutMs, bearer, addProxyKey, cancelOrFail, bytes =>
-                            {
-                                lock (progressLock) done[index] += bytes;
-                                report();
-                            });
-                        lock (progressLock) done[index] = needs[index];
-                        report();
-                    }
-                    catch (Exception ex)
-                    {
-                        errors[index] = ex;
-                        Interlocked.Exchange(ref failed, 1);
-                    }
-                }) { IsBackground = true, Name = "managed-dl-r" + index };
-                threads[i].Start();
-            }
-            for (int i = 0; i < n; i++)
-                threads[i].Join();
-
-            Exception firstError = null;
-            for (int i = 0; i < n; i++)
-            {
-                if (errors[i] == null) continue;
-                if (firstError == null || !(errors[i] is OperationCanceledException))
-                    firstError = errors[i];
-                if (!(errors[i] is OperationCanceledException)) break;
-            }
-
-            // Consolidate on the way out: keep the contiguous prefix plus the first
-            // partial span, truncate the sparse tail, and record fresh metadata so
-            // any resume appends after verified bytes instead of after a gap.
-            long keep = ParallelDownloadCheckpoint.RetainedBytes(done, needs);
-            try
-            {
-                using (var fs = new FileStream(part, FileMode.Open, FileAccess.Write, FileShare.None))
-                    if (fs.Length != keep) fs.SetLength(keep);
-            }
-            catch { }
-            ParallelDownloadCheckpoint.DeleteRangeMap(part);
-            if (keep > 0)
-            {
-                var consolidated = DownloadResumeInfo.Create(url, url, null, null,
-                    total, expectedTitleId, expectedPackageId);
-                consolidated.Save(part);
-            }
-            else
-            {
-                ParallelDownloadCheckpoint.DeleteAll(part);
-            }
-            if (progress != null)
-                try { progress(keep, total); } catch { }
-
-            if (cancel != null && cancel())
-                throw new OperationCanceledException("paused at " + keep + " bytes");
-            if (firstError != null)
-                throw new Exception("parallel: " + firstError.Message);
-            if (keep != total)
-                throw new Exception("parallel checkpoint " + keep + " != " + total);
-            if (new FileInfo(part).Length != total)
-                throw new Exception("parallel size " + new FileInfo(part).Length + " != " + total);
-            return FinishManagedPart(part, finalPath, expectedTitleId);
-        }
-        static void ManagedDownloadExactRange(string url, long start, long end, long expectedTotal,
-            string destination, int timeoutMs, string bearer, bool addProxyKey, Func<bool> cancel,
-            Action<int> onChunk)
-        {
-            var req = CreateManagedRangeRequest(url, start, end, timeoutMs, bearer, addProxyKey);
-            var requestDone = new ManualResetEvent(false);
-            Thread abortThread = null;
-            if (cancel != null)
-            {
-                abortThread = new Thread(() =>
-                {
-                    while (!requestDone.WaitOne(100))
-                    {
-                        bool stop = false;
-                        try { stop = cancel(); } catch { }
-                        if (!stop) continue;
-                        try { req.Abort(); } catch { }
-                        return;
-                    }
-                }) { IsBackground = true, Name = "managed range cancel" };
-                abortThread.Start();
-            }
-
-            try
-            {
-                using (var resp = (HttpWebResponse)req.GetResponse())
-                {
-                    long actualStart, actualEnd, actualTotal;
-                    bool unsatisfied;
-                    long expected = end - start + 1;
-                    if (resp.StatusCode != HttpStatusCode.PartialContent ||
-                        !DownloadResumeInfo.TryParseContentRange(resp.Headers["Content-Range"],
-                            out actualStart, out actualEnd, out actualTotal, out unsatisfied) ||
-                        unsatisfied || actualStart != start || actualEnd != end ||
-                        actualTotal != expectedTotal ||
-                        (resp.ContentLength >= 0 && resp.ContentLength != expected))
-                        throw new Exception("invalid Content-Range for bytes=" + start + "-" + end);
-
-                    long received = 0;
-                    byte[] buffer = new byte[256 * 1024];
-                    using (var input = resp.GetResponseStream())
-                    using (var output = new FileStream(destination, FileMode.Create, FileAccess.Write,
-                        FileShare.None, 512 * 1024))
-                    {
-                        int read;
-                        while (input != null && (read = input.Read(buffer, 0, buffer.Length)) > 0)
-                        {
-                            if (cancel != null && cancel())
-                                throw new OperationCanceledException("paused");
-                            output.Write(buffer, 0, read);
-                            received += read;
-                            if (onChunk != null) onChunk(read);
-                        }
-                        output.Flush();
-                    }
-                    if (received != expected)
-                        throw new Exception("range read " + received + " of " + expected);
-                }
-            }
-            finally
-            {
-                requestDone.Set();
-                if (abortThread == null || abortThread.Join(1000)) requestDone.Close();
-            }
+            catch { TraceDownloadDecision(false, DownloadDecision.ProbeError); return false; }
         }
 
         static void ManagedDownloadExactRangeTo(string part, long start, long end, long expectedTotal,
             string url, int timeoutMs, string bearer, bool addProxyKey, Func<bool> cancel,
-            Action<int> onChunk)
+            Action<int> onChunk, string etag = null)
         {
             var req = CreateManagedRangeRequest(url, start, end, timeoutMs, bearer, addProxyKey);
-            var requestDone = new ManualResetEvent(false);
-            Thread abortThread = null;
-            if (cancel != null)
-            {
-                abortThread = new Thread(() =>
-                {
-                    while (!requestDone.WaitOne(100))
-                    {
-                        bool stop = false;
-                        try { stop = cancel(); } catch { }
-                        if (!stop) continue;
-                        try { req.Abort(); } catch { }
-                        return;
-                    }
-                }) { IsBackground = true, Name = "managed range cancel" };
-                abortThread.Start();
-            }
+            if (etag != null) req.Headers["If-Range"] = etag;
+            var cancellation = new TransferCancellation(cancel, () => req.Abort());
 
             try
             {
@@ -960,40 +1040,31 @@ namespace Orbis
                     long actualStart, actualEnd, actualTotal;
                     bool unsatisfied;
                     long expected = end - start + 1;
+                    if ((etag != null && !string.Equals(etag, resp.Headers["ETag"], StringComparison.Ordinal)) ||
+                        resp.ResponseUri.AbsoluteUri != url || !DownloadTransferSettings.IdentityEncoding(resp.Headers["Content-Encoding"]))
+                        throw new DownloadRangeRejectedException("Range response identity changed");
                     if (resp.StatusCode != HttpStatusCode.PartialContent ||
                         !DownloadResumeInfo.TryParseContentRange(resp.Headers["Content-Range"],
                             out actualStart, out actualEnd, out actualTotal, out unsatisfied) ||
                         unsatisfied || actualStart != start || actualEnd != end ||
                         actualTotal != expectedTotal ||
                         (resp.ContentLength >= 0 && resp.ContentLength != expected))
-                        throw new Exception("invalid Content-Range for bytes=" + start + "-" + end);
+                        throw new DownloadRangeRejectedException("invalid Content-Range for bytes=" + start + "-" + end);
 
-                    long received = 0;
-                    byte[] buffer = new byte[256 * 1024];
                     using (var input = resp.GetResponseStream())
                     using (var output = new FileStream(part, FileMode.Open, FileAccess.Write,
                         FileShare.ReadWrite, 512 * 1024))
                     {
                         output.Position = start;
-                        int read;
-                        while (input != null && (read = input.Read(buffer, 0, buffer.Length)) > 0)
-                        {
-                            if (cancel != null && cancel())
-                                throw new OperationCanceledException("paused");
-                            output.Write(buffer, 0, read);
-                            received += read;
-                            if (onChunk != null) onChunk(read);
-                        }
-                        output.Flush();
+                        ExactRangeTransfer.Copy((buffer, offset, count) => input == null ? 0 : input.Read(buffer, offset, count),
+                            output, expected, cancel, onChunk);
+                        output.Flush(true);
                     }
-                    if (received != expected)
-                        throw new Exception("range read " + received + " of " + expected);
                 }
             }
             finally
             {
-                requestDone.Set();
-                if (abortThread == null || abortThread.Join(1000)) requestDone.Close();
+                cancellation.Dispose();
             }
         }
 
@@ -1005,7 +1076,7 @@ namespace Orbis
             req.UserAgent = UserAgent;
             req.Timeout = timeoutMs;
             req.ReadWriteTimeout = timeoutMs;
-            req.AllowAutoRedirect = true;
+            req.AllowAutoRedirect = !addProxyKey;
             req.KeepAlive = false;
             req.Headers["Accept-Encoding"] = "identity";
             req.AddRange(start, end);
@@ -1034,16 +1105,6 @@ namespace Orbis
             return new FileInfo(finalPath).Length;
         }
 
-        static bool IsLocalIoFailure(Exception ex)
-        {
-            if (ex == null) return false;
-            if (ex is IOException || ex is UnauthorizedAccessException || ex is OutOfMemoryException)
-                return true;
-            string message = ex.Message ?? "";
-            return message.IndexOf("disk", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   message.IndexOf("space", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   message.IndexOf("I/O", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
     }
 
     internal sealed class DownloadResumeInfo
@@ -1058,6 +1119,12 @@ namespace Orbis
         /// <summary>Stable package identity (expected content ID, else expected SHA-256).
         /// Empty for metadata written before identity binding existed.</summary>
         public string PackageId;
+        public bool StrictIdentity;
+        public string IntegrityHeader;
+        bool integrityRevalidated;
+        public string SourceResourceKey;
+        public string EffectiveResourceKey;
+        bool boundRenewal;
 
         public static string RestartRequired(string reason)
         {
@@ -1066,6 +1133,9 @@ namespace Orbis
 
         public static bool IsRestartRequired(string message)
         {
+            const string nativePrefix = "Native HTTPS DL: ";
+            if (message != null && message.StartsWith(nativePrefix, StringComparison.Ordinal))
+                message = message.Substring(nativePrefix.Length);
             return !string.IsNullOrEmpty(message) &&
                 message.StartsWith(RestartPrefix, StringComparison.Ordinal);
         }
@@ -1086,6 +1156,8 @@ namespace Orbis
             {
                 SourceKey = Fingerprint(sourceUrl),
                 EffectiveKey = Fingerprint(effectiveUrl),
+                SourceResourceKey = ResourceFingerprint(sourceUrl),
+                EffectiveResourceKey = ResourceFingerprint(effectiveUrl),
                 ETag = etag ?? "",
                 LastModified = lastModified ?? "",
                 TitleId = titleId ?? "",
@@ -1096,12 +1168,16 @@ namespace Orbis
 
         public bool CanResume(string sourceUrl, string titleId, long localLength, string packageId = null)
         {
+            boundRenewal = false;
             if (localLength <= 0 || Total < localLength || Total <= 0) return false;
             // Package identity binds saved bytes to one package: a same-title,
             // same-size replacement must not splice into these bytes. Signed-URL
             // rotation keeps the same identity, so legitimate resumes still pass.
             string stored = (PackageId ?? "").Trim();
             string incoming = (packageId ?? "").Trim();
+            boundRenewal = IsBoundIdentity(stored) && string.Equals(stored, incoming, StringComparison.OrdinalIgnoreCase);
+            if (StrictIdentity && !string.Equals(SourceKey, Fingerprint(sourceUrl), StringComparison.Ordinal) &&
+                !(boundRenewal && SameResource(SourceResourceKey, sourceUrl))) return false;
             if (stored.Length > 0 && incoming.Length > 0)
                 return string.Equals(stored, incoming, StringComparison.OrdinalIgnoreCase);
             // Real-Debrid CDN URLs change every unrestrict — key resume on TitleId + total size.
@@ -1114,6 +1190,10 @@ namespace Orbis
 
         public bool MatchesResponse(string effectiveUrl, string etag, string lastModified)
         {
+            if (StrictIdentity) return (string.Equals(EffectiveKey, Fingerprint(effectiveUrl), StringComparison.Ordinal) ||
+                (boundRenewal && SameResource(EffectiveResourceKey, effectiveUrl))) &&
+                ((DownloadTransferSettings.StrongEtag(ETag) && string.Equals(ETag, etag, StringComparison.Ordinal)) ||
+                    (string.IsNullOrEmpty(ETag) && !string.IsNullOrEmpty(IntegrityHeader) && integrityRevalidated));
             // Real-Debrid rotates CDN URL and ETag every unrestrict.
             // Resume safety is Content-Range start == existingBytes + Total match.
             return true;
@@ -1126,17 +1206,42 @@ namespace Orbis
             Total = total;
         }
 
+        internal void RequireHeaderMatch(string part, long existingBytes, byte[] fresh)
+        {
+            int count = (int)Math.Min(existingBytes, fresh.Length);
+            var local = new byte[count];
+            using (var input = new FileStream(part, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                int read = 0;
+                while (read < count)
+                {
+                    int got = input.Read(local, read, count - read);
+                    if (got <= 0) throw new IOException("Partial prefix is unreadable");
+                    read += got;
+                }
+            }
+            if (count <= 0 || !PkgHeaderEquals(fresh, local, count))
+                throw new IOException(RestartRequired("downloaded package header changed; saved bytes belong to a different package"));
+            if (!string.IsNullOrEmpty(IntegrityHeader))
+            {
+                if (!string.Equals(PkgIntegrity.TransferHeaderIdentity(fresh, Total, TitleId), IntegrityHeader, StringComparison.Ordinal))
+                    throw new IOException(RestartRequired("package integrity header changed"));
+                integrityRevalidated = true;
+            }
+        }
+
         public void Save(string partPath)
         {
             string path = MetadataPath(partPath);
-            string tmp = path + ".tmp";
-            string body = "2\n" + (SourceKey ?? "") + "\n" + (EffectiveKey ?? "") + "\n" +
+            bool v4 = StrictIdentity && !string.IsNullOrEmpty(SourceResourceKey) && !string.IsNullOrEmpty(EffectiveResourceKey);
+            bool v5 = v4 && !string.IsNullOrEmpty(IntegrityHeader);
+            string body = (v5 ? "5\n" : v4 ? "4\n" : StrictIdentity ? "3\n" : "2\n") + (SourceKey ?? "") + "\n" + (EffectiveKey ?? "") + "\n" +
                           Encode(ETag) + "\n" + Encode(LastModified) + "\n" + Encode(TitleId) + "\n" +
                           Total.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n" +
                           Encode(PackageId);
-            File.WriteAllText(tmp, body);
-            if (File.Exists(path)) File.Delete(path);
-            File.Move(tmp, path);
+            if (v4) body += "\n" + SourceResourceKey + "\n" + EffectiveResourceKey;
+            if (v5) body += "\n" + IntegrityHeader;
+            AtomicFile.WriteText(path, body);
         }
 
         public static DownloadResumeInfo Load(string partPath)
@@ -1147,8 +1252,10 @@ namespace Orbis
                 long total;
                 // v2 carries PackageId; an empty identity leaves no 8th line
                 // because ReadAllLines drops the trailing empty entry.
-                bool v2 = (lines.Length == 8 || lines.Length == 7) && lines[0] == "2";
-                if ((!v2 && (lines.Length != 7 || lines[0] != "1")) ||
+                bool v2 = (lines.Length == 8 || lines.Length == 7) && (lines[0] == "2" || lines[0] == "3");
+                bool v5 = lines.Length == 11 && lines[0] == "5" && System.Text.RegularExpressions.Regex.IsMatch(lines[10], "\\A[0-9A-F]{64}\\z");
+                bool v4 = (lines.Length == 10 && lines[0] == "4") || v5;
+                if ((!v4 && !v2 && (lines.Length != 7 || lines[0] != "1")) ||
                     !long.TryParse(lines[6], System.Globalization.NumberStyles.Integer,
                         System.Globalization.CultureInfo.InvariantCulture, out total))
                     return null;
@@ -1160,7 +1267,11 @@ namespace Orbis
                     LastModified = Decode(lines[4]),
                     TitleId = Decode(lines[5]),
                     Total = total,
-                    PackageId = (v2 && lines.Length == 8) ? Decode(lines[7]) : ""
+                    StrictIdentity = lines[0] == "3" || v4,
+                    PackageId = (v4 || (v2 && lines.Length == 8)) ? Decode(lines[7]) : "",
+                    SourceResourceKey = v4 ? lines[8] : "",
+                    EffectiveResourceKey = v4 ? lines[9] : "",
+                    IntegrityHeader = v5 ? lines[10] : ""
                 };
             }
             catch { return null; }
@@ -1188,25 +1299,102 @@ namespace Orbis
         {
             start = end = total = -1;
             unsatisfied = false;
-            if (string.IsNullOrEmpty(value) || !value.StartsWith("bytes ", StringComparison.OrdinalIgnoreCase))
-                return false;
-            string rest = value.Substring(6).Trim();
-            if (rest.StartsWith("*/", StringComparison.Ordinal))
+            if (string.IsNullOrEmpty(value) || value.Length > 256) return false;
+            int at = 0, limit = value.Length;
+            while (at < limit && (value[at] == ' ' || value[at] == '\t')) at++;
+            while (limit > at && (value[limit - 1] == ' ' || value[limit - 1] == '\t')) limit--;
+            if (limit - at < 8 || string.Compare(value, at, "bytes", 0, 5,
+                StringComparison.OrdinalIgnoreCase) != 0 || value[at + 5] != ' ') return false;
+            at += 6;
+            bool missing = value[at] == '*';
+            long a = -1, b = -1, n;
+            if (missing) at++;
+            else if (!TryReadRangeNumber(value, ref at, limit, out a) || at == limit || value[at++] != '-' ||
+                !TryReadRangeNumber(value, ref at, limit, out b) || b < a) return false;
+            if (at == limit || value[at++] != '/' || !TryReadRangeNumber(value, ref at, limit, out n) ||
+                at != limit || (!missing && n <= b)) return false;
+            start = a; end = b; total = n; unsatisfied = missing;
+            return true;
+        }
+
+        // ASCII decimal only; culture, signs and embedded whitespace are not
+        // part of a byte range. Match https/http_range.h without an extra ABI.
+        static bool TryReadRangeNumber(string value, ref int at, int limit, out long number)
+        {
+            number = 0;
+            if (at == limit || value[at] < '0' || value[at] > '9') return false;
+            do
             {
-                unsatisfied = true;
-                return long.TryParse(rest.Substring(2), out total) && total >= 0;
-            }
-            int dash = rest.IndexOf('-');
-            int slash = rest.LastIndexOf('/');
-            if (dash <= 0 || slash <= dash + 1 || slash + 1 >= rest.Length || rest[slash + 1] == '*')
-                return false;
-            return long.TryParse(rest.Substring(0, dash), out start) &&
-                   long.TryParse(rest.Substring(dash + 1, slash - dash - 1), out end) &&
-                   long.TryParse(rest.Substring(slash + 1), out total) &&
-                   start >= 0 && end >= start && total > end;
+                int digit = value[at] - '0';
+                if (number > (long.MaxValue - digit) / 10) return false;
+                number = number * 10 + digit;
+                at++;
+            } while (at < limit && value[at] >= '0' && value[at] <= '9');
+            return true;
         }
 
         static string MetadataPath(string partPath) { return partPath + ".resume"; }
+
+        static bool IsBoundIdentity(string value)
+        {
+            if (value.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (value.Length != 71) return false;
+                for (int i = 7; i < value.Length; i++) if (!Uri.IsHexDigit(value[i])) return false;
+                return true;
+            }
+            return value.Length == 36 && value[6] == '-' && value[16] == '_' && value[19] == '-' &&
+                string.Equals(value.Substring(7, 4), "CUSA", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool SameResource(string saved, string url)
+        {
+            return !string.IsNullOrEmpty(saved) && string.Equals(saved, ResourceFingerprint(url), StringComparison.Ordinal);
+        }
+
+        // Production managed PKG preflight header: the first 0x438 bytes carry the
+        // magic, content ID, kind and package size. Mirrors
+        // LoopbackPkgFeeder.HeaderBytes without referencing the feeder so the
+        // isolated transfer tests keep compiling against this file alone.
+        internal const int PkgHeaderLength = 0x438;
+
+        internal static bool LooksLikePkgHeader(byte[] data, int count)
+        {
+            return data != null && count >= PkgHeaderLength && count <= data.Length &&
+                data[0] == 0x7F && data[1] == 0x43 && data[2] == 0x4E && data[3] == 0x54;
+        }
+
+        /// <summary>SHA-256 (lowercase hex) of the full production header.
+        /// Empty when the probe is too short or not a PKG header.</summary>
+        internal static string HashPkgHeader(byte[] data, int count)
+        {
+            if (!LooksLikePkgHeader(data, count)) return "";
+            using (var sha = SHA256.Create())
+            {
+                byte[] digest = sha.ComputeHash(data, 0, PkgHeaderLength);
+                var text = new StringBuilder(digest.Length * 2);
+                foreach (byte b in digest) text.Append(b.ToString("x2"));
+                return text.ToString();
+            }
+        }
+
+        internal static bool PkgHeaderEquals(byte[] first, byte[] second, int count)
+        {
+            if (first == null || second == null || count <= 0 ||
+                count > first.Length || count > second.Length) return false;
+            for (int i = 0; i < count; i++)
+                if (first[i] != second[i]) return false;
+            return true;
+        }
+        // Query signatures may rotate; retaining bytes still requires package
+        // identity, a strong ETag and an exact total.
+        static string ResourceFingerprint(string value)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(value, UriKind.Absolute, out uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)) return "";
+            return Fingerprint(uri.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.UriEscaped));
+        }
 
         static bool IsStrongEtag(string etag)
         {

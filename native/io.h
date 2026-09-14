@@ -5,6 +5,7 @@ extern char mainExe[0x100];
 
 
 void klog(const char* str);
+void boot_stage(const char* stage, int code);
 void klogf(const char* str, ...);
 int direxists(const char* path);
 int file_exists(const char* path);

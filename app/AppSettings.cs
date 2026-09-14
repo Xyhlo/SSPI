@@ -26,6 +26,46 @@ namespace Orbis
         public const string EtaClock = "clock";
 
         public int ConnectionMbps;
+        public string StagingLocation = "ps4";
+        static string _stagingLocation = "ps4";
+        internal static bool ValidStaging(string value)
+        { return value == "ps4" || (value != null && value.Length == 9 && value.StartsWith("/mnt/usb", StringComparison.Ordinal) && value[8] >= '0' && value[8] <= '7'); }
+        internal static string StagingRoot(string location)
+        { return location == "ps4" ? Path.Combine(DataDir, "downloads") : Path.Combine(location, "SSPI", "staging"); }
+        internal static void RequireStaging(string directory)
+        {
+            string normalized = directory.Replace('\\', '/');
+            if (normalized.StartsWith("/mnt/usb", StringComparison.Ordinal))
+            {
+                string mount = normalized.Length >= 9 ? normalized.Substring(0, 9) : "";
+                string detail;
+                if (!UsbVolumeLabel.IsConnected(mount, out detail)) { SspiLog.Write("download", "usb-storage " + detail); throw new IOException(detail + "; files are retained"); }
+                for (string p = mount; p != null && normalized.StartsWith(p, StringComparison.Ordinal);)
+                {
+                    if (Directory.Exists(p) && (File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0) throw new IOException("Linked staging folders are not supported");
+                    if (p == normalized) break;
+                    int next = normalized.IndexOf('/', p.Length + 1);
+                    p = next < 0 ? normalized : normalized.Substring(0, next);
+                }
+            }
+            Directory.CreateDirectory(directory);
+        }
+        internal bool SelectStaging(string location, out string error)
+        {
+            error = null;
+            if (!ValidStaging(location)) { error = "Choose PS4 or a connected USB drive"; return false; }
+            string old = StagingLocation;
+            try
+            {
+                string root = StagingRoot(location); RequireStaging(root);
+                string probe = Path.Combine(root, ".sspi-write-" + Guid.NewGuid().ToString("N"));
+                File.WriteAllText(probe, "1"); File.Delete(probe);
+                StagingLocation = location;
+                if (!Save()) throw new IOException("Could not save staging location");
+                _stagingLocation = location; return true;
+            }
+            catch (Exception ex) { StagingLocation = old; error = ex.Message; return false; }
+        }
         public string RealDebridToken = "";
         public bool UseRealDebrid = true;
         /// <summary>
@@ -35,6 +75,7 @@ namespace Orbis
         public string RealDebridLocation = RdLocationAuto;
         public string DeepbridApiKey = "";
         public string AllDebridApiKey = "";
+        public string PremiumizeApiKey = "";
         public string TorBoxApiKey = "";
         public bool ShowFirmwareHints = true;
         public bool BackgroundMusic = true;
@@ -42,6 +83,8 @@ namespace Orbis
         public int AudioVolume = 35;
         public string UnlockProviderId = UnlockProviders.RealDebridId;
         public bool UseUnlockProvider = true;
+        // Null preserves the legacy single-provider choice until the first checkbox change.
+        public string EnabledUnlockProviders;
         public string ApiBaseUrl = "";
         public bool UseLanProxy = false;
         public bool ForceProxy = false;
@@ -49,20 +92,14 @@ namespace Orbis
         public string ProxyKey = "game-search-lan";
         /// <summary>0=size+speed+ETA, 1=size only, 2=size+speed, 3=size+ETA</summary>
         public int DownloadStatsMode = 0;
-        /// <summary>Legacy setting retained for checkpoint migration; new transfers use one stream.</summary>
+        /// <summary>Automatic bounded connections; each resolved provider link supplies its allowed limit.</summary>
         public int DownloadRangeCount = DownloadTransferSettings.DefaultRangeCount;
-        public int DownloadLimitMBps;
         /// <summary>Downloads terminal + speed graph (technical, no secrets).</summary>
         public bool NerdStats = false;
         /// <summary>
         /// Validated local package URLs register with system BGFT (PS4 notifications).
         /// </summary>
         public bool UseBgftDirect = true;
-        /// <summary>
-        /// Experimental: register the preflight-resolved origin URL directly with
-        /// system BGFT (PS4 notification download). settings.ini only, no UI row.
-        /// </summary>
-        public bool BgftDirectUrl = false;
 
         // UI V2 defaults must look complete without first-run setup.
         public string Accent = ThemePalette.DefaultAccentHex;
@@ -84,6 +121,21 @@ namespace Orbis
         static string _dataDir;
         static bool _dataDirResolved;
         static bool _dataDirWritable;
+        static string _dataDirError = "";
+        public static bool DataMigrationPending { get { var _ = DataDir; return SspiDataMigration.Pending; } }
+        public static string DataMigrationNotice { get { var _ = DataDir; return SspiDataMigration.Notice; } }
+
+        internal static bool RetryDataMigration()
+        {
+            lock (typeof(AppSettings))
+            {
+                var existing = DataDir;
+                if (!SspiDataMigration.Pending) return true;
+                string root = SspiDataMigration.RetryPending();
+                ResolveDataDirectory(new[] { root });
+                return !SspiDataMigration.Pending && _dataDirWritable;
+            }
+        }
 
         public static string DataDir
         {
@@ -95,34 +147,57 @@ namespace Orbis
                     if (_dataDirResolved) return _dataDir;
                     string[] candidates =
                     {
-                        "/data/GameSearch",
-                        "/user/data/GameSearch",
+                        SspiDataMigration.PreparePrimary(),
+                        "/user/data/SSPI",
                         Path.Combine(SafeAppBase(), "data")
                     };
-                    foreach (var c in candidates)
-                    {
-                        try
-                        {
-                            if (!Directory.Exists(c)) Directory.CreateDirectory(c);
-                            string probe = Path.Combine(c, ".write_test");
-                            File.WriteAllText(probe, "1");
-                            File.Delete(probe);
-                            _dataDir = c;
-                            _dataDirWritable = true;
-                            _dataDirResolved = true;
-                            return _dataDir;
-                        }
-                        catch { }
-                    }
-                    _dataDir = ".";
-                    _dataDirWritable = false;
-                    _dataDirResolved = true;
-                    return _dataDir;
+                    return ResolveDataDirectory(candidates);
                 }
             }
         }
 
         public static bool DataDirWritable { get { var _ = DataDir; return _dataDirWritable; } }
+        public static string DataDirError { get { var _ = DataDir; return _dataDirError; } }
+
+        internal static string ResolveDataDirectory(string[] candidates)
+        {
+            _dataDirWritable = false;
+            _dataDirError = "";
+            foreach (string candidate in candidates)
+            {
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(candidate) || !Path.IsPathRooted(candidate))
+                        throw new IOException("Application storage requires an absolute path");
+                    Directory.CreateDirectory(candidate);
+                    string probe = Path.Combine(candidate, ".sspi-write-" + Guid.NewGuid().ToString("N"));
+                    try
+                    {
+                        using (var stream = new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                            stream.WriteByte(1);
+                    }
+                    finally { if (File.Exists(probe)) File.Delete(probe); }
+                    _dataDir = candidate;
+                    _dataDirWritable = true;
+                    _dataDirResolved = true;
+                    _dataDirError = "";
+                    return _dataDir;
+                }
+                catch (Exception ex)
+                {
+                    string reason = ex.GetType().Name + " 0x" + ex.HResult.ToString("X8");
+                    if (_dataDirError.Length == 0)
+                        _dataDirError = "SSPI storage is unavailable at " + candidate + " (" + reason + "). Check folder access; existing files are retained.";
+                    SspiLog.Write("startup", "storage_probe_failed path=" + candidate + " error=" + reason + " stack=" + ex.StackTrace);
+                }
+            }
+            // Keep a useful absolute path when storage is unavailable. A relative
+            // fallback targets the read-only application mount and hides the fault.
+            _dataDir = SspiDataMigration.CurrentRoot;
+            _dataDirResolved = true;
+            if (_dataDirError.Length == 0) _dataDirError = "SSPI storage is unavailable at " + _dataDir + ".";
+            return _dataDir;
+        }
 
         public static string SettingsPath { get { return Path.Combine(DataDir, "settings.ini"); } }
 
@@ -130,8 +205,8 @@ namespace Orbis
         {
             get
             {
-                string d = Path.Combine(DataDir, "downloads");
-                try { if (!Directory.Exists(d)) Directory.CreateDirectory(d); } catch { }
+                string d = StagingRoot(_stagingLocation);
+                if (_stagingLocation == "ps4") try { if (!Directory.Exists(d)) Directory.CreateDirectory(d); } catch { }
                 return d;
             }
         }
@@ -156,12 +231,15 @@ namespace Orbis
         {
             try
             {
+                int schedulerVersion = 0;
                 // Migrate token from alternate data dirs if primary has no settings
                 string path = SettingsPath;
                 if (!File.Exists(path))
                 {
                     string[] alt =
                     {
+                        "/data/SSPI/settings.ini",
+                        "/user/data/SSPI/settings.ini",
                         "/data/GameSearch/settings.ini",
                         "/user/data/GameSearch/settings.ini",
                         Path.Combine(SafeAppBase(), "data", "settings.ini")
@@ -198,10 +276,12 @@ namespace Orbis
                     else if (Eq(key, "rd_location") || Eq(key, "rd_cdn"))
                         RealDebridLocation = NormalizeRdLocation(val);
                     else if (Eq(key, "db_key") || Eq(key, "deepbrid_key")) DeepbridApiKey = val;
-                    else if (Eq(key, "ad_key")) AllDebridApiKey = val;
+                    else if (Eq(key, "ad_key") || Eq(key, "alldebrid_key")) AllDebridApiKey = val;
+                    else if (Eq(key, "pm_key") || Eq(key, "premiumize_key")) PremiumizeApiKey = val;
                     else if (Eq(key, "tb_key")) TorBoxApiKey = val;
                     else if (Eq(key, "unlock_provider")) UnlockProviderId = val;
                     else if (Eq(key, "use_unlock")) UseUnlockProvider = IsTrue(val);
+                    else if (Eq(key, "enabled_unlock_providers")) EnabledUnlockProviders = UnlockProviders.NormalizeIds(val);
                     else if (Eq(key, "api_base")) ApiBaseUrl = val;
                     else if (Eq(key, "use_proxy")) UseLanProxy = IsTrue(val);
                     else if (Eq(key, "force_proxy")) ForceProxy = IsTrue(val);
@@ -212,19 +292,18 @@ namespace Orbis
                         int m;
                         if (int.TryParse(val, out m) && m >= 0 && m <= 3) DownloadStatsMode = m;
                     }
-                    else if (Eq(key, "download_limit_mb_s")) { int limit; if (int.TryParse(val, out limit)) DownloadLimitMBps = Math.Max(0, Math.Min(1000, limit)); }
                     else if (Eq(key, "download_range_count"))
                     {
                         int count;
                         if (int.TryParse(val, out count))
                             DownloadRangeCount = DownloadTransferSettings.ClampRangeCount(count);
                     }
+                    else if (Eq(key, "download_scheduler_version")) int.TryParse(val, out schedulerVersion);
                     else if (Eq(key, "bgft_direct") || Eq(key, "use_bgft"))
                         UseBgftDirect = IsTrue(val);
-                    else if (Eq(key, "bgft_direct_url"))
-                        BgftDirectUrl = IsTrue(val);
                     else if (Eq(key, "nerd_stats") || Eq(key, "stats_for_nerds"))
                         NerdStats = IsTrue(val);
+                    else if (Eq(key, "staging_location")) StagingLocation = ValidStaging(val) ? val : "ps4";
                     else if (Eq(key, "accent")) Accent = val;
                     else if (Eq(key, "accent_name")) AccentName = val;
                     else if (Eq(key, "bg_mode")) BackgroundMode = val;
@@ -239,11 +318,18 @@ namespace Orbis
                     else if (Eq(key, "eta_format")) EtaFormat = val;
                 }
                 // Migrate legacy use_rd into Link Service selection.
+                // Earlier releases always persisted three lanes even when the user
+                // never changed that default. Preserve intentional single-lane mode.
+                if ((schedulerVersion < 2 && DownloadRangeCount == 3) ||
+                    (schedulerVersion < 3 && DownloadRangeCount == 4) ||
+                    (schedulerVersion < 4 && DownloadRangeCount == 8))
+                    DownloadRangeCount = DownloadTransferSettings.DefaultRangeCount;
                 if (string.IsNullOrEmpty(UnlockProviderId))
                     UnlockProviderId = UseRealDebrid ? UnlockProviders.RealDebridId : UnlockProviders.NoneId;
-                if (!UseRealDebrid && string.Equals(UnlockProviderId, UnlockProviders.RealDebridId, StringComparison.OrdinalIgnoreCase))
+                if (EnabledUnlockProviders == null && !UseRealDebrid && string.Equals(UnlockProviderId, UnlockProviders.RealDebridId, StringComparison.OrdinalIgnoreCase))
                     UseUnlockProvider = false;
                 if (UseLanProxy) ForceProxy = true;
+                _stagingLocation = StagingLocation;
                 ValidateAppearance(true);
                 ApplyToNetHttp();
             }
@@ -270,25 +356,27 @@ namespace Orbis
                 sb.AppendLine("rd_location=" + NormalizeRdLocation(RealDebridLocation));
                 sb.AppendLine("db_key=" + (DeepbridApiKey ?? ""));
                 sb.AppendLine("ad_key=" + (AllDebridApiKey ?? ""));
+                sb.AppendLine("pm_key=" + (PremiumizeApiKey ?? ""));
                 sb.AppendLine("tb_key=" + (TorBoxApiKey ?? ""));
                 sb.AppendLine("unlock_provider=" + (UnlockProviderId ?? UnlockProviders.RealDebridId));
                 sb.AppendLine("use_unlock=" + (UseUnlockProvider ? "1" : "0"));
+                if (EnabledUnlockProviders != null) sb.AppendLine("enabled_unlock_providers=" + UnlockProviders.NormalizeIds(EnabledUnlockProviders));
                 sb.AppendLine("api_base=" + (ApiBaseUrl ?? ""));
                 sb.AppendLine("use_proxy=" + (UseLanProxy ? "1" : "0"));
                 sb.AppendLine("force_proxy=" + (ForceProxy ? "1" : "0"));
                 sb.AppendLine("proxy_base=" + (ProxyBaseUrl ?? ""));
                 sb.AppendLine("proxy_key=" + (ProxyKey ?? ""));
                 sb.AppendLine("dl_stats=" + DownloadStatsMode);
-                sb.AppendLine("download_range_count=1");
-                sb.AppendLine("download_limit_mb_s=" + DownloadLimitMBps);
+                sb.AppendLine("download_range_count=" + DownloadRangeCount);
+                sb.AppendLine("download_scheduler_version=4");
                 sb.AppendLine("bgft_direct=" + (UseBgftDirect ? "1" : "0"));
-                sb.AppendLine("bgft_direct_url=" + (BgftDirectUrl ? "1" : "0"));
                 sb.AppendLine("nerd_stats=" + (NerdStats ? "1" : "0"));
                 sb.AppendLine("accent=" + Accent);
                 sb.AppendLine("accent_name=" + AccentName);
                 sb.AppendLine("bg_mode=" + BackgroundMode);
                 sb.AppendLine("bg_image=" + (BackgroundImagePath ?? ""));
                 sb.AppendLine("bg_quality=" + (BackgroundQuality ?? BgQualityPerformance));
+                sb.AppendLine("staging_location=" + StagingLocation);
                 sb.AppendLine("cloud=" + (CoverCloud ? "on" : "off"));
                 sb.AppendLine("cloud_density=" + CoverCloudDensity);
                 sb.AppendLine("style=" + UiStyle);
@@ -300,8 +388,12 @@ namespace Orbis
                 sb.AppendLine("background_music=" + (BackgroundMusic ? "1" : "0"));
                 sb.AppendLine("interface_sounds=" + (InterfaceSounds ? "1" : "0"));
                 sb.AppendLine("audio_volume=" + Math.Max(0, Math.Min(100, AudioVolume)));
-                string path = SettingsPath;
-                AtomicFile.WriteText(path, sb.ToString());
+                // Migration retry rewrites persisted paths under this same lock.
+                lock (typeof(AppSettings))
+                {
+                    string path = SettingsPath;
+                    AtomicFile.WriteText(path, sb.ToString());
+                }
                 ApplyToNetHttp();
                 return true;
             }
@@ -315,12 +407,11 @@ namespace Orbis
         public void ApplyToNetHttp()
         {
             DownloadRangeCount = DownloadTransferSettings.ClampRangeCount(DownloadRangeCount);
-            UseBgftDirect = true; UseLanProxy = false; ForceProxy = false; RealDebridLocation = RdLocationAuto;
+            UseLanProxy = false; ForceProxy = false; RealDebridLocation = RdLocationAuto;
             NetHttp.ForceProxy = false;
             NetHttp.ProxyBase = ProxyBaseUrl ?? "";
             NetHttp.ProxyKey = ProxyKey ?? "game-search-lan";
-            NetHttp.DownloadRangeCount = 1;
-            SequentialDownloadEngine.LimitBytesPerSecond = (long)DownloadLimitMBps * 1000000;
+            NetHttp.DownloadRangeCount = DownloadRangeCount;
         }
 
         public bool HasRealDebrid
@@ -343,6 +434,11 @@ namespace Orbis
             get { return !string.IsNullOrEmpty(TorBoxApiKey) && TorBoxApiKey.Trim().Length >= 8; }
         }
 
+        public bool HasPremiumize
+        {
+            get { return !string.IsNullOrEmpty(PremiumizeApiKey) && PremiumizeApiKey.Trim().Length >= 8; }
+        }
+
         public int TokenLen
         {
             get { return string.IsNullOrEmpty(RealDebridToken) ? 0 : RealDebridToken.Trim().Length; }
@@ -352,8 +448,7 @@ namespace Orbis
         {
             get
             {
-                if (!UseUnlockProvider) return false;
-                return UnlockProviders.IsConfigured(this, UnlockProviderId);
+                return UnlockProviders.EnabledIds(this).Length != 0;
             }
         }
 
@@ -394,16 +489,38 @@ namespace Orbis
         public bool TrySelectDownloadService(string id, out string error)
         {
             error = null;
-            if (id != UnlockProviders.RealDebridId && id != UnlockProviders.TorBoxId && id != UnlockProviders.NoneId)
-            { error = "Choose Real-Debrid, TorBox or direct links"; return false; }
+            if (!UnlockProviders.IsSupported(id) && id != UnlockProviders.NoneId)
+            { error = "Choose an available link service or direct links"; return false; }
             if (!UnlockProviders.IsConfigured(this, id))
             { error = "Link " + UnlockProviders.DisplayName(id) + " from the QR page first"; return false; }
-            string previous = UnlockProviderId;
+            string previous = UnlockProviderId, previousEnabled = EnabledUnlockProviders;
             bool use = UseUnlockProvider, rd = UseRealDebrid;
             UnlockProviderId = id; UseUnlockProvider = id != UnlockProviders.NoneId; UseRealDebrid = id == UnlockProviders.RealDebridId;
+            EnabledUnlockProviders = id == UnlockProviders.NoneId ? "" : id;
             if (Save()) return true;
             UnlockProviderId = previous; UseUnlockProvider = use; UseRealDebrid = rd;
+            EnabledUnlockProviders = previousEnabled;
             error = "Could not save the download service. Try again."; return false;
+        }
+
+        public bool TryToggleDownloadService(string id, out string error)
+        {
+            if (id == UnlockProviders.NoneId) return TrySelectDownloadService(id, out error);
+            error = null;
+            if (!UnlockProviders.IsSupported(id) || !UnlockProviders.IsConfigured(this, id))
+            { error = "Link " + UnlockProviders.DisplayName(id) + " from the QR page first"; return false; }
+            string previous = UnlockProviderId, previousEnabled = EnabledUnlockProviders;
+            bool previousUse = UseUnlockProvider, previousRd = UseRealDebrid;
+            var enabled = new System.Collections.Generic.List<string>(UnlockProviders.EnabledIds(this));
+            if (!enabled.Remove(id)) enabled.Add(id);
+            EnabledUnlockProviders = UnlockProviders.NormalizeIds(string.Join(",", enabled.ToArray()));
+            UseUnlockProvider = enabled.Count != 0;
+            if (!enabled.Contains(UnlockProviderId)) UnlockProviderId = enabled.Count == 0 ? UnlockProviders.NoneId : enabled[0];
+            if (Save()) return true;
+            UnlockProviderId = previous; EnabledUnlockProviders = previousEnabled;
+            UseUnlockProvider = previousUse; UseRealDebrid = previousRd;
+            error = "Could not save the enabled services. Try again.";
+            return false;
         }
 
         public void ValidateAppearance(bool notify)

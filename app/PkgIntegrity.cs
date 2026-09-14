@@ -120,7 +120,9 @@ namespace Orbis
                 using (var input = File.OpenRead(path))
                 {
                     header = Read(input, 0x1000);
-                    CheckHash(input, 0, 0xfe0, header, 0xfe0, null, null);
+                    TransferHeaderIdentity(header, input.Length, titleId);
+                    if (expectedCategory != "ac" && Be64(header, 0x418) == 0)
+                        throw new IOException("Game/update package has no filesystem data");
                 }
                 byte[] sfo = Entry(path, 0x1000);
                 string category = SfoValue(sfo, "CATEGORY"), actualTitle = SfoValue(sfo, "TITLE_ID");
@@ -136,8 +138,21 @@ namespace Orbis
             }
             catch (Exception ex) { error = ex.Message; return false; }
         }
+        // Called only after the native engine checked this exact expected SHA-256
+        // and released the completed file. Keep the existing file-change binding.
+        internal static void RememberVerifiedSha256(string path, string expected)
+        {
+            expected = (expected ?? "").Trim().Replace("-", "").ToLowerInvariant();
+            using (var input = File.OpenRead(path))
+            {
+                byte[] head = Read(input, (int)Math.Min(input.Length, 0x1000));
+                string stamp = expected + ":" + input.Length + ":" + File.GetLastWriteTimeUtc(path).Ticks + ":" + Convert.ToBase64String(head);
+                lock (CacheGate) { if (Verified.Count >= 64) Verified.Clear(); Verified["sha:" + path] = stamp; }
+            }
+        }
         internal static bool VerifyFile(string path, string expected, Action<string> status, Func<bool> cancel, out string error)
         {
+            expected = (expected ?? "").Trim().Replace("-", "").ToLowerInvariant();
             error = null;
             try
             {
@@ -180,17 +195,9 @@ namespace Orbis
                 {
                     byte[] h = Read(s, 0x1000);
                     if (cancel != null && cancel()) throw new OperationCanceledException();
-                    CheckHash(s, 0, 0xFE0, h, 0xFE0, cancel, null);
-                    string stamp = s.Length + ":" + File.GetLastWriteTimeUtc(path).Ticks + ":" + Convert.ToBase64String(h);
-                    bool cached;
-                    lock (CacheGate) { string previous; cached = Verified.TryGetValue(path, out previous) && previous == stamp; }
-                    if (!cached)
-                    {
-                        CheckHash(s, Be64(h, 0x20), Be64(h, 0x28), h, 0x160, cancel, status);
-                        CheckHash(s, Be64(h, 0x410), Be64(h, 0x418), h, 0x440, cancel, status);
-                        lock (CacheGate) { if (Verified.Count >= 64) Verified.Clear(); Verified[path] = stamp; }
-                    }
-                    if (status != null) status("Update verified · checking installed game");
+                    TransferHeaderIdentity(h, s.Length, titleId);
+                    if (Be64(h, 0x418) == 0) throw new IOException("Update package has no filesystem data");
+                    if (status != null) status("Checking update compatibility");
                 }
                 byte[] sfo = Entry(path, 0x1000);
                 string category = SfoValue(sfo, "CATEGORY"), actual = SfoValue(sfo, "TITLE_ID");
@@ -246,15 +253,96 @@ namespace Orbis
             }
             catch (Exception ex) { error = ex.Message; return false; }
         }
+
+        internal static string TransferHeaderIdentity(byte[] header, long total, string titleId)
+        {
+            if (header == null || header.Length != 0x1000 || total < 0x1000 || Be32(header, 0) != 0x7f434e54)
+                throw new IOException("Package integrity header is missing");
+            if (Be64(header, 0x430) != total || (!string.IsNullOrEmpty(titleId) &&
+                !string.Equals(Encoding.ASCII.GetString(header, 0x47, 9), titleId, StringComparison.OrdinalIgnoreCase)))
+                throw new IOException("Package integrity identity does not match");
+            long body = Be64(header, 0x20), bodySize = Be64(header, 0x28);
+            long pfs = Be64(header, 0x410), pfsSize = Be64(header, 0x418);
+            // PKG regions may overlap or leave padding. Validate each declared
+            // extent independently; an empty body/PFS is valid for license DLC.
+            if (body > total || bodySize > total - body || (bodySize > 0 && body < 0x1000) ||
+                pfs > total || pfsSize > total - pfs || (pfsSize > 0 && pfs < 0x1000))
+                throw new IOException("Invalid package integrity ranges");
+            using (var sha = CreateSha256())
+            {
+                byte[] digest = sha.ComputeHash(header, 0, 0xfe0);
+                for (int i = 0; i < 32; i++) if (digest[i] != header[0xfe0 + i])
+                    throw new IOException("Package integrity header digest mismatch");
+                return BitConverter.ToString(sha.ComputeHash(header)).Replace("-", "");
+            }
+        }
+
+        // Bind the completed transfer to its header without rereading the body.
+        // A publisher-supplied SHA remains an explicit whole-file check below.
+        internal static void VerifyTransfer(string path, string headerIdentity, string titleId,
+            string expectedSha256, Func<bool> cancel)
+        {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            if (!string.IsNullOrEmpty(headerIdentity))
+            {
+                using (var input = File.OpenRead(path))
+                {
+                    byte[] header = Read(input, 0x1000);
+                    if (!string.Equals(TransferHeaderIdentity(header, input.Length, titleId), headerIdentity, StringComparison.Ordinal))
+                        throw new IOException("Downloaded package header changed; partial kept");
+                }
+            }
+            if (!string.IsNullOrEmpty(expectedSha256))
+            {
+                string error;
+                if (!VerifyFile(path, expectedSha256, null, cancel, out error)) throw new IOException(error);
+            }
+        }
         internal static bool CheckInstalledBase(string patch, string titleId, out string error)
         {
-            foreach (string root in new[] { "/user/app/", "/mnt/ext0/user/app/" })
+            return CheckInstalledBase(patch, titleId, new[] { "/user/app/", "/mnt/ext0/user/app/" }, out error);
+        }
+        const string InstalledBaseUnavailable = "Installed base PKG is unavailable for compatibility checks; update retained.";
+        internal static bool IsInstalledBaseUnavailable(string error)
+        {
+            return string.Equals(error, InstalledBaseUnavailable, StringComparison.Ordinal);
+        }
+        static bool CheckInstalledBase(string patch, string titleId, string[] roots, out string error)
+        {
+            if (!Regex.IsMatch(titleId ?? "", @"^[A-Z]{4}[0-9]{5}$", RegexOptions.IgnoreCase))
+            { error = "Invalid installed base title identity"; return false; }
+            foreach (string root in roots)
             {
-                string path = root + titleId + "/app.pkg";
+                string path = Path.Combine(Path.Combine(root, titleId), "app.pkg");
                 if (File.Exists(path)) return CheckPatchBase(patch, path, out error);
             }
-            error = "Installed base PKG is unavailable for compatibility checks; update retained.";
+            error = InstalledBaseUnavailable;
             return false;
+        }
+        internal static bool WaitForInstalledBase(string patch, string titleId, Action<string> status,
+            Func<bool> cancel, out string error)
+        {
+            return WaitForInstalledBase(patch, titleId, new[] { "/user/app/", "/mnt/ext0/user/app/" },
+                30000, 250, status, cancel, out error);
+        }
+        internal static bool WaitForInstalledBase(string patch, string titleId, string[] roots,
+            int timeoutMs, int pollMs, Action<string> status, Func<bool> cancel, out string error)
+        {
+            // BGFT completion and AppExists can precede visibility of app.pkg.
+            // Wait only for publication; a present but incompatible base still fails immediately.
+            var clock = Stopwatch.StartNew();
+            timeoutMs = Math.Max(0, Math.Min(30000, timeoutMs));
+            pollMs = Math.Max(25, Math.Min(1000, pollMs));
+            long noticeAt = -1000;
+            for (;;)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                if (CheckInstalledBase(patch, titleId, roots, out error)) return true;
+                if (!IsInstalledBaseUnavailable(error) || clock.ElapsedMilliseconds >= timeoutMs) return false;
+                if (status != null && clock.ElapsedMilliseconds - noticeAt >= 1000)
+                { noticeAt = clock.ElapsedMilliseconds; status("Waiting for installed base package · update retained"); }
+                System.Threading.Thread.Sleep((int)Math.Min(pollMs, Math.Max(1, timeoutMs - clock.ElapsedMilliseconds)));
+            }
         }
         static void CheckHash(Stream s, long offset, long length, byte[] header, int digest, Func<bool> cancel, Action<string> status)
         {

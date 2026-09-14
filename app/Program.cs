@@ -13,86 +13,133 @@ namespace Orbis
 
         public static void Main()
         {
+            // Keep the entry point small so a dependency failure while JITting
+            // the UI startup method is caught before native invocation returns.
+            try { RunManaged(); }
+            catch (Exception ex) { RecordFailure(ex); StartupStage("managed-start-failed"); throw; }
+        }
+
+        static void RunManaged()
+        {
             AppDomain.CurrentDomain.AssemblyResolve += ResolveBundledAssembly;
             AppDomain.CurrentDomain.UnhandledException += (sender, args) => RecordFailure(args.ExceptionObject as Exception);
+            StartupStage("managed-entry");
+            SspiLog.Initialize();
 
-            // Keep the branded PS4 launch image visible until SearchWindow has
-            // painted its first frame, including while the resident plugin is staged.
-            for (int i = 0; i < 3; i++)
-            {
-                try
-                {
-                    int uid;
-                    string uerr;
-                    UserService.TryGetUserId(out uid, out uerr);
-                }
-                catch { }
-            }
-
-            // Defer TLS/HTTPS off the pre-UI path (lazy + background).
             try
             {
-                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    try { TlsBootstrap.Initialize(); } catch { }
-                    try { NativeHttp.EnsureInit(); } catch { }
-                });
+                // Record entry before resolving storage: migration may perform I/O.
+                StartupStage("data-directory-resolve");
+                string dataRoot = AppSettings.DataDir;
+                SspiLog.Write("startup", "build=" + BuildIdentity.Label + " stage=data-directory-ready data=" + dataRoot);
             }
-            catch
+            catch (Exception ex) { RecordFailure(ex); StartupStage("data-directory-unavailable"); }
+
+            try
             {
+                StartupStage("user-service");
+                int uid;
+                string uerr;
+                StartupStage(UserService.TryGetUserId(out uid, out uerr) ? "user-service-ready" : "user-service-unavailable");
             }
+            catch (Exception ex) { RecordFailure(ex); }
+
+            // HTTPS remains on demand. Resident maintenance starts on a background
+            // thread after normal menu frames render, never before the first screen.
 
             Util.PrepareAsemblies();
 
-            // Stage the GoldHEN resident plugin independently of the selected
-            // download path. Direct BGFT can fall back before the resident
-            // service is entered, so relying on that service left the plugin
-            // absent on first launch.
             try
             {
-                string pluginStatus;
-                GoldHenPluginInstaller.TryEnsureInstalled(out pluginStatus);
-                try { Kernel.Log("GoldHEN plugin startup: " + pluginStatus); } catch { }
-            }
-            catch (Exception ex)
-            {
-                try { Kernel.Log("GoldHEN plugin startup failed: " + ex.Message); } catch { }
-            }
-
-            try
-            {
+                StartupStage("window-create");
                 Window = new SearchWindow();
                 Window.JoyButtonEvent += OnJoy;
+                StartupStage("window-ready");
             }
             catch (Exception ex)
             {
-                try { Kernel.Log("UI FAIL: " + ex); } catch { }
-                for (int i = 0; i < 40; i++)
-                    System.Threading.Thread.Sleep(500);
-                return;
+                RecordFailure(ex);
+                StartupStage("window-create-failed");
+                // The native bootstrap captures this exception and reports the failed
+                // startup stage instead of treating it as a successful app exit.
+                throw;
             }
 
-            try { Window.Run(); }
-            catch (Exception ex) { RecordFailure(ex); throw; }
-            finally { try { Window.Dispose(); } catch { } }
+            try { StartupStage("window-run"); Window.Run(); StartupStage("window-exit"); }
+            catch (Exception ex) { RecordFailure(ex); StartupStage("window-run-failed"); throw; }
+            finally
+            {
+                ResidentDownloadService.StopLaunchMaintenance();
+                try { Window.Dispose(); } catch { }
+            }
         }
 
         static readonly object FailureLock = new object();
-        static void RecordFailure(Exception exception)
+        internal static void StartupStage(string stage)
+        {
+            try
+            {
+                lock (FailureLock)
+                {
+                    SspiLog.Write("startup", "build=" + BuildIdentity.Label + " stage=" + stage);
+                }
+            }
+            catch { }
+        }
+
+        internal static void RecordFailure(Exception exception)
         {
             if (exception == null) return;
             try
             {
                 lock (FailureLock)
                 {
-                    Directory.CreateDirectory(AppSettings.DataDir);
-                    string path = Path.Combine(AppSettings.DataDir, "managed-errors.log");
-                    if (File.Exists(path) && new FileInfo(path).Length > 512 * 1024) File.Delete(path);
-                    // Exception messages can contain signed URLs; keep only type and stack.
-                    File.AppendAllText(path, DateTime.UtcNow.ToString("o") + " " + exception.GetType().FullName + "\n" + exception.StackTrace + "\n");
+                    for (int depth = 0; exception != null && depth < 8; depth++, exception = exception.InnerException)
+                    {
+                        string identity = "exception=" + exception.GetType().FullName + " depth=" + depth +
+                            " hresult=0x" + unchecked((uint)exception.HResult).ToString("X8");
+                        // Preserve basic identity before any optional formatter or
+                        // SDL type resolution can fail on the console runtime.
+                        SspiLog.Write("startup", identity);
+                        try
+                        {
+                            string message = StartupFailureMessage(exception);
+                            if (!string.IsNullOrEmpty(message)) SspiLog.Write("startup", identity + " " + BoundedDiagnostic(message, 1024));
+                        }
+                        catch { }
+                        try
+                        {
+                            string stack = exception.StackTrace;
+                            if (!string.IsNullOrEmpty(stack)) SspiLog.Write("startup", identity + " stack=" + BoundedDiagnostic(stack, 2048));
+                        }
+                        catch { }
+                    }
                 }
             }
             catch { }
+        }
+
+        static string BoundedDiagnostic(string value, int length)
+        { return value.Length <= length ? value : value.Substring(0, length); }
+
+        static string StartupFailureMessage(Exception exception)
+        {
+            // Binding/type failures name the missing runtime member or library.
+            // Arbitrary application exception messages can contain user secrets.
+            if (exception is TypeLoadException || exception is TypeInitializationException ||
+                exception is MissingMemberException || exception is DllNotFoundException ||
+                exception is EntryPointNotFoundException || exception is BadImageFormatException ||
+                exception is FileNotFoundException || exception is FileLoadException)
+                return "message=" + exception.Message;
+            return SdlFailureMessage(exception);
+        }
+
+        static string SdlFailureMessage(Exception exception)
+        {
+            // SDLException hides Exception.Message in this binding. Isolate that
+            // dependency from the basic exception logger's JIT compilation.
+            var sdl = exception as SDL2.Exceptions.SDLException;
+            return sdl == null ? null : "sdl_code=" + sdl.ErrorCode + " sdl_error=" + sdl.Message;
         }
 
         private static Assembly ResolveBundledAssembly(object sender, ResolveEventArgs args)

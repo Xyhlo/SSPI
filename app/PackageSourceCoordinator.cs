@@ -55,17 +55,30 @@ namespace Orbis
 
         public List<SourceTitleResult> Search(string query, int limit)
         {
-            if (limit <= 0) limit = 25;
-            if (limit > 100) limit = 100;
-            var request = new SourceSearchRequest { Query = (query ?? "").Trim(), Limit = limit };
-            var merged = new List<SourceTitleResult>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var reports = new List<SourceExecutionReport>();
+            return SearchPage(query, 0, limit, null, null).Results;
+        }
 
-            var calls = BeginCalls(runtime => runtime.Search(request));
-            foreach (var runtime in _runtimes)
+        public SourceSearchPage SearchPage(string query, int offset, int limit,
+            Action<SourceSearchPage> progress, Func<bool> cancel, string region = "")
+        {
+            if (offset < 0) offset = 0;
+            if (limit <= 0) limit = 25;
+            if (limit > 250) limit = 250;
+            var request = new SourceSearchRequest { Query = (query ?? "").Trim(), Region = PackageSourceEngineStatic.NormalizeRegion(region), Limit = PackageSourceEngineStatic.MaxTitles, Cancel = cancel };
+            var merged = new List<SourceTitleResult>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var reports = new List<SourceExecutionReport>();
+            var calls = BeginCalls(runtime => runtime.Search(request), cancel, null);
+            while (calls.Count > 0)
             {
-                if (!IsEnabled(runtime)) continue;
+                ThrowIfCanceled(cancel);
+                IPackageSourceRuntime runtime = null;
+                foreach (var item in calls) if (item.Value.IsCompleted) { runtime = item.Key; break; }
+                if (runtime == null)
+                {
+                    var pending = new List<Task>(); foreach (var call in calls.Values) pending.Add(call);
+                    Task.WaitAny(pending.ToArray(), 100); continue;
+                }
                 DateTime started = DateTime.UtcNow;
                 try
                 {
@@ -80,13 +93,15 @@ namespace Orbis
                             string.IsNullOrWhiteSpace(result.CatalogUrl) &&
                             string.IsNullOrWhiteSpace(result.StableResultId)) continue;
                         Stamp(result, runtime.Source);
-                        string key = !string.IsNullOrWhiteSpace(result.CatalogUrl)
-                            ? "catalog:" + result.CatalogUrl.Trim()
-                            : (result.TitleId ?? "").Trim() + "\n" + (result.Region ?? "").Trim();
+                        result.Region = PackageSourceEngineStatic.NormalizeRegion(result.Region);
+                        if (request.Region.Length > 0 && result.Region != request.Region) continue;
+                        string key = result.SourceId + "\n" + result.SourceVersion + "\n" +
+                            (!string.IsNullOrWhiteSpace(result.CatalogUrl) ? "catalog:" + result.CatalogUrl.Trim() :
+                            (result.TitleId ?? "").Trim().ToUpperInvariant() + "\n" + result.Region);
                         if (!seen.Add(key)) continue;
+                        if (merged.Count >= 60000) throw new InvalidOperationException("Too many source matches; narrow the search");
                         merged.Add(result);
                         accepted++;
-                        if (merged.Count >= limit) break;
                     }
                     reports.Add(Report(runtime.Source, started, true, SourceFailureCode.None, "", accepted));
                 }
@@ -94,10 +109,31 @@ namespace Orbis
                 {
                     reports.Add(Report(runtime.Source, started, false, MapFailure(ex), SafeMessage(ex), 0));
                 }
-                if (merged.Count >= limit) break;
+                calls.Remove(runtime);
+                ThrowIfCanceled(cancel);
+                PublishReports(reports);
+                if (progress != null) progress(Page(merged, query, offset, limit, calls.Count == 0));
             }
             PublishReports(reports);
-            return merged;
+            ThrowIfCanceled(cancel);
+            return Page(merged, query, offset, limit, true);
+        }
+
+        static SourceSearchPage Page(List<SourceTitleResult> merged, string query, int offset, int limit, bool complete)
+        {
+            var sorted = new List<SourceTitleResult>(merged);
+            var ranks = new Dictionary<SourceTitleResult, int>();
+            foreach (var title in sorted) ranks[title] = title.SearchRankHint >= 0 ? title.SearchRankHint : PackageSourceEngineStatic.SearchRank(title, query);
+            sorted.Sort((a, b) => {
+                int ar = ranks[a], br = ranks[b];
+                int order = (ar < 0 ? 4 : ar).CompareTo(br < 0 ? 4 : br);
+                return order != 0 ? order : PackageSourceEngineStatic.CompareTitle(a, b);
+            });
+            var page = new SourceSearchPage { Offset = offset, PageSize = limit, TotalMatches = sorted.Count, IsComplete = complete,
+                AllMatches = complete ? sorted : null };
+            for (int i = offset; i < sorted.Count && page.Results.Count < limit; i++) page.Results.Add(PackageSourceEngineStatic.CloneTitle(sorted[i]));
+            if (offset + page.Results.Count < sorted.Count) page.NextCursor = (offset + page.Results.Count).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return page;
         }
 
         public List<PackageCandidate> Resolve(string titleId, string name, int limit)
@@ -112,6 +148,10 @@ namespace Orbis
 
         public List<PackageCandidate> Resolve(string titleId, string name, string region,
             string catalogUrl, int limit)
+        { return Resolve(titleId, name, region, catalogUrl, "", "", limit, null); }
+
+        public List<PackageCandidate> Resolve(string titleId, string name, string region,
+            string catalogUrl, string sourceId, string sourceVersion, int limit, Func<bool> cancel)
         {
             if (limit <= 0) limit = PackageSourceEngineRemote.MaxPackages;
             if (limit > PackageSourceEngineRemote.MaxPackages) limit = PackageSourceEngineRemote.MaxPackages;
@@ -121,26 +161,33 @@ namespace Orbis
                 Name = (name ?? "").Trim(),
                 Region = (region ?? "").Trim(),
                 CatalogUrl = (catalogUrl ?? "").Trim(),
-                Limit = limit
+                Limit = limit, Cancel = cancel
             };
             var merged = new List<PackageCandidate>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
             var reports = new List<SourceExecutionReport>();
 
-            var calls = BeginCalls(runtime => runtime.Resolve(request));
+            Func<IPackageSourceRuntime, bool> selected = runtime => string.IsNullOrEmpty(sourceId) ||
+                (runtime.Source.SourceId == sourceId && (string.IsNullOrEmpty(sourceVersion) ||
+                (runtime.Source.Descriptor != null && runtime.Source.Descriptor.Version == sourceVersion)));
+            var calls = BeginCalls(runtime => runtime.Resolve(request), cancel, selected);
             foreach (var runtime in _runtimes)
             {
-                if (!IsEnabled(runtime)) continue;
+                if (!IsEnabled(runtime) || !selected(runtime)) continue;
+                ThrowIfCanceled(cancel);
                 DateTime started = DateTime.UtcNow;
                 try
                 {
                     var call = calls[runtime].GetAwaiter().GetResult();
                     if (call.Error != null) throw call.Error;
-                    List<PackageCandidate> results = GroupArchiveVolumes(call.Results ?? new List<PackageCandidate>());
+                    List<PackageCandidate> results = call.Results ?? new List<PackageCandidate>();
+                    if (!IsStatic(runtime)) results = GroupArchiveVolumes(results);
                     int accepted = 0;
                     foreach (var candidate in results)
                     {
                         if (!IsUsable(candidate, request.TitleId)) continue;
+                        if (!string.IsNullOrEmpty(request.Region) && PackageSourceEngineStatic.NormalizeRegion(candidate.Region) !=
+                            PackageSourceEngineStatic.NormalizeRegion(request.Region)) continue;
                         Stamp(candidate, runtime.Source);
                         string key = CandidateKey(candidate);
                         if (!seen.Add(key)) continue;
@@ -157,6 +204,7 @@ namespace Orbis
                 if (merged.Count >= limit) break;
             }
             PublishReports(reports);
+            ThrowIfCanceled(cancel);
             return merged;
         }
 
@@ -195,23 +243,35 @@ namespace Orbis
         }
 
         static readonly SemaphoreSlim SourceSlots = new SemaphoreSlim(2, 2);
+        static readonly SemaphoreSlim LocalSourceSlots = new SemaphoreSlim(2, 2);
         sealed class SourceCall<T> { public List<T> Results; public Exception Error; }
-        Dictionary<IPackageSourceRuntime, Task<SourceCall<T>>> BeginCalls<T>(Func<IPackageSourceRuntime, List<T>> run)
+        Dictionary<IPackageSourceRuntime, Task<SourceCall<T>>> BeginCalls<T>(Func<IPackageSourceRuntime, List<T>> run,
+            Func<bool> cancel, Func<IPackageSourceRuntime, bool> include)
         {
             var calls = new Dictionary<IPackageSourceRuntime, Task<SourceCall<T>>>();
             foreach (var runtime in _runtimes)
             {
-                if (!IsEnabled(runtime)) continue;
+                if (!IsEnabled(runtime) || (include != null && !include(runtime))) continue;
                 var captured = runtime;
                 calls[captured] = Task.Run(() => {
-                    SourceSlots.Wait();
-                    try { return new SourceCall<T> { Results = run(captured) }; }
+                    bool slot = false;
+                    SemaphoreSlim slots = IsStatic(captured) ? LocalSourceSlots : SourceSlots;
+                    try {
+                        while (!slots.Wait(100)) ThrowIfCanceled(cancel); slot = true;
+                        ThrowIfCanceled(cancel);
+                        return new SourceCall<T> { Results = run(captured) };
+                    }
                     catch (Exception ex) { return new SourceCall<T> { Error = ex }; }
-                    finally { SourceSlots.Release(); }
+                    finally { if (slot) slots.Release(); }
                 });
             }
             return calls;
         }
+
+        static bool IsStatic(IPackageSourceRuntime runtime)
+        { return runtime.Source.Descriptor != null && runtime.Source.Descriptor.Engine != null && runtime.Source.Descriptor.Engine.Type == PackageSourceEngineStatic.EngineType; }
+        static void ThrowIfCanceled(Func<bool> cancel)
+        { if (cancel != null && cancel()) throw new OperationCanceledException(); }
 
         static bool IsEnabled(IPackageSourceRuntime runtime)
         {
@@ -241,18 +301,17 @@ namespace Orbis
 
         static string CandidateKey(PackageCandidate candidate)
         {
-            if (!string.IsNullOrEmpty(candidate.ExpectedSha256)) return "hash:" + candidate.ExpectedSha256;
-            if (!string.IsNullOrEmpty(candidate.ExpectedContentId)) return "content:" + candidate.ExpectedContentId;
-            if (!string.IsNullOrEmpty(candidate.CandidateId))
-                return "id:" + candidate.SourceId + ":" + candidate.CandidateId;
-            return "url:" + candidate.Url;
+            return candidate.SourceId + "\n" + candidate.SourceVersion + "\n" + candidate.TitleId + "\n" +
+                PackageSourceEngineStatic.NormalizeRegion(candidate.Region) + "\n" + candidate.PackageKindHint + "\n" +
+                candidate.PackageVersion + "\n" + candidate.RequiredFirmware + "\n" + candidate.PackageGroupId + "\n" +
+                candidate.CandidateId + "\n" + candidate.Url + "\n" + candidate.ExpectedContentId + "\n" + candidate.ExpectedSha256;
         }
 
         static void Stamp(SourceTitleResult result, InstalledPackageSource source)
         {
             if (source == null) return;
-            if (string.IsNullOrEmpty(result.SourceId)) result.SourceId = source.SourceId ?? "";
-            if (string.IsNullOrEmpty(result.SourceVersion) && source.Descriptor != null)
+            result.SourceId = source.SourceId ?? "";
+            if (source.Descriptor != null)
                 result.SourceVersion = source.Descriptor.Version ?? "";
             if (string.IsNullOrEmpty(result.SourceAttribution) && source.Descriptor != null)
                 result.SourceAttribution = source.Descriptor.DisplayName ?? "";
@@ -261,8 +320,8 @@ namespace Orbis
         static void Stamp(PackageCandidate candidate, InstalledPackageSource source)
         {
             if (source == null) return;
-            if (string.IsNullOrEmpty(candidate.SourceId)) candidate.SourceId = source.SourceId ?? "";
-            if (string.IsNullOrEmpty(candidate.SourceVersion) && source.Descriptor != null)
+            candidate.SourceId = source.SourceId ?? "";
+            if (source.Descriptor != null)
                 candidate.SourceVersion = source.Descriptor.Version ?? "";
             if (string.IsNullOrEmpty(candidate.SourceAttribution) && source.Descriptor != null)
                 candidate.SourceAttribution = source.Descriptor.DisplayName ?? "";

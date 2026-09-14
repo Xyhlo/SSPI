@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -8,7 +9,7 @@ using System.Threading;
 
 namespace Orbis
 {
-    internal sealed class PairServer
+    internal sealed partial class PairServer
     {
         public const int Port = 8741;
         public bool Running { get; private set; }
@@ -36,6 +37,45 @@ namespace Orbis
         public int Revision;
         public string SourceChoicesJson = "[]";
         public Func<string, bool, string> SetSourceEnabled;
+        public Func<string, string> QueueDownloadLink;
+        readonly object _downloadLock = new object();
+        readonly HashSet<string> _queuedLinks = new HashSet<string>(StringComparer.Ordinal);
+
+        internal string QueueDownloads(string links)
+        {
+            if (QueueDownloadLink == null) throw new IOException("Downloads are not ready. Reopen Downloads on your PS4.");
+            var unique = new HashSet<string>(StringComparer.Ordinal);
+            var validated = new List<string>();
+            int repeated = 0;
+            foreach (string line in (links ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string url = line.Trim();
+                if (url.Length == 0) continue;
+                if (url.Length > 8192 || !CloudCatalog.ValidLink(url))
+                    throw new IOException("Enter one complete HTTP or HTTPS link per line. Nothing in this batch was queued.");
+                if (unique.Add(url)) validated.Add(url); else repeated++;
+                if (validated.Count > 50) throw new IOException("Send up to 50 links at a time. Nothing in this batch was queued.");
+            }
+            if (validated.Count == 0) throw new IOException("Paste at least one download link.");
+            int queued = 0, duplicate = repeated, failed = 0;
+            lock (_downloadLock)
+            {
+                foreach (string url in validated)
+                {
+                    if (_queuedLinks.Contains(url)) { duplicate++; continue; }
+                    try
+                    {
+                        string id = QueueDownloadLink(url);
+                        if (string.IsNullOrEmpty(id)) { failed++; continue; }
+                        // Bound session memory. The persisted download queue also deduplicates.
+                        if (_queuedLinks.Count >= 500) _queuedLinks.Clear();
+                        _queuedLinks.Add(url); queued++;
+                    }
+                    catch { failed++; }
+                }
+            }
+            return "{\"queued\":" + queued + ",\"duplicates\":" + duplicate + ",\"failed\":" + failed + "}";
+        }
         TcpListener _listener;
         Thread _thread;
         volatile bool _stop;
@@ -52,9 +92,8 @@ namespace Orbis
             }
             string tokenPath = Path.Combine(AppSettings.DataDir, "pair-token.txt");
             Directory.CreateDirectory(AppSettings.DataDir);
-            OneTimeToken = File.Exists(tokenPath) ? File.ReadAllText(tokenPath).Trim() : "";
-            Guid parsed;
-            if (!Guid.TryParseExact(OneTimeToken, "N", out parsed)) { OneTimeToken = Guid.NewGuid().ToString("N"); AtomicFile.WriteText(tokenPath, OneTimeToken); }
+            OneTimeToken = Guid.NewGuid().ToString("N");
+            try { File.Delete(tokenPath); } catch { }
             LocalIp = DetectLanIp();
             if (string.IsNullOrEmpty(LocalIp) || LocalIp == "0.0.0.0")
             {
@@ -64,7 +103,7 @@ namespace Orbis
                 return;
             }
             PairUrl = "http://" + LocalIp + ":" + Port + "/pair/" + OneTimeToken;
-            ExpiresUtc = DateTime.MaxValue;
+            ExpiresUtc = DateTime.UtcNow.AddMinutes(Math.Max(1, Math.Min(30, minutes)));
             GotKey = false;
             ReceivedKey = null;
             ReceivedDeepbridKey = null;
@@ -125,7 +164,7 @@ namespace Orbis
 
         public int RemainingSeconds
         {
-            get { return 86400; }
+            get { return Math.Max(0, (int)Math.Ceiling((ExpiresUtc - DateTime.UtcNow).TotalSeconds)); }
         }
 
         void ListenLoop()
@@ -237,10 +276,17 @@ namespace Orbis
                 { WriteResponse(stream, 410, "text/plain", "Background uploads have been removed. Update the pairing page."); return; }
                 if (Settings != null && method == "GET" && path == pairPrefix + "/config")
                 { WriteResponse(stream, 200, "application/json", ConfigJson()); return; }
+                if (method == "POST" && path == pairPrefix + "/downloads")
+                {
+                    try { WriteResponse(stream, 200, "application/json", QueueDownloads(ParseForm(body, "links"))); }
+                    catch (IOException ex) { WriteResponse(stream, 400, "text/plain", ex.Message); }
+                    return;
+                }
                 if (Settings != null && method == "POST" &&
                     (path == pairPrefix + "/services" || path == pairPrefix + "/source" || path == pairPrefix + "/appearance" || path == pairPrefix + "/source-toggle"))
                 {
                     string error = SaveConfiguration(path.Substring(pairPrefix.Length), body);
+                    if (error != null && path == pairPrefix + "/services") PublishServiceNotice("Services not saved: " + error, false);
                     WriteResponse(stream, error == null ? 200 : 400, error == null ? "application/json" : "text/plain", error ?? "{\"saved\":true}"); return;
                 }
                 if (method == "GET" && path == "/")
@@ -352,24 +398,33 @@ namespace Orbis
         string PairHtml()
         {
             return @"<!doctype html><html><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width,initial-scale=1""><title>SSPI · Console setup</title><style>
-:root{color-scheme:dark;font:16px system-ui;background:#101010;color:#eee}*{box-sizing:border-box}body{margin:0}main{max-width:960px;margin:36px auto;padding:24px}header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #353535;padding-bottom:24px}.brand{font-size:25px;letter-spacing:3px;font-weight:750}.muted,small{color:#aaa}h1{font-size:36px;margin:32px 0 8px}nav{display:flex;gap:8px;margin:28px 0;flex-wrap:wrap}button{border:1px solid #484848;border-radius:12px;background:#292929;color:#eee;padding:13px 20px;cursor:pointer;font:inherit}nav button.active,button.save{background:#e3e3df;color:#161616;border-color:#e3e3df}section[hidden]{display:none}.card{border:1px solid #393939;border-radius:18px;padding:24px;background:#202020;margin:16px 0}.providers{display:grid;grid-template-columns:1fr 1fr;gap:18px}.providers .card{margin:0}.logo{display:flex;gap:12px;align-items:center;font-size:24px;font-weight:700;margin-bottom:20px}.mark{display:grid;place-items:center;border-radius:10px;background:#333;width:46px;height:46px;color:#89c7a7}.rd{color:#f1a14b}label{display:block;margin:18px 0 9px}input,select{width:100%;font:inherit;color:#eee;background:#141414;border:1px solid #494949;border-radius:10px;padding:13px}input[type=checkbox]{width:auto}input[type=color]{height:50px}a{color:#ccc}#notice{min-height:28px;color:#9bd2b4;margin:20px 0}#sources{white-space:pre-wrap;line-height:1.9}.actions{display:flex;gap:12px;align-items:center;margin-top:20px;flex-wrap:wrap}footer{color:#888;font-size:13px;margin-top:36px}@media(max-width:640px){main{margin:0;padding:20px}.providers{grid-template-columns:1fr}h1{font-size:30px}header .muted{font-size:12px}}
-</style></head><body><main><header><div class=""brand"" style=""display:flex;align-items:center;gap:12px"">__SSPI_BRAND__SSPI</div><span class=""muted"">YOUR PS4 · CONNECTED SETUP</span></header><h1>Make it yours.</h1><p class=""muted"">Link your services, add sources, and choose your accent and background.</p><nav><button class=""active"" data-tab=""services"">Link services</button><button data-tab=""packages"">Package sources</button><button data-tab=""appearance"">Appearance</button></nav><div id=""notice"" role=""status"">Loading saved configuration…</div>
-<section id=""services""><div class=""providers""><div class=""card""><div class=""logo""><span class=""mark rd"">RD</span>Real-Debrid</div><small id=""rdSaved""></small><label for=""key"">API key</label><input type=""password"" id=""key"" autocomplete=""off"" placeholder=""Paste key; blank keeps saved key""><p><a href=""https://real-debrid.com/apitoken"" target=""_blank"" rel=""noreferrer"">Get your API key ↗</a></p></div><div class=""card""><div class=""logo""><span class=""mark""><svg width=""32"" height=""32"" viewBox=""0 0 32 32"" fill=""none"" stroke=""currentColor"" stroke-width=""2""><path d=""M16 3 29 10v13l-13 7L3 23V10zM3 10l13 7 13-7M16 17v13""/></svg></span>TorBox</div><small id=""tbSaved""></small><label for=""tb_key"">API key</label><input type=""password"" id=""tb_key"" autocomplete=""off"" placeholder=""Paste key; blank keeps saved key""><p><a href=""https://torbox.app/settings"" target=""_blank"" rel=""noreferrer"">Open TorBox settings ↗</a></p></div></div><div class=""card""><label for=""provider"">Preferred download service</label><select id=""provider""><option value=""real-debrid"">Real-Debrid</option><option value=""torbox"">TorBox</option><option value=""none"">Direct links · no debrid</option></select><div class=""actions""><button class=""save"" id=""saveKeys"">Save services</button><small>Both keys are kept when you switch tabs.</small></div></div></section>
+:root{color-scheme:dark;font:16px system-ui;background:#101010;color:#eee}*{box-sizing:border-box}body{margin:0}main{max-width:960px;margin:36px auto;padding:24px}header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #353535;padding-bottom:24px}.brand{font-size:25px;letter-spacing:3px;font-weight:750}.muted,small{color:#aaa}h1{font-size:36px;margin:32px 0 8px}nav{display:flex;gap:8px;margin:28px 0;flex-wrap:wrap}button{border:1px solid #484848;border-radius:12px;background:#292929;color:#eee;padding:13px 20px;cursor:pointer;font:inherit}nav button.active,button.save{background:#e3e3df;color:#161616;border-color:#e3e3df}section[hidden]{display:none}.card{border:1px solid #393939;border-radius:18px;padding:24px;background:#202020;margin:16px 0}.providers{display:grid;grid-template-columns:1fr 1fr;gap:18px}.providers .card{margin:0}.logo{display:flex;gap:12px;align-items:center;font-size:24px;font-weight:700;margin-bottom:20px}.mark{display:grid;place-items:center;border-radius:10px;background:#333;width:46px;height:46px;color:#89c7a7}.rd{color:#f1a14b}label{display:block;margin:18px 0 9px}input,select,textarea{width:100%;font:inherit;color:#eee;background:#141414;border:1px solid #494949;border-radius:10px;padding:13px}input[type=checkbox]{width:auto}input[type=color]{height:50px}a{color:#ccc}#notice{position:sticky;top:12px;z-index:5;min-height:28px;color:#d7f3e2;background:#183225;border:1px solid #6cbf95;border-radius:12px;padding:16px;margin:20px 0;box-shadow:0 4px 20px #0008}#notice:empty{display:none}.service-state{display:block;min-height:40px}.service-state[data-state=valid]{color:#9bd2b4}.service-state[data-state=limited],.service-state[data-state=plan_unknown],.service-state[data-state=unavailable]{color:#f0ce89}button:disabled{opacity:.65;cursor:wait}#sources{white-space:pre-wrap;line-height:1.9}.actions{display:flex;gap:12px;align-items:center;margin-top:20px;flex-wrap:wrap}footer{color:#888;font-size:13px;margin-top:36px}@media(max-width:640px){main{margin:0;padding:20px}.providers{grid-template-columns:1fr}h1{font-size:30px}header .muted{font-size:12px}}
+</style></head><body><main><header><div class=""brand"" style=""display:flex;align-items:center;gap:12px"">__SSPI_BRAND__SSPI</div><span class=""muted"">YOUR PS4 · CONNECTED SETUP</span></header><h1>Make it yours.</h1><p class=""muted"">Link your services, add sources, and choose your accent and background.</p><nav><button class=""active"" data-tab=""services"">Link services</button><button data-tab=""packages"">Package sources</button><button data-tab=""appearance"">Appearance</button><button data-tab=""downloads"">Downloads</button></nav><div id=""notice"" role=""status"" aria-live=""polite"">Loading saved configuration…</div>
+<section id=""services""><div class=""providers""><div class=""card""><div class=""logo""><span class=""mark"">RD</span>Real-Debrid</div><small class=""service-state"" id=""rdSaved""></small><label for=""key"">API key</label><input type=""password"" id=""key"" autocomplete=""off"" placeholder=""Paste key; blank keeps saved key""><p><a href=""https://real-debrid.com/apitoken"" target=""_blank"" rel=""noreferrer"">Get your API key ↗</a></p></div><div class=""card""><div class=""logo""><span class=""mark"">TB</span>TorBox</div><small class=""service-state"" id=""tbSaved""></small><label for=""tb_key"">API key</label><input type=""password"" id=""tb_key"" autocomplete=""off"" placeholder=""Paste key; blank keeps saved key""><p><a href=""https://torbox.app/settings"" target=""_blank"" rel=""noreferrer"">Get your API key ↗</a></p></div><div class=""card""><div class=""logo""><span class=""mark"">AD</span>AllDebrid</div><small class=""service-state"" id=""adSaved""></small><label for=""ad_key"">API key</label><input type=""password"" id=""ad_key"" autocomplete=""off"" placeholder=""Paste key; blank keeps saved key""><p><a href=""https://alldebrid.com/apikeys"" target=""_blank"" rel=""noreferrer"">Get your API key ↗</a></p></div><div class=""card""><div class=""logo""><span class=""mark"">PM</span>Premiumize</div><small class=""service-state"" id=""pmSaved""></small><label for=""pm_key"">API key</label><input type=""password"" id=""pm_key"" autocomplete=""off"" placeholder=""Paste key; blank keeps saved key""><p><a href=""https://www.premiumize.me/account"" target=""_blank"" rel=""noreferrer"">Get your API key ↗</a></p></div></div><div class=""card""><label for=""provider"">Preferred download service</label><select id=""provider""><option value=""real-debrid"">Real-Debrid</option><option value=""torbox"">TorBox</option><option value=""alldebrid"">AllDebrid</option><option value=""premiumize"">Premiumize</option><option value=""none"">Direct links · no debrid</option></select><div class=""actions""><button class=""save"" id=""saveKeys"">Save and validate</button><small>Check each service you want to use. All keys stay saved.</small></div></div></section>
 <section id=""packages"" hidden><div class=""card""><h2>Package sources</h2><p class=""muted"">Paste a .gssource / .gsource URL. Your PS4 validates and installs the source.</p><label for=""source_url"">Source URL</label><input id=""source_url"" type=""url"" placeholder=""https://…/provider.gssource""><div class=""actions""><button class=""save"" id=""installSource"">Install source on PS4</button></div></div><div class=""card""><h2>Installed on your PS4</h2><div id=""sources"">Checking…</div><p id=""sourceStatus"" class=""muted""></p></div></section>
+<section id=""downloads"" hidden><div class=""card""><h2>Send download links</h2><p class=""muted"">Paste up to 50 links, one per line. Direct packages, archives and supported hoster links use your PS4's selected service and staging drive.</p><label for=""downloadLinks"">Download links</label><textarea id=""downloadLinks"" rows=""7"" maxlength=""60000"" autocomplete=""off"" spellcheck=""false"" placeholder=""https://example.com/file.pkg""></textarea><div class=""actions""><button class=""save"" id=""queueLinks"">Queue on PS4</button></div><p id=""downloadResult"" role=""status"" aria-live=""polite""></p><small>Duplicates are skipped. Titles and artwork appear as package identity is resolved. The PS4 handles verification, extraction and installation order.</small></div></section>
 <section id=""appearance"" hidden><div class=""card""><h2>Appearance</h2><label for=""accent"">Choose your accent</label><input id=""accent"" type=""color"" value=""#E4E4E1""><label for=""background"">Built-in background</label><select id=""background""><option value=""solid"">Plain charcoal</option><option value=""ripple"">Ripple</option><option value=""wave"">Wave</option><option value=""grid"">Mosaic</option><option value=""halo"">Halo</option><option value=""graphite"">Graphite fade</option><option value=""obsidian"">Obsidian</option><option value=""slate"">Slate glow</option></select><p>Choose darker gradients or soft accent patterns. No image uploads.</p><div class=""actions""><button class=""save"" id=""saveAppearance"">Save appearance</button><button id=""restoreAppearance"">Restore original charcoal</button></div></div></section><footer>Saved on your PS4. Keep SSPI open and both devices on the same network. Blank key fields keep your saved credentials.</footer></main><script>
 const base=location.pathname.replace(/\/$/,''),$=id=>document.getElementById(id);
-let dirty=false,appearanceDirty=false,sourceState='',chain=Promise.resolve();
+function selectTab(id){document.querySelectorAll('section').forEach(s=>s.hidden=s.id!==id);document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===id))}
+if(location.hash==='#downloads')selectTab('downloads');
+$('queueLinks').onclick=()=>{const button=$('queueLinks'),submitted=$('downloadLinks').value;button.disabled=true;enqueue(async()=>{await saveKeys();const result=await request('/downloads',new URLSearchParams({links:submitted}));const text=result.queued+' queued, '+result.duplicates+' duplicates skipped'+(result.failed?', '+result.failed+' could not be queued. Retry this batch; accepted links will be skipped.':'.');$('downloadResult').textContent=text;note(text);if(!result.failed&&$('downloadLinks').value===submitted)$('downloadLinks').value=''}).catch(()=>{}).finally(()=>button.disabled=false)};
+let dirty=false,appearanceDirty=false,sourceState='',serviceRevision=-1,chain=Promise.resolve();
+const serviceFields=['key','tb_key','ad_key','pm_key'],serviceCards=[['real-debrid','rdSaved','rd'],['torbox','tbSaved','tb'],['alldebrid','adSaved','ad'],['premiumize','pmSaved','pm']];
+for(const [id,element] of serviceCards){const label=document.createElement('label'),box=document.createElement('input');box.type='checkbox';box.id='enabled-'+id;box.onchange=()=>dirty=true;label.append(box,document.createTextNode(' Enable for downloads'));$(element).before(label)}
+function enabledServices(){return serviceCards.filter(([id])=>$('enabled-'+id).checked).map(([id])=>id).join(',')}
+function serviceSnapshot(){const saved={provider:$('provider').value,enabled_providers:enabledServices()};for(const key of serviceFields)saved[key]=$(key).value;return saved}
 function note(s){$('notice').textContent=s}
 async function request(path,body){const r=await fetch(base+path,{method:body?'POST':'GET',body,cache:'no-store'});if(!r.ok)throw Error(await r.text());return r.json()}
 function renderSources(c){const choices=c.source_choices||[],stamp=JSON.stringify(choices);if(sourceState===stamp)return;sourceState=stamp;$('sources').replaceChildren();if(!choices.length){$('sources').textContent=c.sources||'No package sources installed yet';return}for(const source of choices){const row=document.createElement('div'),label=document.createElement('span'),button=document.createElement('button');row.className='actions';label.textContent=source.name+' · v'+source.version;label.style.flex='1';button.textContent=source.enabled?'Enabled':'Disabled';button.setAttribute('aria-pressed',String(source.enabled));button.onclick=()=>{button.disabled=true;enqueue(async()=>{await saveKeys();await request('/source-toggle',new URLSearchParams({source_id:source.id,enabled:source.enabled?'off':'on'}));sourceState='';await refresh();note('Source selection saved on PS4')}).catch(()=>{}).finally(()=>button.disabled=false)};row.append(label,button);$('sources').append(row)}}
-async function refresh(initial=false){let c=await request('/config');$('rdSaved').textContent=c.rd?'Key saved on PS4':'Not connected';$('tbSaved').textContent=c.tb?'Key saved on PS4':'Not connected';renderSources(c);$('sourceStatus').textContent=c.source_status||'';if(!dirty)$('provider').value=c.provider;if(!appearanceDirty){$('accent').value=c.accent;$('background').value=c.background||'solid'}if(initial)note('Saved configuration loaded.')}
-async function saveKeys(){while(dirty){const saved={key:$('key').value,tb_key:$('tb_key').value,provider:$('provider').value};await request('/services',new URLSearchParams(saved));dirty=Object.keys(saved).some(k=>$(k).value!==saved[k]);if(!dirty){$('key').value='';$('tb_key').value=''}}await refresh()}
+async function refresh(initial=false){let c=await request('/config');for(const [id,element,flag] of serviceCards){const status=(c.service_status||{})[id],el=$(element);el.textContent=status?status.message:c[flag]?'Key saved on PS4':'Not connected';el.dataset.state=status?status.state:c[flag]?'saved':'missing';if(!dirty)$('enabled-'+id).checked=(c.enabled_providers||'').split(',').includes(id)}renderSources(c);$('sourceStatus').textContent=c.source_status||'';if(!dirty)$('provider').value=c.provider;if(!appearanceDirty){$('accent').value=c.accent;$('background').value=c.background||'solid'}if(c.service_revision!==serviceRevision){serviceRevision=c.service_revision;if(c.service_message)note(c.service_message);else if(initial)note('Saved configuration loaded.')}}
+async function saveKeys(force=false){if(force)dirty=true;while(dirty){const saved=serviceSnapshot();await request('/services',new URLSearchParams(saved));const current=serviceSnapshot();dirty=Object.keys(saved).some(k=>current[k]!==saved[k]);for(const key of serviceFields)if($(key).value===saved[key])$(key).value=''}await refresh()}
 async function saveAppearance(){await saveKeys();const saved={accent:$('accent').value,background:$('background').value};await request('/appearance',new URLSearchParams(saved));appearanceDirty=Object.keys(saved).some(k=>$(k).value!==saved[k]);note('Appearance saved on PS4')}
 function enqueue(fn){chain=chain.catch(()=>{}).then(fn).catch(e=>{note(e.message);throw e});return chain}
-['key','tb_key','provider'].forEach(k=>$(k).addEventListener('input',()=>dirty=true));
+[...serviceFields,'provider'].forEach(k=>$(k).addEventListener('input',()=>dirty=true));
+$('provider').addEventListener('change',()=>{const id=$('provider').value;if(id==='none'){for(const [name] of serviceCards)$('enabled-'+name).checked=false}else $('enabled-'+id).checked=true;dirty=true});
 ['accent','background'].forEach(k=>$(k).addEventListener('input',()=>appearanceDirty=true));
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>enqueue(async()=>{await saveKeys();if(appearanceDirty)await saveAppearance();document.querySelectorAll('section').forEach(s=>s.hidden=s.id!==b.dataset.tab);document.querySelectorAll('nav button').forEach(t=>t.classList.toggle('active',t===b))}).catch(()=>{}));
-$('saveKeys').onclick=()=>enqueue(async()=>{await saveKeys();note('Services saved on PS4')}).catch(()=>{});
+$('saveKeys').onclick=()=>{const button=$('saveKeys');button.disabled=true;button.textContent='Saving…';note('Saving keys on PS4…');enqueue(()=>saveKeys(true)).catch(()=>{}).finally(()=>{button.disabled=false;button.textContent='Save and validate'})};
 $('installSource').onclick=()=>enqueue(async()=>{await saveKeys();await request('/source',new URLSearchParams({source_url:$('source_url').value}));note('Source sent to PS4 — installing…')}).catch(()=>{});
 $('saveAppearance').onclick=()=>enqueue(saveAppearance).catch(()=>{});
 $('restoreAppearance').onclick=()=>{appearanceDirty=true;$('background').value='solid';enqueue(saveAppearance).catch(()=>{})};
@@ -381,7 +436,8 @@ refresh(true).catch(e=>note(e.message));setInterval(()=>refresh().catch(()=>{}),
         {
             var c = Settings;
             return "{\"rd\":" + (c.HasRealDebrid ? "true" : "false") + ",\"tb\":" + (c.HasTorBox ? "true" : "false") +
-                ",\"provider\":\"" + JsonLite.Escape(c.UnlockProviderId) + "\",\"accent\":\"" + JsonLite.Escape(c.Accent) +
+                ",\"ad\":" + (c.HasAllDebrid ? "true" : "false") + ",\"pm\":" + (c.HasPremiumize ? "true" : "false") + ServiceJsonFields() +
+                ",\"enabled_providers\":\"" + string.Join(",", UnlockProviders.EnabledIds(c)) + "\",\"provider\":\"" + JsonLite.Escape(c.UnlockProviderId) + "\",\"accent\":\"" + JsonLite.Escape(c.Accent) +
                 "\",\"background\":\"" + JsonLite.Escape(c.BackgroundMode) + "\",\"mbps\":" + c.ConnectionMbps +
                 ",\"reduce_motion\":" + (c.ReduceMotion ? "true" : "false") + ",\"show_continue\":" + (c.SearchContinue ? "true" : "false") +
                 ",\"show_recents\":" + (c.SearchRecents ? "true" : "false") + ",\"sources\":\"" + JsonLite.Escape(InstalledSources) +
@@ -403,21 +459,43 @@ refresh(true).catch(e=>note(e.message));setInterval(()=>refresh().catch(()=>{}),
                     Interlocked.Increment(ref Revision); return null;
                 }
                 var c = Settings;
-                string oldRd = c.RealDebridToken, oldTb = c.TorBoxApiKey, oldProvider = c.UnlockProviderId;
-                string oldAccent = c.Accent, oldAccentName = c.AccentName, oldBackground = c.BackgroundMode;
+                string oldRd = c.RealDebridToken, oldTb = c.TorBoxApiKey, oldAd = c.AllDebridApiKey, oldPm = c.PremiumizeApiKey, oldProvider = c.UnlockProviderId;
+                string oldAccent = c.Accent, oldAccentName = c.AccentName, oldBackground = c.BackgroundMode, oldEnabled = c.EnabledUnlockProviders;
                 bool oldUse = c.UseUnlockProvider, oldUseRd = c.UseRealDebrid;
                 string oldPending = PendingSource, oldStatus = SourceStatus;
                 if (route == "/services")
                 {
                     string rd = (ParseForm(body, "key") ?? "").Trim(), tb = (ParseForm(body, "tb_key") ?? "").Trim();
+                    string ad = (ParseForm(body, "ad_key") ?? "").Trim(), pm = (ParseForm(body, "pm_key") ?? "").Trim();
                     string provider = ParseForm(body, "provider") ?? c.UnlockProviderId;
-                    if (provider != "real-debrid" && provider != "torbox" && provider != "none") return "Choose Real-Debrid or TorBox";
-                    if ((rd.Length > 0 && rd.Length < 8) || (tb.Length > 0 && tb.Length < 8) || rd.Length > 4096 || tb.Length > 4096 ||
-                        rd.IndexOfAny(new[] {'\r','\n','\0'}) >= 0 || tb.IndexOfAny(new[] {'\r','\n','\0'}) >= 0) return "Check the API key length and remove line breaks";
-                    if (provider == "real-debrid" && rd.Length == 0 && !c.HasRealDebrid || provider == "torbox" && tb.Length == 0 && !c.HasTorBox) return "Paste the selected provider's API key";
+                    string requestedEnabled = ParseForm(body, "enabled_providers");
+                    if (requestedEnabled != null)
+                    {
+                        foreach (string candidate in requestedEnabled.Split(','))
+                            if (candidate.Trim().Length != 0 && !UnlockProviders.IsSupported(candidate.Trim())) return "Choose supported download services";
+                        requestedEnabled = UnlockProviders.NormalizeIds(requestedEnabled);
+                        var selected = new List<string>(requestedEnabled.Split(','));
+                        if (requestedEnabled.Length == 0) provider = "none";
+                        else if (!selected.Contains(provider)) provider = selected[0];
+                    }
+                    if (provider != "real-debrid" && provider != "torbox" && provider != "alldebrid" && provider != "premiumize" && provider != "none") return "Choose a supported download service";
+                    foreach (string key in new[] { rd, tb, ad, pm })
+                        if ((key.Length > 0 && key.Length < 8) || key.Length > 4096 || key.IndexOfAny(new[] {'\r','\n','\0'}) >= 0)
+                            return "Check the API key length and remove line breaks";
+                    if (provider == "real-debrid" && rd.Length == 0 && !c.HasRealDebrid || provider == "torbox" && tb.Length == 0 && !c.HasTorBox ||
+                        provider == "alldebrid" && ad.Length == 0 && !c.HasAllDebrid || provider == "premiumize" && pm.Length == 0 && !c.HasPremiumize) return "Paste the selected provider's API key";
+                    if (requestedEnabled != null)
+                        foreach (string id in requestedEnabled.Split(','))
+                            if (id.Length != 0 && !UnlockProviders.IsConfigured(c, id) &&
+                                (id == "real-debrid" ? rd : id == "torbox" ? tb : id == "alldebrid" ? ad : pm).Length == 0)
+                                return "Paste a key for each enabled service";
+                    string enabled = string.Join(",", UnlockProviders.EnabledIds(c));
                     if (rd.Length > 0) c.RealDebridToken = rd;
                     if (tb.Length > 0) c.TorBoxApiKey = tb;
+                    if (ad.Length > 0) c.AllDebridApiKey = ad;
+                    if (pm.Length > 0) c.PremiumizeApiKey = pm;
                     c.UnlockProviderId = provider; c.UseUnlockProvider = provider != "none"; c.UseRealDebrid = provider == "real-debrid";
+                    c.EnabledUnlockProviders = requestedEnabled ?? (provider == "none" ? "" : UnlockProviders.NormalizeIds(enabled + "," + provider));
                 }
                 else if (route == "/source")
                 {
@@ -437,13 +515,15 @@ refresh(true).catch(e=>note(e.message));setInterval(()=>refresh().catch(()=>{}),
                 }
                 else return "Unknown configuration section";
                 if (!c.Save()) {
-                    c.RealDebridToken = oldRd; c.TorBoxApiKey = oldTb; c.UnlockProviderId = oldProvider;
-                    c.UseUnlockProvider = oldUse; c.UseRealDebrid = oldUseRd;
+                    c.RealDebridToken = oldRd; c.TorBoxApiKey = oldTb; c.AllDebridApiKey = oldAd; c.PremiumizeApiKey = oldPm; c.UnlockProviderId = oldProvider;
+                    c.UseUnlockProvider = oldUse; c.UseRealDebrid = oldUseRd; c.EnabledUnlockProviders = oldEnabled;
                     c.Accent = oldAccent; c.AccentName = oldAccentName; c.BackgroundMode = oldBackground;
                     PendingSource = oldPending; SourceStatus = oldStatus;
                     return "The PS4 could not save settings. Try again.";
                 }
-                Interlocked.Increment(ref Revision); return null;
+                Interlocked.Increment(ref Revision);
+                if (route == "/services") BeginServiceValidation(body);
+                return null;
             }
         }
 

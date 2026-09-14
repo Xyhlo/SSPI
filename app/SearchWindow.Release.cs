@@ -30,7 +30,8 @@ namespace Orbis
                     while (stack.Count > 0 && paths.Count < 2048) {
                         string dir = stack.Pop();
                         foreach (string path in Directory.GetFiles(dir)) {
-                            if (path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) continue;
+                            if (path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) ||
+                                path.EndsWith(".xfer-lock", StringComparison.OrdinalIgnoreCase)) continue;
                             var info = new FileInfo(path); if ((info.Attributes & FileAttributes.ReparsePoint) != 0) continue;
                             paths.Add(path); sizes.Add(info.Length); if (paths.Count >= 2048) break;
                         }
@@ -43,7 +44,7 @@ namespace Orbis
             });
         }
 
-        void HandleStorage(DS4Button b)
+        void HandleStoredFiles(DS4Button b)
         {
             if (_storageBusy) return;
             if (b == DS4Button.SCE_PAD_BUTTON_TRIANGLE) { _storageDelete = null; RefreshStorage(); return; }
@@ -62,10 +63,10 @@ namespace Orbis
             if (b == DS4Button.SCE_PAD_BUTTON_SQUARE) { _storageDelete = _storageFiles[_settingsFocus]; _storageMessage = "CROSS deletes this file permanently. SQUARE cancels."; }
         }
 
-        void DrawStorage(IntPtr r, SDL_Rect sheet)
+        void DrawStoredFiles(IntPtr r, SDL_Rect sheet)
         {
             if (!_storageLoaded) RefreshStorage();
-            TextPx(r, sheet.x, sheet.y + 15, 28, "Downloaded files", White);
+            TextPx(r, sheet.x, sheet.y + 15, 28, "Stored files", White);
             TextPx(r, sheet.x + sheet.w - 220, sheet.y + 20, 20, _freeStorageLabel + " free", Muted);
             TextFit(r, sheet.x, sheet.y + 57, 18, sheet.w, _storageBusy ? "Reading storage…" : _storageDelete == null ? "Manage package files saved by SSPI." : "Delete this file? This cannot be undone.", _storageDelete == null ? Muted : Danger);
             if (_storageBusy) DrawActivityRail(r, new SDL_Rect { x = sheet.x, y = sheet.y + 103, w = sheet.w, h = 3 });

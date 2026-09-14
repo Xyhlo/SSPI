@@ -10,29 +10,7 @@ namespace Orbis
     // Read-ahead overlaps network latency with HDD writes without sparse files or seek storms.
     internal static class SequentialDownloadEngine
     {
-        static long _limit;
-        public static long LimitBytesPerSecond
-        {
-            get { return Interlocked.Read(ref _limit); }
-            set { Interlocked.Exchange(ref _limit, Math.Max(0, value)); }
-        }
-
-        public static void LoadLimit(string settingsPath)
-        {
-            long limit = 0;
-            try
-            {
-                foreach (string line in File.ReadAllLines(settingsPath))
-                {
-                    if (!line.StartsWith("download_limit_mb_s=", StringComparison.Ordinal)) continue;
-                    int mb;
-                    if (int.TryParse(line.Substring(20).Trim(), out mb)) limit = Math.Max(0, Math.Min(1000, mb)) * 1000000L;
-                }
-            }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
-            LimitBytesPerSecond = limit;
-        }
+        static int _nextDiagnosticId;
 
         sealed class Block
         {
@@ -45,6 +23,39 @@ namespace Orbis
         {
             return CopyCore((buffer, start, count) => read(buffer), false, output,
                 expectedBytes, offset, total, progress, cancel, null);
+        }
+
+        // At most one pending snapshot; slow diagnostic storage cannot hold up network reads.
+        sealed class DiagnosticWriter
+        {
+            readonly Action<string> _write;
+            readonly object _gate = new object();
+            string _latest;
+            bool _running;
+            public DiagnosticWriter(Action<string> write) { _write = write; }
+            public void Submit(string snapshot)
+            {
+                if (_write == null) return;
+                lock (_gate)
+                {
+                    _latest = snapshot;
+                    if (_running) return;
+                    _running = true;
+                }
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    for (;;)
+                    {
+                        string value;
+                        lock (_gate)
+                        {
+                            value = _latest; _latest = null;
+                            if (value == null) { _running = false; return; }
+                        }
+                        try { _write(value); } catch (Exception) { }
+                    }
+                });
+            }
         }
 
         public static long Copy(Func<byte[], int, int, int> read, Stream output, long expectedBytes,
@@ -62,7 +73,8 @@ namespace Orbis
             {
                 for (int i = 0; i < 4; i++) free.Add(new Block());
                 Exception writerError = null;
-                long written = 0, writeTicks = 0, readTicks = 0, readCalls = 0;
+                long written = 0, writeTicks = 0, readTicks = 0, readCalls = 0, flushTicks = 0;
+                long bufferWaitTicks = 0;
                 var writer = new Thread(() =>
                 {
                     try
@@ -76,15 +88,35 @@ namespace Orbis
                             Interlocked.Add(ref written, block.Count);
                             free.Add(block);
                         }
+                        long flushAt = Stopwatch.GetTimestamp();
                         output.Flush();
+                        Interlocked.Add(ref flushTicks, Stopwatch.GetTimestamp() - flushAt);
                     }
                     catch (Exception ex) { writerError = ex; stopped.Set(); }
                 }) { IsBackground = true, Name = "SSPI sequential disk writer" };
                 writer.Start();
                 var watch = Stopwatch.StartNew();
                 long received = 0, lastProgress = -100, lastDiagnostic = 0;
-                double budget = 0;
-                long budgetAt = 0;
+                bool complete = false;
+                string outcome = "failed";
+                int diagnosticId = Interlocked.Increment(ref _nextDiagnosticId);
+                var diagnostics = new DiagnosticWriter(diagnostic);
+                Action<string> sample = phase =>
+                {
+                    if (diagnostic == null) return;
+                    long committed = Interlocked.Read(ref written), elapsedMs = Math.Max(1, watch.ElapsedMilliseconds);
+                    long readMs = readTicks * 1000 / Stopwatch.Frequency, writeMs = Interlocked.Read(ref writeTicks) * 1000 / Stopwatch.Frequency;
+                    diagnostics.Submit("sample_utc=" + DateTime.UtcNow.ToString("O") + "\ncopy_id=" + diagnosticId + "\nphase=" + phase +
+                        "\nelapsed_ms=" + elapsedMs + "\nresume_offset=" + offset + "\nbytes_written=" + committed +
+                        "\nbytes_received=" + received + "\nthroughput_bytes_s=" + (long)(committed * 1000.0 / elapsedMs) +
+                        "\nread_calls=" + readCalls + "\nread_ms=" + readMs + "\nwrite_ms=" + writeMs +
+                        "\nflush_ms=" + Interlocked.Read(ref flushTicks) * 1000 / Stopwatch.Frequency +
+                        "\nbuffer_wait_ms=" + bufferWaitTicks * 1000 / Stopwatch.Frequency +
+                        "\nread_active_bytes_s=" + (readMs > 0 ? (long)(received * 1000.0 / readMs) : 0) +
+                        "\nwrite_active_bytes_s=" + (writeMs > 0 ? (long)(committed * 1000.0 / writeMs) : 0) +
+                        "\nblock_bytes=524288\nbuffer_count=4\n");
+                };
+                sample("starting");
                 try
                 {
                     for (;;)
@@ -92,7 +124,10 @@ namespace Orbis
                         if (writerError != null) throw new IOException("Download storage failed", writerError);
                         if (cancel != null && cancel()) throw new OperationCanceledException("paused");
                         Block block;
-                        if (!free.TryTake(out block, 25)) continue;
+                        long waitAt = Stopwatch.GetTimestamp();
+                        bool gotBlock = free.TryTake(out block, 25);
+                        bufferWaitTicks += Stopwatch.GetTimestamp() - waitAt;
+                        if (!gotBlock) continue;
                         int n = 0;
                         // Fill the bounded block: a TLS record is usually only 16 KiB.
                         // Publishing each record reduced the effective read-ahead to 64 KiB.
@@ -120,24 +155,6 @@ namespace Orbis
                             if (writerError != null) throw new IOException("Download storage failed", writerError);
                             if (cancel != null && cancel()) throw new OperationCanceledException("paused");
                         }
-                        long limit = LimitBytesPerSecond;
-                        if (limit > 0)
-                        {
-                            long now = watch.ElapsedMilliseconds;
-                            budget = Math.Max(0, budget - (now - budgetAt) * limit / 1000.0) + n;
-                            budgetAt = now;
-                            while (budget > limit * .1)
-                            {
-                                if (cancel != null && cancel()) throw new OperationCanceledException("paused");
-                                if (writerError != null) throw new IOException("Download storage failed", writerError);
-                                if (LimitBytesPerSecond != limit) { budget = 0; break; }
-                                Thread.Sleep((int)Math.Max(1, Math.Min(25, budget * 1000 / limit)));
-                                now = watch.ElapsedMilliseconds;
-                                budget = Math.Max(0, budget - (now - budgetAt) * limit / 1000.0);
-                                budgetAt = now;
-                            }
-                        }
-                        else { budget = 0; budgetAt = watch.ElapsedMilliseconds; }
                         if (progress != null && watch.ElapsedMilliseconds - lastProgress >= 100)
                         {
                             progress(offset + Interlocked.Read(ref written), total);
@@ -145,12 +162,7 @@ namespace Orbis
                         }
                         if (diagnostic != null && watch.ElapsedMilliseconds - lastDiagnostic >= 5000)
                         {
-                            try { diagnostic("elapsed_ms=" + watch.ElapsedMilliseconds + "\nbytes_written=" + Interlocked.Read(ref written) +
-                                "\nread_calls=" + readCalls + "\nread_ms=" + readTicks * 1000 / Stopwatch.Frequency +
-                                "\nwrite_ms=" + Interlocked.Read(ref writeTicks) * 1000 / Stopwatch.Frequency +
-                                "\nlimit_bytes_s=" + LimitBytesPerSecond + "\nblock_bytes=524288\nbuffer_count=4\n"); }
-                            catch (IOException) { }
-                            catch (UnauthorizedAccessException) { }
+                            sample("running");
                             lastDiagnostic = watch.ElapsedMilliseconds;
                         }
                     }
@@ -160,14 +172,17 @@ namespace Orbis
                     if (cancel != null && cancel()) throw new OperationCanceledException("paused");
                     if (expectedBytes >= 0 && written != expectedBytes) throw new IOException("Truncated download response");
                     if (progress != null) progress(offset + written, total);
+                    complete = true;
                     return written;
                 }
+                catch (OperationCanceledException) { outcome = "canceled"; throw; }
                 finally
                 {
                     stopped.Set();
                     if (!pending.IsAddingCompleted) pending.CompleteAdding();
                     // Never close the file or return buffers while the writer still owns them.
                     writer.Join();
+                    sample(complete ? "complete" : outcome);
                 }
             }
         }
