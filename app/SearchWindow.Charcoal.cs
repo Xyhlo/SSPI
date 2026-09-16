@@ -571,6 +571,10 @@ namespace Orbis
         {
             if (item.State == DlState.Failed) return item.Error ?? "Download failed";
             if (item.State == DlState.Paused) return "Paused";
+            // A resolving row is not transferring bytes yet, so a rate line would
+            // read "Measuring speed." forever. Show the resolver's own progress
+            // instead: an uncached provider preparing the file reports continuously.
+            if (item.State == DlState.Resolving && !string.IsNullOrEmpty(item.StatusText)) return item.StatusText;
             if (item.State != DlState.Downloading && item.State != DlState.Resolving && !Extracting(item)) return item.StatusText ?? VisibleState(item);
             string rate = item.BytesPerSec > 0 ? (item.BytesPerSec / 1000000.0).ToString("0.00") + " MB/s" : "Measuring speed…";
             string eta = item.EtaSeconds > 0 ? "ETA " + (item.EtaSeconds / 60) + ":" + (item.EtaSeconds % 60).ToString("00") : "ETA —";

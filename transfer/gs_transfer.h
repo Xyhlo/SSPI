@@ -2,6 +2,7 @@
 #define GS_TRANSFER_H
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #define GS_XFER_API 3
 #define GS_XFER_CHUNK (16U * 1024U * 1024U)
 #define GS_XFER_BUFFER (512U * 1024U)
@@ -13,6 +14,15 @@ typedef struct {
     int64_t done, total, network_bytes;
     char error[256];
 } GsXferStatus;
+/* Bounded operator-facing detail for the preparation phase: admission, source
+ * probe and staging-file open. Provider preparation can take minutes, so the
+ * manager and UI must keep showing that activity instead of an empty 0%. */
+static void gs_preparation_detail(char *out, size_t size, const char *title)
+{
+    if (!out || !size) return;
+    snprintf(out, size, "Preparing %s: probing the source and opening the staging file",
+        title && *title ? title : "package");
+}
 int sspi_xfer_api(void);
 int sspi_xfer_init(int http_context);
 /* Bounded metadata probe: no transfer job, destination, bitmap or writer. */
