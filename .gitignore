@@ -185,3 +185,4 @@
 !/app/DistributionSettings.cs
 !/app/ArchivePasswordDefaults.cs
 !/app/SearchWindow.DownloadDrawer.cs
+!/resident/plugin/gs_stage_dependency.h

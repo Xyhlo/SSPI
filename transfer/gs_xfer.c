@@ -838,6 +838,10 @@ int sspi_xfer_poll(int handle,GsXferStatus *status)
                 snprintf(status->error,sizeof(status->error),"Verifying SHA-256: %u%%",(unsigned)(verified*100/(uint64_t)status->total));
             else snprintf(status->error,sizeof(status->error),"Saving package for installation...");
         }
+        // GS_QUEUED is the preparation phase (admission, source probe, staging
+        // file). Publish its detail on every poll so a cold or slow provider is
+        // never reported as a silent 0% transfer. No byte count is implied.
+        else if(status->state==GS_QUEUED) gs_preparation_detail(status->error,sizeof(status->error),j->title);
         // Live accepted bytes are not a durability claim. Resume uses the map.
         for(int i=0;i<GS_XFER_LANES;i++)if(lanes[i].job>=0 && &jobs[lanes[i].job]==j)status->done+=lanes[i].written;
         if(status->done>status->total)status->done=status->total;

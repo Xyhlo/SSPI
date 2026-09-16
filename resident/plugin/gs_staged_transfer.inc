@@ -313,8 +313,13 @@ static void *gs_stage_worker(void *opaque)
         gs_stage_lock(&stage->lock);
         snprintf(bgft_detail, sizeof(bgft_detail), "%s", stage->bgft_detail);
         gs_stage_unlock(&stage->lock);
-        gs_stage_status(stage, stage->paused ? "paused" : status.state == GS_VALIDATING ? "validating" : "feeding",
-            !stage->paused && status.state != GS_VALIDATING && bgft_detail[0] ? bgft_detail : NULL);
+        /* GS_QUEUED is the engine's preparation phase: admission, source probe
+         * and staging-file open. Forward its detail every poll so an uncached
+         * provider preparation is visible instead of a silent 0% transfer. */
+        const char *detail = NULL;
+        if (!stage->paused && status.state == GS_QUEUED) detail = status.error[0] ? status.error : bgft_detail;
+        else if (!stage->paused && status.state != GS_VALIDATING && bgft_detail[0]) detail = bgft_detail;
+        gs_stage_status(stage, stage->paused ? "paused" : status.state == GS_VALIDATING ? "validating" : "feeding", detail);
         sceKernelUsleep(250000);
     }
  done:
@@ -374,34 +379,7 @@ static int gs_stage_owned(void)
     return 0;
 }
 
-static int gs_stage_dependency_ready(const GsStage *stage)
-{
-    /* Re-evaluate lower-rank packages, including jobs added after this one.
-     * A dependency snapshot alone cannot support arbitrary queue order. */
-    for (int i = 0; i < GS_STAGE_COUNT; i++) {
-        GsJob candidate;
-        if (gs_stage_read_job(i, &candidate) || !strcmp(candidate.id, stage->job.id) ||
-            !candidate.auto_install || !gs_precedes_same_title(stage->job.title, stage->job.expected_kind,
-                candidate.title, candidate.expected_kind)) continue;
-        if (strcmp(gs_stages[i].job.id, candidate.id) || strcmp(gs_stages[i].state, "installed")) return 0;
-    }
-    if (!stage->job.after[0]) return 1;
-    for (int i = 0; i < GS_STAGE_COUNT; i++) {
-        if (!strcmp(gs_stages[i].job.id, stage->job.after) && strcmp(gs_stages[i].state, "installed")) return 0;
-        GsJob queued;
-        if (!gs_stage_read_job(i, &queued) && !strcmp(queued.id, stage->job.after) &&
-            (!gs_stages[i].job.id[0] || strcmp(gs_stages[i].state, "installed"))) return 0;
-    }
-    char path[1100], line[256], id[192], content[49], leaf[256];
-    snprintf(leaf, sizeof(leaf), "/installed-%s.txt", stage->job.after);
-    if (gs_ipc_path(path, sizeof(path), leaf)) return 0;
-    FILE *file = fopen(path, "rb"); if (!file) return 0;
-    int good = !gs_line(file, line, sizeof(line)) && !strcmp(line, "1") &&
-        !gs_encoded_line(file, id, sizeof(id)) && !strcmp(id, stage->job.after) &&
-        !gs_encoded_line(file, content, sizeof(content)) && strlen(content) == 36 &&
-        (!stage->job.title[0] || !memcmp(content + 7, stage->job.title, 9));
-    fclose(file); return good;
-}
+#include "gs_stage_dependency.h"
 
 static int gs_stage_stream_eligible(GsStage *stage)
 {

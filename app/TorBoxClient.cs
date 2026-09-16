@@ -15,6 +15,12 @@ namespace Orbis
         sealed class Pending { public string Id, FileId; public DateTime Until; }
         static readonly Dictionary<string, Pending> PendingDownloads = new Dictionary<string, Pending>();
 
+        // Preparation is bounded by a deadline and reported on every poll. The host
+        // regression harness overrides both seams so the loop can be driven
+        // deterministically without sleeping or waiting ten minutes.
+        internal static TimeSpan PreparationDeadline = TimeSpan.FromMinutes(10);
+        internal static Action<int, Func<bool>> WaitImpl;
+
         public static string Unrestrict(string token, string hostUrl, Action<string> progress = null, Func<bool> cancel = null)
         {
             if (string.IsNullOrWhiteSpace(token))
@@ -42,29 +48,63 @@ namespace Orbis
 
             string fileId = pending.FileId;
             var elapsed = Stopwatch.StartNew();
-            for (int poll = 0; string.IsNullOrEmpty(fileId) && elapsed.Elapsed < TimeSpan.FromMinutes(10); poll++)
+            int listed = 0, transient = 0;
+            string lastState = "";
+            for (int poll = 0; string.IsNullOrEmpty(fileId) && elapsed.Elapsed < PreparationDeadline; poll++)
             {
                 if (cancel != null && cancel()) throw new OperationCanceledException();
                 string list;
                 try { list = NetHttp.GetString(Api + "/webdl/mylist?id=" + Uri.EscapeDataString(pending.Id) + "&bypass_cache=true", 15000, null, token.Trim()); }
-                catch (Exception ex) { throw DebridResolutionError.FromTransport("TorBox", hostUrl, ex); }
+                catch (Exception ex)
+                {
+                    // A list query that never answered says nothing about the prepared
+                    // download, so keep it and retry a bounded number of times before
+                    // surfacing the transport detail.
+                    if (++transient > TransientListAttempts) throw DebridResolutionError.FromTransport("TorBox", hostUrl, ex);
+                    if (progress != null)
+                        progress("TorBox preparing this file · list request retry " + transient + "/" + TransientListAttempts +
+                            " · " + (int)elapsed.Elapsed.TotalSeconds + "s");
+                    Wait(PollDelayMs(poll), cancel);
+                    continue;
+                }
+                transient = 0;
                 var response = Response(list);
                 if (!Flag(response, "success"))
                 {
                     if (MissingJob(Text(response, "error"))) ForgetPending(key);
                     throw DebridResolutionError.FromResponse("TorBox", hostUrl, list);
                 }
-                var job = FindJob(Value(response, "data"), pending.Id);
-                fileId = ReadyFile(job);
+                Dictionary<string, object> job;
+                bool visible = TryFindJob(Value(response, "data"), pending.Id, out job);
+                if (visible) listed++;
+                fileId = visible ? ReadyFile(job) : null;
                 if (!string.IsNullOrEmpty(fileId)) { pending.FileId = fileId; SavePending(key, pending); break; }
-                string state = Text(job, "download_state") ?? "preparing";
-                if (state.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 || state.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0)
-                    { ForgetPending(key); throw new Exception("TorBox host download failed: " + state); }
-                if (progress != null) progress(PreparationProgress(job, elapsed.Elapsed));
+                if (visible)
+                {
+                    string state = Text(job, "download_state") ?? "preparing";
+                    lastState = state;
+                    if (state.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 || state.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0)
+                        { ForgetPending(key); throw new Exception("TorBox host download failed: " + state); }
+                    if (progress != null) progress(PreparationProgress(job, elapsed.Elapsed));
+                }
+                else if (progress != null)
+                {
+                    // A freshly created web download is not always listed immediately.
+                    // Report continuing provider activity instead of failing or waiting
+                    // silently, and never create a second cloud download.
+                    progress("TorBox preparing this file · waiting for the provider to list it · " + (int)elapsed.Elapsed.TotalSeconds + "s");
+                }
                 // Catch a newly cached file quickly; long host transfers poll at the API's five-second cadence.
                 Wait(PollDelayMs(poll), cancel);
             }
-            if (string.IsNullOrEmpty(fileId)) throw new Exception("TorBox is still preparing this file. Retry from Downloads shortly.");
+            if (string.IsNullOrEmpty(fileId))
+            {
+                string detail = listed == 0
+                    ? "the provider never listed the prepared download"
+                    : lastState.Length > 0 ? "last provider state " + lastState : "no file was published yet";
+                throw new Exception("TorBox is still preparing this file after " + (int)elapsed.Elapsed.TotalSeconds +
+                    "s (" + detail + "). The prepared download was kept; retry from Downloads shortly.");
+            }
             if (cancel != null && cancel()) throw new OperationCanceledException();
             string url = Api + "/webdl/requestdl?token=" + Uri.EscapeDataString(token.Trim()) +
                 "&web_id=" + Uri.EscapeDataString(pending.Id) + "&file_id=" + Uri.EscapeDataString(fileId) + "&zip_link=false";
@@ -100,6 +140,9 @@ namespace Orbis
         }
 
         internal static int PollDelayMs(int poll) { return poll == 0 ? 1000 : poll == 1 ? 2000 : 5000; }
+        // Bounded tolerance for a list query that fails outright. The prepared
+        // download id is retained across the retries, so one cloud job is reused.
+        internal const int TransientListAttempts = 3;
         static Dictionary<string, object> Response(string json)
         {
             try { return Object(PackageSourceJson.Parse(json)); }
@@ -125,21 +168,25 @@ namespace Orbis
             foreach (string name in names) { string value = Text(data, name); if (!string.IsNullOrEmpty(value)) return value; }
             return null;
         }
-        static Dictionary<string, object> FindJob(object data, string id)
+        // A freshly created web download is not always listed on the first poll, and
+        // an absent entry is not an error: the caller keeps polling within its
+        // deadline and reports that the provider has not published the file yet.
+        static bool TryFindJob(object data, string id, out Dictionary<string, object> found)
         {
-            var item = data as Dictionary<string, object>;
-            if (item != null)
+            found = data as Dictionary<string, object>;
+            if (found != null)
             {
-                string returnedId = First(item, "id", "webdownload_id");
-                if (returnedId == null || returnedId == id) return item;
+                string returnedId = First(found, "id", "webdownload_id");
+                if (returnedId == null || returnedId == id) return true;
+                found = null;
             }
             var items = data as List<object>;
             if (items != null) foreach (object candidate in items)
             {
-                item = candidate as Dictionary<string, object>;
-                if (item != null && First(item, "id", "webdownload_id") == id) return item;
+                var item = candidate as Dictionary<string, object>;
+                if (item != null && First(item, "id", "webdownload_id") == id) { found = item; return true; }
             }
-            throw new IOException("TorBox did not return the requested download. Retry shortly; preparation was kept.");
+            return false;
         }
         static string ReadyFile(Dictionary<string, object> job)
         {
@@ -196,6 +243,7 @@ namespace Orbis
         }
         static void Wait(int milliseconds, Func<bool> cancel)
         {
+            if (WaitImpl != null) { WaitImpl(milliseconds, cancel); return; }
             for (int n = 0; n < milliseconds; n += 100) {
                 if (cancel != null && cancel()) throw new OperationCanceledException();
                 Thread.Sleep(Math.Min(100, milliseconds - n));
