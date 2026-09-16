@@ -63,6 +63,28 @@ static void gs_stage_path(int slot, const char *kind, char *path, size_t size)
     if (length < 0 || length >= (int)sizeof(leaf) || gs_ipc_path(path, size, leaf)) path[0] = 0;
 }
 
+static void gs_archive_control(void)
+{
+    char path[128];
+    int action = 0;
+    // Read this job's durable intent from the extraction thread as well as the
+    // listener. Cancellation must not wait behind listener/install polling.
+    for (int i = 0; i < GS_STAGE_COUNT; i++) {
+        if (strcmp(gs_stages[i].job.id, gs_job.id) ||
+            strcmp(gs_stages[i].job.generation, gs_job.generation)) continue;
+        gs_stage_path(i, "control", path, sizeof(path));
+        action = gs_read_control_action(path);
+        break;
+    }
+    if (!action && !gs_ipc_path(path, sizeof(path), "/control.txt")) action = gs_read_control_action(path);
+    if (action >= 3) {
+        if (!gs_canceled) gs_log_write("resident", "archive-control job=%s action=%s accepted=1", gs_job.id, action == 4 ? "release" : "cancel");
+        gs_canceled = 1;
+        if (action == 4) gs_release = 1;
+    } else if (action == 1) gs_paused = 1;
+    else if (action == 2) gs_paused = 0;
+}
+
 static void gs_stage_status(GsStage *stage, const char *state, const char *error)
 {
     char path[1100], body[1800], id[260], encoded[900];
@@ -86,8 +108,10 @@ static void gs_stage_status(GsStage *stage, const char *state, const char *error
     int64_t published = stage->done;
     if (published >= stage->job.total && (!strcmp(stage->state, "feeding") || !strcmp(stage->state, "ready") ||
         !strcmp(stage->state, "paused") || !strcmp(stage->state, "validating"))) published = stage->job.total - 1;
+    int extracting = !strcmp(stage->state, "extracting") && !strcmp(stage->job.id, gs_job.id) &&
+        !strcmp(stage->job.generation, gs_job.generation);
     snprintf(body, sizeof(body), "1\n%s\n%s\n%lld\n%lld\n0\n%s\n%d\n%d\n%lld\n%s\n%s\n%llu\n", id, stage->state,
-        (long long)published, (long long)stage->job.total, encoded, stage->active, stage->job.auto_install, (long long)stage->wire_bytes,
+        (long long)(extracting ? gs_done : published), (long long)(extracting ? gs_job.total : stage->job.total), encoded, stage->active, stage->job.auto_install, (long long)stage->wire_bytes,
         stage->job.generation, GS_BUILD_ID, (unsigned long long)g_epoch);
     write_telemetry(path, body);
     uint64_t now = sceKernelGetProcessTime() / 1000;
@@ -132,6 +156,7 @@ static int gs_stage_read_job(int slot, GsJob *job)
         job->auto_install = !strcmp(line, "1");
     }
     if (has_password && ((!job->borrowed_source && kind != 0) || gs_encoded_line(file, job->password, sizeof(job->password)))) goto done;
+    if (has_password && (gs_read_password_fallbacks(file, job) || (kind && job->password_fallback_count))) goto done;
     if (job->total < (job->borrowed_source && !kind ? 8 : 0x1000) || job->total > 8LL * 1024 * 1024 * 1024 * 1024 ||
         lanes < 1 || lanes > 16 || (kind != 0 && (kind < 6 || kind > 8 || strlen(job->content) != 36)) ||
         !job->id[0] || (job->title[0] && strlen(job->title) != 9)) goto done;
@@ -492,7 +517,7 @@ static int gs_stage_can_install(const GsJob *candidate)
 
 static int gs_stage_install_record(GsStage *stage)
 {
-    char body[15000], id[260], url[11000], destination[1500], title[40], sha[100], content[100], password[350];
+    char body[16500], id[260], url[11000], destination[1500], title[40], sha[100], content[100], password[350];
     gs_b64encode((const unsigned char *)stage->job.id, strlen(stage->job.id), id, sizeof(id));
     gs_b64encode((const unsigned char *)stage->job.url, strlen(stage->job.url), url, sizeof(url));
     char metadata[1150]; snprintf(metadata, sizeof(metadata), "%s.bgft-meta", stage->job.destination);
@@ -501,12 +526,20 @@ static int gs_stage_install_record(GsStage *stage)
     gs_b64encode((const unsigned char *)stage->job.title, strlen(stage->job.title), title, sizeof(title));
     gs_b64encode((const unsigned char *)stage->job.sha, strlen(stage->job.sha), sha, sizeof(sha));
     gs_b64encode((const unsigned char *)stage->job.content, strlen(stage->job.content), content, sizeof(content));
-    snprintf(body, sizeof(body), "%d\n%s\n%s\n%s\n%s\n%s\n%s\n%lld\n1\n%d\n%s\n%s\n", stage->job.borrowed_source ? 19 : stage->job.native_bgft ? 17 : stage->job.expected_kind ? 11 : stage->job.password[0] ? 15 : 9, id, url, destination,
+    snprintf(body, sizeof(body), "%d\n%s\n%s\n%s\n%s\n%s\n%s\n%lld\n1\n%d\n%s\n%s\n", stage->job.borrowed_source ? 19 : stage->job.native_bgft ? 17 : stage->job.expected_kind ? 11 : (stage->job.password[0] || stage->job.password_fallback_count) ? 15 : 9, id, url, destination,
         title, sha, content, (long long)stage->job.total, stage->job.expected_kind,
         stage->job.generation, stage->job.storage_token);
-    if (stage->job.borrowed_source || (!stage->job.expected_kind && stage->job.password[0])) {
+    if (stage->job.borrowed_source || (!stage->job.expected_kind && (stage->job.password[0] || stage->job.password_fallback_count))) {
         gs_b64encode((const unsigned char *)stage->job.password, strlen(stage->job.password), password, sizeof(password));
         size_t used = strlen(body); snprintf(body + used, sizeof(body) - used, "%s\n", password);
+    }
+    if (stage->job.password_fallback_count) {
+        size_t used = strlen(body);
+        snprintf(body + used, sizeof(body) - used, "password-fallbacks-v1\n%d\n", stage->job.password_fallback_count);
+        for (int i = 0; i < stage->job.password_fallback_count; i++) {
+            gs_b64encode((const unsigned char *)stage->job.password_fallbacks[i], strlen(stage->job.password_fallbacks[i]), password, sizeof(password));
+            used = strlen(body); snprintf(body + used, sizeof(body) - used, "%s\n", password);
+        }
     }
     char path[128];
     if (gs_ipc_path(path, sizeof(path), "/job.txt")) return -1;
@@ -561,7 +594,8 @@ static void gs_stage_install_poll(void)
                     strstr(message, "Not enough PS4 installation space") || strstr(message, "0x80990004") ||
                     strstr(message, "PS4 task stalled") || strstr(message, "BGFT_UNRESOLVED:") ||
                     strstr(message, "0x80990015") || strstr(message, "0x80990086") ||
-                    strstr(message, "Archive extraction was interrupted.");
+                    strstr(message, "Archive extraction was interrupted.") || strstr(message, "DLC_UNCONFIRMED:") ||
+                    strstr(message, "ARCHIVE_FAILED:");
                 if (!strcmp(gs_state, "failed") && !addon_rejected && stage->install_retries < 3 && !stage->canceled) {
                     stage->install_retries++;
                     stage->install_retry_at = sceKernelGetProcessTime() + (uint64_t)(3 << stage->install_retries) * 1000000;
@@ -582,7 +616,17 @@ static void gs_stage_install_poll(void)
                 int downloading = !strcmp(gs_state, "feeding");
                 gs_stage_status(stage, gs_paused ? "paused" : downloading ? "feeding" : "installing",
                     downloading ? "PS4 is downloading the package directly" : "PS4 is completing installation");
-            } else if (gs_worker_running && gs_stream_slot < 0) gs_stage_idle_status(stage, "installing", NULL);
+            } else if (gs_worker_running && gs_stream_slot < 0) {
+                const char *phase = !strcmp(gs_state, "extracting") ? "extracting" :
+                    !strcmp(gs_state, "validating") ? "validating" : "installing";
+                if (!strcmp(phase, "extracting")) {
+                    char message[96];
+                    if (gs_canceled) snprintf(message, sizeof(message), "Canceling extraction; waiting for file cleanup");
+                    else if (!gs_done) snprintf(message, sizeof(message), "Opening archive and reading package headers");
+                    else snprintf(message, sizeof(message), "Extracted %lld MiB", (long long)(gs_done / (1024 * 1024)));
+                    gs_stage_status(stage, phase, message);
+                } else gs_stage_idle_status(stage, phase, NULL);
+            }
             else if (gs_worker_running && gs_stream_slot == stage->slot) {
                 gs_stage_lock(&stage->lock);
                 snprintf(stage->bgft_detail, sizeof(stage->bgft_detail), "%s", gs_done > 0
@@ -680,7 +724,7 @@ static void gs_stage_poll(void)
             }
             if (stage->canceled && !stage->created && strcmp(gs_job.id, stage->job.id)) {
                 if (gs_archive_cancel_before_start(&stage->job) ||
-                    (stage->job.expected_kind && gs_retire_parked_package(stage->job.id, stage->job.content))) {
+                    (stage->job.expected_kind && gs_retire_parked_package(stage->job.id, stage->job.content, stage->job.expected_kind))) {
                     gs_stage_status(stage, "failed", "Stopping the retained PS4 task is unconfirmed; job and files kept");
                     continue;
                 }
@@ -731,6 +775,9 @@ static void gs_stage_poll(void)
                 }
                 snprintf(saved, sizeof(saved), "%s", previous);
                 if (!matches_generation) { fclose(status_file); status_file = NULL; goto fresh_stage; }
+                // Extraction already has a durable local install record. Resume
+                // that owner after restart instead of starting another transfer.
+                if (!strcmp(saved, "extracting")) snprintf(saved, sizeof(saved), "waiting");
                 stage->paused = !strcmp(saved, "paused");
                 if (!strcmp(saved, "staged") || !strcmp(saved, "failed") || !strcmp(saved, "canceled") ||
                     !strcmp(saved, "installed") || (stage->job.auto_install && (!strcmp(saved, "waiting") || !strcmp(saved, "installing")))) {

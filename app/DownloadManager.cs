@@ -115,6 +115,8 @@ namespace Orbis
         public string FanOutPendingPaths = "";
         public string ArchiveVolumes = "";
         public string ArchivePassword = "";
+        public string ArchivePasswords = "";
+        public string ContainerFormat = "";
         public bool LocalSource;
         public string LocalSourceFingerprint = "";
         public string InstallAfterId = "";
@@ -125,6 +127,7 @@ namespace Orbis
         public bool ResidentArchive;
         public bool ResidentStaged;
         public bool ResidentRemovePending;
+        public bool RemoveRequested;
         public bool ResidentAutoInstall;
         public string ResidentGeneration;
         public string ResolvedProviderId = "";
@@ -267,9 +270,14 @@ namespace Orbis
         {
             get
             {
-                lock (_lock)
+                // UI metadata refreshes must defer instead of waiting for disk/BGFT work.
+                if (!Monitor.TryEnter(_lock)) return true;
+                try
+                {
                     return _activeIds.Count != 0 || _items.Exists(item => item.Background ||
                         item.State == DlState.Installing || item.State == DlState.Submitted);
+                }
+                finally { Monitor.Exit(_lock); }
             }
         }
 
@@ -316,6 +324,7 @@ namespace Orbis
                     if (mirrors != null) item.MirrorCandidates = PackageMirrorFallback.Encode(candidate, mirrors);
                     if (string.IsNullOrEmpty(item.ArchiveVolumes)) item.ArchiveVolumes = candidate.ArchiveVolumes ?? "";
                     item.ArchivePassword = candidate.ArchivePassword ?? "";
+                    item.ArchivePasswords = candidate.ArchivePasswords ?? "";
                     // The candidate identity overload above either creates a row or fills only
                     // missing provenance. Apply the same immutable rule to the remaining fields.
                     if (item.ExpectedByteSize <= 0 && candidate.ExpectedByteSize.HasValue)
@@ -716,10 +725,21 @@ namespace Orbis
 
         public List<DlItem> Snapshot()
         {
-            ReconcileLocalFiles(false);
+            lock (_lock) return CopySnapshot();
+        }
+
+        public bool TrySnapshot(out List<DlItem> snapshot)
+        {
+            snapshot = null;
+            if (!Monitor.TryEnter(_lock)) return false;
+            try { snapshot = CopySnapshot(); return true; }
+            finally { Monitor.Exit(_lock); }
+        }
+
+        // Caller holds _lock. No filesystem or native calls belong in a UI snapshot.
+        List<DlItem> CopySnapshot()
+        {
             long now = TransferClockMs();
-            lock (_lock)
-            {
                 var list = new List<DlItem>(_items.Count);
                 foreach (var i in _items)
                 {
@@ -741,14 +761,17 @@ namespace Orbis
                         MirrorCandidates = i.MirrorCandidates,
                         ArchiveVolumes = i.ArchiveVolumes,
                         ArchivePassword = i.ArchivePassword,
+                        ArchivePasswords = i.ArchivePasswords,
                         LocalSource = i.LocalSource,
                         LocalSourceFingerprint = i.LocalSourceFingerprint,
                         InstallAfterId = i.InstallAfterId,
                         InstallAfterConfirmed = i.InstallAfterConfirmed,
                         BgftLocalInstall = i.BgftLocalInstall,
                         ResidentArchive = i.ResidentArchive,
+                        ContainerFormat = i.ContainerFormat,
                         ResidentStaged = i.ResidentStaged,
                         ResidentRemovePending = i.ResidentRemovePending,
+                        RemoveRequested = i.RemoveRequested,
                         ResidentAutoInstall = i.ResidentAutoInstall,
                         ResidentGeneration = i.ResidentGeneration,
                         ResolvedProviderId = i.ResolvedProviderId,
@@ -780,7 +803,6 @@ namespace Orbis
                     });
                 }
                 return list;
-            }
         }
 
         long _lastReconcileAt;
@@ -1047,7 +1069,7 @@ namespace Orbis
                     error = "Download not found";
                     return false;
                 }
-                if (IsTerminal(it.State))
+                if (IsTerminal(it.State) && !(it.State == DlState.Failed && it.Background && it.ResidentArchive))
                 {
                     error = "Already finished — use Remove";
                     return false;
@@ -1059,9 +1081,9 @@ namespace Orbis
                 }
                 if (it.Background && it.ResidentArchive)
                 {
-                    ResidentDownloadService.MarkFailed(it.Id);
+                    if (!ResidentDownloadService.TryCancel(it.Id, out error)) return false;
                     it.CancelRequested = true;
-                    it.StatusText = "Canceling resident archive and its BGFT task...";
+                    it.StatusText = "Canceling background job...";
                     SaveManifest(); return true;
                 }
                 if (it.Background)
@@ -1177,8 +1199,12 @@ namespace Orbis
                     it.State == DlState.Downloading || it.State == DlState.Finalizing ||
                     it.State == DlState.Installing)
                 {
-                    error = "Still active";
-                    return false;
+                    if (it.State == DlState.Installing) { error = "Installation is already running"; return false; }
+                    bool requested = it.RemoveRequested, canceled = it.CancelRequested;
+                    it.RemoveRequested = it.CancelRequested = true;
+                    if (SaveManifest()) { it.StatusText = "Removing; waiting for file writer to stop"; return true; }
+                    it.RemoveRequested = requested; it.CancelRequested = canceled;
+                    error = "Could not save the removal request"; return false;
                 }
                 if (!IsTerminal(it.State) && it.State != DlState.Queued && it.State != DlState.Paused)
                 {
@@ -1763,8 +1789,11 @@ namespace Orbis
 
         void WorkerLoop(int workerIndex)
         {
+            long failureLoggedAt = -10000;
             while (_run)
             {
+                try
+                {
                 if (Monitor.TryEnter(_bgftRefreshGate))
                 {
                     try { RefreshBackgroundTasks(); }
@@ -1775,6 +1804,13 @@ namespace Orbis
                 string activePath = null;
                 lock (_lock)
                 {
+                    foreach (var pending in _items.ToArray())
+                        if (pending.RemoveRequested && !pending.Background && !_activeIds.Contains(pending.Id) && pending.State != DlState.Installing)
+                        {
+                            pending.State = DlState.Canceled;
+                            string removalError;
+                            if (!Remove(pending.Id, out removalError)) pending.StatusText = removalError;
+                        }
                     bool residentBusy = false;
                     bool backgroundBusy = HasBlockingPipelineOwner(out residentBusy);
                     bool localPending = false;
@@ -1813,6 +1849,7 @@ namespace Orbis
                 }
                 if (job == null)
                 {
+                    ReconcileLocalFiles(false);
                     bool cleanup;
                     lock (_lock) cleanup = _startupCleanupPending && TransferClockMs() >= _startupCleanupAfter &&
                         _activeIds.Count == 0 && !_items.Exists(item => item.Background || item.State == DlState.Installing ||
@@ -1822,8 +1859,7 @@ namespace Orbis
                     continue;
                 }
 
-                SaveManifest();
-                try { RunJob(job, attempt); }
+                try { SaveManifest(); RunJob(job, attempt); }
                 finally
                 {
                     lock (_lock)
@@ -1832,6 +1868,17 @@ namespace Orbis
                         job.ForegroundTransfer = false;
                         if (activePath != null) _activePaths.Remove(activePath);
                     }
+                }
+                }
+                catch (Exception ex)
+                {
+                    long now = TransferClockMs();
+                    if (now - failureLoggedAt >= 10000) {
+                        failureLoggedAt = now;
+                        SspiLog.Write("download", "event=queue-worker-recovered exception=" + ex.GetType().Name);
+                        Program.RecordFailure(ex);
+                    }
+                    Thread.Sleep(1000);
                 }
             }
         }
@@ -2346,6 +2393,7 @@ namespace Orbis
             {
                 if (IsResidentArchiveHeader(header))
                 {
+                    ApplySourceArchivePassword(job, header.Data);
                     string passwordError = ResidentArchivePasswordError(header.Data, job.ArchivePassword);
                     if (passwordError != null)
                     { SetFailureIfCurrent(job, attempt, passwordError); return true; }
@@ -2427,6 +2475,53 @@ namespace Orbis
             return true;
         }
 
+        static void ApplySourceArchivePassword(DlItem job, byte[] header)
+        {
+            job.ContainerFormat = ContainerFormatFromHeader(header);
+            if (header != null && header.Length >= 4 && header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21)
+            {
+                var defaults = ArchivePasswordDefaults.Decode(job.ArchivePasswords);
+                if (string.IsNullOrEmpty(job.ArchivePassword) && defaults.Length > 0) job.ArchivePassword = defaults[0];
+                job.ArchivePassword = DistributionSettings.ArchivePassword(job.SourcePageUrl, job.ArchivePassword);
+            }
+        }
+
+        string[] ArchiveFallbacks(DlItem job)
+        {
+            return _cfg.RetrySourceArchivePasswords
+                ? DistributionSettings.ArchivePasswordFallbacks(job.SourcePageUrl, job.ArchivePassword, job.ArchivePasswords)
+                : new string[0];
+        }
+
+        internal static string ContainerFormatFromHeader(byte[] header)
+        {
+            if (header == null || header.Length < 4) return "";
+            if (header[0] == 0x7f && header[1] == 0x43 && header[2] == 0x4e && header[3] == 0x54) return "pkg";
+            if (header[0] == 0x50 && header[1] == 0x4b &&
+                ((header[2] == 3 && header[3] == 4) || (header[2] == 5 && header[3] == 6) || (header[2] == 7 && header[3] == 8))) return "zip";
+            if (header.Length >= 7 && header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21 &&
+                header[4] == 0x1a && header[5] == 7 && (header[6] == 0 || (header.Length >= 8 && header[6] == 1 && header[7] == 0))) return "rar";
+            if (PackageArchive.IsSevenZipHeader(header)) return "7z";
+            return "";
+        }
+
+        internal static void RestoreContainerFormat(DlItem item)
+        {
+            if (!string.IsNullOrEmpty(item.ContainerFormat)) return;
+            if (!string.IsNullOrEmpty(item.ArchiveVolumes)) { item.ContainerFormat = "rar"; return; }
+            if (string.IsNullOrEmpty(item.DestPath)) return;
+            try {
+                string path = File.Exists(item.DestPath) ? item.DestPath : item.DestPath + ".part";
+                if (!File.Exists(path)) return;
+                byte[] header = new byte[8];
+                using (var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
+                    int read = file.Read(header, 0, header.Length);
+                    Array.Resize(ref header, read);
+                }
+                item.ContainerFormat = ContainerFormatFromHeader(header);
+            } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+
         internal static string ResidentArchivePasswordError(byte[] header, string password)
         {
             if (PackageArchive.IsSevenZipHeader(header))
@@ -2499,6 +2594,7 @@ namespace Orbis
             }
             if (IsResidentArchiveHeader(new HttpRangeResult { Data = header, Total = size }))
             {
+                ApplySourceArchivePassword(job, header);
                 string passwordError = ResidentArchivePasswordError(header, job.ArchivePassword);
                 if (passwordError != null) { SetFailureIfCurrent(job, attempt, passwordError); return; }
                 if (job.ExpectedByteSize > 0 && job.ExpectedByteSize != size)
@@ -2553,6 +2649,8 @@ namespace Orbis
                 { CommitRequestedStop(job, attempt); return true; }
                 if (nativeBgft) job.DestPath = NativeBgftDestination(job.Id);
                 job.Kind = kind; job.TitleId = titleId;
+                if (!archive) job.ContainerFormat = "pkg";
+                else if (string.IsNullOrEmpty(job.ContainerFormat)) job.ContainerFormat = "archive";
                 dependencyId = ResidentDependencyId(job);
                 // Only native-owned predecessors publish native installed receipts. Other
                 // routes can still stage concurrently, then use the app's install gate.
@@ -2593,14 +2691,14 @@ namespace Orbis
                 bool published = localSource
                     ? ResidentDownloadService.TryStartLocalSource(job.Id, job.DestPath, titleId, contentId, size,
                         archive ? 0 : PkgValidator.BgftSubTypeForKind(kind), dependencyId,
-                        archive ? job.ArchivePassword : null, out error, out busy)
+                        archive ? job.ArchivePassword : null, out error, out busy, archive ? ArchiveFallbacks(job) : null)
                     : nativeBgft
                     ? ResidentDownloadService.TryStartNativeBgftPackage(job.Id, url, job.DestPath, titleId,
                         contentId, size, PkgValidator.BgftSubTypeForKind(kind), lanes, autoInstall,
                         autoInstall ? dependencyId : "", out error, out busy)
                     : ResidentDownloadService.TryStartStagedPackageWithPassword(job.Id, url, job.DestPath, titleId,
                         job.ExpectedSha256, contentId, size, archive ? 0 : PkgValidator.BgftSubTypeForKind(kind), lanes,
-                        autoInstall, autoInstall ? dependencyId : "", archive ? job.ArchivePassword : null, out error, out busy);
+                        autoInstall, autoInstall ? dependencyId : "", archive ? job.ArchivePassword : null, out error, out busy, archive ? ArchiveFallbacks(job) : null);
                 if (!published)
                 {
                     job.ResidentStaged = job.ResidentAutoInstall = false;
@@ -2873,6 +2971,8 @@ namespace Orbis
 
         bool TryHandoffArchive(DlItem job, int attempt, List<ArchiveVolume> volumes, List<string> paths)
         {
+            ApplySourceArchivePassword(job, new byte[] { 0x52, 0x61, 0x72, 0x21 });
+            job.ContainerFormat = "rar";
             if (!ResidentDownloadService.ValidArchivePassword(job.ArchivePassword))
             { SetFailureIfCurrent(job, attempt, "Archive password exceeds 256 UTF-8 bytes or is invalid"); return true; }
             if (!InstallDependencyReady(job)) return false;
@@ -2921,7 +3021,7 @@ namespace Orbis
                 throw new IOException("Could not save archive ownership");
             }
             string error;
-            if (!ResidentDownloadService.TryStartArchiveWithPassword(job.Id, job.DestPath, job.TitleId, job.ExpectedContentId, resolved, paths, job.ResidentGeneration, job.ArchivePassword, out error))
+            if (!ResidentDownloadService.TryStartArchiveWithPassword(job.Id, job.DestPath, job.TitleId, job.ExpectedContentId, resolved, paths, job.ResidentGeneration, job.ArchivePassword, out error, ArchiveFallbacks(job)))
                 return ResidentPublicationFailed(job, error);
             NetHttp.TraceDownloadDecision(true, NetHttp.DownloadDecision.ResidentSelected);
             return true;
@@ -2962,6 +3062,7 @@ namespace Orbis
                         job.ExpectedByteSize = mirror.ExpectedByteSize;
                         job.ExpiresUtc = mirror.ExpiresUtc;
                         job.ArchivePassword = mirror.ArchivePassword;
+                        job.ArchivePasswords = mirror.ArchivePasswords;
                     }
                     if (!SaveManifest()) throw new IOException("Could not save the selected package mirror");
                 }, progress, cancelled);
@@ -3033,8 +3134,12 @@ namespace Orbis
                 string error;
                 if (!VerifyCandidateFile(probe, out error)) throw new InvalidDataException("Volume " + (i + 1) + ": " + error);
                 PackageObjectKind kind = PackageArchive.Detect(path);
-                if (kind != PackageObjectKind.Rar4 && kind != PackageObjectKind.Rar5)
-                    throw new InvalidDataException("Volume " + (i + 1) + " is not RAR data");
+                bool singlePayload = volumes.Count == 1 && (kind == PackageObjectKind.Pkg || kind == PackageObjectKind.Zip || kind == PackageObjectKind.SevenZip);
+                if (kind != PackageObjectKind.Rar4 && kind != PackageObjectKind.Rar5 && !singlePayload)
+                    throw new InvalidDataException("Volume " + (i + 1) + " has an unsupported file header");
+                if (singlePayload) {
+                    lock (_lock) { job.DestPath = path; job.ArchiveVolumes = ""; }
+                }
                 SaveManifest();
             }
             FinishDownloadedObject(job, attempt);
@@ -3067,6 +3172,7 @@ namespace Orbis
 
             if (objectKind == PackageObjectKind.Pkg)
             {
+                job.ContainerFormat = "pkg";
                 PkgContentKind actualKind;
                 string actualKindName;
                 string contentId;
@@ -3085,6 +3191,9 @@ namespace Orbis
             if (objectKind == PackageObjectKind.Zip || objectKind == PackageObjectKind.Rar4 ||
                 objectKind == PackageObjectKind.Rar5 || objectKind == PackageObjectKind.SevenZip)
             {
+                if (objectKind == PackageObjectKind.Rar4 || objectKind == PackageObjectKind.Rar5)
+                    ApplySourceArchivePassword(job, new byte[] { 0x52, 0x61, 0x72, 0x21 });
+                job.ContainerFormat = objectKind == PackageObjectKind.Zip ? "zip" : objectKind == PackageObjectKind.SevenZip ? "7z" : "rar";
                 string error;
                 if (!VerifyCandidateFile(job, out error))
                 {
@@ -3219,14 +3328,21 @@ namespace Orbis
                     if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) { CommitRequestedStop(job, attempt); return; }
                     job.State = DlState.Finalizing; job.StatusText = "Extracting packages...";
                 }
-                LogBgftEvent("archive-extraction-start", job, "Managed archive extraction started");
+                var volumes = ArchiveVolumeSet.Decode(job.ArchiveVolumes);
+                List<string> volumeNames = null;
+                if (volumes.Count == paths.Count) {
+                    volumeNames = new List<string>();
+                    foreach (var volume in volumes) volumeNames.Add(volume.Name);
+                }
+                LogBgftEvent("archive-extraction-start", job, "Archive extraction started; RAR uses native UnRAR");
                 List<PackageArchiveEntry> entries = PackageArchive.ExtractPackages(paths, staging,
                     () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested,
                     (done, total) => { lock (_lock) {
                         if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) return;
-                        job.Done = done; job.Total = total;
+                        UpdateTransferStats(job, done, total, "extracting", TransferClockMs(), 0);
                         job.StatusText = "Extracting packages" + (total > 0 ? " - " + Math.Min(100, done * 100.0 / total).ToString("0") + "%" : "...");
-                    } }, job.ArchivePassword);
+                    } }, job.ArchivePassword, ArchiveFallbacks(job), volumeNames,
+                    detail => LogBgftEvent("archive-decoder", job, detail));
                 LogBgftEvent("archive-extraction-complete", job, "Extracted package count=" + entries.Count);
                 for (int i = 0; i < entries.Count; i++)
                 {
@@ -4249,7 +4365,7 @@ namespace Orbis
         {
             done = Math.Max(0, done); total = Math.Max(0, total); nowMs = Math.Max(0, nowMs);
             item.Done = done; item.Total = total;
-            bool transferring = IsTransferStatsPhase(phase);
+            bool transferring = IsTransferStatsPhase(phase) || phase == "extracting";
             long elapsed = nowMs - item.StatsAt;
             if (!transferring || !item.StatsInitialized || elapsed < 0 || elapsed > 15000 || done < item.StatsObservedDone ||
                 item.StatsPhase != phase || item.StatsAttempt != item.AttemptId)
@@ -4290,9 +4406,10 @@ namespace Orbis
 
         internal static bool HasCurrentTransferStats(DlItem item, long nowMs)
         {
-            return item != null && item.StatsInitialized && item.State == DlState.Downloading &&
+            return item != null && item.StatsInitialized &&
+                (item.State == DlState.Downloading || (item.State == DlState.Finalizing && item.StatsPhase == "extracting")) &&
                 !item.PauseRequested && !item.CancelRequested && item.StatsAttempt == item.AttemptId &&
-                IsTransferStatsPhase(item.StatsPhase) && nowMs >= item.StatsAdvancedAt &&
+                (IsTransferStatsPhase(item.StatsPhase) || item.StatsPhase == "extracting") && nowMs >= item.StatsAdvancedAt &&
                 nowMs - item.StatsAdvancedAt < 5000;
         }
 
@@ -4379,6 +4496,12 @@ namespace Orbis
             SaveManifest(); return true;
         }
 
+        internal static bool RetainUnconfirmedAddonFiles(DlItem item)
+        {
+            return item.ResidentAutoInstall && !item.InstallConfirmed &&
+                PkgValidator.BgftSubTypeForKind(item.Kind) == 7;
+        }
+
         void RefreshResidentArchive(DlItem item)
         {
             int attempt = item.AttemptId;
@@ -4396,8 +4519,13 @@ namespace Orbis
                     // The native owner removes its durable job only after readers, transfer
                     // threads and any owned BGFT task have stopped. Until then keep the data.
                     if (!ResidentDownloadService.HasDownloader) return;
-                    if (!TryCleanupFanOutPending(item)) { item.StatusText = "Stored files could not be removed"; return; }
-                    DeleteDownloadFiles(item);
+                    // Removing an unconfirmed add-on stops SSPI tracking, but must not
+                    // delete input that the PS4 installer may still be consuming.
+                    if (!RetainUnconfirmedAddonFiles(item))
+                    {
+                        if (!TryCleanupFanOutPending(item)) { item.StatusText = "Stored files could not be removed"; return; }
+                        DeleteDownloadFiles(item);
+                    }
                     PreserveConfirmedDependency(item);
                     _items.Remove(item);
                     SaveManifest();
@@ -4493,15 +4621,17 @@ namespace Orbis
                     }
                     return;
                 }
-                // Extraction counts output bytes; the resident total still describes compressed input.
-                UpdateLiveTransferStats(item, status.Done, status.State == "extracting" ? 0 : status.Total,
+                // The resident publishes a separate expanded total during extraction.
+                UpdateLiveTransferStats(item, status.Done, status.Total,
                     status.NetworkBytes, status.State, TransferClockMs());
-                item.StatusText = status.State == "extracting" ? "Extracting archive packages in resident worker" :
+                item.StatusText = status.State == "extracting" ? (!string.IsNullOrEmpty(status.Error) ? status.Error : "Extracting: reading archive headers") :
                     status.State == "installing" ? "Installing packages in order" :
                     status.State == "validating" ? "Verifying package integrity · " + Human(status.Done) + " checked" : "Resident download: " + status.State;
                 ApplyResidentTransferPhase(item, status);
                 if ((status.State == "feeding" || status.State == "installing") && !string.IsNullOrEmpty(status.Error))
                     item.StatusText = status.Error;
+                if (item.CancelRequested && status.State != "installed" && status.State != "failed" && status.State != "canceled")
+                    item.StatusText = "Canceling background job; waiting for worker acknowledgement";
                 if (status.State == "installed")
                 {
                     item.State = DlState.Installed; item.InstallConfirmed = true; item.InstallOrderReady = true;
@@ -4553,6 +4683,8 @@ namespace Orbis
 
         internal static void ApplyResidentTransferPhase(DlItem item, ResidentDownloadStatus status)
         {
+            if (status.State == "extracting" && (string.IsNullOrEmpty(item.ContainerFormat) || item.ContainerFormat == "pkg"))
+                item.ContainerFormat = "archive";
             if (status.State == "queued")
             {
                 item.State = DlState.Queued; item.BytesPerSec = 0; item.EtaSeconds = 0;
@@ -4561,7 +4693,7 @@ namespace Orbis
             }
             if (status.State == "installing") item.State = DlState.Installing;
             else if (status.State == "validating" || status.State == "extracting")
-            { item.State = DlState.Finalizing; item.BytesPerSec = 0; item.EtaSeconds = 0; }
+            { item.State = DlState.Finalizing; }
             else if (status.State == "downloading" || status.State == "feeding" || status.State == "ready")
                 item.State = DlState.Downloading;
             if (item.ResidentAutoInstall && (status.State == "waiting" || status.State == "staged"))
@@ -5119,8 +5251,10 @@ namespace Orbis
                         if (i > 0) sb.Append(',');
                         sb.Append('{');
                         sb.Append("\"resident_archive\":").Append(it.ResidentArchive ? "true" : "false").Append(',');
+                        sb.Append("\"container_format\":\"").Append(JsonLite.Escape(it.ContainerFormat)).Append("\",");
                         sb.Append("\"resident_staged\":").Append(it.ResidentStaged ? "true" : "false").Append(',');
                         sb.Append("\"resident_remove_pending\":").Append(it.ResidentRemovePending ? "true" : "false").Append(',');
+                        sb.Append("\"remove_requested\":").Append(it.RemoveRequested ? "true" : "false").Append(',');
                         sb.Append("\"resident_link_renewals\":").Append(it.ResidentLinkRenewals).Append(',');
                         sb.Append("\"resident_last_renewal_bytes\":").Append(it.ResidentLastRenewalBytes).Append(',');
                         sb.Append("\"resident_retry_pending\":").Append(it.ResidentRetryPending ? "true" : "false").Append(',');
@@ -5134,6 +5268,7 @@ namespace Orbis
                         sb.Append("\"install_order_ready\":").Append(it.InstallOrderReady ? "true" : "false").Append(',');
                         sb.Append("\"archive_volumes\":\"").Append(JsonLite.Escape(it.ArchiveVolumes)).Append("\",");
                         sb.Append("\"archive_password\":\"").Append(JsonLite.Escape(it.ArchivePassword)).Append("\",");
+                        sb.Append("\"archive_passwords\":\"").Append(JsonLite.Escape(it.ArchivePasswords)).Append("\",");
                         sb.Append("\"local_source\":").Append(it.LocalSource ? "true" : "false").Append(',');
                         sb.Append("\"local_source_fingerprint\":\"").Append(JsonLite.Escape(it.LocalSourceFingerprint)).Append("\",");
                         sb.Append("\"bgft_local_install\":").Append(it.BgftLocalInstall ? "true" : "false").Append(",");
@@ -5681,14 +5816,17 @@ namespace Orbis
                         MirrorCandidates = JsonLite.GetString(obj, "mirror_candidates") ?? "",
                         ArchiveVolumes = JsonLite.GetString(obj, "archive_volumes") ?? "",
                         ArchivePassword = JsonLite.GetString(obj, "archive_password") ?? "",
+                        ArchivePasswords = JsonLite.GetString(obj, "archive_passwords") ?? "",
                         LocalSource = JsonLite.GetBool(obj, "local_source"),
                         LocalSourceFingerprint = JsonLite.GetString(obj, "local_source_fingerprint") ?? "",
                         InstallAfterId = JsonLite.GetString(obj, "install_after_id") ?? "",
                         InstallAfterConfirmed = JsonLite.GetBool(obj, "install_after_confirmed"),
                         BgftLocalInstall = JsonLite.GetBool(obj, "bgft_local_install"),
                         ResidentArchive = JsonLite.GetBool(obj, "resident_archive"),
+                        ContainerFormat = JsonLite.GetString(obj, "container_format") ?? "",
                         ResidentStaged = JsonLite.GetBool(obj, "resident_staged"),
                         ResidentRemovePending = JsonLite.GetBool(obj, "resident_remove_pending"),
+                        RemoveRequested = JsonLite.GetBool(obj, "remove_requested"),
                         ResidentLinkRenewals = Math.Max(0, ParseInt(JsonLite.GetString(obj, "resident_link_renewals"), 0)),
                         ResidentLastRenewalBytes = Math.Max(0, ParseLong(JsonLite.GetString(obj, "resident_last_renewal_bytes"))),
                         ResidentRetryPending = JsonLite.GetBool(obj, "resident_retry_pending"),
@@ -5765,6 +5903,7 @@ namespace Orbis
                         if (!hasLegacyFiles) it.DestPath = uniquePath;
                         migrated = true;
                     }
+                    RestoreContainerFormat(it);
                     DlItem identityOwner;
                     if (loadedIdentities.TryGetValue(identity, out identityOwner))
                     {

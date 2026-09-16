@@ -133,6 +133,8 @@
 !/resident/plugin/gs_resident_worker.inc
 !/resident/plugin/gs_unrar.cpp
 !/resident/plugin/gs_unrar.h
+!/resident/plugin/gs_unrar_platform.h
+!/resident/plugin/gs_unrar_wide.cpp
 !/resident/plugin/gs_7z.c
 !/resident/plugin/gs_7z_allocator.h
 !/resident/worker/WorkerProgram.cs
@@ -181,3 +183,5 @@
 !/resident/plugin/gs_storage_policy.h
 !/resident/plugin/gs_zip.cpp
 !/app/DistributionSettings.cs
+!/app/ArchivePasswordDefaults.cs
+!/app/SearchWindow.DownloadDrawer.cs

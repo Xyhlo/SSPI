@@ -9,6 +9,8 @@
 typedef struct {
     char id[192], url[8192], destination[1024], title[16], sha[65], content[49];
     char password[257];
+    char password_fallbacks[3][257];
+    int password_fallback_count;
     int64_t total;
     int ranges;
     int expected_kind;
@@ -218,6 +220,22 @@ static void gs_write_status(const char *state, const char *error)
     write_telemetry(path, body);
 }
 
+// Optional trailer keeps old password records valid and survives staged handoff.
+static int gs_read_password_fallbacks(FILE *file, GsJob *job)
+{
+    int next = fgetc(file);
+    if (next == EOF) return ferror(file) ? -1 : 0;
+    ungetc(next, file);
+    char line[64]; const char *end; int64_t count;
+    if (gs_line(file, line, sizeof(line)) || strcmp(line, "password-fallbacks-v1") ||
+        gs_line(file, line, sizeof(line)) || parse_number(line, &count, &end) || *end || count < 1 || count > 3 || job->expected_kind) return -1;
+    for (int i = 0; i < count; i++)
+        if (gs_encoded_line(file, job->password_fallbacks[i], sizeof(job->password_fallbacks[i])) || !job->password_fallbacks[i][0]) return -1;
+    if (fgetc(file) != EOF || ferror(file)) return -1;
+    job->password_fallback_count = (int)count;
+    return 0;
+}
+
 static int gs_read_job(GsJob *job)
 {
     char line[64], path[128]; const char *end; size_t i; int ok = 0;
@@ -259,7 +277,7 @@ static int gs_read_job(GsJob *job)
         if (gs_line(file, job->generation, sizeof(job->generation)) || !gs_hex_token(job->generation) ||
             gs_line(file, job->storage_token, sizeof(job->storage_token))) goto done;
     }
-    if (has_password && gs_encoded_line(file, job->password, sizeof(job->password))) goto done;
+    if (has_password && (gs_encoded_line(file, job->password, sizeof(job->password)) || gs_read_password_fallbacks(file, job))) goto done;
     if (!job->id[0] || (!job->borrowed_source && !job->url[0]) || (job->archive != 1 && strlen(job->content) != 36)) goto done;
     for (i = 0; job->id[i]; i++)
         if (!((job->id[i] >= 'a' && job->id[i] <= 'z') || (job->id[i] >= 'A' && job->id[i] <= 'Z') ||
@@ -280,27 +298,40 @@ done:
     fclose(file); return ok ? 0 : -1;
 }
 
-static void gs_control(void)
+static int gs_read_control_action(const char *path)
 {
-    char line[300], id[192], path[128];
-    FILE *file;
-    if (gs_ipc_path(path, sizeof(path), "/control.txt")) return;
-    file = fopen(path, "rb");
-    if (!file) return;
+    char line[300], id[192];
+    int action = 0;
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
     if (gs_line(file, line, sizeof(line)) == 0 && (!strcmp(line, "1") || !strcmp(line, "2"))) {
         int version = atoi(line); char generation[80];
         if (gs_encoded_line(file, id, sizeof(id)) || strcmp(id, gs_job.id) || gs_line(file, line, sizeof(line)) ||
             (version == 2 && (gs_line(file, generation, sizeof(generation)) || strcmp(generation, gs_job.generation))) ||
-            (version == 1 && gs_job.generation[0])) { fclose(file); return; }
-        if (strcmp(line, "pause") == 0 && !gs_paused && !gs_pause_archive_task(1)) gs_paused = 1;
-        if (strcmp(line, "resume") == 0 && gs_paused && !gs_pause_archive_task(0)) gs_paused = 0;
-        if (strcmp(line, "cancel") == 0) gs_canceled = 1;
-        if (strcmp(line, "release") == 0) { gs_canceled = 1; gs_release = 1; }
+            (version == 1 && gs_job.generation[0])) { fclose(file); return 0; }
+        if (strcmp(line, "pause") == 0) action = 1;
+        if (strcmp(line, "resume") == 0) action = 2;
+        if (strcmp(line, "cancel") == 0) action = 3;
+        if (strcmp(line, "release") == 0) action = 4;
         // Keep the desired state. Unlinking after this read can remove a newer
         // atomic replacement (notably resume arriving while pause is applied).
     }
     fclose(file);
+    return action;
 }
+
+static void gs_control(void)
+{
+    char path[128];
+    if (gs_ipc_path(path, sizeof(path), "/control.txt")) return;
+    int action = gs_read_control_action(path);
+    if (action == 1 && !gs_paused && !gs_pause_archive_task(1)) gs_paused = 1;
+    if (action == 2 && gs_paused && !gs_pause_archive_task(0)) gs_paused = 0;
+    if (action >= 3) gs_canceled = 1;
+    if (action == 4) gs_release = 1;
+}
+
+static void gs_archive_control(void);
 
 #define GS_MODULE_CANDIDATES 8
 #define GS_MODULE_LIST_CAPACITY 1024
@@ -893,6 +924,8 @@ static int gs_start_bgft(void)
     return rc ? -1 : 0;
 }
 
+static int gs_resume_missing_addon(void);
+
 static void *gs_download_worker(void *unused)
 {
     char partial[1050]; struct stat st; FILE *file = NULL; int retries = 0;
@@ -905,6 +938,8 @@ static void *gs_download_worker(void *unused)
         gs_write_status("failed", "Selected staging drive unavailable; input and install ownership retained");
         gs_worker_running = 0; return NULL;
     }
+    if (gs_job.archive == 2 && gs_job.expected_kind == 7 && access(gs_job.destination, F_OK) &&
+        errno == ENOENT && gs_resume_missing_addon()) goto done;
     if (gs_job.borrowed_source && !gs_local_source_check(gs_job.destination, gs_job.storage_root, gs_job.storage_token)) {
         gs_write_status("failed", "Selected USB file path is unavailable or linked; original files retained");
         gs_worker_running = 0; return NULL;
@@ -984,7 +1019,7 @@ static void gs_worker_poll(void)
     if (gs_canceled && !gs_worker_running && gs_job.id[0]) {
         if ((!gs_worker_created && !gs_archive_journal[0] &&
                 (gs_archive_cancel_before_start(&gs_job) || (gs_job.archive != 1 && gs_job.expected_kind &&
-                    gs_retire_parked_package(gs_job.id, gs_job.content)))) || gs_cancel_task()) {
+                    gs_retire_parked_package(gs_job.id, gs_job.content, gs_job.expected_kind)))) || gs_cancel_task()) {
             gs_release = 0; gs_write_status("failed", "BGFT cancellation unconfirmed; ownership retained");
         } else gs_write_status("canceled", NULL);
     }
@@ -1033,7 +1068,12 @@ static void gs_worker_poll(void)
         }
     }
     gs_current_task = -1; gs_worker_running = 1; gs_write_status("ready", NULL);
-    if (scePthreadCreate(&gs_worker, NULL, gs_download_worker, NULL, "gs-download")) {
+    OrbisPthreadAttr attributes;
+    int attr_ready = scePthreadAttrInit(&attributes) == 0;
+    int thread_error = attr_ready ? scePthreadAttrSetstacksize(&attributes, 4 * 1024 * 1024) : -1;
+    if (!thread_error) thread_error = scePthreadCreate(&gs_worker, &attributes, gs_download_worker, NULL, "gs-download");
+    if (attr_ready) scePthreadAttrDestroy(&attributes);
+    if (thread_error) {
         if (gs_stream_slot >= 0) __atomic_store_n(&gs_stages[gs_stream_slot].streaming, 0, __ATOMIC_RELEASE);
         gs_worker_running = 0; gs_write_status("failed", "Resident download thread creation failed");
     } else gs_worker_created = 1;

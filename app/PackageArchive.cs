@@ -36,6 +36,105 @@ namespace Orbis
         static readonly byte[] Rar5Magic = { 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00 };
         static readonly byte[] SevenZipMagic = { 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C };
         static readonly uint[] CrcTable = BuildCrcTable();
+        static readonly object RarGate = new object();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        delegate void NativeRarDiagnostic(IntPtr stage, uint entry, int result, uint dictionary, uint method, ulong size);
+        [DllImport("libGameSearchResident.prx", CallingConvention = CallingConvention.Cdecl)]
+        static extern int gs_extract_rar_password_diagnostic(IntPtr first, IntPtr destination,
+            IntPtr names, IntPtr paths, int volumes, IntPtr packages, int capacity,
+            NativeArchiveProgress progress, IntPtr password, NativeRarDiagnostic diagnostic);
+
+        static IntPtr ArchiveUtf8(string value, List<IntPtr> allocations)
+        {
+            if (value == null || value.IndexOf('\0') >= 0) throw new InvalidDataException("Invalid archive path or password");
+            byte[] bytes = Encoding.UTF8.GetBytes(value + "\0");
+            if (bytes.Length > 1024) throw new InvalidDataException("Archive path or password is too long");
+            IntPtr memory = Marshal.AllocHGlobal(bytes.Length);
+            allocations.Add(memory); Marshal.Copy(bytes, 0, memory, bytes.Length); return memory;
+        }
+
+        internal static List<PackageArchiveEntry> ReadNativeRar(IList<string> paths, string destination,
+            Func<bool> cancel, Action<long, long> progress, string password,
+            IList<string> volumeNames = null, Action<string> diagnostic = null)
+        {
+            if (paths == null || paths.Count == 0 || paths.Count > 512 ||
+                (volumeNames != null && volumeNames.Count != paths.Count))
+                throw new InvalidDataException("Invalid RAR volume set");
+            CheckCancel(cancel);
+            // UnRAR keeps decoder state per process. Wait only on this extraction worker.
+            while (!System.Threading.Monitor.TryEnter(RarGate, 100)) CheckCancel(cancel);
+            var allocations = new List<IntPtr>();
+            Exception callbackError = null;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            long reportedAt = -200, reportedTotal = -1, reportedDone = -1;
+            NativeArchiveProgress callback = (done, total) => {
+                try {
+                    CheckCancel(cancel);
+                    if (callbackError != null) return 1;
+                    if (progress != null && (clock.ElapsedMilliseconds - reportedAt >= 200 || total != reportedTotal ||
+                        (total > 0 && done == total && done != reportedDone))) {
+                        reportedAt = clock.ElapsedMilliseconds; reportedTotal = total; reportedDone = done; progress(done, total);
+                    }
+                    CheckCancel(cancel);
+                    return 0;
+                } catch (Exception ex) { callbackError = ex; return 1; }
+            };
+            NativeRarDiagnostic trace = (stage, entry, result, dictionary, method, size) => {
+                try { if (diagnostic != null) diagnostic("decoder=unrar stage=" + NativeArchiveText(stage) +
+                    " entry=" + entry + " result=" + result + " dictionary_kib=" + dictionary +
+                    " method=" + method + " unpacked=" + size); }
+                catch (Exception ex) { callbackError = ex; }
+            };
+            try {
+                IntPtr nativePaths = Marshal.AllocHGlobal(paths.Count * IntPtr.Size); allocations.Add(nativePaths);
+                IntPtr nativeNames = Marshal.AllocHGlobal(paths.Count * IntPtr.Size); allocations.Add(nativeNames);
+                for (int i = 0; i < paths.Count; i++) {
+                    CheckCancel(cancel);
+                    string path = Path.GetFullPath(paths[i]);
+                    if (!File.Exists(path)) throw new InvalidDataException("Missing archive volume " + (i + 1));
+                    Marshal.WriteIntPtr(nativePaths, i * IntPtr.Size, ArchiveUtf8(path, allocations));
+                    Marshal.WriteIntPtr(nativeNames, i * IntPtr.Size,
+                        ArchiveUtf8(volumeNames == null ? Path.GetFileName(path) : volumeNames[i], allocations));
+                }
+                const int stride = 1032;
+                IntPtr packages = Marshal.AllocHGlobal(MaximumPackageEntries * stride); allocations.Add(packages);
+                int count = gs_extract_rar_password_diagnostic(Marshal.ReadIntPtr(nativePaths), ArchiveUtf8(destination, allocations),
+                    nativeNames, nativePaths, paths.Count, packages, MaximumPackageEntries, callback,
+                    ArchiveUtf8(password ?? "", allocations), trace);
+                if (callbackError != null) throw callbackError;
+                if (count <= 0 || count > MaximumPackageEntries) {
+                    string detail;
+                    switch (-count) {
+                        case 22: case 24: detail = "RAR password rejected; check the password supplied by the source"; break;
+                        case 15: case 18: detail = "RAR volume could not be read; check that every volume finished downloading"; break;
+                        case 11: case 25: detail = "RAR dictionary or expanded size exceeds the supported memory limit"; break;
+                        case 16: case 19: detail = "RAR output could not be written; check storage space and the staging drive"; break;
+                        case 12: detail = "RAR integrity check failed; a volume is missing or damaged"; break;
+                        case 1001: detail = "RAR header scan timed out"; break;
+                        case 1002: detail = "RAR was read successfully but contains no PKG files; check that the source supplied a PS4 package archive"; break;
+                        case 1003: detail = "Another RAR extraction is still running; retry after it finishes"; break;
+                        default: detail = "RAR decoder could not read this archive"; break;
+                    }
+                    throw new InvalidDataException(detail + " (decoder " + count + "). Archive retained.");
+                }
+                var entries = new List<PackageArchiveEntry>(count);
+                for (int i = 0; i < count; i++) {
+                    IntPtr entry = IntPtr.Add(packages, i * stride);
+                    string path = NativeArchiveText(entry);
+                    entries.Add(new PackageArchiveEntry { Name = Path.GetFileName(path),
+                        Size = Marshal.ReadInt64(entry, 1024), ExtractedPath = path });
+                }
+                return entries;
+            }
+            catch (DllNotFoundException) { throw new IOException("RAR decoder is unavailable; reinstall the current SSPI package. Archive retained."); }
+            catch (EntryPointNotFoundException) { throw new IOException("RAR decoder needs the updated SSPI package; restart after updating. Archive retained."); }
+            finally {
+                GC.KeepAlive(callback); GC.KeepAlive(trace);
+                foreach (IntPtr allocation in allocations) Marshal.FreeHGlobal(allocation);
+                System.Threading.Monitor.Exit(RarGate);
+            }
+        }
 
         internal static bool IsSevenZipHeader(byte[] header)
         { return header != null && StartsWith(header, header.Length, SevenZipMagic); }
@@ -138,7 +237,7 @@ namespace Orbis
             if (kind == PackageObjectKind.SevenZip) return ReadSevenZip(archivePath, destination);
             if (kind == PackageObjectKind.Zip) return ReadZip(archivePath, destination);
             if (kind == PackageObjectKind.Rar4 || kind == PackageObjectKind.Rar5)
-                return ReadRar(new[] { archivePath }, destination, null, null);
+                return ExtractPackages(new[] { archivePath }, destination, null, null);
             throw new InvalidDataException("Not a PKG or archive");
         }
 
@@ -236,7 +335,8 @@ namespace Orbis
         }
 
         public static List<PackageArchiveEntry> ExtractPackages(IList<string> paths,
-            string destination, Func<bool> cancel, Action<long, long> progress, string password = null)
+            string destination, Func<bool> cancel, Action<long, long> progress, string password = null, string[] passwordFallbacks = null,
+            IList<string> volumeNames = null, Action<string> diagnostic = null)
         {
             if (paths == null || paths.Count == 0) throw new InvalidDataException("Missing archive volume 1");
             CheckCancel(cancel);
@@ -248,7 +348,32 @@ namespace Orbis
                 return ReadSevenZip(paths[0], Path.GetFullPath(destination), cancel, progress, password);
             }
             if (kind == PackageObjectKind.Rar4 || kind == PackageObjectKind.Rar5)
-                return ReadRar(paths, Path.GetFullPath(destination), cancel, progress, password);
+            {
+                var tried = new HashSet<string>(StringComparer.Ordinal);
+                int next = 0;
+                for (;;)
+                {
+                    CheckCancel(cancel);
+                    tried.Add(password ?? "");
+                    try {
+#if SSPI_PS4
+                        return ReadNativeRar(paths, Path.GetFullPath(destination), cancel, progress, password, volumeNames, diagnostic);
+#else
+                        return ReadRar(paths, Path.GetFullPath(destination), cancel, progress, password);
+#endif
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!(ex is System.Security.Cryptography.CryptographicException) &&
+                            ex.Message.IndexOf("password", StringComparison.OrdinalIgnoreCase) < 0) throw;
+                        while (passwordFallbacks != null && next < Math.Min(3, passwordFallbacks.Length) &&
+                            (string.IsNullOrEmpty(passwordFallbacks[next]) || tried.Contains(passwordFallbacks[next]))) next++;
+                        if (passwordFallbacks == null || next >= Math.Min(3, passwordFallbacks.Length)) throw;
+                        password = passwordFallbacks[next++];
+                        if (progress != null) progress(0, 0);
+                    }
+                }
+            }
             if (paths.Count == 1 && kind == PackageObjectKind.Zip)
                 return ReadZip(paths[0], Path.GetFullPath(destination), cancel, progress);
             throw new InvalidDataException("Not a supported archive");

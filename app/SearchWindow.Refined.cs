@@ -118,6 +118,40 @@ namespace Orbis
             _covers.Draw(renderer, texture, ref source, ref destination);
         }
 
+        void CopyDownloadBackdrop(IntPtr renderer, IntPtr texture, int width, int height, SDL_Rect area, bool drawer)
+        {
+            if (width <= 0 || height <= 0 || area.w <= 0 || area.h <= 0) return;
+            double ratio = area.w / (double)area.h;
+            int cropW = width, cropH = height;
+            if (width / (double)height > ratio) cropW = Math.Max(1, (int)Math.Round(height * ratio));
+            else cropH = Math.Max(1, (int)Math.Round(width / ratio));
+            int cropX = (width - cropW) / 2, cropY = (height - cropH) / 2;
+            int radius = Math.Min(12, Math.Min(area.w, area.h) / 2);
+            // Copy disjoint bands without changing native clip state on the
+            // selected-backdrop path implicated by the console stall.
+            int bands = (drawer ? radius : radius * 2) + 1;
+            MarkUiProgress("downloads-backdrop-copy");
+            for (int i = 0; i < bands; i++)
+            {
+                SDL_Rect band;
+                if (i == 0) band = new SDL_Rect { x = area.x, y = area.y + radius,
+                    w = area.w, h = area.h - (drawer ? radius : radius * 2) };
+                else
+                {
+                    int row = (i - 1) % radius, inset = CornerInsets[radius][row];
+                    band = new SDL_Rect { x = area.x + inset, y = i <= radius ? area.y + row : area.y + area.h - 1 - row,
+                        w = area.w - inset * 2, h = 1 };
+                }
+                if (band.w <= 0 || band.h <= 0) continue;
+                int left = (int)((long)(band.x - area.x) * cropW / area.w);
+                int top = (int)((long)(band.y - area.y) * cropH / area.h);
+                int right = (int)(((long)(band.x - area.x + band.w) * cropW + area.w - 1) / area.w);
+                int bottom = (int)(((long)(band.y - area.y + band.h) * cropH + area.h - 1) / area.h);
+                var source = new SDL_Rect { x = cropX + left, y = cropY + top, w = right - left, h = bottom - top };
+                _covers.Draw(renderer, texture, ref source, ref band);
+            }
+        }
+
         void DrawGroupKinds(IntPtr renderer, DownloadGroup group, int x, int y, bool active)
         {
             bool baseGame = false, update = false, dlc = false, backport = false;
@@ -137,10 +171,9 @@ namespace Orbis
 
         void DrawRefinedDownloads(IntPtr renderer)
         {
+            MarkUiProgress("downloads-model");
             RefreshQueueModel();
-            if (!string.IsNullOrEmpty(_fileDetailId)) { DrawFileDetails(renderer); return; }
             var rows = _queueRows; ClampDownloadFocus(rows);
-            if (_downloadFilesTitle != null) { DrawTransferFiles(renderer); return; }
             int filterX = ContentX;
             for (int i = 0; i < QueueFilters.Length; i++)
             {
@@ -150,44 +183,43 @@ namespace Orbis
             }
             if (rows.Count == 0) { TextPx(renderer, ContentX, 380, 32, "Nothing queued", White); return; }
             // Focus expands within the list; selection order remains stable while jobs update.
-            EnsureVisible(ref _dlScroll, _dlFocus, rows.Count, 4);
+            if (_downloadFilesTitle != null) _dlScroll = _dlFocus;
+            else EnsureVisible(ref _dlScroll, _dlFocus, rows.Count, 4);
             int y = 224;
             for (int i = _dlScroll; i < rows.Count && i < _dlScroll + 4; i++)
             {
                 var row = rows[i]; var group = row.Group; var item = row.Item;
                 bool focus = i == _dlFocus;
-                int height = focus ? 320 : 112;
+                bool drawer = focus && group.Key == _downloadFilesTitle;
+                int height = focus ? (drawer ? 240 : 320) : 112;
+                if (y + height > 948) break;
                 var area = new SDL_Rect { x = ContentX, y = y, w = ContentWidth, h = height };
-                Fill(renderer, area.x, area.y, area.w, area.h, focus ? C(35, 36, 37) : Panel);
+                var frame = area;
+                if (drawer) frame.h += DownloadDrawerHeight;
+                MarkUiProgress("downloads-card");
+                SoftRect(renderer, frame, focus ? C(35, 36, 37) : Panel);
+                MarkUiProgress("downloads-artwork-lookup");
                 EnsureDownloadArtwork(group);
                 if (focus && !string.IsNullOrEmpty(group.ImageUrl))
                 {
                     string key = (group.TitleId ?? "") + "-BACKDROP";
                     _covers.Request(key, group.ImageUrl);
                     IntPtr backdrop; int bw, bh;
-                    if (_covers.TryGet(key, out backdrop, out bw, out bh)) CopyCoverFill(renderer, backdrop, bw, bh, area);
-                }
-                if (focus)
-                {
-                    SDL_Color stateTone = DownloadRingColor(item);
-                    bool moving = item != null && (item.State == DlState.Downloading || item.State == DlState.Resolving ||
-                        item.State == DlState.Finalizing || item.State == DlState.Installing);
-                    double pulse = !_cfg.ReduceMotion && moving ? .65 + .35 * (.5 + .5 * Math.Sin(UiTick() * Math.PI / 1600.0)) : 1;
-                    var halo = new SDL_Rect { x = area.x - 2, y = area.y - 2,
-                        w = area.w + 4, h = area.h + 4 };
-                    StrokeRect(renderer, halo, C((byte)(stateTone.r * pulse / 3), (byte)(stateTone.g * pulse / 3), (byte)(stateTone.b * pulse / 3)), 1);
-                    StrokeRect(renderer, area, C((byte)(stateTone.r * pulse), (byte)(stateTone.g * pulse), (byte)(stateTone.b * pulse)), 2);
+                    if (_covers.TryGet(key, out backdrop, out bw, out bh)) CopyDownloadBackdrop(renderer, backdrop, bw, bh, area, drawer);
                 }
                 int coverW = focus ? 142 : 68, coverH = focus ? 184 : 88;
+                MarkUiProgress("downloads-cover");
                 DrawCase(renderer, new GameHit { TitleId = group.TitleId, Name = group.Name, ImageUrl = group.ImageUrl },
                     new SDL_Rect { x = area.x + 34, y = y + (height - coverH) / 2 - FocusLift(focus), w = coverW, h = coverH });
-                int tx = area.x + (focus ? 218 : 134), tw = ContentWidth - (focus ? 258 : 420);
-                TextFit(renderer, tx, y + (focus ? 45 : 23), focus ? 31 : 26, tw, group.Name, White);
+                MarkUiProgress("downloads-text");
+                int tx = area.x + (focus ? 218 : 134), tw = ContentWidth - (focus ? 408 : 420);
+                int detailShift = drawer ? -60 : 0;
+                TextFit(renderer, tx, y + (focus ? (drawer ? 25 : 45) : 23), focus ? 31 : 26, tw, group.Name, White);
                 if (focus)
                 {
-                    TextPx(renderer, tx, y + 102, 21, group.TitleId ?? "", Muted);
-                    DrawGroupKinds(renderer, group, tx + 164, y + 102, true);
-                    var track = new SDL_Rect { x = tx, y = y + 176, w = ContentWidth - 258, h = 7 };
+                    TextPx(renderer, tx, y + (drawer ? 77 : 102), 21, group.TitleId ?? "", Muted);
+                    DrawGroupKinds(renderer, group, tx + 164, y + (drawer ? 77 : 102), true);
+                    var track = new SDL_Rect { x = tx, y = y + 176 + detailShift, w = ContentWidth - 252, h = 7 };
                     Fill(renderer, track.x, track.y, track.w, track.h, C(81, 83, 85));
                     if (item != null)
                     {
@@ -197,7 +229,7 @@ namespace Orbis
                         else _pocketProgress += (target - _pocketProgress) * Math.Min(1, unchecked(now - _pocketAt) / 140.0);
                         _pocketProgressId = item.Id; _pocketAt = now;
                         Fill(renderer, track.x, track.y, Math.Max(1, (int)(track.w * _pocketProgress)), track.h, White);
-                        TextFit(renderer, tx, y + 205, 22, 520, TransferSizeLine(item), White);
+                        TextFit(renderer, tx, y + 205 + detailShift, 22, 440, TransferSizeLine(item), White);
                         if (_cfg.DownloadStatsMode != 1)
                         {
                             string rate = item.State == DlState.Failed ? "Files kept for retry" : TransferRateLine(item);
@@ -207,22 +239,38 @@ namespace Orbis
                                 string eta = item.EtaSeconds > 0 ? "ETA " + item.EtaSeconds / 60 + ":" + (item.EtaSeconds % 60).ToString("00") : "ETA —";
                                 rate = _cfg.DownloadStatsMode == 2 ? speed : _cfg.DownloadStatsMode == 3 ? eta : speed + "  ·  " + eta;
                             }
-                            TextFit(renderer, tx + 540, y + 205, 23, ContentWidth - 800, rate, White);
+                            TextFit(renderer, tx + 460, y + 205 + detailShift, 23, ContentWidth - 712, rate, White);
                         }
-                        if (_cfg.NerdStats) DrawFocusedSparkline(renderer, new SDL_Rect { x = tx, y = y + 133, w = ContentWidth - 258, h = 31 }, item);
-                        if (item.State == DlState.Failed) TextFit(renderer, tx, y + 258, 19, tw - 180, FriendlyTransferFailure(item.Error), Danger);
-                        else TextFit(renderer, tx, y + 258, 21, tw - 180, ActiveTransferOwnerText(item), StateColor(item.State));
+                        if (_cfg.NerdStats && !drawer) DrawFocusedSparkline(renderer, new SDL_Rect { x = tx, y = y + 133, w = ContentWidth - 252, h = 31 }, item);
+                        var failed = group.Items.Find(entry => entry.State == DlState.Failed);
+                        if (failed != null) TextFit(renderer, tx, y + 258 + detailShift, 19, tw, "Needs attention · " + PackageTitle(failed.Kind) + " · " + FriendlyTransferFailure(failed.Error), Danger);
+                        else TextFit(renderer, tx, y + 258 + detailShift, 21, tw, ActiveTransferOwnerText(item), StateColor(item.State));
                     }
-                    TextFit(renderer, area.x + area.w - 185, y + 265, 20, 150, "Files  " + group.Items.Count + "  ›", White);
+                    TextFit(renderer, area.x + area.w - 172, y + (drawer ? 186 : 265), 18, 150,
+                        (drawer ? "L2  Close  ˄" : "R2  " + group.Items.Count + " files  ˅"), White);
                 }
                 else
                 {
                     DrawGroupKinds(renderer, group, tx, y + 70, false);
                     TextFit(renderer, area.x + area.w - 252, y + 46, 21, 220, DownloadGroupStatus(group), Muted);
                 }
-                y += height + 20;
+                y += height;
+                if (drawer) { MarkUiProgress("downloads-drawer"); DrawDownloadDrawer(renderer, group, y); y += DownloadDrawerHeight; }
+                if (focus)
+                {
+                    MarkUiProgress("downloads-outline");
+                    SDL_Color stateTone = DownloadRingColor(item);
+                    bool moving = item != null && (item.State == DlState.Downloading || item.State == DlState.Resolving ||
+                        item.State == DlState.Finalizing || item.State == DlState.Installing);
+                    double pulse = !_cfg.ReduceMotion && moving ? .65 + .35 * (.5 + .5 * Math.Sin(UiTick() * Math.PI / 1600.0)) : 1;
+                    var halo = new SDL_Rect { x = frame.x - 2, y = frame.y - 2, w = frame.w + 4, h = frame.h + 4 };
+                    StrokeRect(renderer, halo, C((byte)(stateTone.r * pulse / 3), (byte)(stateTone.g * pulse / 3), (byte)(stateTone.b * pulse / 3)), 1);
+                    StrokeRect(renderer, frame, C((byte)(stateTone.r * pulse), (byte)(stateTone.g * pulse), (byte)(stateTone.b * pulse)), 2);
+                }
+                y += 20;
             }
             if (rows.Count > 4) DrawScrollBar(renderer, new SDL_Rect { x = ContentX + ContentWidth + 16, y = 224, w = 4, h = 716 }, rows.Count, 4, _dlScroll);
+            MarkUiProgress("downloads-complete");
         }
 
         static SDL_Color DownloadRingColor(DlItem item)
@@ -242,31 +290,5 @@ namespace Orbis
             }
         }
 
-        void DrawTransferFiles(IntPtr renderer)
-        {
-            var rows = _queueRows;
-            if (rows.Count == 0) { TextPx(renderer, ContentX, 220, 30, "No files queued", White); return; }
-            var group = rows[0].Group;
-            DrawCase(renderer, new GameHit { TitleId = group.TitleId, Name = group.Name, ImageUrl = group.ImageUrl }, new SDL_Rect { x = ContentX, y = 149, w = 70, h = 89 });
-            TextFit(renderer, ContentX + 96, 149, 32, ContentWidth - 96, group.Name, White);
-            TextPx(renderer, ContentX + 96, 201, 18, group.TitleId + " · " + rows.Count + (rows.Count == 1 ? " file" : " files"), Muted);
-            TextPx(renderer, ContentX, 275, 19, "Package queue", White);
-            TextFit(renderer, ContentX + 918, 276, 18, 522, "Base → Update → DLC", Muted);
-            Fill(renderer, ContentX, 316, ContentWidth, 1, Border);
-            EnsureVisible(ref _dlScroll, _dlFocus, rows.Count, 4);
-            for (int i = _dlScroll; i < rows.Count && i < _dlScroll + 4; i++)
-            {
-                var item = rows[i].Item; int y = 338 + (i - _dlScroll) * 140; bool on = i == _dlFocus;
-                var box = new SDL_Rect { x = ContentX - 16, y = y - 8, w = ContentWidth + 32, h = 124 };
-                if (on) DesignCard(renderer, box, true); else Fill(renderer, ContentX, y + 122, ContentWidth, 1, Border);
-                var tag = new SDL_Rect { x = ContentX + 8, y = y + 13, w = 96, h = 30 };
-                SoftRect(renderer, tag, Raised); TextCentered(renderer, tag, 15, KindShort(item.Kind), PackageTint(item.Kind));
-                TextFit(renderer, ContentX + 128, y + 5, 24, 820, PackageDisplayTitle(item.Kind, item.Label, group.Name, "", item.PackageVersion), White);
-                TextFit(renderer, ContentX + 128, y + 48, 18, 850, item.State == DlState.Failed ? FriendlyTransferFailure(item.Error) : TransferRateLine(item), item.State == DlState.Failed ? Danger : Muted);
-                TextFit(renderer, ContentX + 1080, y + 7, 19, 350, VisibleState(item), StateColor(item.State));
-                TextFit(renderer, ContentX + 1080, y + 49, 18, 350, TransferSizeLine(item), Muted);
-                DrawProgress(renderer, new SDL_Rect { x = ContentX + 128, y = y + 97, w = ContentWidth - 140, h = 4 }, item);
-            }
-        }
     }
 }

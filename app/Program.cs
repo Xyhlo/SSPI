@@ -65,7 +65,7 @@ namespace Orbis
                 throw;
             }
 
-            try { StartupStage("window-run"); Window.Run(); StartupStage("window-exit"); }
+            try { StartupStage("window-run"); using (Window.WatchUi()) Window.Run(); StartupStage("window-exit"); }
             catch (Exception ex) { RecordFailure(ex); StartupStage("window-run-failed"); throw; }
             finally
             {

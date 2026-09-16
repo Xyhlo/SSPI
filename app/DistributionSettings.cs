@@ -73,5 +73,30 @@ namespace Orbis
                 (host.Equals(preferred, StringComparison.OrdinalIgnoreCase) ||
                  host.EndsWith("." + preferred, StringComparison.OrdinalIgnoreCase));
         }
+
+        internal static string ArchivePassword(string sourcePageUrl, string supplied)
+        {
+            if (!string.IsNullOrEmpty(supplied)) return supplied;
+            Uri page;
+            if (!Uri.TryCreate(sourcePageUrl, UriKind.Absolute, out page) ||
+                page.Scheme != Uri.UriSchemeHttps || !string.IsNullOrEmpty(page.UserInfo) || !page.IsDefaultPort)
+                return "";
+            return Get("archivePassword." + page.DnsSafeHost.ToLowerInvariant());
+        }
+
+        internal static string[] ArchivePasswordFallbacks(string sourcePageUrl, string primary, string encoded)
+        {
+            var values = new List<string>(ArchivePasswordDefaults.Decode(encoded));
+            Uri page;
+            if (Uri.TryCreate(sourcePageUrl, UriKind.Absolute, out page) && page.Scheme == Uri.UriSchemeHttps &&
+                string.IsNullOrEmpty(page.UserInfo) && page.IsDefaultPort)
+                for (int i = 0; i < 4; i++)
+                    values.Add(Get("archivePassword." + page.DnsSafeHost.ToLowerInvariant() + (i == 0 ? "" : "." + (i + 1))));
+            var result = new List<string>();
+            foreach (string value in values)
+                if (!string.IsNullOrEmpty(value) && value != primary && !result.Contains(value) && result.Count < 3)
+                    result.Add(value);
+            return result.ToArray();
+        }
     }
 }

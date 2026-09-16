@@ -365,7 +365,7 @@ namespace Orbis
             return lines != null && ((lines.Length == 10 && lines[0] == "6") ||
                 (lines.Length == 11 && lines[0] == "7") ||
                 (((lines.Length == 14 && (lines[0] == "10" || lines[0] == "16")) ||
-                    (lines.Length == 15 && (lines[0] == "13" || lines[0] == "18") && ValidEncodedPassword(lines[14]))) && IsGeneration(lines[11]) &&
+                    (lines.Length >= 15 && (lines[0] == "13" || lines[0] == "18") && ValidEncodedPassword(lines[14]) && ValidPasswordTrailer(lines, 15))) && IsGeneration(lines[11]) &&
                     (lines[13] == "0" || lines[13] == "1")));
         }
 
@@ -403,7 +403,7 @@ namespace Orbis
                 }
                 else if (lines[0] != "9" && lines[0] != "11" && lines[0] != "15" && lines[0] != "17" && lines[0] != "19") return null;
                 bool password = lines[0] == "14" || lines[0] == "15" || lines[0] == "19";
-                return lines.Length == index + (password ? 3 : 2) && IsGeneration(lines[index]) &&
+                return (password ? ValidPasswordTrailer(lines, index + 3) : lines.Length == index + 2) && IsGeneration(lines[index]) &&
                     (!password || ValidEncodedPassword(lines[index + 2])) ? lines[index] : null;
             }
             catch { return null; }
@@ -491,6 +491,30 @@ namespace Orbis
             try { return ValidArchivePassword(new UTF8Encoding(false, true).GetString(Convert.FromBase64String(value))); }
             catch { return false; }
         }
+
+        static bool ValidPasswordTrailer(string[] lines, int start)
+        {
+            if (lines.Length == start) return true;
+            int count;
+            if (lines.Length < start + 2 || lines[start] != "password-fallbacks-v1" ||
+                !int.TryParse(lines[start + 1], out count) || count < 1 || count > 3 || lines.Length != start + 2 + count) return false;
+            for (int i = start + 2; i < lines.Length; i++)
+                if (lines[i].Length == 0 || !ValidEncodedPassword(lines[i])) return false;
+            return true;
+        }
+
+        internal static string AppendPasswordFallbacks(string record, string[] passwords)
+        {
+            if (passwords == null || passwords.Length == 0) return record;
+            if (passwords.Length > 3) throw new IOException("Too many archive password fallbacks");
+            var body = new StringBuilder(record).Append("password-fallbacks-v1\n").Append(passwords.Length).Append('\n');
+            foreach (string password in passwords)
+            {
+                if (string.IsNullOrEmpty(password) || !ValidArchivePassword(password)) throw new IOException("Invalid archive password fallback");
+                body.Append(Encode(password)).Append('\n');
+            }
+            return body.ToString();
+        }
         internal static string CreatePasswordStagedRecord(string id, string url, string destination, string titleId,
             string sha256, string contentId, long size, int expectedKind, int rangeCount, bool autoInstall,
             string afterJobId, string generation, string storageToken, string password)
@@ -527,10 +551,10 @@ namespace Orbis
 
         public static bool TryStartStagedPackageWithPassword(string id, string url, string destination, string titleId,
             string sha256, string contentId, long size, int expectedKind, int rangeCount, bool autoInstall,
-            string afterJobId, string password, out string error, out bool busy)
+            string afterJobId, string password, out string error, out bool busy, string[] passwordFallbacks = null)
         {
             return TryPublishStagedPackage(id, url, destination, titleId, sha256, contentId, size,
-                expectedKind, rangeCount, autoInstall, afterJobId, password, false, false, out error, out busy);
+                expectedKind, rangeCount, autoInstall, afterJobId, password, false, false, out error, out busy, passwordFallbacks);
         }
 
         public static bool TryStartNativeBgftPackage(string id, string url, string destination, string titleId,
@@ -542,18 +566,18 @@ namespace Orbis
         }
 
         public static bool TryStartLocalSource(string id, string source, string titleId, string contentId,
-            long size, int expectedKind, string afterJobId, string password, out string error, out bool busy)
+            long size, int expectedKind, string afterJobId, string password, out string error, out bool busy, string[] passwordFallbacks = null)
         {
             return TryPublishStagedPackage(id, "", source, titleId, "", contentId, size,
-                expectedKind, 1, true, afterJobId, password, false, true, out error, out busy);
+                expectedKind, 1, true, afterJobId, password, false, true, out error, out busy, passwordFallbacks);
         }
 
         static bool TryPublishStagedPackage(string id, string url, string destination, string titleId,
             string sha256, string contentId, long size, int expectedKind, int rangeCount, bool autoInstall,
-            string afterJobId, string password, bool nativeBgft, bool localSource, out string error, out bool busy)
+            string afterJobId, string password, bool nativeBgft, bool localSource, out string error, out bool busy, string[] passwordFallbacks = null)
         {
             error = null; busy = false;
-            if (!ValidArchivePassword(password) || (expectedKind != 0 && !string.IsNullOrEmpty(password)))
+            if (!ValidArchivePassword(password) || (expectedKind != 0 && (!string.IsNullOrEmpty(password) || (passwordFallbacks != null && passwordFallbacks.Length > 0))))
             { error = "Resident archive password metadata is invalid"; return false; }
             Uri address; string storageRoot = null, canonical;
             bool sourceValid = localSource ? LocalInstallSource.TryNormalizePath(destination, out canonical)
@@ -629,6 +653,11 @@ namespace Orbis
                             expectedKind, rangeCount, autoInstall, afterJobId, generation)
                         : CreatePasswordStagedRecord(id, url, destination, titleId, sha256, contentId,
                             size, expectedKind, rangeCount, autoInstall, afterJobId, generation, storageToken, password);
+                    if (passwordFallbacks != null && passwordFallbacks.Length > 0)
+                    {
+                        if (record.StartsWith("10\n", StringComparison.Ordinal)) record = "13" + record.Substring(2) + Encode(password) + "\n";
+                        record = AppendPasswordFallbacks(record, passwordFallbacks);
+                    }
                     WriteAtomic(StagedPath(slot, "job"), record);
                     return true; // Durable publication transfers ownership; do not fall back after this point.
                 }
@@ -668,7 +697,7 @@ namespace Orbis
                 if (lines.Length < 7 || lines[0] != "1" || Decode(lines[1]) != id ||
                     !long.TryParse(lines[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out done) ||
                     !long.TryParse(lines[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out total) ||
-                    done < 0 || total < 0 || done > total) return false;
+                    done < 0 || total < 0 || (done > total && !(lines[2] == "extracting" && total == 0))) return false;
                 if (lines.Length > 7) int.TryParse(lines[7], out lanes);
                 string generation = ReadStagedGeneration(jobPath);
                 if (generation != null && (lines.Length < 13 || lines[10] != generation)) return false;
@@ -795,7 +824,7 @@ namespace Orbis
 
         public static bool TryStartArchiveWithPassword(string id, string destination, string titleId, string expectedContentId,
             System.Collections.Generic.IList<ArchiveVolume> volumes,
-            System.Collections.Generic.IList<string> paths, string generation, string password, out string error)
+            System.Collections.Generic.IList<string> paths, string generation, string password, out string error, string[] passwordFallbacks = null)
         {
             lock (Gate)
             {
@@ -837,7 +866,8 @@ namespace Orbis
                         rangeCount = DownloadTransferSettings.ConnectionsFor(volume.Url, rangeCount);
                     string storageToken = StorageToken(root);
                     var body = new StringBuilder();
-                    body.Append(string.IsNullOrEmpty(password) ? "12\n" : "14\n").Append(Encode(id)).Append('\n').Append(Encode(volumes[0].Url)).Append('\n')
+                    bool hasPassword = !string.IsNullOrEmpty(password) || (passwordFallbacks != null && passwordFallbacks.Length > 0);
+                    body.Append(hasPassword ? "14\n" : "12\n").Append(Encode(id)).Append('\n').Append(Encode(volumes[0].Url)).Append('\n')
                         .Append(Encode(destination)).Append('\n').Append(Encode(titleId)).Append("\n\n").Append(Encode(expectedContentId)).Append('\n')
                         .Append(volumes[0].Size.ToString(CultureInfo.InvariantCulture)).Append("\n").Append(rangeCount).Append("\n")
                         .Append(volumes.Count.ToString(CultureInfo.InvariantCulture)).Append('\n');
@@ -849,8 +879,8 @@ namespace Orbis
                             .Append(volume.Size.ToString(CultureInfo.InvariantCulture)).Append('\n');
                     }
                     body.Append(generation).Append('\n').Append(storageToken).Append('\n');
-                    if (!string.IsNullOrEmpty(password)) body.Append(Encode(password)).Append('\n');
-                    WriteAtomic(JobPath, body.ToString());
+                    if (hasPassword) body.Append(Encode(password)).Append('\n');
+                    WriteAtomic(JobPath, AppendPasswordFallbacks(body.ToString(), passwordFallbacks));
                     // Durable publication transfers ownership even if the process switches
                     // before the plugin can acknowledge it. Never fall back after this write.
                     error = null;
@@ -1292,6 +1322,13 @@ namespace Orbis
         public static void MarkFailed(string id)
         {
             WriteControl(id, "cancel");
+        }
+
+        public static bool TryCancel(string id, out string error)
+        {
+            bool written = WriteControl(id, "cancel");
+            error = written ? null : "Could not send cancellation to the resident: " + LastError;
+            return written;
         }
 
         public static void Release(string id)

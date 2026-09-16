@@ -269,7 +269,9 @@ namespace Orbis
                         Label = Text(row, "label", 512, false), HosterName = Text(row, "hoster", 256, false),
                         PackageVersion = Text(row, "version", 64, false), RequiredFirmware = Text(row, "requiredFirmware", 64, false),
                         PackageGroupId = Text(row, "groupId", 256, false), SourcePageUrl = Url(Text(row, "sourcePageUrl", 2048, false), false),
-                        ArchivePassword = Text(row, "archivePassword", 256, false), ExpectedSha256 = Sha(Text(row, "sha256", 64, false)),
+                        ArchivePassword = Text(row, "archivePassword", 256, false),
+                        ArchivePasswords = PasswordDefaults(row),
+                        ExpectedSha256 = Sha(Text(row, "sha256", 64, false)),
                         ExpectedContentId = Text(row, "contentId", 128, false), AccessType = Access(Text(row, "accessType", 32, true)) };
                     if (publishedKind == "backport" && candidate.Label.IndexOf("backport", StringComparison.OrdinalIgnoreCase) < 0)
                         candidate.Label = candidate.Label.Length == 0 ? "Backport" : "Backport - " + candidate.Label;
@@ -374,13 +376,20 @@ namespace Orbis
             return value;
         }
         static string Hash(byte[] value) { using (var sha = SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(value)).Replace("-", "").ToLowerInvariant(); }
+        static string PasswordDefaults(Dictionary<string, object> row)
+        {
+            object value = Value(row, "archivePasswords", false);
+            if (value != null && !(value is IList)) throw Bad("archivePasswords must be an array");
+            try { return ArchivePasswordDefaults.Encode(value as IList); }
+            catch (FormatException ex) { throw Bad(ex.Message); }
+        }
         static InvalidDataException Bad(string message) { return new InvalidDataException("Static catalog: " + message); }
         static void CheckCanceled(Func<bool> cancel) { if (cancel != null && cancel()) throw new OperationCanceledException(); }
         internal static int CompareTitle(SourceTitleResult a, SourceTitleResult b)
         { int n = StringComparer.OrdinalIgnoreCase.Compare(a.DisplayName, b.DisplayName); if (n != 0) return n; n = StringComparer.Ordinal.Compare(a.SourceId, b.SourceId); if (n != 0) return n; n = StringComparer.Ordinal.Compare(a.TitleId, b.TitleId); return n != 0 ? n : StringComparer.Ordinal.Compare(a.Region, b.Region); }
         internal static SourceTitleResult CloneTitle(SourceTitleResult value)
-        { return new SourceTitleResult { SourceId = value.SourceId, SourceVersion = value.SourceVersion, SourceAttribution = value.SourceAttribution, StableResultId = value.StableResultId, TitleId = value.TitleId, DisplayName = value.DisplayName, Region = value.Region, ImageUrl = value.ImageUrl, CatalogUrl = value.CatalogUrl, Rating = value.Rating, Genres = value.Genres, Backport = value.Backport, SearchRankHint = value.SearchRankHint }; }
+        { return new SourceTitleResult { SourceId = value.SourceId, SourceVersion = value.SourceVersion, SourceAttribution = value.SourceAttribution, StableResultId = value.StableResultId, TitleId = value.TitleId, DisplayName = value.DisplayName, Region = value.Region, ImageUrl = value.ImageUrl, CatalogUrl = value.CatalogUrl, Rating = value.Rating, Genres = value.Genres, Backport = value.Backport, SearchRankHint = value.SearchRankHint, Variants = value.Variants == null ? null : new List<SourceTitleResult>(value.Variants) }; }
         static PackageCandidate CloneCandidate(PackageCandidate value)
-        { return new PackageCandidate { SourceId = value.SourceId, SourceVersion = value.SourceVersion, SourceAttribution = value.SourceAttribution, CandidateId = value.CandidateId, TitleId = value.TitleId, DisplayName = value.DisplayName, Region = value.Region, PackageKindHint = value.PackageKindHint, PackageVersion = value.PackageVersion, RequiredFirmware = value.RequiredFirmware, PackageGroupId = value.PackageGroupId, HosterName = value.HosterName, Label = value.Label, Url = value.Url, AccessType = value.AccessType, SourcePageUrl = value.SourcePageUrl, ExpectedByteSize = value.ExpectedByteSize, ExpectedSha256 = value.ExpectedSha256, ExpectedContentId = value.ExpectedContentId, ArchiveVolumes = value.ArchiveVolumes, ArchivePassword = value.ArchivePassword, ResolutionError = value.ResolutionError }; }
+        { return new PackageCandidate { SourceId = value.SourceId, SourceVersion = value.SourceVersion, SourceAttribution = value.SourceAttribution, CandidateId = value.CandidateId, TitleId = value.TitleId, DisplayName = value.DisplayName, Region = value.Region, PackageKindHint = value.PackageKindHint, PackageVersion = value.PackageVersion, RequiredFirmware = value.RequiredFirmware, PackageGroupId = value.PackageGroupId, HosterName = value.HosterName, Label = value.Label, Url = value.Url, AccessType = value.AccessType, SourcePageUrl = value.SourcePageUrl, ExpectedByteSize = value.ExpectedByteSize, ExpectedSha256 = value.ExpectedSha256, ExpectedContentId = value.ExpectedContentId, ArchiveVolumes = value.ArchiveVolumes, ArchivePassword = value.ArchivePassword, ArchivePasswords = value.ArchivePasswords, ResolutionError = value.ResolutionError }; }
     }
 }
