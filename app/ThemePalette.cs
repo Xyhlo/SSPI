@@ -58,7 +58,8 @@ namespace Orbis
             new ThemeAccentPreset("Violet", "#A78BFA"),
             new ThemeAccentPreset("Crimson", "#FF4D4D"),
             new ThemeAccentPreset("Amber", "#F5A623"),
-            new ThemeAccentPreset("Teal", "#2EE6C5")
+            new ThemeAccentPreset("Teal", "#2EE6C5"),
+            new ThemeAccentPreset("Pink", "#F58BBF")
         };
 
         public static IList<ThemeAccentPreset> Presets
