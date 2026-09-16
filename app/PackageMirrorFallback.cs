@@ -9,6 +9,7 @@ namespace Orbis
     {
         internal string Url, CandidateId, AccessType, SourcePageUrl, SourceAttribution;
         internal string ExpectedSha256, ExpectedContentId, ExpiresUtc, ArchivePassword;
+        internal string ArchivePasswords;
         internal long ExpectedByteSize;
     }
 
@@ -34,6 +35,7 @@ namespace Orbis
                     Field(output, "content_id", candidate.ExpectedContentId);
                     Field(output, "expires_utc", candidate.ExpiresUtc.HasValue ? candidate.ExpiresUtc.Value.ToUniversalTime().ToString("o") : "");
                     Field(output, "archive_password", candidate.ArchivePassword);
+                    Field(output, "archive_passwords", candidate.ArchivePasswords);
                     output.Append("\"size\":").Append((candidate.ExpectedByteSize ?? 0).ToString(CultureInfo.InvariantCulture)).Append('}');
                     if (count == 3) break;
                 }
@@ -91,7 +93,8 @@ namespace Orbis
                     AccessType = access, SourcePageUrl = JsonLite.GetString(row, "source_page_url") ?? "",
                     SourceAttribution = JsonLite.GetString(row, "source_attribution") ?? "",
                     ExpectedSha256 = JsonLite.GetString(row, "sha256") ?? "", ExpectedContentId = JsonLite.GetString(row, "content_id") ?? "",
-                    ExpectedByteSize = Math.Max(0, size), ExpiresUtc = expires ?? "", ArchivePassword = JsonLite.GetString(row, "archive_password") ?? "" });
+                    ExpectedByteSize = Math.Max(0, size), ExpiresUtc = expires ?? "", ArchivePassword = JsonLite.GetString(row, "archive_password") ?? "",
+                    ArchivePasswords = JsonLite.GetString(row, "archive_passwords") ?? "" });
                 if (output.Count == 3) break;
             }
             return output;

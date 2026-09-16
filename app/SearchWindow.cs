@@ -426,7 +426,7 @@ namespace Orbis
         {
             _landingContinue.Clear();
             _landingPebble = null;
-            List<DlItem> items = _dlMgr == null ? null : _dlMgr.Snapshot();
+            List<DlItem> items = ReadDownloadSnapshot();
             PollDownloadAudio(items);
             if (items != null)
             {
@@ -529,9 +529,9 @@ namespace Orbis
                     item.State != DlState.Submitted)
                     continue;
                 if (!seen.Add(item.TitleId)) continue;
-                bool onConsole = false;
-                try { onConsole = PkgInstaller.IsTitleInstalled(item.TitleId); } catch { }
-                if (!onConsole && item.State != DlState.Installed) continue;
+                // The background console scan above supplies installed titles. A
+                // render/update must never enter the native installer to check one.
+                if (item.State != DlState.Installed) continue;
                 var hit = new GameHit
                 {
                     TitleId = item.TitleId,
@@ -772,6 +772,13 @@ namespace Orbis
         {
             _lastInputAt = UiTick();
             if (!_launchFinished) { HandleStartupButton(button); Invalidated = true; return; }
+            if (!_settingsOpen && !_softKbOpen && _uiOverlay == UiOverlay.None &&
+                _tab == TopTab.Downloads && _downloadFilesTitle != null)
+            {
+                HandleDownloads(button);
+                Invalidated = true;
+                return;
+            }
             if (!_settingsOpen && !_softKbOpen && _uiOverlay == UiOverlay.None && _tab == TopTab.Downloads && button == DS4Button.SCE_PAD_BUTTON_TOUCH_PAD)
             { _settingsOpen=true; _settingsPage=6; _settingsFocus=0; _cloudFolder=""; _cloudMenu=false; _cloudMessage=""; return; }
             if (_settingsOpen && _settingsPage==6 && !_softKbOpen && _uiOverlay == UiOverlay.None)
@@ -1041,7 +1048,7 @@ namespace Orbis
 
         void HandleSettingsGeneral(DS4Button b)
         {
-            const int n = 7;
+            const int n = 8;
             if (b == DS4Button.SCE_PAD_BUTTON_UP) { _settingsFocus = (_settingsFocus + n - 1) % n; return; }
             if (b == DS4Button.SCE_PAD_BUTTON_DOWN) { _settingsFocus = (_settingsFocus + 1) % n; return; }
             if (b != DS4Button.SCE_PAD_BUTTON_CROSS) return;
@@ -1056,6 +1063,7 @@ namespace Orbis
             else if (_settingsFocus == 3) { _cfg.NerdStats = !_cfg.NerdStats; MarkSettingsDirty(); }
             else if (_settingsFocus == 4) { _cfg.ShowFirmwareHints = !_cfg.ShowFirmwareHints; MarkSettingsDirty(); }
             else if (_settingsFocus == 5) { _uiOverlay = UiOverlay.ConfirmClearHistory; _overlayTitle = "Clear removable history?"; }
+            else if (_settingsFocus == 6) { _cfg.RetrySourceArchivePasswords = !_cfg.RetrySourceArchivePasswords; MarkSettingsDirty(); }
             else SaveSettingsAndClose();
         }
 
@@ -1817,6 +1825,15 @@ namespace Orbis
                 if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE) LeaveDetail();
                 return;
             }
+            if (b == DS4Button.SCE_PAD_BUTTON_L2) {
+                if (_selected != null && _selected.Variants != null && _selected.Variants.Count > 1) {
+                    var variants = _selected.Variants;
+                    int index = variants.FindIndex(v => v.TitleId == _selected.TitleId && v.Region == _selected.Region && v.Source == _selected.Source && v.CatalogUrl == _selected.CatalogUrl);
+                    _selected = _selected.WithVariant(variants[(index + 1) % variants.Count]);
+                    ResetPackageFilters(); StartResolveJob();
+                }
+                return;
+            }
             if (_links.Count == 0)
             {
                 if (b == DS4Button.SCE_PAD_BUTTON_CROSS ||
@@ -1829,11 +1846,10 @@ namespace Orbis
                 if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE) LeaveDetail();
                 return;
             }
-            if (b == DS4Button.SCE_PAD_BUTTON_LEFT || b == DS4Button.SCE_PAD_BUTTON_RIGHT || b == DS4Button.SCE_PAD_BUTTON_L2 || b == DS4Button.SCE_PAD_BUTTON_R2)
+            if (b == DS4Button.SCE_PAD_BUTTON_LEFT || b == DS4Button.SCE_PAD_BUTTON_RIGHT || b == DS4Button.SCE_PAD_BUTTON_R2)
             {
                 if (b == DS4Button.SCE_PAD_BUTTON_LEFT) _packageFilter = (_packageFilter + 4) % 5;
                 if (b == DS4Button.SCE_PAD_BUTTON_RIGHT) _packageFilter = (_packageFilter + 1) % 5;
-                if (b == DS4Button.SCE_PAD_BUTTON_L2) _hostFilter = (_hostFilter + 1) % (_detailHosts.Count + 1);
                 if (b == DS4Button.SCE_PAD_BUTTON_R2) _latestUpdateOnly = !_latestUpdateOnly;
                 _detailFocus = _detailScroll = 0; RebuildDetailRows(); return;
             }
@@ -1903,113 +1919,35 @@ namespace Orbis
 
         void HandleDownloads(DS4Button b)
         {
-            if (_fileDetailId == null && _downloadFilesTitle != null && b == DS4Button.SCE_PAD_BUTTON_CIRCLE) { _downloadFilesTitle = null; _dlFocus = _dlScroll = 0; _queueModelReady = false; return; }
-            if (!string.IsNullOrEmpty(_fileDetailId))
-            {
-                if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE || b == DS4Button.SCE_PAD_BUTTON_R2) _fileDetailId = null;
-                else if (b == DS4Button.SCE_PAD_BUTTON_UP) _fileScroll = Math.Max(0, _fileScroll - 1);
-                else if (b == DS4Button.SCE_PAD_BUTTON_DOWN) _fileScroll++;
-                return;
-            }
-            if (b == DS4Button.SCE_PAD_BUTTON_L2) { _queueFilter = (_queueFilter + 1) % 3; _dlFocus = _dlScroll = 0; }
             RefreshQueueModel(true);
             var rows = _queueRows;
-            _queueModelReady = false;
+            ClampDownloadFocus(rows);
+            if (_downloadFilesTitle != null && HandleDownloadDrawer(b)) return;
+            if (b == DS4Button.SCE_PAD_BUTTON_L2) { _queueFilter = (_queueFilter + 1) % 3; _dlFocus = _dlScroll = 0; _queueModelReady = false; return; }
             if (rows.Count == 0)
             {
                 if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE) { _tab = TopTab.Search; SetStatus("Search"); }
-                else if (b == DS4Button.SCE_PAD_BUTTON_SQUARE)
-                {
-                    int skipped;
-                    string err;
-                    int n = _dlMgr.ClearTerminal(out skipped, out err);
-                    SetStatus(n > 0 ? ("Cleared " + n + " finished") : "Nothing to clear");
-                }
                 return;
             }
-            ClampDownloadFocus(rows);
-            DownloadTreeRow current = rows[_dlFocus];
-            string groupKey = current.Group.Key ?? "";
-            if (b == DS4Button.SCE_PAD_BUTTON_R2)
-            {
-                if (_downloadFilesTitle == null) { _downloadFilesTitle = groupKey; _dlFocus = _dlScroll = 0; _queueModelReady = false; }
-                else OpenFileDetails(current.Item);
-                return;
-            }
-
+            var current = rows[_dlFocus];
             switch (b)
             {
-                case DS4Button.SCE_PAD_BUTTON_LEFT:
-                    if (!current.IsRoot)
-                        _dlFocus = FindDownloadRoot(rows, groupKey);
-                    else if (current.HasChildren)
-                        _collapsedDownloadGroups.Add(groupKey);
-                    return;
-                case DS4Button.SCE_PAD_BUTTON_RIGHT:
-                    if (current.IsRoot && current.HasChildren)
-                    {
-                        if (_collapsedDownloadGroups.Remove(groupKey)) return;
-                        if (_dlFocus + 1 < rows.Count && !rows[_dlFocus + 1].IsRoot)
-                            _dlFocus++;
-                    }
-                    return;
-                case DS4Button.SCE_PAD_BUTTON_UP:
-                    _dlFocus = (_dlFocus + rows.Count - 1) % rows.Count;
-                    return;
-                case DS4Button.SCE_PAD_BUTTON_DOWN:
-                    _dlFocus = (_dlFocus + 1) % rows.Count;
-                    return;
-                case DS4Button.SCE_PAD_BUTTON_CROSS:
-                    if (current.Item != null)
-                    {
-                        if (current.Item.State == DlState.Completed) { _overlayDownloadId = current.Item.Id; _uiOverlay = UiOverlay.Install; }
-                        else ActOnDownload(current.Item);
-                    }
-                    else if (current.HasChildren)
-                    {
-                        if (_collapsedDownloadGroups.Remove(groupKey)) return;
-                        if (_dlFocus + 1 < rows.Count && !rows[_dlFocus + 1].IsRoot)
-                            _dlFocus++;
-                    }
-                    break;
-                case DS4Button.SCE_PAD_BUTTON_TRIANGLE:
-                    var cur = current.Item;
-                    if (cur == null)
-                    {
-                        int skipped;
-                        string cerr;
-                        int n = _dlMgr.ClearTerminal(out skipped, out cerr);
-                        SetStatus(n > 0
-                            ? ("Cleared " + n + (skipped > 0 ? ("; skipped " + skipped) : ""))
-                            : "Nothing finished to clear");
-                        return;
-                    }
-                    if ((cur.State == DlState.Completed || cur.State == DlState.Installed) && IsBasePackage(cur))
-                        StartInstall(cur, true);
-                    else
-                        SetStatus("TRIANGLE on game row = clear finished; on PKG = force reinstall");
-                    break;
+                case DS4Button.SCE_PAD_BUTTON_UP: _dlFocus = (_dlFocus + rows.Count - 1) % rows.Count; return;
+                case DS4Button.SCE_PAD_BUTTON_DOWN: _dlFocus = (_dlFocus + 1) % rows.Count; return;
+                case DS4Button.SCE_PAD_BUTTON_R2:
+                case DS4Button.SCE_PAD_BUTTON_RIGHT: OpenDownloadDrawer(current.Group); return;
+                case DS4Button.SCE_PAD_BUTTON_CROSS: if (current.Item != null) ActOnDownload(current.Item); return;
                 case DS4Button.SCE_PAD_BUTTON_SQUARE:
-                    cur = current.Item;
-                    if (cur == null) return;
-                    if (cur.State == DlState.Installing)
-                    {
-                        SetStatus("Install is already running");
-                        return;
-                    }
-                    _overlayDownloadId = cur.Id;
-                    _overlayTitle = "Remove " + PackageTitle(cur.Kind) + "?";
-                    _uiOverlay = (cur.State == DlState.Downloading || cur.State == DlState.Resolving || cur.State == DlState.Finalizing)
-                        ? UiOverlay.ConfirmCancel : UiOverlay.ConfirmRemove;
-                    break;
-                case DS4Button.SCE_PAD_BUTTON_CIRCLE:
-                    _tab = TopTab.Search; SetStatus("Search"); break;
+                    _removeGroupIds = current.Group.Items.ConvertAll(item => item.Id).ToArray();
+                    _overlayDownloadId = current.Item == null ? null : current.Item.Id;
+                    _overlayTitle = "Remove game from queue?"; _uiOverlay = UiOverlay.ConfirmRemove; return;
+                case DS4Button.SCE_PAD_BUTTON_CIRCLE: _tab = TopTab.Search; SetStatus("Search"); return;
             }
         }
 
         DlItem OverlayDownload()
         {
-            foreach (DlItem item in _dlMgr.Snapshot())
+            foreach (DlItem item in ReadDownloadSnapshot())
                 if (string.Equals(item.Id, _overlayDownloadId, StringComparison.Ordinal)) return item;
             return null;
         }
@@ -2042,7 +1980,7 @@ namespace Orbis
                 else DiscardSettingsAndClose();
                 return;
             }
-            if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE) { _uiOverlay = UiOverlay.None; return; }
+            if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE) { _removeGroupIds = null; _uiOverlay = UiOverlay.None; return; }
             if (_uiOverlay == UiOverlay.DownloadActions)
             {
                 const int n = 4;
@@ -2058,12 +1996,15 @@ namespace Orbis
                 }
                 else if (_overlayFocus == 1)
                 {
-                    string error;
-                    User.NotifyToast(_dlMgr.MoveUp(item.Id, out error) ? "Moved up" : Clip(error, 42));
+                    RunDownloadAction(() => {
+                        string error;
+                        User.NotifyToast(_dlMgr.MoveUp(item.Id, out error) ? "Moved up" : Clip(error, 42));
+                    });
                     _uiOverlay = UiOverlay.None;
                 }
                 else if (_overlayFocus == 2)
                 {
+                    _removeGroupIds = null;
                     _uiOverlay = (item.Background || item.State == DlState.Queued || item.State == DlState.Installing ||
                         item.State == DlState.Downloading || item.State == DlState.Resolving || item.State == DlState.Finalizing)
                         ? UiOverlay.ConfirmCancel : UiOverlay.ConfirmRemove;
@@ -2080,11 +2021,28 @@ namespace Orbis
             }
             else if (_uiOverlay == UiOverlay.ConfirmRemove || _uiOverlay == UiOverlay.ConfirmCancel)
             {
-                DlItem item = OverlayDownload(); string error = null; bool ok = false;
-                if (item != null) ok = _uiOverlay == UiOverlay.ConfirmCancel
-                    ? _dlMgr.Cancel(item.Id, out error) : _dlMgr.Remove(item.Id, out error);
+                if (_removeGroupIds != null)
+                {
+                    var ids = _removeGroupIds;
+                    _removeGroupIds = null; _uiOverlay = UiOverlay.None;
+                    RunDownloadAction(() => {
+                    int removed = 0; string detail = null;
+                    foreach (string id in ids)
+                    {
+                        string groupError;
+                        if (_dlMgr.Remove(id, out groupError) || groupError == "Download not found") removed++; else detail = groupError;
+                    }
+                    User.NotifyToast(detail == null ? "Removal requested for " + removed + " packages" : "Removed " + removed + "; " + Clip(detail, 60));
+                    });
+                    return;
+                }
+                DlItem item = OverlayDownload();
                 _uiOverlay = UiOverlay.None;
-                User.NotifyToast(ok ? "Removed " + (item == null ? "package" : item.TitleId) : Clip(error ?? "Remove failed", 48));
+                RunDownloadAction(() => {
+                    string error = null;
+                    bool ok = item != null && _dlMgr.Remove(item.Id, out error);
+                    User.NotifyToast(ok ? "Removal requested" : Clip(error ?? "Remove failed", 48));
+                });
             }
             else if (_uiOverlay == UiOverlay.ConfirmClearToken)
             {
@@ -2102,54 +2060,77 @@ namespace Orbis
             }
             else if (_uiOverlay == UiOverlay.ConfirmClearHistory)
             {
-                int skipped; string error; int count = _dlMgr.ClearTerminal(out skipped, out error);
-                _uiOverlay = UiOverlay.None; User.NotifyToast(count > 0 ? "History cleared" : "Nothing to clear");
+                _uiOverlay = UiOverlay.None;
+                RunDownloadAction(() => {
+                    int skipped; string error; int count = _dlMgr.ClearTerminal(out skipped, out error);
+                    User.NotifyToast(count > 0 ? "History cleared" : "Nothing to clear");
+                });
             }
         }
 
         void DrawUiOverlay(IntPtr r)
         {
             if (_uiOverlay == UiOverlay.QrPair) { DrawCharcoalPair(r); return; }
-            var panel = new SDL_Rect { x = 570, y = 290, w = 780, h = _uiOverlay == UiOverlay.DownloadActions ? 480 :
-                (_uiOverlay == UiOverlay.ConfirmSaveSettings ? 360 : 310) };
-            Fill(r, panel.x + 8, panel.y + 10, panel.w, panel.h, Shadow); Fill(r, panel.x, panel.y, panel.w, panel.h, Panel);
-            StrokeRect(r, panel, Border, 2); Fill(r, panel.x, panel.y + 14, 6, panel.h - 28, Accent);
+            var panel = new SDL_Rect { x = (W - 900) / 2, w = 900, h = _uiOverlay == UiOverlay.DownloadActions ? 490 :
+                (_uiOverlay == UiOverlay.ConfirmSaveSettings ? 400 : 350) };
+            panel.y = (H - panel.h) / 2;
+            Fill(r, 0, 0, W, H, new SDL_Color { r = 0, g = 0, b = 0, a = 155 });
+            SoftRect(r, new SDL_Rect { x = panel.x - 5, y = panel.y + 8, w = panel.w + 10, h = panel.h + 6 }, new SDL_Color { r = 0, g = 0, b = 0, a = 110 });
+            SoftRect(r, panel, Panel); StrokeRect(r, panel, C(77, 80, 82), 1);
             DlItem item = OverlayDownload();
             string title = _uiOverlay == UiOverlay.Install ? "Install package?" :
                 (_uiOverlay == UiOverlay.DownloadActions ? (item == null ? "Package actions" : PackageTitle(item.Kind)) :
                 (_uiOverlay == UiOverlay.ConfirmSaveSettings ? "Save settings?" : _overlayTitle));
             TextFit(r, panel.x + 36, panel.y + 30, 30, panel.w - 72, title, White);
+            Fill(r, panel.x + 36, panel.y + 78, panel.w - 72, 1, Border);
             if (_uiOverlay == UiOverlay.DownloadActions)
             {
                 string primary = item != null && item.State == DlState.Paused ? "Resume" :
                     (item != null && (item.State == DlState.Failed || item.State == DlState.Canceled) ? "Retry" : "Pause");
                 string[] actions = { primary, "Move up", "Remove", "Cancel" };
-                for (int i = 0; i < actions.Length; i++)
-                    DrawSettingsRow(r, panel.x + 36, panel.y + 92 + i * 78, panel.w - 72, 66, _overlayFocus == i ? _settingsFocus : -2,
-                        actions[i], "", i == 2 ? "REMOVE" : "");
-                // DrawSettingsRow keys from settings focus; add the actual action focus explicitly.
-                int fy = panel.y + 92 + _overlayFocus * 78;
-                StrokeRect(r, new SDL_Rect { x = panel.x + 36, y = fy, w = panel.w - 72, h = 66 }, Accent, 3);
+                for (int i = 0; i < actions.Length; i++) {
+                    var action = new SDL_Rect { x = panel.x + 28, y = panel.y + 98 + i * 78, w = panel.w - 56, h = 64 };
+                    bool focused = _overlayFocus == i; var tone = i == 2 ? Danger : Accent;
+                    SoftRect(r, action, focused ? Focused : Row);
+                    if (focused) StrokeRect(r, action, tone, 2);
+                    TextPx(r, action.x + 24, action.y + 18, 22, actions[i], i == 2 ? Danger : White);
+                    if (focused) GamepadIcons.Draw(r, "cross", action.x + action.w - 56, action.y + 15, 34);
+                }
+                TextPx(r, panel.x + 36, panel.y + panel.h - 45, 17, "↑ / ↓ Select     × Choose     ○ Back", Muted);
             }
             else if (_uiOverlay == UiOverlay.ConfirmSaveSettings)
             {
                 TextFit(r, panel.x + 36, panel.y + 92, 20, panel.w - 72,
                     "Unsaved changes will be lost if you skip save.", Muted);
-                DrawSettingsRow(r, panel.x + 36, panel.y + 150, panel.w - 72, 66, -2,
-                    "Save changes", "Write settings.ini", "SAVE");
-                DrawSettingsRow(r, panel.x + 36, panel.y + 226, panel.w - 72, 66, -2,
-                    "Don't save", "Discard and close", "SKIP");
-                int fy = panel.y + (_overlayFocus == 0 ? 150 : 226);
-                StrokeRect(r, new SDL_Rect { x = panel.x + 36, y = fy, w = panel.w - 72, h = 66 }, Accent, 3);
+                for (int i = 0; i < 2; i++) {
+                    var choice = new SDL_Rect { x = panel.x + 28, y = panel.y + 150 + i * 78, w = panel.w - 56, h = 66 };
+                    SoftRect(r, choice, _overlayFocus == i ? Focused : Row);
+                    if (_overlayFocus == i) StrokeRect(r, choice, Accent, 2);
+                    TextPx(r, choice.x + 24, choice.y + 19, 22, i == 0 ? "Save changes" : "Discard changes", White);
+                    if (_overlayFocus == i) GamepadIcons.Draw(r, "cross", choice.x + choice.w - 56, choice.y + 16, 34);
+                }
+                TextPx(r, panel.x + 36, panel.y + panel.h - 45, 17, "↑ / ↓ Select     × Choose     ○ Back", Muted);
             }
             else
             {
                 string consequence = _uiOverlay == UiOverlay.Install ?
                     ((item == null ? "PKG" : PackageTitle(item.Kind)) + " · install from local storage") :
                     (_uiOverlay == UiOverlay.ConfirmClearToken ? "Downloads will use direct links until paired again." :
-                    (_uiOverlay == UiOverlay.ConfirmClearHistory ? "Finished and removable rows will be cleared." : "This action cannot be undone."));
-                TextFit(r, panel.x + 36, panel.y + 100, 20, panel.w - 72, consequence, Muted);
-                TextPx(r, panel.x + 36, panel.y + panel.h - 68, 19, "× Confirm     ○ Cancel", White);
+                    (_uiOverlay == UiOverlay.ConfirmClearHistory ? "Finished and removable rows will be cleared." :
+                    _removeGroupIds != null ? "All " + _removeGroupIds.Length + " queued packages. Installed games and USB originals are kept." : "Remove this package from the queue. Installed games and USB originals are kept."));
+                int split = consequence.Length > 72 ? consequence.LastIndexOf(' ', Math.Min(72, consequence.Length - 1)) : -1;
+                TextFit(r, panel.x + 36, panel.y + 108, 21, panel.w - 72, split > 0 ? consequence.Substring(0, split) : consequence, Muted);
+                if (split > 0) TextFit(r, panel.x + 36, panel.y + 142, 21, panel.w - 72, consequence.Substring(split + 1), Muted);
+                bool destructive = _uiOverlay != UiOverlay.Install;
+                var confirm = new SDL_Rect { x = panel.x + 28, y = panel.y + panel.h - 94, w = (panel.w - 72) / 2, h = 64 };
+                var cancel = new SDL_Rect { x = confirm.x + confirm.w + 16, y = confirm.y, w = confirm.w, h = confirm.h };
+                SoftRect(r, confirm, destructive ? C(62, 33, 41) : Focused);
+                StrokeRect(r, confirm, destructive ? Danger : Accent, 1);
+                SoftRect(r, cancel, Row); StrokeRect(r, cancel, Border, 1);
+                GamepadIcons.Draw(r, "cross", confirm.x + 24, confirm.y + 14, 36);
+                GamepadIcons.Draw(r, "circle", cancel.x + 24, cancel.y + 14, 36);
+                TextPx(r, confirm.x + 76, confirm.y + 19, 22, _uiOverlay == UiOverlay.Install ? "Install" : "Confirm", White);
+                TextPx(r, cancel.x + 76, cancel.y + 19, 22, "Cancel", White);
             }
         }
 
@@ -2177,22 +2158,15 @@ namespace Orbis
             }
             if (item.State == DlState.Completed)
             {
-                string miss;
-                if (!_dlMgr.EnsureLocalPackage(item.Id, out miss))
-                {
-                    SetStatus(miss);
-                    return;
-                }
                 StartInstall(item, false);
             }
             else if (item.State == DlState.Failed &&
                      (item.Error ?? "").IndexOf("missing", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                _dlMgr.TogglePause(item.Id); // re-queue
-                SetStatus("Re-queued missing PKG");
+                RunDownloadAction(() => { _dlMgr.TogglePause(item.Id); SetStatus("Re-queued missing PKG"); });
             }
             else
-                _dlMgr.TogglePause(item.Id);
+                RunDownloadAction(() => _dlMgr.TogglePause(item.Id));
         }
 
         void ClampDownloadFocus(List<DownloadTreeRow> rows)
@@ -2236,12 +2210,7 @@ namespace Orbis
             var rows = new List<DownloadTreeRow>();
             foreach (var group in groups)
             {
-                if (_downloadFilesTitle != null)
-                {
-                    if (group.Key != _downloadFilesTitle) continue;
-                    foreach (var item in group.Items) rows.Add(new DownloadTreeRow { Group = group, Item = item });
-                }
-                else if (QueueGroupMatches(group))
+                if (QueueGroupMatches(group) || group.Key == _downloadFilesTitle)
                     rows.Add(new DownloadTreeRow { Group = group, Item = PrimaryTransfer(group), IsRoot = true, ChildCount = group.Items.Count });
             }
             return rows;
@@ -2387,7 +2356,11 @@ namespace Orbis
         {
             var hits = new List<GameHit>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var result in results)
+            var variants = new List<SourceTitleResult>();
+            foreach (var group in results) {
+                if (group.Variants != null) variants.AddRange(group.Variants); else variants.Add(group);
+            }
+            foreach (var result in variants)
             {
                 string key = result.SourceId + "\n" + result.SourceVersion + "\n" + result.TitleId + "\n" + result.Region + "\n" + result.CatalogUrl;
                 if ((string.IsNullOrEmpty(result.TitleId) && string.IsNullOrEmpty(result.CatalogUrl)) || !seen.Add(key)) continue;
@@ -2399,7 +2372,7 @@ namespace Orbis
                     CatalogUrl = result.CatalogUrl, Rating = result.Rating, Genres = result.Genres, Backport = result.Backport
                 });
             }
-            return hits;
+            return GameHit.GroupGames(hits);
         }
 
         static string ResolveSelectionRegion(string region)
@@ -2914,10 +2887,14 @@ namespace Orbis
             }
             try
             {
-                string queueMessage;
-                _dlMgr.Enqueue(_selected, candidate, _linkCandidates, out queueMessage);
-                SetStatus(queueMessage + " · R1 Downloads");
-                User.NotifyToast(PackageTitle(candidate.PackageKindHint) + " added · R1 Downloads");
+                var game = _selected;
+                var mirrors = new List<PackageCandidate>(_linkCandidates);
+                RunDownloadAction(() => {
+                    string queueMessage;
+                    _dlMgr.Enqueue(game, candidate, mirrors, out queueMessage);
+                    SetStatus(queueMessage + " · R1 Downloads");
+                    User.NotifyToast(PackageTitle(candidate.PackageKindHint) + " added · R1 Downloads");
+                });
                 Invalidated = true;
             }
             catch (Exception ex)
@@ -2927,6 +2904,32 @@ namespace Orbis
         }
 
         void StartInstall(DlItem item, bool uninstallFirst)
+        { RunDownloadAction(() => PrepareInstall(item, uninstallFirst)); }
+
+        int _downloadActionBusy;
+        void RunDownloadAction(Action action)
+        {
+            if (Interlocked.CompareExchange(ref _downloadActionBusy, 1, 0) != 0)
+            { User.NotifyToast("Previous queue action is still finishing"); return; }
+            SetStatus("Updating download queue...");
+            ThreadPool.QueueUserWorkItem(_ => {
+                try { action(); }
+                catch (Exception ex) {
+                    Program.RecordFailure(ex);
+                    SetStatus("Queue action failed: " + Clip(ex.Message, 100));
+                    User.NotifyToast("Queue action failed; files retained");
+                }
+                finally {
+                    lock (_lock) {
+                        _queueModelReady = false; Invalidated = true;
+                        if (_status == "Updating download queue...") _status = "Download queue updated";
+                    }
+                    Interlocked.Exchange(ref _downloadActionBusy, 0);
+                }
+            });
+        }
+
+        void PrepareInstall(DlItem item, bool uninstallFirst)
         {
             if (item == null || string.IsNullOrEmpty(item.DestPath)) return;
             if (_cfg.UseBgftDirect)
@@ -3099,6 +3102,13 @@ namespace Orbis
 
         public override void OnCycleBegin(uint FrameTime, uint NextFrameTime)
         {
+            MarkUiProgress("update");
+            try { UpdateFrame(FrameTime, NextFrameTime); }
+            catch (Exception ex) when (_startupServicesReady) { RecoverUi(ex, "update"); }
+        }
+
+        void UpdateFrame(uint FrameTime, uint NextFrameTime)
+        {
             _frameTime = FrameTime;
             ObservePresentedFrame();
             PollResidentLaunchMaintenance();
@@ -3146,7 +3156,9 @@ namespace Orbis
             // throttle previously reduced normal navigation and downloads to 10 FPS.
             Invalidated = true;
             _lastUiRefresh = FrameTime;
+            MarkUiProgress("artwork-upload");
             _covers.PumpReady(Renderer.Handler, 1);
+            MarkUiProgress("update-complete");
             RecordFrameTiming(FrameTime);
         }
 
@@ -3161,12 +3173,55 @@ namespace Orbis
         {
             // Source workers publish several related lists under this gate. Keep
             // one consistent model for the entire frame, including footer hints.
-            lock (_lock) DrawFrame(FrameTime);
+            MarkUiProgress("draw-wait");
+            try { lock (_lock) DrawFrame(FrameTime); }
+            catch (Exception ex) when (_startupServicesReady) { RecoverUi(ex, "draw"); }
+            MarkUiProgress("present");
             _frameAwaitingPresentation = true;
+        }
+
+        long _uiProgressTick;
+        volatile string _uiPhase = "starting";
+        uint _lastUiFailureAt;
+        void MarkUiProgress(string phase)
+        {
+            _uiPhase = phase;
+            Interlocked.Exchange(ref _uiProgressTick, System.Diagnostics.Stopwatch.GetTimestamp());
+        }
+
+        internal IDisposable WatchUi()
+        {
+            MarkUiProgress("starting");
+            long reportedTick = 0;
+            return new System.Threading.Timer(_ => {
+                long tick = Interlocked.Read(ref _uiProgressTick);
+                long elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - tick) / System.Diagnostics.Stopwatch.Frequency;
+                if (elapsed < 8 || Interlocked.Exchange(ref reportedTick, tick) == tick) return;
+                SspiLog.Write("startup", "event=ui-stall phase=" + _uiPhase + " seconds=" + elapsed +
+                    " queue_action=" + Volatile.Read(ref _downloadActionBusy) + " build=" + BuildIdentity.Label);
+            }, null, 10000, 5000);
+        }
+
+        void RecoverUi(Exception error, string phase)
+        {
+            if (_lastUiFailureAt == 0 || UiElapsed(_lastUiFailureAt) >= 5000) {
+                _lastUiFailureAt = UiTick();
+                ThreadPool.QueueUserWorkItem(_ => {
+                    SspiLog.Write("startup", "event=ui-recovered phase=" + phase);
+                    Program.RecordFailure(error);
+                });
+            }
+            lock (_lock) {
+                CloseDownloadDrawer(); _uiOverlay = UiOverlay.None;
+                _tab = TopTab.Search; _screen = BrowseScreen.Search;
+                _status = "Screen recovered after an error. Downloads continue; details saved in the log.";
+                Invalidated = true;
+            }
         }
 
         void DrawFrame(uint FrameTime)
         {
+            MarkUiProgress("draw-background");
             IntPtr r = Renderer.Handler;
             UiFont.BindRenderer(r);
             GamepadIcons.Ensure(r);
@@ -3190,7 +3245,10 @@ namespace Orbis
 
             DrawHeader(r);
             if (_tab == TopTab.Downloads)
+            {
+                MarkUiProgress("draw-downloads");
                 DrawDownloads(r);
+            }
             else if (_screen == BrowseScreen.Detail)
                 DrawDetail(r);
             else
@@ -3203,6 +3261,7 @@ namespace Orbis
             }
 
             // No center modal — busy state is footer text + skeleton/panel animation.
+            MarkUiProgress("draw-footer");
             DrawFooter(r);
             if (_uiOverlay != UiOverlay.None) DrawUiOverlay(r);
             DrawToast(r);
@@ -3433,10 +3492,6 @@ namespace Orbis
         void DrawFooterHints(IntPtr r, int y)
         {
             // Build hint pairs first, measure total width, center on viewport X=960.
-            if (!_settingsOpen && _tab == TopTab.Downloads && !string.IsNullOrEmpty(_fileDetailId))
-            {
-                TextCentered(r, new SDL_Rect { x = 470, y = y, w = 980, h = 36 }, 22, "↑ / ↓  Scroll files      ○  Back to downloads", Muted); return;
-            }
             var pairs = new List<KeyValuePair<string, string>>();
             Action<string, string> add = (icon, label) =>
                 pairs.Add(new KeyValuePair<string, string>(icon, label));
@@ -3451,6 +3506,12 @@ namespace Orbis
                     (_softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox ||
                     _softKbForProxy ? "Save" : "Search"));
                 add("circle", "Close");
+            }
+            else if (!_settingsOpen && _tab == TopTab.Downloads && _downloadFilesTitle != null)
+            {
+                add("cross", "Package action");
+                add("square", "Remove package");
+                add("l2", "Close drawer");
             }
             else if (_settingsOpen)
             {
@@ -3511,20 +3572,13 @@ namespace Orbis
                         else
                             add("cross", "Action");
 
-                        if (focused.State == DlState.Downloading || focused.State == DlState.Resolving ||
-                            focused.State == DlState.Finalizing ||
-                            focused.State == DlState.Installing)
-                            add("square", "Cancel");
-                        else if (focused.State == DlState.Submitted)
-                            add("square", "Reset status");
-                        else
-                            add("square", "Remove");
+                        add("square", "Remove game");
                     }
                     else
                     {
                         add("cross", "Expand / collapse");
                     }
-                    add("r2", _downloadFilesTitle == null ? "Files" : "File details");
+                    add("r2", "File drawer");
                     add("circle", "Back");
                     add("l1", "Tabs");
                     add("options", "Settings");
@@ -3711,7 +3765,8 @@ namespace Orbis
             DrawSettingsRow(r, x, y + 231, w, 67, 3, "Stats for nerds", "Show a speed graph on the selected download", _cfg.NerdStats ? "ON" : "OFF");
             DrawSettingsRow(r, x, y + 308, w, 67, 4, "Firmware and backport hints", "Show package requirements when available", _cfg.ShowFirmwareHints ? "ON" : "OFF");
             DrawSettingsRow(r, x, y + 385, w, 67, 5, "Clear removable history", "Installed content and retry files stay protected", "CLEAR");
-            DrawSettingsSave(r, sheet, 6);
+            DrawSettingsRow(r, x, y + 462, w, 67, 6, "Retry source passwords", "Try up to four source passwords when an archive rejects its password", _cfg.RetrySourceArchivePasswords ? "ON" : "OFF");
+            DrawSettingsSave(r, sheet, 7);
         }
 
         void DrawSettingsAppearancePage(IntPtr r, SDL_Rect sheet)
@@ -4287,7 +4342,7 @@ namespace Orbis
 
         bool RecommendedAlreadyQueued()
         {
-            List<DlItem> items = _dlMgr.Snapshot();
+            List<DlItem> items = ReadDownloadSnapshot();
             int baseIndex = PreferredCandidate(_linkCandidates, "base", false);
             int updateIndex = PreferredRecommendedPatch(_linkCandidates, _firmwareVersion);
             if (baseIndex < 0 && updateIndex < 0) return false;
@@ -5009,7 +5064,7 @@ namespace Orbis
         string FormatDlLine(DlItem item)
         {
             if (item == null) return "";
-            if (Extracting(item)) return DownloadManager.Human(item.Done) + (item.Total > 0 ? " / " + DownloadManager.Human(item.Total) : " extracted · total pending");
+            if (Extracting(item)) return item.Total > 0 ? Math.Min(100, item.Done * 100.0 / item.Total).ToString("0.0") + "% · " + TransferSizeLine(item) + " extracted" : item.Done > 0 ? DownloadManager.Human(item.Done) + " extracted" : "Reading archive headers…";
             if (item.State == DlState.Failed && !string.IsNullOrEmpty(item.Error))
                 return "Error: " + item.Error;
             if (item.State == DlState.Completed && !string.IsNullOrEmpty(item.Error))

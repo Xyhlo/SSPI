@@ -18,7 +18,7 @@
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
-    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <DefineConstants>DEBUG;TRACE;SSPI_PS4</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -31,7 +31,7 @@
     <DebugSymbols>false</DebugSymbols>
     <Deterministic>true</Deterministic>
     <Optimize>true</Optimize>
-    <DefineConstants>TRACE</DefineConstants>
+    <DefineConstants>TRACE;SSPI_PS4</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -78,6 +78,8 @@
     <Compile Include="AppSettings.cs" />
     <Compile Include="CommunitySources.cs" />
     <Compile Include="DistributionSettings.cs" />
+    <Compile Include="ArchivePasswordDefaults.cs" />
+    <Compile Include="SearchWindow.DownloadDrawer.cs" />
     <Compile Include="UsbVolumeLabel.cs" />
     <Compile Include="SearchWindow.Community.cs" />
     <Compile Include="..\..\Build-Output\PS4\generated\BuildIdentity.cs" />

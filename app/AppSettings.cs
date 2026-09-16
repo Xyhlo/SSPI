@@ -96,6 +96,7 @@ namespace Orbis
         public int DownloadRangeCount = DownloadTransferSettings.DefaultRangeCount;
         /// <summary>Downloads terminal + speed graph (technical, no secrets).</summary>
         public bool NerdStats = false;
+        public bool RetrySourceArchivePasswords = true;
         /// <summary>
         /// Validated local package URLs register with system BGFT (PS4 notifications).
         /// </summary>
@@ -229,6 +230,7 @@ namespace Orbis
 
         public void Load()
         {
+            RetrySourceArchivePasswords = true;
             try
             {
                 int schedulerVersion = 0;
@@ -303,6 +305,8 @@ namespace Orbis
                         UseBgftDirect = IsTrue(val);
                     else if (Eq(key, "nerd_stats") || Eq(key, "stats_for_nerds"))
                         NerdStats = IsTrue(val);
+                    else if (Eq(key, "retry_source_archive_passwords"))
+                        RetrySourceArchivePasswords = IsTrue(val);
                     else if (Eq(key, "staging_location")) StagingLocation = ValidStaging(val) ? val : "ps4";
                     else if (Eq(key, "accent")) Accent = val;
                     else if (Eq(key, "accent_name")) AccentName = val;
@@ -371,6 +375,7 @@ namespace Orbis
                 sb.AppendLine("download_scheduler_version=4");
                 sb.AppendLine("bgft_direct=" + (UseBgftDirect ? "1" : "0"));
                 sb.AppendLine("nerd_stats=" + (NerdStats ? "1" : "0"));
+                sb.AppendLine("retry_source_archive_passwords=" + (RetrySourceArchivePasswords ? "1" : "0"));
                 sb.AppendLine("accent=" + Accent);
                 sb.AppendLine("accent_name=" + AccentName);
                 sb.AppendLine("bg_mode=" + BackgroundMode);

@@ -6,6 +6,35 @@ namespace Orbis
 {
     internal sealed class GameHit
     {
+        public List<GameHit> Variants;
+        internal static List<GameHit> Flatten(IEnumerable<GameHit> hits)
+        {
+            var result = new List<GameHit>();
+            foreach (var hit in hits) if (hit != null) {
+                if (hit.Variants != null) result.AddRange(hit.Variants); else result.Add(hit);
+            }
+            return result;
+        }
+        internal static List<GameHit> GroupGames(IEnumerable<GameHit> hits)
+        {
+            var result = new List<GameHit>();
+            var groups = new Dictionary<string, GameHit>(StringComparer.Ordinal);
+            foreach (var hit in Flatten(hits)) {
+                string key = SourceTitleResult.GameKey(hit.Name, hit.TitleId);
+                GameHit group;
+                if (!groups.TryGetValue(key, out group)) {
+                    group = (GameHit)hit.MemberwiseClone(); group.Variants = new List<GameHit>();
+                    groups.Add(key, group); result.Add(group);
+                }
+                if (!group.Variants.Exists(v => v.Source == hit.Source && v.SourceVersion == hit.SourceVersion && v.TitleId == hit.TitleId &&
+                    v.Region == hit.Region && v.CatalogUrl == hit.CatalogUrl)) group.Variants.Add(hit);
+            }
+            return result;
+        }
+        internal GameHit WithVariant(GameHit variant)
+        {
+            var result = (GameHit)variant.MemberwiseClone(); result.Variants = Variants; return result;
+        }
         public string TitleId;
         public string Name;
         public string Region;

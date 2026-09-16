@@ -14,8 +14,17 @@
 #include <string>
 #include "../../SDK/vendor/unrar/dll.hpp"
 #include "gs_unrar.h"
+#ifdef GS_RAR_PS4
+#include <orbis/libkernel.h>
+#endif
 
 static const uint64_t maximum_expanded_bytes = 512ULL * 1024 * 1024 * 1024;
+static int extraction_busy;
+struct ExtractionLease {
+    bool held;
+    ExtractionLease() : held(__sync_lock_test_and_set(&extraction_busy, 1) == 0) {}
+    ~ExtractionLease() { if (held) __sync_lock_release(&extraction_busy); }
+};
 
 static void rar_checkpoint(GsArchiveDiagnostic diagnostic, const char *stage,
     unsigned entry, int result, const RARHeaderDataEx *header = NULL)
@@ -32,7 +41,8 @@ static void rar_checkpoint(GsArchiveDiagnostic diagnostic, const char *stage,
         header ? (uint64_t(header->UnpSizeHigh) << 32) | header->UnpSize : 0);
 }
 
-static bool valid_entry_name(const char *name, size_t length)
+template <typename Character>
+static bool valid_entry_name(const Character *name, size_t length)
 {
     if (!length || length > 1024 || name[0] == '/' || name[0] == '\\') return false;
     size_t start = 0;
@@ -57,11 +67,47 @@ struct Extraction {
     const char *password;
     wchar_t wide_password[257];
     unsigned password_requests;
+    GsArchiveDiagnostic diagnostic;
+    uint64_t opening_since;
+    bool opening, open_timed_out;
+    uint64_t total;
+    int volume_index;
 };
 
-static bool decode_password(const char *password, wchar_t *output, size_t capacity)
+static Extraction *active_extraction;
+
+extern "C" int gs_rar_input_allowed(const char *path)
 {
-    if (!password || strnlen(password, 257) > 256 || !capacity) return false;
+    if (!active_extraction || !path) return 0;
+    for (int i = 0; i < active_extraction->volume_count; i++)
+        if (!strcmp(path, active_extraction->paths[i])) return 1;
+    return 0;
+}
+
+extern "C" int gs_rar_io_poll(const char *stage)
+{
+    Extraction *ctx = active_extraction;
+    if (!ctx) return -1;
+#ifdef GS_RAR_PS4
+    if (ctx->opening && sceKernelGetProcessTime() - ctx->opening_since > 30000000) {
+        ctx->open_timed_out = true;
+        return -1;
+    }
+#endif
+    if (!strcmp(stage, "file-open-before") || !strcmp(stage, "file-open-after") ||
+        (ctx->opening && !strncmp(stage, "unicode-", 8)))
+        rar_checkpoint(ctx->diagnostic, stage, 0, 0);
+    return ctx->progress && ctx->progress(ctx->processed, ctx->total) ? -1 : 0;
+}
+
+struct ActiveExtraction {
+    ActiveExtraction(Extraction *ctx) { active_extraction = ctx; }
+    ~ActiveExtraction() { active_extraction = NULL; }
+};
+
+static bool decode_utf8(const char *password, wchar_t *output, size_t capacity)
+{
+    if (!password || !capacity) return false;
     size_t used = 0;
     const unsigned char *p = reinterpret_cast<const unsigned char *>(password);
     while (*p) {
@@ -89,10 +135,34 @@ static bool decode_password(const char *password, wchar_t *output, size_t capaci
     return true;
 }
 
+static bool encode_utf8(const wchar_t *input, char *output, size_t capacity)
+{
+    if (!input || !capacity) return false;
+    size_t used = 0;
+    for (size_t i = 0; i < 1024; i++) {
+        uint32_t value = input[i];
+        if (!value) { output[used] = 0; return true; }
+        if (sizeof(wchar_t) == 2 && value >= 0xd800 && value <= 0xdbff) {
+            if (++i >= 1024 || input[i] < 0xdc00 || input[i] > 0xdfff) return false;
+            value = 0x10000 + ((value - 0xd800) << 10) + (input[i] - 0xdc00);
+        }
+        if (value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) return false;
+        unsigned bytes = value < 0x80 ? 1 : value < 0x800 ? 2 : value < 0x10000 ? 3 : 4;
+        if (used + bytes >= capacity) return false;
+        if (bytes == 1) output[used++] = static_cast<char>(value);
+        else {
+            output[used++] = static_cast<char>((bytes == 2 ? 0xc0 : bytes == 3 ? 0xe0 : 0xf0) | (value >> (6 * (bytes - 1))));
+            for (unsigned j = bytes - 1; j > 0; j--)
+                output[used++] = static_cast<char>(0x80 | ((value >> (6 * (j - 1))) & 63));
+        }
+    }
+    return false;
+}
+
 static int callback(UINT message, LPARAM opaque, LPARAM p1, LPARAM p2)
 {
     Extraction *ctx = reinterpret_cast<Extraction *>(opaque);
-    if (ctx->progress && ctx->progress(ctx->processed, 0)) return -1;
+    if (ctx->progress && ctx->progress(ctx->processed, ctx->total)) return -1;
     if (message == UCM_NEEDPASSWORD || message == UCM_NEEDPASSWORDW) {
         if (!p1 || p2 <= 0 || !ctx->password || !*ctx->password || ++ctx->password_requests > 4) return -1;
         size_t length = message == UCM_NEEDPASSWORDW ? wcslen(ctx->wide_password) : strlen(ctx->password);
@@ -105,18 +175,24 @@ static int callback(UINT message, LPARAM opaque, LPARAM p1, LPARAM p2)
     if (message == UCM_LARGEDICT) return -1;
     if (message == UCM_CHANGEVOLUME || message == UCM_CHANGEVOLUMEW) {
         if (p2 == RAR_VOL_NOTIFY) return 1;
-        // UnRAR asks for a specific next volume. Only map names supplied with this job.
+        // Downloads use hashed disk names. Resolve the source name first, then
+        // the explicitly ordered input set; never open an unlisted disk path.
         char requested[1024];
         if (message == UCM_CHANGEVOLUMEW) {
-            if (wcstombs(requested, reinterpret_cast<wchar_t *>(p1), sizeof(requested)) >= sizeof(requested)) return -1;
+            if (!encode_utf8(reinterpret_cast<wchar_t *>(p1), requested, sizeof(requested))) return -1;
         } else snprintf(requested, sizeof(requested), "%s", reinterpret_cast<char *>(p1));
         const char *name = strrchr(requested, '/'); name = name ? name + 1 : requested;
-        for (int i = 0; i < ctx->volume_count; i++) {
-            if (strcasecmp(name, ctx->names[i])) continue;
+        int selected = -1;
+        for (int i = ctx->volume_index + 1; i < ctx->volume_count; i++)
+            if (!strcasecmp(name, ctx->names[i])) { selected = i; break; }
+        if (selected < 0 && ctx->volume_index + 1 < ctx->volume_count) selected = ctx->volume_index + 1;
+        if (selected >= 0) {
+            int i = selected;
             if (strlen(ctx->paths[i]) >= 1024) return -1;
             if (message == UCM_CHANGEVOLUMEW) {
-                if (mbstowcs(reinterpret_cast<wchar_t *>(p1), ctx->paths[i], 1024) == static_cast<size_t>(-1)) return -1;
+                if (!decode_utf8(ctx->paths[i], reinterpret_cast<wchar_t *>(p1), 1024)) return -1;
             } else strcpy(reinterpret_cast<char *>(p1), ctx->paths[i]);
+            ctx->volume_index = i;
             return 1;
         }
         return -1;
@@ -131,6 +207,50 @@ static int callback(UINT message, LPARAM opaque, LPARAM p1, LPARAM p2)
         }
     }
     return 1;
+}
+
+// LIST skips compressed payloads (including solid files) with 64-bit seeks.
+// Count each split file once; never divide expanded output by compressed size.
+template <typename Character>
+static bool pkg_name(const Character *name, size_t capacity)
+{
+    size_t length = 0;
+    while (length < capacity && name[length]) length++;
+    return length >= 4 && length < capacity && name[length - 4] == '.' &&
+        (name[length - 3] == 'p' || name[length - 3] == 'P') &&
+        (name[length - 2] == 'k' || name[length - 2] == 'K') &&
+        (name[length - 1] == 'g' || name[length - 1] == 'G');
+}
+
+static int measure_archive(RAROpenArchiveDataEx open, Extraction &ctx)
+{
+    open.OpenMode = RAR_OM_LIST;
+    HANDLE archive = RAROpenArchiveEx(&open);
+    int rc = open.OpenResult ? static_cast<int>(open.OpenResult) : archive ? 0 : ERAR_BAD_ARCHIVE;
+    uint64_t total = 0;
+    unsigned entries = 0, packages = 0;
+    while (archive && !rc) {
+        RARHeaderDataEx header = {};
+        ctx.password_requests = 0;
+        if (gs_rar_io_poll("scan")) { rc = ctx.open_timed_out ? 1001 : ERAR_UNKNOWN; break; }
+        rc = RARReadHeaderEx(archive, &header);
+        if (rc == ERAR_END_ARCHIVE) { rc = 0; break; }
+        if (rc) break;
+        uint64_t size = (uint64_t(header.UnpSizeHigh) << 32) | header.UnpSize;
+        if (++entries > 4096 || size > maximum_expanded_bytes - total || header.DictSize > 256 * 1024)
+        { rc = ERAR_LARGE_DICT; break; }
+        if (!(header.Flags & RHDF_DIRECTORY)) {
+            total += size;
+            if (header.FileNameW[0] ? pkg_name(header.FileNameW, sizeof(header.FileNameW) / sizeof(wchar_t))
+                : pkg_name(header.FileName, sizeof(header.FileName))) packages++;
+        }
+        rc = RARProcessFile(archive, RAR_SKIP, NULL, NULL);
+    }
+    if (archive) RARCloseArchive(archive);
+    if (!rc) ctx.total = total;
+    rar_checkpoint(ctx.diagnostic, "scan-complete", 0, rc);
+    if (ctx.diagnostic) ctx.diagnostic("scan-pkg-count", packages, rc, 0, 0, total);
+    return rc;
 }
 
 extern "C" int gs_extract_rar(const char *first, const char *destination,
@@ -155,14 +275,33 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
 {
     if (!first || !destination || !names || !paths || !packages || volume_count < 1 ||
         volume_count > 512 || capacity < 1) return -ERAR_BAD_DATA;
+    ExtractionLease lease;
+    if (!lease.held) return -1003;
     if (capacity > 256) capacity = 256;
-    Extraction ctx = { names, paths, volume_count, NULL, 0, 0, 0, progress, password ? password : "", {}, 0 };
-    if (!decode_password(ctx.password, ctx.wide_password, 257)) return -ERAR_BAD_PASSWORD;
+    Extraction ctx = { names, paths, volume_count, NULL, 0, 0, 0, progress, password ? password : "", {}, 0, diagnostic, 0, true, false };
+    ActiveExtraction active(&ctx);
+#ifdef GS_RAR_PS4
+    ctx.opening_since = sceKernelGetProcessTime();
+#endif
+    if (strnlen(ctx.password, 257) > 256 || !decode_utf8(ctx.password, ctx.wide_password, 257)) return -ERAR_BAD_PASSWORD;
+    wchar_t archive_path[1300];
+    if (strnlen(first, 1300) >= 1300 || !decode_utf8(first, archive_path, 1300)) return -ERAR_EOPEN;
     RAROpenArchiveDataEx open = {};
     open.ArcName = const_cast<char *>(first); open.OpenMode = RAR_OM_EXTRACT;
+    open.ArcNameW = archive_path;
     open.Callback = callback; open.UserData = reinterpret_cast<LPARAM>(&ctx);
+    int measured = measure_archive(open, ctx);
+    if (measured) return -measured;
+    ctx.volume_index = 0;
+    ctx.password_requests = 0;
+    if (progress && progress(0, ctx.total)) return -ERAR_UNKNOWN;
+#ifdef GS_RAR_PS4
+    ctx.opening_since = sceKernelGetProcessTime();
+#endif
     rar_checkpoint(diagnostic, "open-before", 0, 0);
+    if (gs_rar_io_poll("open-check")) return ctx.open_timed_out ? -1001 : -ERAR_UNKNOWN;
     HANDLE archive = RAROpenArchiveEx(&open);
+    ctx.opening = false;
     rar_checkpoint(diagnostic, "open-after", 0,
         static_cast<int>(open.OpenResult ? open.OpenResult : archive ? ERAR_SUCCESS : ERAR_BAD_ARCHIVE));
     if (!archive || open.OpenResult) {
@@ -171,11 +310,11 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
             int close_result = RARCloseArchive(archive);
             rar_checkpoint(diagnostic, "close-after", 0, close_result);
         }
-        return -static_cast<int>(open.OpenResult ? open.OpenResult : ERAR_BAD_ARCHIVE);
+        return ctx.open_timed_out ? -1001 : -static_cast<int>(open.OpenResult ? open.OpenResult : ERAR_BAD_ARCHIVE);
     }
     int count = 0, entries = 0, rc = ERAR_SUCCESS;
     uint64_t declared = 0;
-    std::set<std::string> seen;
+    std::set<std::wstring> seen;
     char output[1100] = {};
     bool output_owned = false;
     try {
@@ -187,22 +326,41 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
             rar_checkpoint(diagnostic, "header-after", entries + 1, rc, rc == ERAR_SUCCESS ? &header : NULL);
             if (rc == ERAR_END_ARCHIVE) { rc = ERAR_SUCCESS; break; }
             if (rc != ERAR_SUCCESS) break;
-            if (++entries > 4096 || (progress && progress(ctx.processed, 0))) { rc = ERAR_BAD_DATA; break; }
-            const char *name = header.FileName;
-            size_t length = strnlen(name, sizeof(header.FileName));
-            if (length == sizeof(header.FileName) || !valid_entry_name(name, length) || header.RedirType ||
-                (header.HostOS == 3 && ((header.FileAttr & 0170000) == 0120000))) { rc = ERAR_BAD_DATA; break; }
+            if (++entries > 4096 || (progress && progress(ctx.processed, ctx.total))) {
+                rc = ERAR_BAD_DATA; rar_checkpoint(diagnostic, "entry-stopped", entries, rc, &header); break;
+            }
+            // The DLL's narrow name uses the host locale. Shell hosts may not
+            // have a working multibyte locale, even when the wide name is valid.
+            std::wstring name;
+            if (header.FileNameW[0]) {
+                size_t length = 0, capacity = sizeof(header.FileNameW) / sizeof(header.FileNameW[0]);
+                while (length < capacity && header.FileNameW[length]) length++;
+                if (length == capacity) { rc = ERAR_BAD_DATA; }
+                else name.assign(header.FileNameW, length);
+            } else {
+                size_t length = strnlen(header.FileName, sizeof(header.FileName));
+                if (length == sizeof(header.FileName)) { rc = ERAR_BAD_DATA; }
+                else for (size_t i = 0; i < length; i++) name += static_cast<unsigned char>(header.FileName[i]);
+            }
+            if (rc || !valid_entry_name(name.c_str(), name.size())) {
+                rc = ERAR_BAD_DATA; rar_checkpoint(diagnostic, "entry-name-rejected", entries, rc, &header); break;
+            }
+            if (header.RedirType || (header.HostOS == 3 && ((header.FileAttr & 0170000) == 0120000))) {
+                rc = ERAR_BAD_DATA; rar_checkpoint(diagnostic, "entry-link-rejected", entries, rc, &header); break;
+            }
             if ((header.Flags & RHDF_ENCRYPTED) && !*ctx.password) { rc = ERAR_MISSING_PASSWORD; break; }
             uint64_t size = (uint64_t(header.UnpSizeHigh) << 32) | header.UnpSize;
             if (size > maximum_expanded_bytes - declared || header.DictSize > 256 * 1024) { rc = ERAR_LARGE_DICT; break; }
             declared += size;
-            std::string key(name);
+            std::wstring key(name);
             for (size_t i = 0; i < key.size(); i++) {
                 if (key[i] == '\\') key[i] = '/';
                 else if (key[i] >= 'A' && key[i] <= 'Z') key[i] += 'a' - 'A';
             }
-            if (!(header.Flags & RHDF_DIRECTORY) && !seen.insert(key).second) { rc = ERAR_BAD_DATA; break; }
-            bool selected = !(header.Flags & RHDF_DIRECTORY) && length >= 4 && !strcasecmp(name + length - 4, ".pkg");
+            if (!(header.Flags & RHDF_DIRECTORY) && !seen.insert(key).second) {
+                rc = ERAR_BAD_DATA; rar_checkpoint(diagnostic, "entry-duplicate-rejected", entries, rc, &header); break;
+            }
+            bool selected = !(header.Flags & RHDF_DIRECTORY) && key.size() >= 4 && key.compare(key.size() - 4, 4, L".pkg") == 0;
             if (selected) {
                 if (count >= capacity) { rc = ERAR_BAD_DATA; break; }
                 int64_t available = gs_storage_available_bytes(destination);
@@ -220,6 +378,8 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
                 ctx.output = fdopen(descriptor, "wb");
                 if (!ctx.output) close(descriptor);
                 if (!ctx.output) { rc = ERAR_ECREATE; break; }
+                // A bounded buffer avoids tiny writes on large sequential PKGs.
+                setvbuf(ctx.output, NULL, _IOFBF, 1024 * 1024);
                 ctx.written = 0; ctx.expected = size;
             }
             // TEST decompresses and verifies checksums but never lets UnRAR create paths.
@@ -249,11 +409,19 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
     rar_checkpoint(diagnostic, "close-before", 0, 0);
     int close_result = RARCloseArchive(archive);
     rar_checkpoint(diagnostic, "close-after", 0, close_result);
-    if (!rc && count == 0) rc = ERAR_BAD_ARCHIVE;
+    if (!rc && count == 0) rc = 1002;
     if (rc) {
         if (output_owned) unlink(output);
         for (int i = 0; i < count; i++) unlink(packages[i].path);
         return -rc;
+    }
+    if (ctx.processed != ctx.total) {
+        for (int i = 0; i < count; i++) unlink(packages[i].path);
+        return -ERAR_BAD_DATA;
+    }
+    if (progress && progress(ctx.processed, ctx.total)) {
+        for (int i = 0; i < count; i++) unlink(packages[i].path);
+        return -ERAR_UNKNOWN;
     }
     return count;
 }

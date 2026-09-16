@@ -34,7 +34,6 @@ namespace Orbis
         List<DownloadGroup> _queueGroups = new List<DownloadGroup>();
         List<DownloadTreeRow> _queueRows = new List<DownloadTreeRow>();
         string _fileDetailId;
-        int _fileScroll;
         List<ArchiveVolume> _fileVolumes = new List<ArchiveVolume>();
         sealed class FileOutput { public string Name; public string State; public long Size; }
         List<FileOutput> _fileOutputs = new List<FileOutput>();
@@ -122,9 +121,13 @@ namespace Orbis
                 _filteredResults = new List<GameHit>();
                 foreach (var hit in _results)
                 {
-                    string region = (hit.Region ?? "").ToUpperInvariant();
-                    bool known = region == "EU" || region == "US" || region == "JP";
-                    if (_regionFilter == 0 || (_regionFilter == 4 ? !known : region == RegionFilters[_regionFilter])) _filteredResults.Add(hit);
+                    foreach (var variant in hit.Variants ?? new List<GameHit> { hit }) {
+                        string region = (variant.Region ?? "").ToUpperInvariant();
+                        bool known = region == "EU" || region == "US" || region == "JP";
+                        if (_regionFilter == 0 || (_regionFilter == 4 ? !known : region == RegionFilters[_regionFilter])) {
+                            _filteredResults.Add(hit.WithVariant(variant)); break;
+                        }
+                    }
                 }
                 int nextFocus = -1;
                 if (focused != null)
@@ -174,13 +177,24 @@ namespace Orbis
             return _queuedGroups.Contains(DetailGroupKey(_linkPresentation[index]));
         }
 
+        List<DlItem> ReadDownloadSnapshot()
+        {
+            List<DlItem> current;
+            if (_dlMgr != null && _dlMgr.TrySnapshot(out current)) _queueSnapshot = current;
+            return _queueSnapshot;
+        }
+
         void RefreshQueueModel(bool force = false)
         {
             if (!force && _queueModelReady && UiElapsed(_queueModelAt) < 250) return;
+            string focusKey = _dlFocus >= 0 && _dlFocus < _queueRows.Count ? _queueRows[_dlFocus].Group.Key : null;
             _queueModelAt = UiTick(); _queueModelReady = true;
-            _queueSnapshot = _dlMgr.Snapshot();
+            _queueSnapshot = ReadDownloadSnapshot();
             _queueGroups = BuildDownloadGroups(_queueSnapshot);
             _queueRows = BuildDownloadRows(_queueGroups);
+            int focus = _queueRows.FindIndex(row => row.Group.Key == (_downloadFilesTitle ?? focusKey));
+            if (focus >= 0) _dlFocus = focus;
+            if (_downloadFilesTitle != null && !_queueGroups.Exists(group => group.Key == _downloadFilesTitle)) CloseDownloadDrawer();
             _downloadView = _queueSnapshot;
         }
 
@@ -193,6 +207,13 @@ namespace Orbis
                 if (_queueFilter == 2 && (item.State == DlState.Failed || item.State == DlState.Paused || item.State == DlState.Canceled)) return true;
             }
             return false;
+        }
+
+        internal static bool IsArchiveItem(DlItem item)
+        {
+            return item != null && (item.ContainerFormat == "rar" || item.ContainerFormat == "zip" ||
+                item.ContainerFormat == "7z" || item.ContainerFormat == "archive" || item.Kind == "archive" ||
+                !string.IsNullOrEmpty(item.ArchiveVolumes));
         }
 
         static bool Extracting(DlItem item)
@@ -398,8 +419,12 @@ namespace Orbis
             }
             Fill(r, rightX, 332, rightW, 1, Border);
             GamepadIcons.Draw(r, "l2", rightX, 350, 26);
-            string selectedHost = _hostFilter > 0 && _hostFilter <= _detailHosts.Count ? _detailHosts[_hostFilter - 1] : "All hosts";
-            TextFit(r, rightX + 36, 352, 18, rightW / 2 - 40, selectedHost, Muted);
+            string regionLabel = "Region " + (string.IsNullOrEmpty(_selected.Region) ? "?" : _selected.Region);
+            if (_selected.Variants != null && _selected.Variants.Count > 1) {
+                int regionIndex = _selected.Variants.FindIndex(v => v.TitleId == _selected.TitleId && v.Region == _selected.Region && v.Source == _selected.Source && v.CatalogUrl == _selected.CatalogUrl);
+                regionLabel += "  ·  " + (Math.Max(0, regionIndex) + 1) + "/" + _selected.Variants.Count;
+            }
+            TextFit(r, rightX + 36, 352, 18, 330, regionLabel, Muted);
             string versions = _latestUpdateOnly ? "Latest update" : "All update versions";
             int versionX = rightX + rightW - UiFont.MeasurePx(18, versions);
             GamepadIcons.Draw(r, "r2", versionX - 36, 350, 26);
@@ -552,66 +577,10 @@ namespace Orbis
             return rate + "  ·  " + eta + (Extracting(item) ? "  ·  Extracting" : "");
         }
 
-        void DrawCharcoalDownloads(IntPtr r)
-        {
-            RefreshQueueModel();
-            if (!string.IsNullOrEmpty(_fileDetailId)) { DrawFileDetails(r); return; }
-            int active = 0, extracting = 0;
-            foreach (var item in _queueSnapshot) { if (Extracting(item)) extracting++; else if (item.State == DlState.Downloading) active++; }
-            TextPx(r, ContentX, 132, 42, "Downloads", White);
-            TextPx(r, ContentX, 190, 22, _queueGroups.Count + (_queueGroups.Count == 1 ? " game" : " games") + "  ·  " + _queueSnapshot.Count + (_queueSnapshot.Count == 1 ? " package" : " packages") + (active > 0 ? "  ·  " + active + " downloading" : "") + (extracting > 0 ? "  ·  " + extracting + " extracting" : ""), Muted);
-            TextPx(r, ContentX, 249, 20, "L2   " + QueueFilters[_queueFilter] + " downloads", White);
-            TextFit(r, ContentX + ContentWidth - 400, 249, 20, 400, "LEFT / RIGHT   Expand / collapse", Muted);
-            Fill(r, ContentX, 287, ContentWidth, 1, Border);
-            var rows = _queueRows; ClampDownloadFocus(rows);
-            if (rows.Count == 0) { TextPx(r, ContentX + 28, 396, 30, _queueSnapshot.Count == 0 ? "Nothing queued" : "No jobs match this filter", White); return; }
-            const int top = 308, rowH = 120, visible = 5;
-            EnsureVisible(ref _dlScroll, _dlFocus, rows.Count, visible);
-            for (int i = 0; i < visible && _dlScroll + i < rows.Count; i++)
-            {
-                int index = _dlScroll + i, y = top + i * rowH; var tree = rows[index]; var group = tree.Group; var item = tree.Item;
-                bool child = !tree.IsRoot; int x = ContentX + (child ? 72 : 0), width = ContentWidth - (child ? 72 : 0);
-                if (child) TreeBranch(r, ContentX + 28, Math.Max(top, y - 14), y + 51, y + rowH, x, tree.IsLastChild);
-                Card(r, new SDL_Rect { x = x, y = y, w = width, h = 106 }, index == _dlFocus, Panel, Accent);
-                if (!child)
-                {
-                    EnsureDownloadArtwork(group);
-                    DrawCover(r, new GameHit { TitleId = group.TitleId, Name = group.Name, ImageUrl = group.ImageUrl }, new SDL_Rect { x = x + 18, y = y + 16, w = 66, h = 74 });
-                }
-                else TextPx(r, x + 24, y + 38, 17, KindShort(item.Kind), Dim);
-                int tx = x + (child ? 136 : 112), textW = width - (child ? 470 : 446);
-                TextFit(r, tx, y + 9, 27, textW, child ? PackageDisplayTitle(item.Kind, item.Label, group.Name, "", item.PackageVersion) : group.Name, White);
-                TextFit(r, tx, y + 49, 20, textW, child ? TransferRateLine(item) : group.TitleId + "  ·  " + PackageMix(group), Muted);
-                string state = child ? VisibleState(item) : DownloadGroupStatus(group);
-                if (!child) foreach (var member in group.Items) if (Extracting(member)) { state = "Extracting"; break; }
-                TextFit(r, x + width - 315, y + 14, 20, 290, state, child ? StateColor(item.State) : DownloadGroupColor(group));
-                if (child)
-                {
-                    if (_cfg.NerdStats && index == _dlFocus) DrawFocusedSparkline(r, new SDL_Rect { x = tx, y = y + 79, w = textW, h = 21 }, item);
-                    else DrawProgress(r, new SDL_Rect { x = tx, y = y + 84, w = textW, h = 6 }, item);
-                    TextFit(r, x + width - 315, y + 49, 18, 290, TransferSizeLine(item), Muted);
-                }
-                else
-                {
-                    long done, total; DownloadGroupProgress(group, out done, out total);
-                    if (_collapsedDownloadGroups.Contains(group.Key ?? ""))
-                    {
-                        Fill(r, tx, y + 84, textW, 6, Raised);
-                        if (total > 0) Fill(r, tx, y + 84, (int)Math.Min(textW, Math.Max(0, done * (double)textW / total)), 6, Accent);
-                    }
-                    TextFit(r, x + width - 315, y + 48, 18, 290, DownloadManager.Human(done) + (total > 0 ? " / " + DownloadManager.Human(total) : ""), Muted);
-                    if (_collapsedDownloadGroups.Contains(group.Key ?? "")) TextFit(r, tx, y + 49, 18, textW, GroupProgressLine(group, done, total), Muted);
-                    TextFit(r, x + width - 315, y + 77, 18, 290, (_collapsedDownloadGroups.Contains(group.Key ?? "") ? "+ Expand · " : "− Collapse · ") + group.Items.Count + (group.Items.Count == 1 ? " package" : " packages"), Muted);
-                }
-            }
-            DrawScrollBar(r, new SDL_Rect { x = ContentX + ContentWidth + 16, y = top, w = 5, h = 586 }, rows.Count, visible, _dlScroll);
-            TextPx(r, ContentX, 932, 20, "Install order   Base → Update → DLC", Muted);
-        }
-
         void OpenFileDetails(DlItem item)
         {
             if (item == null) return;
-            _fileDetailId = item.Id; _fileScroll = 0; _fileReadAt = 0;
+            _fileDetailId = item.Id; _fileReadAt = 0;
             lock (_lock) _fileOutputs = new List<FileOutput>();
             try { _fileVolumes = string.IsNullOrEmpty(item.ArchiveVolumes) ? new List<ArchiveVolume>() : ArchiveVolumeSet.Decode(item.ArchiveVolumes); }
             catch { _fileVolumes = new List<ArchiveVolume>(); }
@@ -621,8 +590,9 @@ namespace Orbis
         {
             string[] record = (value ?? "").Split(new[] { ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries);
             int task;
-            if ((record.Length != 4 && record.Length != 5) || !int.TryParse(record[1], out task)) return "Waiting for dependency";
-            if (record.Length == 5 && record[4] == "6" && record[2] == "1") return "Installed";
+            if ((record.Length < 4 || record.Length > 6) || !int.TryParse(record[1], out task)) return "Waiting for dependency";
+            bool validKind = record.Length < 6 || record[5] == "6" || record[5] == "7" || record[5] == "8";
+            if (record.Length >= 5 && record[4] == "6" && record[2] == "1" && validKind) return "Installed";
             if (failed) return "Failed · " + (error ?? "Installation not confirmed");
             return task >= 0 || record[3] == "2" ? "Installing" : "Waiting to install";
         }
@@ -665,9 +635,10 @@ namespace Orbis
                     }
                     else if (Directory.Exists(directory))
                     {
-                        foreach (string path in Directory.EnumerateFiles(directory, "pkg-*.pkg"))
+                        foreach (string path in Directory.EnumerateFiles(directory, "pkg-*.pkg*"))
                         {
                             if (rows.Count >= 256) break;
+                            if (!path.EndsWith(".pkg", StringComparison.Ordinal) && !path.EndsWith(".pkg.part", StringComparison.Ordinal)) continue;
                             rows.Add(new FileOutput { Name = Path.GetFileName(path), Size = new FileInfo(path).Length, State = "Extracting · size so far" });
                         }
                         rows.Sort((a,b) => string.CompareOrdinal(a.Name,b.Name));
@@ -677,73 +648,9 @@ namespace Orbis
                 catch (UnauthorizedAccessException) { }
                 finally
                 {
-                    lock (_lock) { if (_fileDetailId == id) _fileOutputs = rows; _fileReadBusy = false; }
+                    lock (_lock) { if (_fileDetailId == id) { _fileOutputs = rows; _drawerRowsDirty = true; } _fileReadBusy = false; }
                 }
             });
-        }
-
-        void DrawFileDetails(IntPtr r)
-        {
-            DlItem item = _queueSnapshot.Find(x => x.Id == _fileDetailId);
-            if (item == null) { _fileDetailId = null; return; }
-            RefreshFileOutputs(item);
-            List<FileOutput> outputs; lock (_lock) outputs = _fileOutputs;
-            bool extracting = Extracting(item), archive = item.Kind == "archive" || _fileVolumes.Count > 0 || extracting || outputs.Count > 0;
-            int installStage = archive ? 2 : 1;
-            bool downloadComplete = item.Total > 0 && item.Done >= item.Total;
-            int stage = extracting ? 1 : item.State == DlState.Submitted || item.State == DlState.Installed ||
-                item.State == DlState.Installing || item.State == DlState.Completed ||
-                (item.StatusText ?? "").StartsWith("Installing packages") ||
-                (!archive && downloadComplete) ? installStage : 0;
-            if (item.State == DlState.Failed && outputs.Count > 0) stage = installStage;
-            TextFit(r, ContentX, 132, 38, ContentWidth, item.Name ?? item.TitleId, White);
-            TextFit(r, ContentX, 191, 22, ContentWidth, (string.IsNullOrEmpty(item.TitleId) ? "" : item.TitleId + " · ") +
-                (archive ? (_fileVolumes.Count > 1 ? _fileVolumes.Count + " archive volumes" : "Archive · extract packages before installation") : "Direct package · extraction skipped"), Muted);
-            string firstStage = item.LocalSource ? "USB file" : "Download";
-            string[] stages = archive ? new[] { firstStage, "Extract PKGs", "Install" } : new[] { firstStage, "Install" };
-            int stageWidth = (ContentWidth - (stages.Length - 1) * 20) / stages.Length;
-            for (int i = 0; i < stages.Length; i++) FilterChip(r, ContentX + i * (stageWidth + 20), 246, stageWidth, (i + 1) + "  " + stages[i], stage == i);
-            Card(r, new SDL_Rect { x = ContentX, y = 320, w = ContentWidth, h = 172 }, false, Panel, Border);
-            TextFit(r, ContentX + 26, 340, 30, ContentWidth - 52, VisibleState(item), White);
-            string detail = !string.IsNullOrEmpty(item.Error) ? item.Error : item.StatusText ?? "Waiting for progress";
-            int apiAt = detail.IndexOf("API=", StringComparison.Ordinal);
-            TextFit(r, ContentX + 26, 389, 22, ContentWidth - 52, apiAt >= 0 ? detail.Substring(0, apiAt).Trim() : detail, Muted);
-            if (apiAt >= 0)
-                TextFit(r, ContentX + 26, 435, 18, ContentWidth - 52, detail.Substring(apiAt), Danger);
-            else {
-                DrawProgress(r, new SDL_Rect { x = ContentX + 26, y = 439, w = 800, h = 8 }, item);
-                TextFit(r, ContentX + 860, 430, 21, 550, item.State == DlState.Installed ? "Installation confirmed" :
-                    item.State == DlState.Installing || item.State == DlState.Submitted ? "Waiting for install confirmation" : FormatDlLine(item), Muted);
-            }
-            TextPx(r, ContentX, 522, 26, archive && stage == 0 ? "Archive volumes" : "Package files", White);
-            var related = new List<DlItem>();
-            foreach (var child in _queueSnapshot) if (child.Id == item.Id || (!string.IsNullOrEmpty(item.TitleId) && child.TitleId == item.TitleId)) related.Add(child);
-            bool showVolumes = archive && stage == 0 && _fileVolumes.Count > 0;
-            int count = showVolumes ? _fileVolumes.Count : outputs.Count > 0 ? outputs.Count : related.Count;
-            _fileScroll = Math.Max(0, Math.Min(_fileScroll, Math.Max(0, count - 4)));
-            long volumeTotal = 0, offset = 0; foreach (var v in _fileVolumes) volumeTotal += v.Size;
-            for (int i = 0; i < count; i++)
-            {
-                string name, state, size;
-                if (showVolumes)
-                {
-                    var volume = _fileVolumes[i]; name = volume.Name; size = volume.Size > 0 ? FileBytes(volume.Size) : "Size pending";
-                    bool known = volumeTotal > 0 && item.Total == volumeTotal && volume.Size > 0;
-                    state = known && item.Done >= offset + volume.Size ? "Downloaded" : known && item.Done > offset ? "Downloading" : "Waiting";
-                    offset += volume.Size;
-                }
-                else if (outputs.Count > 0) { var output = outputs[i]; name = output.Name; size = FileBytes(output.Size); state = output.State; }
-                else { var child = related[i]; name = string.IsNullOrEmpty(child.Label) ? PackageTitle(child.Kind) : child.Label; size = child.Total > 0 ? FileBytes(child.Total) : "Size pending"; state = VisibleState(child); }
-                if (i < _fileScroll || i >= _fileScroll + 4) continue;
-                int y = 576 + (i - _fileScroll) * 80;
-                TreeBranch(r, ContentX + 18, y - 8, y + 30, y + 80, ContentX + 64, i == count - 1);
-                Card(r, new SDL_Rect { x = ContentX + 64, y = y, w = ContentWidth - 64, h = 68 }, false, Panel, Border);
-                TextFit(r, ContentX + 86, y + 15, 22, 790, name, White);
-                TextFit(r, ContentX + 910, y + 19, 20, 180, size, Muted);
-                TextFit(r, ContentX + 1110, y + 19, 20, 300, state, Muted);
-            }
-            if (archive && stage == 1) TextFit(r, ContentX, 925, 20, ContentWidth, "Extracted output appears as it is reported. Download and extraction use separate byte totals.", Muted);
-            else TextFit(r, ContentX, 925, 20, ContentWidth, "↑ / ↓ Scroll files    ·    CIRCLE returns to queue    ·    Files are kept until installation is confirmed", Muted);
         }
 
         void DrawCharcoalPair(IntPtr r)

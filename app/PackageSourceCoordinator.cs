@@ -129,6 +129,7 @@ namespace Orbis
                 int order = (ar < 0 ? 4 : ar).CompareTo(br < 0 ? 4 : br);
                 return order != 0 ? order : PackageSourceEngineStatic.CompareTitle(a, b);
             });
+            sorted = SourceTitleResult.GroupGames(sorted);
             var page = new SourceSearchPage { Offset = offset, PageSize = limit, TotalMatches = sorted.Count, IsComplete = complete,
                 AllMatches = complete ? sorted : null };
             for (int i = offset; i < sorted.Count && page.Results.Count < limit; i++) page.Results.Add(PackageSourceEngineStatic.CloneTitle(sorted[i]));

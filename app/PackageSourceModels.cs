@@ -150,6 +150,35 @@ namespace Orbis
 
     internal sealed class SourceTitleResult
     {
+        public List<SourceTitleResult> Variants;
+        internal static string GameKey(string name, string titleId)
+        {
+            string title = (name ?? "").Trim().ToUpperInvariant();
+            title = Regex.Replace(title, @"\b(?:CUSA|PPSA)\d{5}\b", "");
+            title = Regex.Replace(title, @"[\[(](?:USA|EUR|EUROPE|US|EU|JP|JPN|ASIA|PS4|PS5)[\])]", "");
+            title = Regex.Replace(title, @"[^\p{L}\p{N}]+", " ").Trim();
+            string platform = (titleId ?? "").StartsWith("CUSA", StringComparison.OrdinalIgnoreCase) ? "PS4" :
+                (titleId ?? "").StartsWith("PPSA", StringComparison.OrdinalIgnoreCase) ? "PS5" : (titleId ?? "");
+            return platform + "|" + (title.Length == 0 ? titleId : title);
+        }
+        internal static List<SourceTitleResult> GroupGames(IEnumerable<SourceTitleResult> titles)
+        {
+            var result = new List<SourceTitleResult>();
+            var groups = new Dictionary<string, SourceTitleResult>(StringComparer.Ordinal);
+            foreach (var title in titles) {
+                foreach (var variant in title.Variants ?? new List<SourceTitleResult> { title }) {
+                    string key = GameKey(variant.DisplayName, variant.TitleId);
+                    SourceTitleResult group;
+                    if (!groups.TryGetValue(key, out group)) {
+                        group = (SourceTitleResult)variant.MemberwiseClone();
+                        group.Variants = new List<SourceTitleResult>(); groups.Add(key, group); result.Add(group);
+                    }
+                    if (!group.Variants.Exists(v => v.SourceId == variant.SourceId && v.SourceVersion == variant.SourceVersion &&
+                        v.TitleId == variant.TitleId && v.Region == variant.Region && v.CatalogUrl == variant.CatalogUrl)) group.Variants.Add(variant);
+                }
+            }
+            return result;
+        }
         internal int SearchRankHint = -1;
         public string SourceId = "";
         public string SourceVersion = "";
@@ -169,6 +198,7 @@ namespace Orbis
     {
         public string ArchiveVolumes = "";
         public string ArchivePassword = "";
+        public string ArchivePasswords = "";
         public string ResolutionError = "";
         public string SourceId = "";
         public string SourceVersion = "";
