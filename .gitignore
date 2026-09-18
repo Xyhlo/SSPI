@@ -25,6 +25,7 @@
 !/app/DeepbridClient.cs
 !/app/DownloadLinkParser.cs
 !/app/DownloadManager.cs
+!/app/QueueScheduler.cs
 !/app/LocalInstallSource.cs
 !/app/DownloadTransferSettings.cs
 !/app/DownloadLinkRecovery.cs
@@ -186,3 +187,6 @@
 !/app/ArchivePasswordDefaults.cs
 !/app/SearchWindow.DownloadDrawer.cs
 !/resident/plugin/gs_stage_dependency.h
+
+# Concept/design artifacts for the Library redesign (kept local, ignored on purpose)
+/features/

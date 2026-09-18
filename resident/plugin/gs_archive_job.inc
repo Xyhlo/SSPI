@@ -843,7 +843,8 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                 api, (unsigned)rc, task, gs_job.content, kind);
         }
         if (task < 0) {
-            char error[384]; snprintf(error, sizeof(error), "%s. PKG retained. API=%s rc=0x%08X task=%d", gs_bgft_error(rc), api, (unsigned)rc, task);
+            char error[384]; snprintf(error, sizeof(error), "%s%s. PKG retained. API=%s rc=0x%08X task=%d",
+                gs_bgft_error_terminal(rc) ? "BGFT_TERMINAL:" : "", gs_bgft_error(rc), api, (unsigned)rc, task);
             if ((uint32_t)rc == 0x80990015u || (uint32_t)rc == 0x80990086u)
                 snprintf(error, sizeof(error), "BGFT_UNRESOLVED:An existing PS4 download conflicts with this package. Open PS4 Notifications > Downloads, finish or cancel the matching title, then retry. PKG retained. API=%s rc=0x%08X task=%d", api, (unsigned)rc, task);
             // Registration returned without creating a task. Clear only our intent.
@@ -857,7 +858,8 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         if (rc) {
             snprintf(record, sizeof(record), "%s %d 0 3 %d %d", gs_job.content, task, route_version, kind);
             if (write_atomic(journal, record)) return -1;
-            char error[384]; snprintf(error, sizeof(error), "%s. API=%s rc=0x%08X task=%d. Task and PKG retained.", gs_bgft_error(rc), api, (unsigned int)rc, task);
+            char error[384]; snprintf(error, sizeof(error), "%s%s. API=%s rc=0x%08X task=%d. Task and PKG retained.",
+                gs_bgft_error_terminal(rc) ? "BGFT_TERMINAL:" : "", gs_bgft_error(rc), api, (unsigned int)rc, task);
             gs_write_status("failed", error); return -1;
         }
     }
@@ -935,7 +937,8 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                     continue;
                 }
             }
-            char error[384]; snprintf(error, sizeof(error), "%s. API=sceBgftServiceDownloadGetProgress rc=0x%08X error=0x%08X task=%d. PKG retained.", gs_bgft_error(p.error), (unsigned)rc, (unsigned)p.error, task);
+            char error[384]; snprintf(error, sizeof(error), "%s%s. API=sceBgftServiceDownloadGetProgress rc=0x%08X error=0x%08X task=%d. PKG retained.",
+                gs_bgft_error_terminal(p.error) ? "BGFT_TERMINAL:" : "", gs_bgft_error(p.error), (unsigned)rc, (unsigned)p.error, task);
             gs_write_status("failed", error); return -1;
         }
         if (gs_bgft_stalled(&watch, &p, now, gs_paused, gs_stream_slot >= 0 && !gs_stage_stream_finished())) {

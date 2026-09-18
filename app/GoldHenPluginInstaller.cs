@@ -423,7 +423,8 @@ namespace Orbis
 
         static readonly string[] ResidentCertificateNames =
         {
-            "ca-certificates.crt", "real-debrid-geotrust-tls-rsa-ca-g1.pem", "letsencrypt-generation-y-roots.pem"
+            "ca-certificates.crt", "real-debrid-geotrust-tls-rsa-ca-g1.pem", "letsencrypt-generation-y-roots.pem",
+            "letsencrypt-generation-y-intermediates.pem"
         };
 
         /// <summary>The shell worker loads resident certificates from its own

@@ -203,7 +203,7 @@ namespace Orbis
             if (_queueFilter == 0) return true;
             foreach (var item in group.Items)
             {
-                if (_queueFilter == 1 && (item.State == DlState.Downloading || item.State == DlState.Resolving || item.State == DlState.Finalizing || item.State == DlState.Installing)) return true;
+                if (_queueFilter == 1 && (item.State == DlState.Downloading || item.State == DlState.Resolving || item.State == DlState.Finalizing || item.State == DlState.Installing || item.ParkedForProvider)) return true;
                 if (_queueFilter == 2 && (item.State == DlState.Failed || item.State == DlState.Paused || item.State == DlState.Canceled)) return true;
             }
             return false;
@@ -232,6 +232,7 @@ namespace Orbis
         {
             if (item == null) return "Queued";
             if (Extracting(item)) return "Extracting";
+            if (item.ParkedForProvider) return "Preparing in TorBox";
             if (item.State == DlState.Submitted && !item.Background && PkgValidator.BgftSubTypeForKind(item.Kind) == 7) return "Installing";
             if ((item.StatusText ?? "").StartsWith("Installing packages", StringComparison.OrdinalIgnoreCase)) return "Installing in order";
             if (item.State == DlState.Queued && !item.InstallAfterConfirmed && !string.IsNullOrEmpty(item.InstallAfterId)) return "Waiting for dependency";
@@ -571,6 +572,9 @@ namespace Orbis
         {
             if (item.State == DlState.Failed) return item.Error ?? "Download failed";
             if (item.State == DlState.Paused) return "Paused";
+            // A parked TorBox preparation is progress of its own; the provider's
+            // own metric must not be replaced by a "Measuring speed." placeholder.
+            if (item.ParkedForProvider) return !string.IsNullOrEmpty(item.StatusText) ? item.StatusText : "Preparing in TorBox · other downloads continue";
             // A resolving row is not transferring bytes yet, so a rate line would
             // read "Measuring speed." forever. Show the resolver's own progress
             // instead: an uncached provider preparing the file reports continuously.

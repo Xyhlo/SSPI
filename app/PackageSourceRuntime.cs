@@ -78,8 +78,8 @@ namespace Orbis
             if (_engineType == PackageSourceEngineStatic.EngineType)
                 return PackageSourceEngineStatic.Resolve(_source, _versionPath, request);
             if (string.Equals(_engineType, "remote-api-v1", StringComparison.OrdinalIgnoreCase))
-                return PackageSourceEngineRemote.Resolve(_source, _versionPath,
-                    request.TitleId ?? "", request.Name ?? "");
+                return PackageSourceEngineRemote.Resolve(_source.Descriptor, _versionPath,
+                    request.TitleId ?? "", request.Name ?? "", request.Region ?? "");
             if ((string.Equals(_engineType, "recipe-v1", StringComparison.OrdinalIgnoreCase) || string.Equals(_engineType, "recipe-v2", StringComparison.OrdinalIgnoreCase)))
             {
                 string error;

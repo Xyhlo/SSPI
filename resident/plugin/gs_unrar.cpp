@@ -227,6 +227,11 @@ static int measure_archive(RAROpenArchiveDataEx open, Extraction &ctx)
     open.OpenMode = RAR_OM_LIST;
     HANDLE archive = RAROpenArchiveEx(&open);
     int rc = open.OpenResult ? static_cast<int>(open.OpenResult) : archive ? 0 : ERAR_BAD_ARCHIVE;
+    /* A failed open and a failed first header block are different problems: a
+     * wrong RAR4 header password reports ERAR_BAD_DATA here because UnRAR sets
+     * BrokenHeader before it examines FailedHeaderDecryption. Record the open
+     * result so a console log can tell them apart without guessing. */
+    if (open.OpenResult) rar_checkpoint(ctx.diagnostic, "open-failed", 0, static_cast<int>(open.OpenResult));
     uint64_t total = 0;
     unsigned entries = 0, packages = 0;
     while (archive && !rc) {
@@ -248,7 +253,10 @@ static int measure_archive(RAROpenArchiveDataEx open, Extraction &ctx)
     }
     if (archive) RARCloseArchive(archive);
     if (!rc) ctx.total = total;
-    rar_checkpoint(ctx.diagnostic, "scan-complete", 0, rc);
+    /* entry 0 with a failure means no file header was ever listed, so the
+     * archive could not be opened or its first header block is broken. A
+     * successful scan keeps entry 0 so the bounded entry trace is unaffected. */
+    rar_checkpoint(ctx.diagnostic, "scan-complete", rc ? entries : 0, rc);
     if (ctx.diagnostic) ctx.diagnostic("scan-pkg-count", packages, rc, 0, 0, total);
     return rc;
 }

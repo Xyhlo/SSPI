@@ -91,7 +91,7 @@ namespace Orbis
         }
         internal static long Download(string url, string destination, Action<long,long> progress,
             Func<bool> canceled, string bearer, string title, string content, string sha, int lanes,
-            Action<long,long,long> telemetry = null, Action<string> phase = null)
+            Action<long,long,long> telemetry = null, Action<string> phase = null, Action<string> activity = null)
         {
             EnsureReady();
             int handle = start(url, bearer ?? "", destination, title ?? "", content ?? "", sha ?? "",
@@ -107,6 +107,8 @@ namespace Orbis
                     if (telemetry != null) telemetry(state.Done, state.Total, state.NetworkBytes);
                     else if (progress != null) progress(state.Done, state.Total);
                     if (state.State == 4 && phase != null) phase(state.Error);
+                    else if ((state.State == 1 || state.State == 2) && activity != null && !string.IsNullOrEmpty(state.Error))
+                        activity(state.Error);
                     if (state.State == 5)
                     {
                         // Release native file/ownership handles before publishing the file.

@@ -89,6 +89,34 @@ void gs_http_abort(GsHttp *h)
     int r=__atomic_load_n(&h->request,__ATOMIC_ACQUIRE);if(r>=0)http_abort(r);
     request_unlock(h);
 }
+static int64_t days_from_civil(int year,unsigned month,unsigned day)
+{
+    year-=month<=2;int era=(year>=0?year:year-399)/400;
+    unsigned yoe=(unsigned)(year-era*400);
+    unsigned mp=month>2?month-3:month+9;
+    unsigned doy=(153*mp+2)/5+day-1;
+    unsigned doe=yoe*365+yoe/4-yoe/100+doy;
+    return (int64_t)era*146097+(int64_t)doe-719468;
+}
+static int parse_retry_after(const char *value,int *invalid_time)
+{
+    const char *at=value;int64_t seconds=0;
+    *invalid_time=0;
+    if(!number(&at,&seconds)&&!*at)return seconds>INT_MAX?INT_MAX:(int)seconds;
+    char week[4]={0},month_name[4]={0},zone[4]={0};int day,year,hour,minute,second;
+    if(sscanf(value,"%3[^,], %d %3s %d %d:%d:%d %3s",week,&day,month_name,&year,&hour,&minute,&second,zone)!=8 ||
+       strcmp(zone,"GMT") || day<1 || day>31 || year<1970 || hour<0 || hour>23 || minute<0 || minute>59 || second<0 || second>60)return 0;
+    static const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    unsigned month=0;for(unsigned i=0;i<12;i++)if(!strcmp(month_name,months[i])){month=i+1;break;}if(!month)return 0;
+    int64_t target=days_from_civil(year,month,(unsigned)day)*86400+(int64_t)hour*3600+minute*60+second;
+    time_t wall=time(NULL);
+    // A console with an unset epoch cannot translate an HTTP date to a
+    // monotonic delay. Mark it explicitly and let recovery use its bounded
+    // default rather than interpreting decades as a server cooldown.
+    if((int64_t)wall<1577836800){*invalid_time=1;return 0;}
+    if(target<=(int64_t)wall)return 0;
+    int64_t delay=target-(int64_t)wall;return delay>INT_MAX?INT_MAX:(int)delay;
+}
 static void response_close(GsHttp *h)
 {
     request_lock(h);
@@ -155,7 +183,7 @@ static int http_open_request(GsHttp *h,const char *url,const char *bearer,int64_
             }
             h->stage="timeouts";
             if((rc=http_connect_timeout(h->template_id,10000000))<0 ||
-               (rc=http_recv_timeout(h->template_id,60000000))<0 ||
+               (rc=http_recv_timeout(h->template_id,120000000))<0 ||
                (rc=http_send_timeout(h->template_id,60000000))<0)return rc;
             h->stage="connect";h->connection=http_connection(h->template_id,current,1);
             if(h->connection<0)return h->connection;
@@ -193,8 +221,9 @@ static int http_open_request(GsHttp *h,const char *url,const char *bearer,int64_
         if(connection_header)for(const char *p=value;*p;p++)
             if((p==value||p[-1]==','||p[-1]==' ')&&!strncasecmp(p,"close",5)&&(p[5]==0||p[5]==','||p[5]==' ')){h->retire=1;break;}
         if(header(block,length,"Location",h->location,sizeof(h->location))<0)return -2;
-        h->retry_after=0;
-        if(header(block,length,"Retry-After",value,sizeof(value))>0) {const char *v=value;int64_t delay;if(!number(&v,&delay)&&!*v)h->retry_after=(int)(delay>INT_MAX?INT_MAX:delay);}
+        h->retry_after=0;h->retry_after_invalid_time=0;
+        if(header(block,length,"Retry-After",value,sizeof(value))>0)
+            h->retry_after=parse_retry_after(value,&h->retry_after_invalid_time);
         if(h->status==301||h->status==302||h->status==303||h->status==307||h->status==308) {
             if(hop==8||!h->location[0])return -2;
             char next[8192];int written;
@@ -232,7 +261,7 @@ static void failure_details(GsHttp *h)
 int gs_http_open(GsHttp *h,const char *url,const char *bearer,int64_t start,int64_t end)
 {
     h->ssl_error=h->native_errno=0;h->ssl_verify=h->open_wait_ms=h->interruptions=0;
-    h->status=h->retry_after=h->reused=0;h->stage="request-slot";
+    h->status=h->retry_after=h->retry_after_invalid_time=h->reused=0;h->stage="request-slot";
     __atomic_store_n(&h->aborted,0,__ATOMIC_RELEASE);
     uint64_t began=gs_clock();
     // Bound TLS/request setup pressure on the shared firmware HTTP heap.
@@ -241,7 +270,7 @@ int gs_http_open(GsHttp *h,const char *url,const char *bearer,int64_t start,int6
         h->open_wait_ms=(unsigned)(gs_clock()-began);
         if(__atomic_load_n(&h->aborted,__ATOMIC_ACQUIRE))return -1;
         int active=__atomic_load_n(&pending_opens,__ATOMIC_ACQUIRE);
-        if(active<2 && __atomic_compare_exchange_n(&pending_opens,&active,active+1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
+        if(active<1 && __atomic_compare_exchange_n(&pending_opens,&active,active+1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
         if(h->open_wait_ms>=30000)return -15;
         gs_sleep(5);
     }

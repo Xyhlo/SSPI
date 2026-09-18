@@ -187,6 +187,7 @@ namespace Orbis
         public bool ForceLocalInstall;
         public long RetryAfterUtcTicks;
         public int TransientHttpRetries;
+        public long HttpRetryLastDurableBytes;
         public int InstallRetries;
         // Reuse a resolved URL for transient failures; never persist it in diagnostics.
         public string HttpRetryUrl;
@@ -199,6 +200,19 @@ namespace Orbis
         // Last accepted resident command wins over a status sampled before it.
         public bool? ResidentPauseDesired;
         public bool CancelRequested;
+
+        // Provider preparation parking. A provider-side prepare must not own the one
+        // transfer slot, so the row stays Queued with its provider progress while
+        // the worker advances other games. Transient by design: a restart rebuilds
+        // it from the account-bound durable pending record. Queue ownership and
+        // poll cadence are persisted; signed URLs and provider credentials are not.
+        internal bool ParkedForProvider;
+        internal long ParkPollDueUtcTicks;
+        internal int ParkPollCount;
+        internal int ParkTransientFailures;
+        internal string ParkProviderId = "";
+        internal string ParkLastState = "";
+        internal long ParkStartedUtcTicks;
     }
 
     /// <summary>Bounded transfer queue with independent, ordered package installation.</summary>
@@ -231,6 +245,9 @@ namespace Orbis
         long _saveVersion;
         long _savedVersion;
         int _residentPreparationAttempted;
+        int _parkPollBusy;
+        int _parkTimerStarted;
+        Timer _parkPollTimer;
         readonly NerdTelemetry _nerd = new NerdTelemetry();
         public NerdTelemetry Nerd { get { return _nerd; } }
 
@@ -249,6 +266,7 @@ namespace Orbis
                 try { _workers[i].Priority = ThreadPriority.BelowNormal; } catch (PlatformNotSupportedException) { }
                 _workers[i].Start();
             }
+            if (_items.Exists(item => item.ParkedForProvider)) EnsureParkPollTimer();
         }
 
         public bool IsBusyDownloading
@@ -351,6 +369,54 @@ namespace Orbis
             }
             SaveManifest();
             return id;
+        }
+
+        bool TryParkProviderPreparation(DlItem job, int attempt, out HashSet<string> unavailableProviders)
+        {
+            unavailableProviders = null;
+            if (!AllDebridIsFirstProvider(_cfg, job.HosterUrl))
+                return TryParkTorBoxPreparation(job, attempt, out unavailableProviders);
+            AllDebridClient.PreparedPollResult poll;
+            try
+            {
+                poll = AllDebridClient.TryParkOrPrepare(_cfg.AllDebridApiKey, job.HosterUrl,
+                    () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested);
+            }
+            catch (DebridResolutionError rejection)
+            {
+                if (rejection.CanTryProvider && UnlockProviders.EnabledIds(_cfg).Length > 1)
+                { unavailableProviders = new HashSet<string>(StringComparer.Ordinal) { UnlockProviders.AllDebridId }; return false; }
+                throw;
+            }
+            lock (_lock) if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) return true;
+            if (poll.Kind == AllDebridClient.PreparedPollKind.Ready) return false;
+            if (poll.Kind == AllDebridClient.PreparedPollKind.Rejected || poll.Kind == AllDebridClient.PreparedPollKind.Terminal)
+            {
+                if (UnlockProviders.EnabledIds(_cfg).Length > 1)
+                { unavailableProviders = new HashSet<string>(StringComparer.Ordinal) { UnlockProviders.AllDebridId }; return false; }
+                throw new Exception(string.IsNullOrEmpty(poll.Error) ? "AllDebrid preparation failed" : poll.Error);
+            }
+            long nowTicks = DateTime.UtcNow.Ticks;
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) return true;
+                job.State = DlState.Queued;job.ParkedForProvider = true;job.ParkProviderId = UnlockProviders.AllDebridId;
+                job.ParkStartedUtcTicks = nowTicks;job.ParkPollCount = 0;job.ParkTransientFailures = 0;
+                job.ParkLastState = poll.ProviderState ?? "";
+                job.ParkPollDueUtcTicks = nowTicks + TimeSpan.FromMilliseconds(AllDebridClient.PollDelayMilliseconds).Ticks;
+                job.BytesPerSec = 0;job.EtaSeconds = 0;
+                job.StatusText = "Preparing in AllDebrid · next check in 5s · other downloads continue";
+                _nextJobStartAt = TransferClockMs();
+            }
+            SaveManifest();EnsureParkPollTimer();return true;
+        }
+
+        static bool AllDebridIsFirstProvider(AppSettings cfg, string hosterUrl)
+        {
+            if (cfg == null || !cfg.UseUnlockProvider || !cfg.HasAllDebrid || string.IsNullOrEmpty(hosterUrl) ||
+                !UnlockProviders.IsEnabled(cfg, UnlockProviders.AllDebridId)) return false;
+            string[] ranked = UnlockProviders.RankedProviderIds(cfg, hosterUrl);
+            return ranked.Length > 0 && string.Equals(ranked[0], UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -793,6 +859,7 @@ namespace Orbis
                         StatusText = i.StatusText,
                         InstallConfirmed = i.InstallConfirmed,
                         Background = i.Background,
+                        ParkedForProvider = i.ParkedForProvider,
                         BgftLoopback = i.BgftLoopback,
                         BgftResident = i.BgftResident,
                         BgftLoopbackServed = i.BgftLoopbackServed,
@@ -892,6 +959,30 @@ namespace Orbis
                     return false;
                 }
                 return true;
+            }
+        }
+
+        public string DownloadNext(string id)
+        {
+            lock (_lock)
+            {
+                var target = Find(id);
+                if (target == null) return "Package is no longer in the queue";
+                if (target.State != DlState.Queued && target.State != DlState.Paused && target.State != DlState.Downloading && target.State != DlState.Resolving)
+                    return "Only queued, paused, or downloading packages can be prioritized";
+                if (!InstallDependencyReady(target))
+                    return "Resume this game's base or earlier update first; installation order is preserved";
+                // Pause competing transfers through their existing owner, never stop an installer.
+                foreach (var other in _items.ToArray())
+                    if (other.Id != id && !other.PauseRequested &&
+                        (other.State == DlState.Queued || other.State == DlState.Downloading || other.State == DlState.Resolving))
+                        TogglePause(other.Id);
+                if (target.State == DlState.Paused) TogglePause(id);
+                // The scheduler scans oldest/end first. Persist this explicit choice.
+                _items.Remove(target); _items.Add(target);
+                _nextJobStartAt = 0;
+                SaveManifest();
+                return "Download prioritized; other transfers paused. Active installation and dependencies finish first.";
             }
         }
 
@@ -1774,7 +1865,7 @@ namespace Orbis
             {
                 if (item.Background && item.ResidentStaged && item.ResidentAutoInstall)
                 { residentBusy = true; continue; }
-                if ((item.Background && (item.State != DlState.Installed && item.State != DlState.Canceled)) ||
+                if ((item.Background && (item.State != DlState.Installed && item.State != DlState.Canceled && item.State != DlState.Paused)) ||
                     item.State == DlState.Installing || (item.State == DlState.Submitted && !item.InstallOrderReady)) return true;
             }
             return false;
@@ -1799,6 +1890,9 @@ namespace Orbis
                     try { RefreshBackgroundTasks(); }
                     finally { Monitor.Exit(_bgftRefreshGate); }
                 }
+                // Parked TorBox preparations are polled off-thread; the worker
+                // itself never waits on a provider that has not published a file.
+                PumpParkedPreparations();
                 DlItem job = null;
                 int attempt = 0;
                 string activePath = null;
@@ -1826,11 +1920,14 @@ namespace Orbis
                         bool local = File.Exists(i.DestPath);
                         bool publishOnly = residentBusy && CanPrepareResidentHandoff(i, BackgroundSelected) &&
                             CanInstallWithResidentDependency(ResidentDependencyId(i));
-                        if (i.State == DlState.Queued && !i.Background &&
-                            (!residentBusy || publishOnly) && (!localPending || local || publishOnly) &&
-                            (publishOnly ? !HasUnstartedPrerequisite(i) : InstallDependencyReady(i)) &&
-                            i.RetryAfterUtcTicks <= DateTime.UtcNow.Ticks && !_activeIds.Contains(i.Id) &&
-                            !_activePaths.Contains(pathKey))
+                        bool dependencyAllowed = publishOnly ? !HasUnstartedPrerequisite(i) : InstallDependencyReady(i);
+                        // One pure policy call, shared with the host regression, so a
+                        // parked TorBox preparation is never claimed a second time and
+                        // never blocks an independent game behind it.
+                        if (QueueScheduler.CanClaim(i.ParkedForProvider, i.State == DlState.Queued, i.Background,
+                            backgroundBusy, residentBusy, publishOnly, localPending, local, dependencyAllowed,
+                            DateTime.UtcNow.Ticks, i.RetryAfterUtcTicks, TransferClockMs(), _nextJobStartAt,
+                            _activeIds.Count, WorkerCount, _activePaths.Contains(pathKey)))
                         {
                             job = i;
                             _nextJobStartAt = TransferClockMs() + 3000;
@@ -1881,6 +1978,341 @@ namespace Orbis
                     Thread.Sleep(1000);
                 }
             }
+        }
+
+        /// <summary>
+        /// TorBox preparation is a remote operation that can take minutes. It is
+        /// parked instead of holding the only transfer slot: the row returns to
+        /// Queued with the provider's own metric, and the park poller re-queues it
+        /// once the provider publishes the file. Returns true when the worker must
+        /// move on to the next eligible game.
+        /// </summary>
+        bool TryParkTorBoxPreparation(DlItem job, int attempt, out HashSet<string> unavailableProviders)
+        {
+            unavailableProviders = null;
+            if (!TorBoxIsFirstProvider(_cfg, job.HosterUrl)) return false;
+            // A provider job is created at most once: TryParkOrPrepare reuses the
+            // durable pending record and only polls when one already exists.
+            TorBoxClient.PreparedPollResult poll;
+            try
+            {
+                poll = TorBoxClient.TryParkOrPrepare(_cfg.TorBoxApiKey, job.HosterUrl,
+                    () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested);
+            }
+            catch (DebridResolutionError rejection)
+            {
+                // A definite TorBox rejection keeps the previous multi-provider
+                // fallback: resolve again with TorBox excluded rather than failing
+                // the job. Without another configured provider the rejection is
+                // reported unchanged.
+                if (rejection.CanTryProvider && UnlockProviders.EnabledIds(_cfg).Length > 1)
+                {
+                    unavailableProviders = new HashSet<string>(StringComparer.Ordinal) { UnlockProviders.TorBoxId };
+                    return false;
+                }
+                throw;
+            }
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) return true;
+            }
+            if (poll.Kind == TorBoxClient.PreparedPollKind.Ready) return false;
+            if (poll.Kind == TorBoxClient.PreparedPollKind.Rejected || poll.Kind == TorBoxClient.PreparedPollKind.Terminal)
+                throw new Exception(string.IsNullOrEmpty(poll.Error) ? "TorBox preparation failed" : poll.Error);
+            long nowTicks = DateTime.UtcNow.Ticks;
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) return true;
+                job.State = DlState.Queued;
+                job.ParkedForProvider = true;
+                job.ParkProviderId = UnlockProviders.TorBoxId;
+                job.ParkStartedUtcTicks = nowTicks;
+                job.ParkPollCount = 1;
+                job.ParkTransientFailures = poll.Kind == TorBoxClient.PreparedPollKind.Transient ? 1 : 0;
+                job.ParkLastState = poll.ProviderState ?? "";
+                job.ParkPollDueUtcTicks = nowTicks + TimeSpan.FromMilliseconds(QueueScheduler.NextPollDelayMs(0)).Ticks;
+                job.BytesPerSec = 0;
+                job.EtaSeconds = 0;
+                job.StatusText = ParkedPreparationStatus(poll);
+                // A park must free the queue immediately: the post-claim cooldown
+                // exists to pace transfers, not to delay an unrelated game.
+                _nextJobStartAt = TransferClockMs();
+            }
+            SaveManifest();
+            // The worker is busy inside another job while a download runs, so the
+            // park poller owns its own one second cadence. Due times and the
+            // single-flight latch bound it; no polling happens when nothing parks.
+            EnsureParkPollTimer();
+            return true;
+        }
+
+        void EnsureParkPollTimer()
+        {
+            if (Volatile.Read(ref _parkTimerStarted) == 1) return;
+            if (Interlocked.CompareExchange(ref _parkTimerStarted, 1, 0) != 0) return;
+            _parkPollTimer = new Timer(delegate { if (_run) PumpParkedPreparations(); }, null, 1000, 1000);
+        }
+
+        /// <summary>Only the first-ranked provider for this link parks. Later
+        /// candidates keep their existing fallback behavior.</summary>
+        static bool TorBoxIsFirstProvider(AppSettings cfg, string hosterUrl)
+        {
+            if (cfg == null || !cfg.UseUnlockProvider || !cfg.HasTorBox || string.IsNullOrEmpty(hosterUrl)) return false;
+            if (!UnlockProviders.IsEnabled(cfg, UnlockProviders.TorBoxId)) return false;
+            string[] ranked = UnlockProviders.RankedProviderIds(cfg, hosterUrl);
+            return ranked.Length > 0 && string.Equals(ranked[0], UnlockProviders.TorBoxId, StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string ParkedPreparationStatus(TorBoxClient.PreparedPollResult poll)
+        {
+            if (poll.Kind == TorBoxClient.PreparedPollKind.Transient)
+                return "Preparing in TorBox · list request retry 1/" + TorBoxClient.TransientListAttempts +
+                    " · other downloads continue";
+            string metric = string.IsNullOrEmpty(poll.Metric) ? "" : " · " + poll.Metric;
+            if (!poll.Visible)
+                return "Preparing in TorBox · waiting for the provider to list it" + metric + " · other downloads continue";
+            return "Preparing in TorBox" + metric + " · other downloads continue";
+        }
+
+        /// <summary>
+        /// Polls one parked TorBox preparation at a time, off the worker thread.
+        /// Single-flight: at most one provider request is in flight, the per-row
+        /// cadence is 1s/2s/5s, and every result is re-validated against the live
+        /// queue row before it is applied.
+        /// </summary>
+        void PumpParkedPreparations()
+        {
+            if (_cfg == null || Interlocked.CompareExchange(ref _parkPollBusy, 1, 0) != 0) return;
+            DlItem target = null;
+            int attempt = 0;
+            string token = null;
+            bool rearmed = false;
+            bool expired = false;
+            long nowTicks = DateTime.UtcNow.Ticks;
+            lock (_lock)
+            {
+                // Earliest due first: a just-polled row must not starve a row that
+                // has never been polled, and list order keeps equal deadlines fair.
+                for (int index = _items.Count - 1; index >= 0; index--)
+                {
+                    var candidate = _items[index];
+                    if (!candidate.ParkedForProvider) continue;
+                    if (candidate.State != DlState.Queued) continue;
+                    if (candidate.PauseRequested || candidate.CancelRequested || candidate.RemoveRequested)
+                    {
+                        candidate.ParkedForProvider = false;
+                        rearmed = true;
+                        continue;
+                    }
+                    // The durable provider record is the park's only source of truth.
+                    // If it vanished (restart, six hour expiry, provider cleanup) the
+                    // row must be reclaimable so the next claim can create a fresh
+                    // prepared download instead of waiting forever.
+                    bool allDebrid = string.Equals(candidate.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase);
+                    bool hasPending = allDebrid
+                        ? AllDebridClient.HasPreparedDownload(_cfg.AllDebridApiKey, candidate.HosterUrl)
+                        : TorBoxClient.HasPreparedDownload(_cfg.TorBoxApiKey, candidate.HosterUrl);
+                    if (!hasPending)
+                    {
+                        candidate.ParkedForProvider = false;
+                        candidate.RetryAfterUtcTicks = 0;
+                        candidate.StatusText = (allDebrid ? "AllDebrid" : "TorBox") + " preparation restarted · queued";
+                        rearmed = true;
+                        continue;
+                    }
+                    if (target == null || candidate.ParkPollDueUtcTicks < target.ParkPollDueUtcTicks)
+                    {
+                        target = candidate;
+                        attempt = candidate.AttemptId;
+                    }
+                }
+                if (target != null && nowTicks < target.ParkPollDueUtcTicks) target = null;
+                if (target != null)
+                {
+                    bool allDebrid = string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase);
+                    token = allDebrid ? _cfg.AllDebridApiKey : _cfg.TorBoxApiKey;
+                    expired = nowTicks - target.ParkStartedUtcTicks >
+                        (allDebrid ? AllDebridClient.PreparationDeadline : TorBoxClient.PreparationDeadline).Ticks;
+                }
+            }
+            if (rearmed) SaveManifest();
+            if (target == null)
+            {
+                Volatile.Write(ref _parkPollBusy, 0);
+                return;
+            }
+            if (expired)
+            {
+                ExpireParkedPreparation(target, attempt);
+                Volatile.Write(ref _parkPollBusy, 0);
+                return;
+            }
+            string hostUrl = target.HosterUrl;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Exception failure = null;
+                    bool allDebrid = string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase);
+                    if (allDebrid)
+                    {
+                        AllDebridClient.PreparedPollResult poll = null;
+                        try { poll = AllDebridClient.PollPrepared(token, hostUrl, () => !IsParkedPollCurrent(target, attempt)); }
+                        catch (OperationCanceledException) { }
+                        catch (Exception ex) { failure = ex; }
+                        if (poll != null || failure != null) ApplyAllDebridParkedPollResult(target, attempt, poll, failure);
+                    }
+                    else
+                    {
+                        TorBoxClient.PreparedPollResult poll = null;
+                        try { poll = TorBoxClient.PollPrepared(token, hostUrl, () => !IsParkedPollCurrent(target, attempt)); }
+                        catch (OperationCanceledException) { }
+                        catch (Exception ex) { failure = ex; }
+                        if (poll != null || failure != null) ApplyParkedPollResult(target, attempt, poll, failure);
+                    }
+                }
+                finally { Volatile.Write(ref _parkPollBusy, 0); }
+            });
+        }
+
+        bool IsParkedPollCurrent(DlItem target, int attempt)
+        {
+            lock (_lock)
+            {
+                return object.ReferenceEquals(Find(target.Id), target) && target.AttemptId == attempt &&
+                    target.ParkedForProvider && target.State == DlState.Queued;
+            }
+        }
+
+        void ApplyParkedPollResult(DlItem target, int attempt, TorBoxClient.PreparedPollResult poll, Exception failure)
+        {
+            string failMessage = null;
+            bool changed = false;
+            lock (_lock)
+            {
+                if (!object.ReferenceEquals(Find(target.Id), target) || target.AttemptId != attempt ||
+                    !target.ParkedForProvider) return;
+                if (target.PauseRequested || target.CancelRequested || target.RemoveRequested)
+                {
+                    target.ParkedForProvider = false;
+                    changed = true;
+                }
+                else if (failure != null || poll == null)
+                {
+                    failMessage = ParkedTransientFailure(target, failure);
+                    changed = true;
+                }
+                else
+                {
+                    switch (poll.Kind)
+                    {
+                        case TorBoxClient.PreparedPollKind.Ready:
+                            target.ParkedForProvider = false;
+                            target.RetryAfterUtcTicks = 0;
+                            target.ParkLastState = "";
+                            target.StatusText = "TorBox ready · other downloads continue";
+                            changed = true;
+                            break;
+                        case TorBoxClient.PreparedPollKind.Preparing:
+                            target.ParkPollCount++;
+                            target.ParkTransientFailures = 0;
+                            target.ParkLastState = poll.ProviderState ?? "";
+                            target.ParkPollDueUtcTicks = DateTime.UtcNow.Ticks +
+                                TimeSpan.FromMilliseconds(ParkPollDelayMs(target)).Ticks;
+                            target.StatusText = ParkedPreparationStatus(poll);
+                            changed = true;
+                            break;
+                        case TorBoxClient.PreparedPollKind.Transient:
+                            failMessage = ParkedTransientFailure(target, poll.Transport);
+                            changed = true;
+                            break;
+                        default:
+                            target.ParkedForProvider = false;
+                            failMessage = string.IsNullOrEmpty(poll.Error) ? "TorBox preparation failed" : poll.Error;
+                            changed = true;
+                            break;
+                    }
+                }
+            }
+            if (!changed) return;
+            if (failMessage != null) SetFailureIfCurrent(target, attempt, failMessage);
+            else SaveManifest();
+        }
+
+        void ApplyAllDebridParkedPollResult(DlItem target, int attempt, AllDebridClient.PreparedPollResult poll, Exception failure)
+        {
+            string failMessage = null;bool changed = false;
+            lock (_lock)
+            {
+                if (!object.ReferenceEquals(Find(target.Id), target) || target.AttemptId != attempt || !target.ParkedForProvider) return;
+                if (target.PauseRequested || target.CancelRequested || target.RemoveRequested)
+                { target.ParkedForProvider = false;changed = true; }
+                else if (failure != null || poll == null)
+                { ParkedTransientFailure(target, failure);changed = true; }
+                else switch (poll.Kind)
+                {
+                    case AllDebridClient.PreparedPollKind.Ready:
+                        target.ParkedForProvider = false;target.RetryAfterUtcTicks = 0;target.ParkLastState = "";
+                        target.ResolvedProviderId = UnlockProviders.AllDebridId;
+                        target.StatusText = "AllDebrid ready · queued";changed = true;break;
+                    case AllDebridClient.PreparedPollKind.Preparing:
+                        target.ParkPollCount++;target.ParkTransientFailures = 0;target.ParkLastState = poll.ProviderState ?? "";
+                        target.ParkPollDueUtcTicks = DateTime.UtcNow.Ticks + TimeSpan.FromMilliseconds(ParkPollDelayMs(target)).Ticks;
+                        target.StatusText = "Preparing in AllDebrid · next check in 5s · other downloads continue";changed = true;break;
+                    case AllDebridClient.PreparedPollKind.Transient:
+                        ParkedTransientFailure(target, poll.Transport);changed = true;break;
+                    default:
+                        target.ParkedForProvider = false;
+                        failMessage = string.IsNullOrEmpty(poll.Error) ? "AllDebrid preparation failed" : poll.Error;
+                        changed = true;break;
+                }
+            }
+            if (!changed) return;if (failMessage != null) SetFailureIfCurrent(target, attempt, failMessage);else SaveManifest();
+        }
+
+        static int ParkPollDelayMs(DlItem target)
+        {
+            return string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase)
+                ? AllDebridClient.PollDelayMilliseconds : QueueScheduler.NextPollDelayMs(target.ParkPollCount);
+        }
+
+        /// <summary>Provider polling failures retain the remote preparation and
+        /// back off visibly. They are not evidence that the remote job failed.</summary>
+        string ParkedTransientFailure(DlItem target, Exception failure)
+        {
+            if (target.ParkTransientFailures < int.MaxValue) target.ParkTransientFailures++;
+            target.ParkPollCount++;
+            int shift = Math.Min(6, Math.Max(0, target.ParkTransientFailures - 1));
+            long delay = Math.Max(ParkPollDelayMs(target), Math.Min(60000L, 1000L << shift));
+            var rejection = failure as DebridResolutionError;
+            if (rejection != null && rejection.RetryAfterSeconds > 0)
+                delay = Math.Max(delay, Math.Min((long)int.MaxValue, (long)rejection.RetryAfterSeconds * 1000L));
+            long ticks = TimeSpan.FromMilliseconds(delay).Ticks;
+            target.ParkPollDueUtcTicks = DateTime.MaxValue.Ticks - DateTime.UtcNow.Ticks < ticks
+                ? DateTime.MaxValue.Ticks : DateTime.UtcNow.Ticks + ticks;
+            string provider = string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase) ? "AllDebrid" : "TorBox";
+            target.StatusText = "Preparing in " + provider + " · provider check retry " + target.ParkTransientFailures +
+                " in " + Math.Max(1, delay / 1000) + "s · other downloads continue";
+            return null;
+        }
+
+        void ExpireParkedPreparation(DlItem target, int attempt)
+        {
+            long seconds;
+            string detail;
+            lock (_lock)
+            {
+                if (!object.ReferenceEquals(Find(target.Id), target) || target.AttemptId != attempt ||
+                    !target.ParkedForProvider) return;
+                target.ParkedForProvider = false;
+                seconds = Math.Max(1, (DateTime.UtcNow.Ticks - target.ParkStartedUtcTicks) / TimeSpan.TicksPerSecond);
+                detail = string.IsNullOrEmpty(target.ParkLastState)
+                    ? "the provider never listed the prepared download"
+                    : "last provider state " + target.ParkLastState;
+            }
+            string provider = string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase) ? "AllDebrid" : "TorBox";
+            SetFailureIfCurrent(target, attempt, provider + " is still preparing this file after " + seconds + "s (" +
+                detail + "). The prepared download ID was kept; retry from Downloads shortly.");
         }
 
         void RunJob(DlItem job, int attempt)
@@ -1961,6 +2393,8 @@ namespace Orbis
                 }
                 string direct = job.HosterUrl;
                 string foregroundStatus = "Downloading in SSPI...";
+                if (job.AccessType == "Personal" && CloudCatalog.PersonalLocator(job.HosterUrl) != null)
+                    job.AccessType = "Cloud";
                 if (job.AccessType == "Personal")
                 {
                     // Resolve routing on the worker, never while drawing the link overlay.
@@ -1980,7 +2414,12 @@ namespace Orbis
                     direct = job.HttpRetryUrl;
                 }
                 else if (job.AccessType == "Cloud")
-                { direct = CloudCatalog.Resolve(_cfg, job.HosterUrl); foregroundStatus = "Downloading cloud file..."; }
+                {
+                    direct = CloudCatalog.Resolve(_cfg, job.HosterUrl,
+                        message => { lock(_lock) { if(job.AttemptId==attempt)job.StatusText=message; } },
+                        () => !_run || job.AttemptId!=attempt || job.PauseRequested || job.CancelRequested);
+                    foregroundStatus = "Downloading cloud file...";
+                }
                 else if (IsDirectAccess(job.AccessType))
                 {
                     foregroundStatus = "Downloading direct...";
@@ -1993,7 +2432,12 @@ namespace Orbis
                         if (job.AttemptId != attempt) return;
                         job.StatusText = "Unlocking (" + UnlockProviders.DisplayName(_cfg.UnlockProviderId) + ")...";
                     }
-                    direct = ResolveJobHost(job, attempt);
+                    // TorBox preparation is remote and can take minutes. Park it so
+                    // the worker advances another eligible game instead of holding the
+                    // single transfer slot; the park poller re-queues it when ready.
+                    HashSet<string> torboxUnavailable;
+                    if (TryParkProviderPreparation(job, attempt, out torboxUnavailable)) return;
+                    direct = ResolveJobHost(job, attempt, torboxUnavailable);
                     foregroundStatus = "Downloading (" + UnlockProviders.DisplayName(job.ResolvedProviderId) + ")...";
                 }
                 else
@@ -2207,11 +2651,7 @@ namespace Orbis
                     },
                     () => TransferClient.DurableBytes(job.DestPath),
                     () => CanRefreshUnlock(job),
-                    () => UnlockProviders.Unrestrict(_cfg, job.HosterUrl,
-                        text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } },
-                        cancel,
-                        provider => { lock (_lock) { if (job.AttemptId == attempt) job.ResolvedProviderId = provider; } },
-                        job.ResolvedProviderId),
+                    () => RenewJobLink(job, attempt, cancel),
                     cancel,
                     count => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = "Refreshing rejected link..."; } });
 
@@ -2254,13 +2694,18 @@ namespace Orbis
                 long retryAt;
                 if (!DownloadHttpException.TryGetRetry(error, job.TransientHttpRetries,
                     DateTime.UtcNow, out retryAt)) return false;
-                job.TransientHttpRetries++;
+                long durable = TransferClient.DurableBytes(job.DestPath);
+                if (durable > job.HttpRetryLastDurableBytes) job.TransientHttpRetries = 0;
+                job.HttpRetryLastDurableBytes = Math.Max(job.HttpRetryLastDurableBytes, durable);
+                if (job.TransientHttpRetries < int.MaxValue) job.TransientHttpRetries++;
                 job.RetryAfterUtcTicks = retryAt;
                 job.State = DlState.Queued;
                 job.Error = null;
                 job.BytesPerSec = 0;
                 job.EtaSeconds = 0;
-                job.StatusText = "Server temporarily unavailable · retry " + job.TransientHttpRetries + "/3 scheduled";
+                long seconds = Math.Max(1, (retryAt - DateTime.UtcNow.Ticks + TimeSpan.TicksPerSecond - 1) / TimeSpan.TicksPerSecond);
+                job.StatusText = "Server temporarily unavailable · recovery retry " + job.TransientHttpRetries +
+                    " in " + seconds + "s";
             }
             SaveManifest();
             return true;
@@ -3036,9 +3481,9 @@ namespace Orbis
                 string.Equals(volume.AccessType, "HosterLanding", StringComparison.OrdinalIgnoreCase));
         }
 
-        string ResolveJobHost(DlItem job, int attempt)
+        string ResolveJobHost(DlItem job, int attempt, ISet<string> unavailable = null)
         {
-            var unavailableProviders = new HashSet<string>(StringComparer.Ordinal);
+            var unavailableProviders = unavailable ?? new HashSet<string>(StringComparer.Ordinal);
             Func<bool> cancelled = () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested;
             Action<string> progress = text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } };
             return PackageMirrorFallback.Resolve(job.HosterUrl, job.MirrorCandidates,
@@ -4587,6 +5032,7 @@ namespace Orbis
                     !item.ResidentArchive || !item.Background) return;
                 if (CanRenewResidentLink(item, status, CanRefreshUnlock(item)))
                 {
+                    if (status.Done > item.ResidentLastRenewalBytes) item.ResidentLinkRenewals = 0;
                     item.ResidentLinkRenewals++;
                     item.ResidentLastRenewalBytes = status.Done;
                     item.ResidentRetryPending = true;
@@ -4675,9 +5121,9 @@ namespace Orbis
             return item != null && status != null && canResolve && item.ResidentStaged && item.Background &&
                 !item.BgftLocalInstall && !item.ResidentRetryPending &&
                 !item.CancelRequested && !item.PauseRequested && item.State != DlState.Canceled &&
-                item.ResidentLinkRenewals < 3 && status.Id == item.Id && status.State == "failed" &&
+                (item.ResidentLinkRenewals < DownloadLinkRecovery.MaximumRenewals || status.Done > item.ResidentLastRenewalBytes) &&
+                status.Id == item.Id && status.State == "failed" &&
                 status.Total > 0 && status.Done < status.Total &&
-                (item.ResidentLinkRenewals == 0 || status.Done > item.ResidentLastRenewalBytes) &&
                 DownloadLinkRecovery.IsExpired(status.Error);
         }
 
@@ -5259,12 +5705,20 @@ namespace Orbis
                         sb.Append("\"resident_last_renewal_bytes\":").Append(it.ResidentLastRenewalBytes).Append(',');
                         sb.Append("\"resident_retry_pending\":").Append(it.ResidentRetryPending ? "true" : "false").Append(',');
                         sb.Append("\"http_retries\":").Append(it.TransientHttpRetries).Append(',');
+                        sb.Append("\"http_retry_durable\":").Append(it.HttpRetryLastDurableBytes).Append(',');
                         sb.Append("\"install_retries\":").Append(it.InstallRetries).Append(',');
                         sb.Append("\"http_retry_at\":").Append(it.TransientHttpRetries > 0 || it.InstallRetries > 0 ? it.RetryAfterUtcTicks : 0).Append(',');
                         sb.Append("\"resident_auto_install\":").Append(it.ResidentAutoInstall ? "true" : "false").Append(',');
                         sb.Append("\"resident_generation\":\"").Append(JsonLite.Escape(it.ResidentGeneration ?? "")).Append("\",");
                         sb.Append("\"resident_pause\":\"").Append(it.ResidentPauseDesired == true ? "pause" : it.ResidentPauseDesired == false ? "resume" : "").Append("\",");
                         sb.Append("\"resolved_provider_id\":\"").Append(JsonLite.Escape(it.ResolvedProviderId)).Append("\",");
+                        sb.Append("\"parked_provider\":").Append(it.ParkedForProvider ? "true" : "false").Append(',');
+                        sb.Append("\"park_provider_id\":\"").Append(JsonLite.Escape(it.ParkProviderId ?? "")).Append("\",");
+                        sb.Append("\"park_poll_due\":").Append(it.ParkPollDueUtcTicks).Append(',');
+                        sb.Append("\"park_poll_count\":").Append(it.ParkPollCount).Append(',');
+                        sb.Append("\"park_transient_failures\":").Append(it.ParkTransientFailures).Append(',');
+                        sb.Append("\"park_last_state\":\"").Append(JsonLite.Escape(it.ParkLastState ?? "")).Append("\",");
+                        sb.Append("\"park_started\":").Append(it.ParkStartedUtcTicks).Append(',');
                         sb.Append("\"install_order_ready\":").Append(it.InstallOrderReady ? "true" : "false").Append(',');
                         sb.Append("\"archive_volumes\":\"").Append(JsonLite.Escape(it.ArchiveVolumes)).Append("\",");
                         sb.Append("\"archive_password\":\"").Append(JsonLite.Escape(it.ArchivePassword)).Append("\",");
@@ -5831,8 +6285,9 @@ namespace Orbis
                         ResidentLastRenewalBytes = Math.Max(0, ParseLong(JsonLite.GetString(obj, "resident_last_renewal_bytes"))),
                         ResidentRetryPending = JsonLite.GetBool(obj, "resident_retry_pending"),
                         InstallRetries = Math.Max(0, Math.Min(3, ParseInt(JsonLite.GetString(obj, "install_retries"), 0))),
-                        TransientHttpRetries = Math.Max(0, Math.Min(3, ParseInt(JsonLite.GetString(obj, "http_retries"), 0))),
-                        RetryAfterUtcTicks = Math.Max(0, Math.Min(DateTime.UtcNow.AddMinutes(5).Ticks,
+                        TransientHttpRetries = Math.Max(0, ParseInt(JsonLite.GetString(obj, "http_retries"), 0)),
+                        HttpRetryLastDurableBytes = Math.Max(0, ParseLong(JsonLite.GetString(obj, "http_retry_durable"))),
+                        RetryAfterUtcTicks = Math.Max(0, Math.Min(DateTime.MaxValue.Ticks,
                             ParseLong(JsonLite.GetString(obj, "http_retry_at")))),
                         ResidentAutoInstall = JsonLite.GetBool(obj, "resident_auto_install"),
                         ResidentGeneration = JsonLite.GetString(obj, "resident_generation") ?? "",
@@ -5840,6 +6295,13 @@ namespace Orbis
                             JsonLite.GetString(obj, "resident_pause") == "resume" ? (bool?)false : null,
                         PauseRequested = JsonLite.GetBool(obj, "background") && JsonLite.GetString(obj, "resident_pause") == "pause",
                         ResolvedProviderId = JsonLite.GetString(obj, "resolved_provider_id") ?? "",
+                        ParkedForProvider = JsonLite.GetBool(obj, "parked_provider"),
+                        ParkProviderId = JsonLite.GetString(obj, "park_provider_id") ?? "",
+                        ParkPollDueUtcTicks = Math.Max(0, Math.Min(DateTime.MaxValue.Ticks, ParseLong(JsonLite.GetString(obj, "park_poll_due")))),
+                        ParkPollCount = Math.Max(0, ParseInt(JsonLite.GetString(obj, "park_poll_count"), 0)),
+                        ParkTransientFailures = Math.Max(0, ParseInt(JsonLite.GetString(obj, "park_transient_failures"), 0)),
+                        ParkLastState = JsonLite.GetString(obj, "park_last_state") ?? "",
+                        ParkStartedUtcTicks = Math.Max(0, Math.Min(DateTime.MaxValue.Ticks, ParseLong(JsonLite.GetString(obj, "park_started")))),
                         InstallOrderReady = JsonLite.GetBool(obj, "install_order_ready"),
                         FanOutPendingPaths = JsonLite.GetString(obj, "fanout_pending_paths") ?? "",
                         ExpectedSha256 = JsonLite.GetString(obj, "expected_sha256") ?? "",
@@ -6294,11 +6756,27 @@ namespace Orbis
 
         bool CanRefreshUnlock(DlItem job)
         {
-            if (job == null || job.AccessType == "Cloud" || IsDirectAccess(job.AccessType)) return false;
+            if (job == null || IsDirectAccess(job.AccessType)) return false;
+            if (job.AccessType == "Cloud") return CloudCatalog.CanRenew(_cfg, job.HosterUrl);
             AppSettings cfg = _cfg;
             return cfg != null && cfg.UseUnlockProvider &&
                 UnlockProviders.EnabledIds(cfg).Length > 0 &&
                 !string.IsNullOrEmpty(job.HosterUrl);
+        }
+
+        string RenewJobLink(DlItem job, int attempt, Func<bool> cancel)
+        {
+            Action<string> progress = text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } };
+            if (job.AccessType == "Cloud")
+            {
+                string provider = CloudCatalog.OwningProvider(job.HosterUrl);
+                string resolved = CloudCatalog.Resolve(_cfg, job.HosterUrl, progress, cancel);
+                lock (_lock) if (job.AttemptId == attempt) job.ResolvedProviderId = provider;
+                return resolved;
+            }
+            return UnlockProviders.Unrestrict(_cfg, job.HosterUrl, progress, cancel,
+                provider => { lock (_lock) { if (job.AttemptId == attempt) job.ResolvedProviderId = provider; } },
+                job.ResolvedProviderId);
         }
 
         static bool IsAuthExpiry(Exception ex)
@@ -6416,6 +6894,11 @@ namespace Orbis
                 _nerd.RegionHint = RegionFromHost(_nerd.CdnHost, _cfg != null ? _cfg.RealDebridLocation : "auto");
                 _nerd.TransferMode = "in-app";
                 job.TransferMode = _nerd.TransferMode;
+                string provider = string.IsNullOrEmpty(job.ResolvedProviderId) ?
+                    (job.AccessType == "Cloud" ? CloudCatalog.OwningProvider(job.HosterUrl) : "direct") : job.ResolvedProviderId;
+                SspiLog.Write("download", "event=provider-selected job=" + (job.Id ?? "") +
+                    " attempt=" + job.AttemptId + " provider=" + provider + " route=" + (job.AccessType ?? "") +
+                    " cdn=" + _nerd.CdnHost + " allowance=" + DownloadTransferSettings.ConnectionsFor(directUrl, NetHttp.DownloadRangeCount));
             }
         }
 

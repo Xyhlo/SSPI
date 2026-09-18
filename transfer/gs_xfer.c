@@ -24,6 +24,7 @@ typedef struct {
     int64_t written, received; unsigned char *buffer;
     WriteBlock writes[2]; unsigned producer, consumer, hash_consumer; int write_error, hashing;
     SHA256_CTX hash; int source_handle, source_generation;
+    uint64_t retry_after;
 #if SSPI_OWNER_DEBUG
     uint64_t owner_filling, owner_wait_started;
 #endif
@@ -136,7 +137,7 @@ static void log_line(const char *destination,const char *line)
 }
 static void format_log(const GsJobState *j,const char *event,char *line,size_t size)
 {
-    snprintf(line,size,"ms=%llu api=3 engine=sceHttp-chunks revision=five-lane-background-1 event=%s handle=%d state=%d lanes=%d done=%lld total=%lld network=%lld retries=%d code=%d limit=%d target=%d checkpoint_ms=%llu request_ms=%llu read_ms=%llu write_ms=%llu hash_ms=%llu read_calls=%llu write_calls=%llu write_bytes=%llu buffer_wait_ms=%llu read_interruptions=%llu write_jumps=%llu write_jump_bytes=%llu write_switches=%llu write_max_ms=%llu span_chunks=2 write_run_mib=16 write_block_kib=4096 read_block_kib=1024 buffer_mib=%u\n",
+    snprintf(line,size,"ms=%llu api=3 engine=sceHttp-chunks revision=five-lane-background-1 event=%s handle=%d state=%d lanes=%d done=%lld total=%lld network=%lld retries=%d code=%d limit=%d target=%d checkpoint_ms=%llu request_ms=%llu read_ms=%llu write_ms=%llu hash_ms=%llu read_calls=%llu write_calls=%llu write_bytes=%llu buffer_wait_ms=%llu read_interruptions=%llu write_jumps=%llu write_jump_bytes=%llu write_switches=%llu write_max_ms=%llu span_chunks=8 write_run_mib=16 write_block_kib=4096 read_block_kib=1024 buffer_mib=%u\n",
         (unsigned long long)gs_clock(),event,j->handle,j->status.state,j->status.lanes,
         (long long)j->status.done,(long long)j->status.total,(long long)j->status.network_bytes,j->status.retries,j->status.error_code,j->limit,j->target_limit,
         (unsigned long long)j->checkpoint_ms,(unsigned long long)j->request_ms,(unsigned long long)j->read_ms,
@@ -202,6 +203,15 @@ static void owner_sample(const GsJobState *j,char *line,size_t capacity)
 #endif
 static GsJobState *lookup(int handle) {for(int i=0;i<GS_XFER_JOBS;i++)if(jobs[i].handle==handle)return &jobs[i];return NULL;}
 static void fail(GsJobState *j,int code,const char *message) {j->status.state=GS_FAILED;j->status.error_code=code;snprintf(j->status.error,sizeof(j->status.error),"%s (0x%08X)",message,(unsigned)code);__atomic_store_n(&j->stop,3,__ATOMIC_RELEASE);gs_transfer_log(j,"failed");}
+static uint64_t add_deadline(uint64_t now,uint64_t delay)
+{
+    return UINT64_MAX-now<delay?UINT64_MAX:now+delay;
+}
+static uint64_t retry_delay(unsigned attempts,uint64_t base)
+{
+    unsigned shift=attempts?attempts-1:0;if(shift>6)shift=6;
+    uint64_t delay=base<<shift;return delay>60000?60000:delay;
+}
 // Called with gate held. The checkpoint worker owns this immutable snapshot;
 // network lanes keep reading while data and then its resume map are flushed.
 static int checkpoint(GsJobState *j)
@@ -225,7 +235,8 @@ static void *checkpoint_worker(void *unused)
         uint64_t started=gs_clock();int rc=gs_store_snapshot(j,header,j->checkpoint_chunks);
         gs_lock(&gate);j->checkpoint_ms+=gs_clock()-started;
         if(rc) {
-            fail(j,-12,"Chunk checkpoint could not be committed");
+            j->checkpoint_failed=1;
+            fail(j,-12,j->storage_error[0]?j->storage_error:"Chunk checkpoint could not be committed");
             for(int i=0;i<GS_XFER_LANES;i++)if(lanes[i].job>=0 && &jobs[lanes[i].job]==j)gs_http_abort(&lanes[i].http);
         }
         else {j->dirty-=j->checkpoint_dirty;j->checkpoint_at=gs_clock();}
@@ -240,7 +251,7 @@ static void checkpoint_drain(GsJobState *j)
     j->checkpoint_waiters++;
     for(;;) {
         if(!j->checkpointing) {
-            if(!j->dirty || j->status.state==GS_FAILED)break;
+            if(!j->dirty || j->checkpoint_failed)break;
             checkpoint(j);
         }
         gs_unlock(&gate);gs_sleep(1);gs_lock(&gate);
@@ -382,16 +393,66 @@ static void clean_chunk(GsJobState *j)
         j->limit++;j->clean_chunks=0;j->recovery_at=gs_clock()+10000;
     }
 }
+static void useful_progress(GsJobState *j,uint64_t offset,uint64_t length)
+{
+    uint64_t useful=0;
+    while(length && j->accepted) {
+        uint32_t chunk=(uint32_t)(offset/GS_XFER_CHUNK);if(chunk>=j->header.count)break;
+        uint64_t within=offset%GS_XFER_CHUNK;
+        uint64_t available=GS_XFER_CHUNK-within;if(available>length)available=length;
+        uint64_t high=within+available;
+        if(high>j->accepted[chunk]){useful+=high-j->accepted[chunk];j->accepted[chunk]=high;j->attempts[chunk]=0;j->retry_at[chunk]=0;}
+        offset+=available;length-=available;
+    }
+    if(!useful)return;
+    j->useful_bytes=UINT64_MAX-j->useful_bytes<useful?UINT64_MAX:j->useful_bytes+useful;
+    uint64_t now=gs_clock();j->useful_progress_at=now;
+    // A quiet connection that is still accepting new offsets is healthy even
+    // before another 16 MiB checkpoint chunk completes. Restore one lane per
+    // quiet interval so tiny reads and short final spans can recover the
+    // governor instead of finishing permanently throttled.
+    if(j->limit<j->target_limit && now>=j->recovery_at) {
+        j->limit++;j->clean_chunks=0;j->recovery_at=add_deadline(now,10000);
+    }
+    j->tls_failure_started=0;j->tls_failures=0;j->tls_failed_lanes=0;
+    j->recovery_class=GS_FAILURE_NONE;j->recovery_deadline=0;j->recovery_detail[0]=0;
+}
+static void note_tls_failure(GsJobState *j,unsigned lane)
+{
+    uint64_t now=gs_clock();
+    if(!j->tls_failure_started || (j->useful_progress_at && j->useful_progress_at>=j->tls_failure_started)) {
+        j->tls_failure_started=now;j->tls_failures=0;j->tls_failed_lanes=0;
+    }
+    if(j->tls_failures<UINT32_MAX)j->tls_failures++;
+    if(lane<32)j->tls_failed_lanes|=1U<<lane;
+}
+static unsigned bit_count(unsigned value){unsigned n=0;for(;value;value>>=1)n+=value&1U;return n;}
+static int tls_episode_terminal(const GsJobState *j,uint64_t now)
+{
+    unsigned required=(unsigned)(j->limit<1?1:j->limit);if(required>GS_XFER_LANES)required=GS_XFER_LANES;
+    if(j->tls_failures<8 || !j->tls_failure_started || now-j->tls_failure_started<120000 ||
+       bit_count(j->tls_failed_lanes)<required || (j->useful_progress_at&&j->useful_progress_at>=j->tls_failure_started))return 0;
+    // An active lane is only considered healthy until it has itself produced a
+    // trust failure in this episode. This avoids two synchronized bad handshakes
+    // keeping each other alive forever while preserving a genuinely untested lane.
+    for(unsigned i=0;i<GS_XFER_LANES;i++)if(lanes[i].job>=0 && &jobs[lanes[i].job]==j && !(j->tls_failed_lanes&(1U<<i)))return 0;
+    return 1;
+}
 static const char *retry_chunk(GsJobState *j,uint32_t chunk,unsigned lane,int rc,int retry_after,uint64_t *delay)
 {
     uint64_t now=gs_clock();
     j->clean_chunks=0;j->recovery_at=now+10000;
     int transient=rc==408||rc==425||rc==429||rc==500||rc==502||rc==503||rc==504;
     int tls=(unsigned)rc==0x8095F00CU;
-    *delay=(tls?2000U:transient||rc==-15?1000U:250U)<<(j->attempts[chunk]-1);
+    *delay=retry_delay(j->attempts[chunk],tls?1000U:transient||rc==-15?1000U:250U);
     *delay+=lane*23U;
-    if(retry_after>0)*delay=(uint64_t)retry_after*1000U;
-    j->retry_at[chunk]=now+*delay;
+    if(retry_after>0)*delay=(uint64_t)retry_after>UINT64_MAX/1000U?UINT64_MAX:(uint64_t)retry_after*1000U;
+    j->retry_at[chunk]=add_deadline(now,*delay);
+    j->recovery_class=(rc==429||rc==503)?GS_FAILURE_COOLDOWN:tls?GS_FAILURE_TLS:GS_FAILURE_TRANSPORT;
+    j->recovery_deadline=j->retry_at[chunk];
+    snprintf(j->recovery_detail,sizeof(j->recovery_detail),"%s; retrying in %llu s",
+        tls?"Reconnecting after TLS trust failure":rc==429||rc==503?"Provider cooldown":"Reconnecting after transport interruption",
+        (unsigned long long)((*delay+999)/1000));
 
     // An isolated failure retires only its connection. Healthy lanes can keep
     // claiming work; the failed chunk remains eligible after its own delay.
@@ -435,12 +496,13 @@ static int recover_stream(Lane *lane,GsJobState *j,int rc,unsigned attempt,uint6
     uint64_t now=gs_clock();unsigned shift=attempt-1;if(shift>5)shift=5;
     uint64_t delay=250U<<shift;
     delay+=(unsigned)((now^(uintptr_t)lane^(offset>>9))%201U);
-    if(delay>10000)delay=10000;
+    if(delay>60000)delay=60000;
     int server=rc==429||rc==503;
     if(server)delay=h->retry_after>0?(uint64_t)h->retry_after*1000U:15000U;
     gs_lock(&gate);
     int old_limit=j->limit;int burst=0;
     j->status.retries++;
+    if((unsigned)rc==0x8095F00CU)note_tls_failure(j,(unsigned)(lane-lanes));
     // A recovered body is still a recent connection failure. Require new clean
     // data and a quiet interval before adding another lane, even when isolated.
     j->clean_chunks=0;j->recovery_at=now+10000;
@@ -456,9 +518,9 @@ static int recover_stream(Lane *lane,GsJobState *j,int rc,unsigned attempt,uint6
     if(server)server_backoff(now+delay);
     int new_limit=j->limit;gs_unlock(&gate);
     char line[768];
-    snprintf(line,sizeof(line),"ms=%llu api=3 revision=supervised-streams-1 event=stream-retry handle=%d lane=%u attempt=%u hex=0x%08X http=%d stage=%s offset=%llu delay_ms=%llu scope=%s ssl=0x%08X verify=0x%X errno=0x%08X\n",
+    snprintf(line,sizeof(line),"ms=%llu api=3 revision=supervised-streams-1 event=stream-retry handle=%d lane=%u attempt=%u hex=0x%08X http=%d stage=%s offset=%llu delay_ms=%llu scope=%s ssl=0x%08X verify=0x%X errno=0x%08X host=%s\n",
         (unsigned long long)now,j->handle,(unsigned)(lane-lanes),attempt,(unsigned)rc,h->status,h->stage?h->stage:"open",
-        (unsigned long long)offset,(unsigned long long)delay,server?"global":burst?"burst":"stream",(unsigned)h->ssl_error,h->ssl_verify,(unsigned)h->native_errno);
+        (unsigned long long)offset,(unsigned long long)delay,server?"global":burst?"burst":"stream",(unsigned)h->ssl_error,h->ssl_verify,(unsigned)h->native_errno,strstr(h->origin,"://")?strstr(h->origin,"://")+3:"unknown");
     log_line(j->dest,line);
     snprintf(line,sizeof(line),"ms=%llu event=lane-budget handle=%d before=%d after=%d scope=%s\n",(unsigned long long)now,j->handle,old_limit,new_limit,server?"global":burst?"burst":"stream");log_line(j->dest,line);
     gs_http_close(h);
@@ -476,7 +538,7 @@ static int chunk_transfer(Lane *lane,GsJobState *j,uint32_t index,unsigned char 
     uint64_t start=j->single?0:(uint64_t)index*GS_XFER_CHUNK;
     uint64_t length=j->single?j->header.total:j->header.total-start;
     if(!j->single&&length>(uint64_t)lane->span*GS_XFER_CHUNK)length=(uint64_t)lane->span*GS_XFER_CHUNK;
-    uint64_t done=0,progress_at=0;
+    uint64_t done=0;
     unsigned failures=0;
     sha256_init(&lane->hash);
     GsHttp *h=&lane->http;
@@ -495,8 +557,8 @@ reopen:
     if(rc)goto interrupted;
     if(!h->reused) {
         char transport[768];
-        snprintf(transport,sizeof(transport),"ms=%llu event=http-receive-buffer handle=%d lane=%u origin=%s bytes=%d rc=0x%08X interrupted_calls=%u\n",
-            (unsigned long long)gs_clock(),j->handle,(unsigned)(lane-lanes),h->origin,h->recv_block,(unsigned)h->recv_block_rc,h->interruptions);
+        snprintf(transport,sizeof(transport),"ms=%llu event=http-receive-buffer handle=%d lane=%u host=%s bytes=%d rc=0x%08X interrupted_calls=%u\n",
+            (unsigned long long)gs_clock(),j->handle,(unsigned)(lane-lanes),strstr(h->origin,"://")?strstr(h->origin,"://")+3:"unknown",h->recv_block,(unsigned)h->recv_block_rc,h->interruptions);
         log_line(j->dest,transport);
     }
     h->stage="validate-headers";
@@ -522,13 +584,14 @@ reopen:
             gs_lock(&gate);j->read_ms+=read_ms;j->read_calls++;j->read_interruptions+=h->interruptions-interruptions;
             if(n>0&&(unsigned)n<=read_size) {
                 j->status.network_bytes+=n;
+                useful_progress(j,start+done+filled,(uint64_t)n);
 #if SSPI_OWNER_DEBUG
                 owner_metrics[j-jobs].network_progress_at=before+read_ms;
                 lane->owner_filling=filled+(unsigned)n;owner_buffer_peak(j);
 #endif
             }gs_unlock(&gate);
             if(n<=0){rc=n<0?n:-11;break;}if((unsigned)n>read_size)return -10;
-            filled+=(unsigned)n;lane->received+=n;
+            filled+=(unsigned)n;lane->received+=n;failures=0;
         }
         if(!filled)goto interrupted;
         gs_lock(&gate);
@@ -538,7 +601,6 @@ reopen:
 #endif
         lane->writes[slot].state=1;lane->producer^=1;gs_unlock(&gate);
         done+=filled;
-        if(done-progress_at>=1024*1024){failures=0;progress_at=done;}
         if(!j->single && done<length && done%GS_XFER_CHUNK==0) {
             if(wait_write(lane,j,1))return -12;
             gs_lock(&gate);
@@ -563,7 +625,7 @@ interrupted:
 static void apply_resume(GsJobState *j)
 {
     if(j->resume_requested && j->status.state==GS_PAUSED && j->stop==1 &&
-       !j->active && !j->finishing && !j->preparing && !j->checkpointing && !j->checkpoint_waiters) {
+       j->chunks && !j->active && !j->finishing && !j->preparing && !j->checkpointing && !j->checkpoint_waiters) {
         j->resume_requested=0;__atomic_store_n(&j->stop,0,__ATOMIC_RELEASE);j->status.state=GS_DOWNLOADING;
     }
 }
@@ -585,7 +647,7 @@ static int claim(int *job,uint32_t *chunk,unsigned *span)
         for(uint32_t c=0;c<count;c++)if(!j->chunks[c].done&&!j->claims[c]&&now>=j->retry_at[c]) {
             if(j->single && j->active)break;
             unsigned wanted=j->single?1:(j->header.count+(unsigned)j->target_limit-1)/(unsigned)j->target_limit;
-            if(wanted>2)wanted=2; // 32 MiB on one reusable connection, bounded disk interleaving.
+            if(wanted>8)wanted=8; // Up to 128 MiB per request; still commit/hash each 16 MiB chunk.
             *span=1;
             while(*span<wanted && c+*span<j->header.count && !j->chunks[c+*span].done && !j->claims[c+*span] && now>=j->retry_at[c+*span])(*span)++;
             for(unsigned n=0;n<*span;n++)j->claims[c+n]=1;
@@ -597,6 +659,7 @@ static void *worker(void *argument)
 {
     background_thread("reader");Lane *lane=argument;gs_http_reset(&lane->http);lane->job=-1;
     while(!__atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE)) {
+        if(gs_clock()<lane->retry_after){gs_sleep(20);continue;}
         int slot=-1;uint32_t chunk=0;gs_lock(&gate);int found=claim(&slot,&chunk,&lane->span);if(found==1){lane->job=slot;lane->written=lane->received=0;}gs_unlock(&gate);
         if(!found){gs_sleep(20);continue;}
         GsJobState *j=&jobs[slot];unsigned char digest[32];
@@ -604,14 +667,15 @@ static void *worker(void *argument)
         if(lane->source_handle!=j->handle || lane->source_generation!=j->verification_retries) {
             gs_http_close(&lane->http);lane->source_handle=j->handle;lane->source_generation=j->verification_retries;
         }
-        int rc=chunk_transfer(lane,j,chunk,digest);
+        uint32_t claimed_chunk=chunk;int rc=chunk_transfer(lane,j,claimed_chunk,digest);
         int retry_after=lane->http.retry_after,status=lane->http.status,reused=lane->http.reused;
         int ssl_error=lane->http.ssl_error,native_errno=lane->http.native_errno;
         unsigned ssl_verify=lane->http.ssl_verify,open_wait_ms=lane->http.open_wait_ms;
         const char *stage=lane->http.stage?lane->http.stage:"open";
-        uint64_t range_start=j->single?0:(uint64_t)chunk*GS_XFER_CHUNK;
-        uint64_t range_end=j->single?j->header.total:(uint64_t)(chunk+lane->span)*GS_XFER_CHUNK;
+        uint64_t range_start=j->single?0:(uint64_t)claimed_chunk*GS_XFER_CHUNK;
+        uint64_t range_end=j->single?j->header.total:(uint64_t)(claimed_chunk+lane->span)*GS_XFER_CHUNK;
         if(range_end>j->header.total)range_end=j->header.total;
+        uint64_t unread_offset=range_start+(uint64_t)(lane->received<0?0:lane->received);if(unread_offset>range_end)unread_offset=range_end;
         char retry_line[1024]={0},destination[1024];
         if(rc)gs_http_close(&lane->http);
         // Drain even on cancellation/failure before releasing ownership or reusing
@@ -621,9 +685,9 @@ static void *worker(void *argument)
 #if SSPI_OWNER_DEBUG
         lane->owner_filling=lane->owner_wait_started=0;
 #endif
-        for(unsigned n=0;n<lane->span;n++)j->claims[chunk+n]=0;
-        unsigned last=chunk+lane->span-1;
-        while(chunk<last && j->chunks[chunk].done)chunk++;
+        for(unsigned n=0;n<lane->span;n++)j->claims[claimed_chunk+n]=0;
+        unsigned last=claimed_chunk+lane->span-1;
+        chunk=claimed_chunk;while(chunk<last && j->chunks[chunk].done)chunk++;
         if(!rc && !j->stop) {
             if(j->single) {
                 // A range-ignoring server cannot safely resume. The complete body is
@@ -633,22 +697,36 @@ static void *worker(void *argument)
             } else {
                 j->chunks[chunk].done=1;memcpy(j->chunks[chunk].hash,digest,32);
                 uint64_t n=j->header.total-(uint64_t)chunk*GS_XFER_CHUNK;j->status.done+=(int64_t)(n>GS_XFER_CHUNK?GS_XFER_CHUNK:n);
+                j->accepted[chunk]=n>GS_XFER_CHUNK?GS_XFER_CHUNK:n;
             }
             j->dirty++;clean_chunk(j);
         } else if(rc && !j->stop) {
-            j->status.retries++;j->attempts[chunk]++;
+            j->status.retries++;if(j->attempts[chunk]<255)j->attempts[chunk]++;
             int old_limit=j->limit;uint64_t delay=0;const char *scope="fatal";
-            if(rc==401||rc==403||rc==410)fail(j,rc,"Provider rejected link; resolve it again and resume");
+            if(rc==401||rc==403||rc==410) {
+                char message[160];snprintf(message,sizeof(message),"Provider rejected the signed link with HTTP %d; refresh it and resume",rc);fail(j,rc,message);
+            }
             else if(rc==-12)fail(j,rc,"Positioned disk write failed; committed chunks retained");
-            else if(!j->single || j->attempts[chunk]>3)fail(j,rc,"Transfer recovery exhausted; completed chunks retained");
+            else if(rc==-11)fail(j,rc,"Provider repeatedly ended the response before the validated Content-Length; completed chunks retained");
+            else if(rc==-10||rc==-13)fail(j,rc,rc==-13?"Package identity validation failed; retained data was not replaced":"Provider returned an invalid range, length, encoding or EOF response");
+            else if(rc>=400&&rc<=499&&rc!=408&&rc!=425&&rc!=429) {
+                char message[160];snprintf(message,sizeof(message),"Provider returned permanent HTTP %d; choose another source or refresh the link",rc);fail(j,rc,message);
+            }
             else {
-                scope=retry_chunk(j,chunk,(unsigned)(lane-lanes),rc,retry_after,&delay);
-                if(rc==429||rc==503)server_backoff(j->retry_at[chunk]);
+                uint64_t now=gs_clock();int tls=(unsigned)rc==0x8095F00CU;
+                if(tls&&tls_episode_terminal(j,now))
+                    fail(j,rc,"Provider TLS certificate not trusted on fresh sessions for two minutes with no useful progress; completed chunks retained");
+                else {
+                    scope=retry_chunk(j,chunk,(unsigned)(lane-lanes),rc,retry_after,&delay);
+                    lane->retry_after=add_deadline(now,30000);
+                    if(tls)scope="tls-quarantine";
+                    if(rc==429||rc==503)server_backoff(j->retry_at[chunk]);
+                }
             }
             snprintf(destination,sizeof(destination),"%s",j->dest);
-            snprintf(retry_line,sizeof(retry_line),"ms=%llu api=3 revision=supervised-streams-1 event=retry handle=%d lane=%u chunk=%u attempt=%u raw=%d hex=0x%08X http=%d stage=%s reused=%d range_start=%llu range_end=%llu received=%lld delay_ms=%llu scope=%s limit_before=%d limit=%d target=%d ssl=0x%08X verify=0x%X errno=0x%08X open_wait_ms=%u\n",
-                (unsigned long long)gs_clock(),j->handle,(unsigned)(lane-lanes),chunk,(unsigned)j->attempts[chunk],rc,(unsigned)rc,status,stage,reused,
-                (unsigned long long)range_start,(unsigned long long)(range_end-1),(long long)lane->received,(unsigned long long)delay,scope,old_limit,j->limit,j->target_limit,
+            snprintf(retry_line,sizeof(retry_line),"ms=%llu api=3 revision=supervised-streams-2 event=retry handle=%d lane=%u claim_chunk=%u failed_chunk=%u attempt=%u raw=%d hex=0x%08X http=%d stage=%s reused=%d claimed_start=%llu range_end=%llu unread_offset=%llu received=%lld delay_ms=%llu scope=%s limit_before=%d limit=%d target=%d ssl=0x%08X verify=0x%X errno=0x%08X open_wait_ms=%u\n",
+                (unsigned long long)gs_clock(),j->handle,(unsigned)(lane-lanes),claimed_chunk,chunk,(unsigned)j->attempts[chunk],rc,(unsigned)rc,status,stage,reused,
+                (unsigned long long)range_start,(unsigned long long)(range_end-1),(unsigned long long)unread_offset,(long long)lane->received,(unsigned long long)delay,scope,old_limit,j->limit,j->target_limit,
                 (unsigned)ssl_error,ssl_verify,(unsigned)native_errno,open_wait_ms);
         }
         if(j->chunks && (j->dirty>=32||gs_clock()-j->checkpoint_at>=15000))checkpoint(j);
@@ -715,6 +793,97 @@ init_failed:
     for(int i=0;i<GS_XFER_LANES;i++){free(lanes[i].buffer);lanes[i].buffer=NULL;}
     gs_unlock(&init_gate);return -4;
 }
+static int preparation_transient(int rc)
+{
+    return (rc<0&&rc!=-3&&rc!=-10&&rc!=-12&&rc!=-13)||rc==408||rc==425||rc==429||rc==500||rc==502||rc==503||rc==504;
+}
+static void *prepare_job(void *argument)
+{
+    GsJobState *j=argument;background_thread("prepare");unsigned round=0;
+restart:
+    gs_http_reset(&j->preparation_http);unsigned char header[0x1000],identity[32];size_t got=0;
+    char preparation_error[220]={0};const char *probe_stage="response";int rc=0,complete=0,store_opened=0;
+    for(;;) {
+        for(;;) {
+            gs_lock(&gate);uint64_t now=gs_clock();
+            if(j->stop||__atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE)){gs_unlock(&gate);rc=-3;goto prepared;}
+            if(now>=server_cooldown&&source_available(j)&&host_active(j)<GS_XFER_LANES&&total_active()<GS_XFER_LANES) {
+                j->active=1;j->recovery_class=GS_FAILURE_NONE;j->recovery_detail[0]=0;gs_unlock(&gate);break;
+            }
+            j->recovery_class=now<server_cooldown?GS_FAILURE_COOLDOWN:GS_FAILURE_ADMISSION;
+            j->recovery_deadline=now<server_cooldown?server_cooldown:add_deadline(now,1000);
+            snprintf(j->recovery_detail,sizeof(j->recovery_detail),"%s",now<server_cooldown?"Waiting for provider cooldown":"Waiting for transfer admission");
+            gs_unlock(&gate);gs_sleep(25);
+        }
+        got=0;j->single=0;memset(header,0,sizeof(header));probe_stage="response";
+        gs_http_reset(&j->preparation_http);
+        if(j->stop){rc=-3;}else rc=gs_http_open(&j->preparation_http,j->url,j->bearer,0,0xfff);
+        GsHttp *h=&j->preparation_http;
+        if(!rc) {
+            if(h->status==206&&h->start==0&&h->end==0xfff&&h->total>=0x1000&&(h->length<0||h->length==0x1000))j->status.total=h->total;
+            else if(h->status==200&&h->length>=0x1000){j->status.total=h->length;j->single=1;}
+            else rc=h->status>=400?h->status:-10;
+        }
+        if(!rc)probe_stage="header read";
+        while(!rc&&got<sizeof(header)){if(j->stop){rc=-3;break;}int n=gs_http_read(h,header+got,(unsigned)(sizeof(header)-got));if(n<=0||(size_t)n>sizeof(header)-got)rc=n<0?n:-11;else got+=(size_t)n;}
+        if(!rc&&!j->single){probe_stage="range completion";unsigned char extra;int n=gs_http_read(h,&extra,1);if(n)rc=n<0?n:-10;}
+        int status=h->status,retry_after=h->retry_after,ssl=h->ssl_error,native_errno=h->native_errno;
+        const char *native_stage=h->stage?h->stage:"unknown";
+        gs_http_abort(h);gs_http_close(h);
+        gs_lock(&gate);j->active=0;
+        if((unsigned)rc==0x8095F00CU)note_tls_failure(j,round%GS_XFER_LANES);
+        if(status==429||status==503) {
+            uint64_t delay=retry_after>0?(uint64_t)retry_after*1000U:15000U;server_backoff(add_deadline(gs_clock(),delay));
+        }
+        int stop=j->stop||__atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE);
+        gs_unlock(&gate);if(stop){rc=-3;goto prepared;}
+        if(!rc)break;
+        snprintf(preparation_error,sizeof(preparation_error),"Package identity probe failed at %s/%s (HTTP %d, errno %d, TLS 0x%08X)",probe_stage,native_stage,status,native_errno,(unsigned)ssl);
+        if(!preparation_transient(rc))goto prepared;
+        gs_lock(&gate);uint64_t now=gs_clock();
+        if((unsigned)rc==0x8095F00CU&&tls_episode_terminal(j,now)){gs_unlock(&gate);goto prepared;}
+        if(round<UINT32_MAX)round++;
+        uint64_t delay=retry_after>0?(uint64_t)retry_after*1000U:retry_delay(round,1000U);
+        j->recovery_class=status==429||status==503?GS_FAILURE_COOLDOWN:(unsigned)rc==0x8095F00CU?GS_FAILURE_TLS:GS_FAILURE_TRANSPORT;
+        j->recovery_deadline=add_deadline(now,delay);
+        snprintf(j->recovery_detail,sizeof(j->recovery_detail),"%s during source probe; retrying in %llu s",
+            (unsigned)rc==0x8095F00CU?"TLS trust failure":status==429||status==503?"Provider cooldown":"Transport interruption",
+            (unsigned long long)((delay+999)/1000));
+        j->status.retries++;uint64_t until=j->recovery_deadline;gs_unlock(&gate);
+        while(gs_clock()<until&&!j->stop)gs_sleep(25);
+    }
+    if(gs_verify_header(header,got,j->status.total,j->title,j->content)<0){rc=-13;snprintf(preparation_error,sizeof(preparation_error),"Package header failed size, title or content verification");goto prepared;}
+    gs_digest(header,sizeof(header),identity);rc=gs_store_open(j,identity);store_opened=!rc;
+    if(rc==-2&&j->stop)rc=-3;
+    complete=!rc&&j->status.done==j->status.total;
+    if(complete){unsigned char *buffer=malloc(GS_XFER_BUFFER);rc=buffer?gs_finalize_file(j,buffer):-4;if(!buffer)snprintf(preparation_error,sizeof(preparation_error),"Not enough memory to verify the staged package");free(buffer);}
+    if(complete&&rc==-2&&j->expected[0]) {
+        char detail[512];snprintf(detail,sizeof(detail),"ms=%llu event=verification-retry handle=%d resumed=1 %s\n",(unsigned long long)gs_clock(),j->handle,j->verification_error);log_line(j->dest,detail);
+        j->verification_retries=1;j->status.retries++;j->status.done=0;j->validation_done=0;
+        memset(j->chunks,0,j->header.count*sizeof(GsChunk));memset(j->accepted,0,j->header.count*sizeof(uint64_t));j->dirty++;complete=0;
+        rc=gs_store_checkpoint(j)?-12:0;
+    }
+prepared:
+    gs_lock(&gate);j->active=0;
+    int stopping=j->stop||__atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE);
+    int restart=stopping&&j->stop==1&&j->resume_requested&&!__atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE);
+    if(restart){j->resume_requested=0;__atomic_store_n(&j->stop,0,__ATOMIC_RELEASE);j->status.state=GS_QUEUED;j->status.error_code=0;j->status.error[0]=0;}
+    else if(stopping) { /* control() already published PAUSED or CANCELED */ }
+    else if(rc) {
+        const char *reason=j->storage_error[0]?j->storage_error:j->verification_error[0]?j->verification_error:preparation_error[0]?preparation_error:"Staged package verification failed";
+        if((unsigned)rc==0x8095F00CU)reason="Provider TLS certificate not trusted on fresh probe sessions for two minutes with no useful progress";
+        fail(j,rc,reason);
+        char detail[512];snprintf(detail,sizeof(detail),"ms=%llu event=preparation-failed handle=%d storage_stage=%s storage_errno=%d code=%d reason=%s\n",(unsigned long long)gs_clock(),j->handle,j->storage_stage[0]?j->storage_stage:"none",j->storage_errno,rc,reason);log_line(j->dest,detail);
+    } else {
+        if(j->single)j->target_limit=1;j->limit=j->target_limit<2?j->target_limit:2;
+        j->recovery_at=add_deadline(gs_clock(),10000);j->recovery_class=GS_FAILURE_NONE;j->recovery_detail[0]=0;
+        j->status.state=complete?GS_COMPLETE:GS_DOWNLOADING;gs_transfer_log(j,j->single?"range-ignored-single":"range-ready-no-etag");
+    }
+    if(!restart)j->preparing=0;gs_unlock(&gate);
+    if(restart){if(j->fd>=0||j->lock_fd>=0||j->chunks)gs_store_close(j);goto restart;}
+    if(stopping&&!store_opened&&j->fd>=0)gs_store_close(j);
+    return NULL;
+}
 int sspi_xfer_start(const char *url,const char *bearer,const char *destination,const char *title,const char *content,const char *sha,int requested)
 {
     if(!initialized||!url||!destination||strlen(url)>=8192||strlen(destination)>=1024||
@@ -726,74 +895,14 @@ int sspi_xfer_start(const char *url,const char *bearer,const char *destination,c
     if(!j){gs_unlock(&gate);return -6;}
     memset(j,0,sizeof(*j));j->fd=j->lock_fd=-1;j->handle=next_handle++;if(next_handle<=0)next_handle=1;
 #if SSPI_OWNER_DEBUG
-    memset(&owner_metrics[j-jobs],0,sizeof(owner_metrics[0]));
-    owner_metrics[j-jobs].sampled_at=owner_metrics[j-jobs].network_progress_at=gs_clock();
+    memset(&owner_metrics[j-jobs],0,sizeof(owner_metrics[0]));owner_metrics[j-jobs].sampled_at=owner_metrics[j-jobs].network_progress_at=gs_clock();
 #endif
-    j->status.state=GS_QUEUED;j->limit=1;j->preparing=1;
-    j->target_limit=requested<1?1:requested>GS_XFER_LANES?GS_XFER_LANES:requested;
+    j->status.state=GS_QUEUED;j->limit=1;j->preparing=1;j->target_limit=requested<1?1:requested>GS_XFER_LANES?GS_XFER_LANES:requested;
     snprintf(j->url,sizeof(j->url),"%s",url);snprintf(j->bearer,sizeof(j->bearer),"%s",bearer?bearer:"");
     snprintf(j->dest,sizeof(j->dest),"%s",destination);snprintf(j->origin,sizeof(j->origin),"%s",origin);
     snprintf(j->title,sizeof(j->title),"%s",title?title:"");snprintf(j->content,sizeof(j->content),"%s",content?content:"");snprintf(j->expected,sizeof(j->expected),"%s",sha?sha:"");
-    gs_unlock(&gate);
-    // The caller has no handle yet. Bound local admission and keep preparation
-    // pinned until shutdown/cancellation can no longer race its job storage.
-    uint64_t admission_started=gs_clock();
-    for(;;) {
-        gs_lock(&gate);uint64_t now=gs_clock();
-        int canceled=__atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE) || j->stop;
-        if(canceled || now-admission_started>=15000) {
-            fail(j,canceled?-3:503,canceled?"Transfer preparation canceled before identity probe":"Transfer admission busy before identity probe; retry later");
-            gs_transfer_log(j,canceled?"probe-admission-canceled":"probe-admission-timeout");
-            j->preparing=0;int handle=j->handle;gs_unlock(&gate);return handle;
-        }
-        if(now>=server_cooldown && source_available(j) && host_active(j)<GS_XFER_LANES && total_active()<GS_XFER_LANES) {
-            j->active=1;gs_unlock(&gate);break;
-        }
-        gs_unlock(&gate);gs_sleep(25);
-    }
-    GsHttp h;gs_http_reset(&h);unsigned char header[0x1000],identity[32];size_t got=0;
-    char preparation_error[220]={0};const char *probe_stage="response";
-    int rc=gs_http_open(&h,url,bearer,0,0xfff);
-    if(!rc) {
-        if(h.status==206 && h.start==0 && h.end==0xfff && h.total>=0x1000 && (h.length<0||h.length==0x1000))j->status.total=h.total;
-        else if(h.status==200 && h.length>=0x1000){j->status.total=h.length;j->single=1;}
-        else rc=h.status>=400?h.status:-10;
-    }
-    if(!rc)probe_stage="header read";
-    while(!rc && got<sizeof(header)){int n=gs_http_read(&h,header+got,(unsigned)(sizeof(header)-got));if(n<=0 || (size_t)n>sizeof(header)-got)rc=n<0?n:-11;else got+=(size_t)n;}
-    if(!rc&&!j->single){probe_stage="range completion";unsigned char extra;int n=gs_http_read(&h,&extra,1);if(n)rc=n<0?n:-10;}
-    if(h.status==429 || h.status==503) {
-        uint64_t delay=h.retry_after>0?(uint64_t)h.retry_after*1000U:15000U;
-        gs_lock(&gate);server_backoff(gs_clock()+delay);gs_unlock(&gate);
-    }
-    if(rc)snprintf(preparation_error,sizeof(preparation_error),"Package identity probe failed at %s/%s (HTTP %d, errno %d, TLS 0x%08X)",probe_stage,h.stage?h.stage:"unknown",h.status,h.native_errno,(unsigned)h.ssl_error);
-    gs_http_abort(&h);gs_http_close(&h);
-    if(__atomic_load_n(&j->stop,__ATOMIC_ACQUIRE))rc=-3;
-    if(!rc && gs_verify_header(header,got,j->status.total,j->title,j->content)<0){rc=-13;snprintf(preparation_error,sizeof(preparation_error),"Package header failed size, title or content verification");}
-    if(!rc){gs_digest(header,sizeof(header),identity);rc=gs_store_open(j,identity);}
-    int complete=!rc && j->status.done==j->status.total;
-    if(complete){unsigned char *buffer=malloc(GS_XFER_BUFFER);gs_lock(&gate);j->active=0;gs_unlock(&gate);rc=buffer?gs_finalize_file(j,buffer):-4;if(!buffer)snprintf(preparation_error,sizeof(preparation_error),"Not enough memory to verify the staged package");free(buffer);}
-    if(complete && rc==-2 && j->expected[0]) {
-        char detail[512];snprintf(detail,sizeof(detail),"ms=%llu event=verification-retry handle=%d resumed=1 %s\n",(unsigned long long)gs_clock(),j->handle,j->verification_error);log_line(j->dest,detail);
-        j->verification_retries=1;j->status.retries++;j->status.done=0;j->validation_done=0;
-        memset(j->chunks,0,j->header.count*sizeof(GsChunk));j->dirty++;complete=0;
-        rc=gs_store_checkpoint(j)?-12:0;
-    }
-    gs_lock(&gate);j->active=0;
-    if(j->stop || __atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE))fail(j,-3,"Native transfer preparation canceled");
-    else if(rc) {
-        const char *reason=j->storage_error[0]?j->storage_error:j->verification_error[0]?j->verification_error:preparation_error[0]?preparation_error:"Staged package verification failed";
-        fail(j,rc,reason);
-        char detail[512];snprintf(detail,sizeof(detail),"ms=%llu event=preparation-failed handle=%d storage_stage=%s storage_errno=%d code=%d reason=%s\n",(unsigned long long)gs_clock(),j->handle,j->storage_stage[0]?j->storage_stage:"none",j->storage_errno,rc,reason);log_line(j->dest,detail);
-    }
-    else {
-        if(j->single)j->target_limit=1;
-        j->limit=j->target_limit<2?j->target_limit:2;
-        j->recovery_at=gs_clock()+10000;
-        j->status.state=GS_DOWNLOADING;gs_transfer_log(j,j->single?"range-ignored-single":"range-ready-no-etag");
-        if(complete)j->status.state=GS_COMPLETE;
-    }
-    j->preparing=0;int handle=j->handle;gs_unlock(&gate);return handle;
+    int handle=j->handle;if(gs_thread_start(&j->preparation_thread,prepare_job,j)){memset(j,0,sizeof(*j));gs_unlock(&gate);return -4;}
+    j->preparation_started=1;gs_unlock(&gate);return handle;
 }
 int sspi_xfer_probe(int http_context,const char *url,int64_t total,int64_t offset,void *data,unsigned length)
 {
@@ -841,7 +950,12 @@ int sspi_xfer_poll(int handle,GsXferStatus *status)
         // GS_QUEUED is the preparation phase (admission, source probe, staging
         // file). Publish its detail on every poll so a cold or slow provider is
         // never reported as a silent 0% transfer. No byte count is implied.
-        else if(status->state==GS_QUEUED) gs_preparation_detail(status->error,sizeof(status->error),j->title);
+        else if(status->state==GS_QUEUED) {
+            if(j->recovery_detail[0])snprintf(status->error,sizeof(status->error),"%s",j->recovery_detail);
+            else gs_preparation_detail(status->error,sizeof(status->error),j->title);
+        }
+        else if(status->state==GS_DOWNLOADING&&j->recovery_detail[0]&&gs_clock()<j->recovery_deadline)
+            snprintf(status->error,sizeof(status->error),"%s",j->recovery_detail);
         // Live accepted bytes are not a durability claim. Resume uses the map.
         for(int i=0;i<GS_XFER_LANES;i++)if(lanes[i].job>=0 && &jobs[lanes[i].job]==j)status->done+=lanes[i].written;
         if(status->done>status->total)status->done=status->total;
@@ -873,6 +987,7 @@ static int control(int handle,int cancel)
     j->resume_requested=0;
     if(j->status.state!=GS_COMPLETE&&j->status.state!=GS_FAILED&&j->status.state!=GS_CANCELED){__atomic_store_n(&j->stop,cancel?2:1,__ATOMIC_RELEASE);j->status.state=cancel?GS_CANCELED:GS_PAUSED;}
     for(int i=0;i<GS_XFER_LANES;i++)if(lanes[i].job>=0 && &jobs[lanes[i].job]==j)gs_http_abort(&lanes[i].http);
+    if(j->preparing)gs_http_abort(&j->preparation_http);
     if(!j->active&&!j->finishing)checkpoint(j);
     gs_unlock(&gate);return 0;
 }
@@ -880,15 +995,34 @@ int sspi_xfer_pause(int handle){return control(handle,0);}
 int sspi_xfer_cancel(int handle){return control(handle,1);}
 int sspi_xfer_resume(int handle)
 {
+    GsThread old_thread;int join_old=0;
     gs_lock(&gate);GsJobState *j=lookup(handle);int rc=-1;
-    if(j&&j->status.state==GS_PAUSED&&j->stop==1){j->resume_requested=1;apply_resume(j);rc=0;}
-    else if(j&&(j->status.state==GS_DOWNLOADING||j->status.state==GS_VALIDATING||j->status.state==GS_COMPLETE))rc=0;
+    if(j&&j->status.state==GS_PAUSED&&j->stop==1) {
+        if(j->preparing){j->resume_requested=1;rc=0;gs_unlock(&gate);return rc;}
+        if(j->chunks){j->resume_requested=1;apply_resume(j);rc=0;gs_unlock(&gate);return rc;}
+        if(j->preparation_started&&!j->preparation_joining){old_thread=j->preparation_thread;j->preparation_joining=1;join_old=1;}
+    } else if(j&&(j->status.state==GS_DOWNLOADING||j->status.state==GS_VALIDATING||j->status.state==GS_COMPLETE))rc=0;
+    gs_unlock(&gate);
+    if(!join_old)return rc;
+    gs_thread_join(old_thread);
+    gs_lock(&gate);j=lookup(handle);
+    if(j){j->preparation_started=0;j->preparation_joining=0;}
+    if(!j||j->status.state!=GS_PAUSED||j->stop!=1){gs_unlock(&gate);return -1;}
+    __atomic_store_n(&j->stop,0,__ATOMIC_RELEASE);j->status.state=GS_QUEUED;j->status.error_code=0;j->status.error[0]=0;j->preparing=1;
+    if(gs_thread_start(&j->preparation_thread,prepare_job,j)){j->preparing=0;fail(j,-4,"Could not restart transfer preparation");rc=-1;}
+    else {j->preparation_started=1;rc=0;}
     gs_unlock(&gate);return rc;
 }
 int sspi_xfer_destroy(int handle)
 {
+    GsThread preparation;int join=0;
     gs_lock(&gate);GsJobState *j=lookup(handle);if(!j){gs_unlock(&gate);return -1;}
-    if(j->active||j->finishing||j->preparing||j->checkpointing||j->checkpoint_waiters||j->resume_requested||j->status.state==GS_DOWNLOADING||j->status.state==GS_QUEUED){gs_unlock(&gate);return -2;}
+    if(j->active||j->finishing||j->preparing||j->preparation_joining||j->checkpointing||j->checkpoint_waiters||j->resume_requested||j->status.state==GS_DOWNLOADING||j->status.state==GS_QUEUED){gs_unlock(&gate);return -2;}
+    if(j->preparation_started&&!j->preparation_joining){preparation=j->preparation_thread;j->preparation_joining=1;join=1;}
+    gs_unlock(&gate);if(join)gs_thread_join(preparation);
+    gs_lock(&gate);j=lookup(handle);if(!j){gs_unlock(&gate);return -1;}
+    j->preparation_started=0;j->preparation_joining=0;
+    if(j->active||j->finishing||j->preparing||j->checkpointing||j->checkpoint_waiters){gs_unlock(&gate);return -2;}
     gs_store_close(j);memset(j,0,sizeof(*j));gs_unlock(&gate);return 0;
 }
 void sspi_xfer_shutdown(void)
@@ -900,6 +1034,9 @@ void sspi_xfer_shutdown(void)
         gs_lock(&gate);int preparing=0;
         for(int i=0;i<GS_XFER_JOBS;i++)preparing+=jobs[i].preparing;
         gs_unlock(&gate);if(!preparing)break;gs_sleep(1);
+    }
+    for(int i=0;i<GS_XFER_JOBS;i++)if(jobs[i].handle&&jobs[i].preparation_started) {
+        gs_thread_join(jobs[i].preparation_thread);jobs[i].preparation_started=0;jobs[i].preparation_joining=0;
     }
     for(int i=0;i<GS_XFER_LANES;i++){if(lanes[i].started)gs_thread_join(lanes[i].thread);lanes[i].started=0;}
     gs_lock(&gate);checkpoint_stopping=1;gs_unlock(&gate);

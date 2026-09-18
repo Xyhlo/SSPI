@@ -22,6 +22,7 @@ static int storage_failure(GsJobState *j,const char *stage,int error)
         case ENOENT:reason="staging folder is missing or storage disconnected";break;
         case ENOTDIR:case EISDIR:reason="staging path has the wrong file type";break;
         case EEXIST:reason="an existing transfer lock must be released before retrying";break;
+        case EINVAL:reason="retained transfer identity, size or range mode changed; move or remove the retained .part and .map files before retrying";break;
         case ENOMEM:reason="not enough memory";break;
         case EIO:reason="storage I/O error";break;
 #ifdef ELOOP
@@ -115,10 +116,10 @@ static int acquire(GsJobState *j)
     if(!created) {
         char previous[96]={0};int64_t length=0;long pid=0;int consumed=0;
         if(gs_store_size(fd,&length)){int error=errno;close(fd);return storage_failure(j,"lock size query",error);}
-        if(length<=0 || length>=(int64_t)sizeof(previous)){close(fd);return storage_failure(j,"lock format",EEXIST);}
+        if(length>=(int64_t)sizeof(previous)){close(fd);return storage_failure(j,"lock format",EEXIST);}
         int n=(int)length;
-        if(gs_store_read(fd,previous,(size_t)n,0)){int error=errno;close(fd);return storage_failure(j,"lock read",error);}
-        int parsed=sscanf(previous,"%ld\n%n",&pid,&consumed)==1 && pid>0 && pid<=INT32_MAX;
+        if(n>0 && gs_store_read(fd,previous,(size_t)n,0)){int error=errno;close(fd);return storage_failure(j,"lock read",error);}
+        int parsed=n>0 && sscanf(previous,"%ld\n%n",&pid,&consumed)==1 && pid>0 && pid<=INT32_MAX;
         parsed=parsed && !memchr(previous,0,(size_t)n);
         int modern=parsed && n-consumed==(int)strlen("SSPI-XFER-LOCK 1\n") && !strcmp(previous+consumed,"SSPI-XFER-LOCK 1\n");
         // A versioned lock is owned by its open descriptor, not its PID. A
@@ -132,7 +133,15 @@ static int acquire(GsJobState *j)
             dead=kill((pid_t)pid,0)<0 && errno==ESRCH;
 #endif
         }
-        if(!modern && !dead){close(fd);return storage_failure(j,"lock ownership",EEXIST);}
+        // Reaching this point already proves exclusive ownership: the flock (or
+        // LockFileEx) above succeeded, so no live process holds this inode. An
+        // unreadable record therefore cannot be a live owner; it is the artifact
+        // of a crash or power loss between lock creation and the record write
+        // (including a truncated legacy record). Failing here would block every
+        // later resume of the completed chunks forever. Reclaim it and record the
+        // recovery for the console log instead.
+        if(!modern && !legacy) gs_transfer_log(j,"resume-lock-reclaimed");
+        else if(!modern && !dead){close(fd);return storage_failure(j,"lock ownership",EEXIST);}
     }
     j->lock_fd=fd;
     char text[64];int n=snprintf(text,sizeof(text),"%ld\nSSPI-XFER-LOCK 1\n",(long)getpid());
@@ -186,6 +195,7 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32])
     // no-symlink policy atomically when opening, without a libc stat ABI.
     flags|=O_NOFOLLOW|O_NONBLOCK;
 #endif
+    int part_existed=access(j->part,F_OK)==0;
     j->fd=open(j->part,flags,0600);if(j->fd<0)return storage_failure(j,"package open",errno);
     j->header.magic=0x33585347;j->header.version=3;j->header.chunk_size=GS_XFER_CHUNK;
     j->header.total=(uint64_t)j->status.total;
@@ -195,9 +205,11 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32])
     if(!j->header.count || j->header.count>65536)return storage_failure(j,"package size validation",EFBIG);
     j->checkpoint_chunks=calloc(j->header.count,sizeof(GsChunk));
     j->chunks=calloc(j->header.count,sizeof(GsChunk));j->claims=calloc(j->header.count,1);j->attempts=calloc(j->header.count,1);
-    j->retry_at=calloc(j->header.count,sizeof(uint64_t));
-    if(!j->chunks||!j->checkpoint_chunks||!j->claims||!j->attempts||!j->retry_at)return storage_failure(j,"resume-map allocation",ENOMEM);
+    j->retry_at=calloc(j->header.count,sizeof(uint64_t));j->accepted=calloc(j->header.count,sizeof(uint64_t));
+    if(!j->chunks||!j->checkpoint_chunks||!j->claims||!j->attempts||!j->retry_at||!j->accepted)return storage_failure(j,"resume-map allocation",ENOMEM);
+    int map_present=access(j->map,F_OK)==0;
     FILE *f=fopen(j->map,"rb");int valid=0;
+    if(map_present&&!f)return storage_failure(j,"resume-map open",errno?errno:EACCES);
     if(f) {
         GsMapHeader old;
         if(fread(&old,1,sizeof(old),f)==sizeof(old) && old.magic==j->header.magic && old.version==3 && old.count==j->header.count &&
@@ -208,18 +220,24 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32])
         }fclose(f);
     }
     int64_t file_size=0;if(gs_store_size(j->fd,&file_size))return storage_failure(j,"package size query",errno);
-    if(file_size!=j->status.total)valid=0;
+    // Never resize or replace retained data when its durable map describes a
+    // different source, size, checksum, or range capability. The operator can
+    // move/remove the pair explicitly; automatic recovery must stay lossless.
+    if(map_present&&!valid)return storage_failure(j,"resume identity",EINVAL);
+    if(valid&&file_size!=j->status.total)return storage_failure(j,"resume size",EINVAL);
+    if(!map_present&&part_existed&&file_size>0)return storage_failure(j,"unmapped retained package",EINVAL);
     if(!valid || j->single)memset(j->chunks,0,j->header.count*sizeof(GsChunk));
     if(ftruncate(j->fd,j->status.total))return storage_failure(j,"package resize",errno);
     unsigned char *buffer=malloc(GS_XFER_BUFFER);if(!buffer)return storage_failure(j,"verification-buffer allocation",ENOMEM);
     for(uint32_t i=0;i<j->header.count;i++) if(j->chunks[i].done) {
+        if(__atomic_load_n(&j->stop,__ATOMIC_ACQUIRE)){free(buffer);return -2;}
         SHA256_CTX hash;unsigned char digest[32];sha256_init(&hash);
         uint64_t start=(uint64_t)i*GS_XFER_CHUNK, end=start+GS_XFER_CHUNK;if(end>j->header.total)end=j->header.total;
         int bad=0;
-        for(uint64_t at=start;at<end;){size_t n=(size_t)(end-at);if(n>GS_XFER_BUFFER)n=GS_XFER_BUFFER;if(gs_store_read(j->fd,buffer,n,at)){bad=1;break;}sha256_update(&hash,buffer,n);at+=n;}
+        for(uint64_t at=start;at<end;){if(__atomic_load_n(&j->stop,__ATOMIC_ACQUIRE)){free(buffer);return -2;}size_t n=(size_t)(end-at);if(n>GS_XFER_BUFFER)n=GS_XFER_BUFFER;if(gs_store_read(j->fd,buffer,n,at)){bad=1;break;}sha256_update(&hash,buffer,n);at+=n;}
         sha256_final(&hash,digest);
         if(bad||memcmp(digest,j->chunks[i].hash,32))memset(&j->chunks[i],0,sizeof(GsChunk));
-        else j->status.done+=(int64_t)(end-start);
+        else {j->status.done+=(int64_t)(end-start);j->accepted[i]=end-start;}
     }
     free(buffer);return gs_store_checkpoint(j);
 }
@@ -231,7 +249,7 @@ void gs_store_close(GsJobState *j)
     if(j->lock_fd>=0)close(j->lock_fd);j->lock_fd=-1;
     free(j->checkpoint_chunks);j->checkpoint_chunks=NULL;
     free(j->chunks);free(j->claims);free(j->attempts);j->chunks=NULL;j->claims=j->attempts=NULL;
-    free(j->retry_at);j->retry_at=NULL;
+    free(j->retry_at);j->retry_at=NULL;free(j->accepted);j->accepted=NULL;
 }
 int64_t sspi_xfer_durable(const char *destination)
 {
