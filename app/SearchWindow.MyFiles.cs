@@ -73,7 +73,12 @@ namespace Orbis
         bool CloudBack()
         {
             if (_usbInstallOpen) return UsbInstallBack();
+            string parent=_cloudFolder.StartsWith("rd-torrent/")?"rd-torrents":
+                _cloudFolder.StartsWith("ad-torrent/")?"ad-torrents":
+                _cloudFolder.StartsWith("tb-folder/torrents/")?"tb-torrents":
+                _cloudFolder.StartsWith("tb-folder/webdl/")?"tb-webdl":null;
             ++_cloudGeneration;_cloudBusy=false;_cloudPage=0;_settingsFocus=0;
+            if(parent!=null){LoadCloud(parent,0);return true;}
             if(_cloudFolder!=""){_cloudFolder="";_cloudFiles.Clear();_cloudMessage="";return true;}
             if(_cloudMenu){_cloudMenu=false;return true;}
             _settingsOpen=false;_settingsPage=0;return true;
@@ -81,10 +86,10 @@ namespace Orbis
         void LoadCloud(string folder,int page)
         {
             if(_cloudBusy)return;_cloudFolder=folder;_cloudPage=Math.Max(0,page);_cloudBusy=true;_cloudMessage="Loading your files...";
-            int generation=++_cloudGeneration;
+            int generation=++_cloudGeneration, requestedPage=_cloudPage;
             ThreadPool.QueueUserWorkItem(_=>{
                 List<CloudFile> files=null;string message="";
-                try{files=CloudCatalog.List(_cfg,folder,_cloudPage);if(files.Count==0)message="No files on this page. LEFT returns to the previous page.";}
+                try{files=CloudCatalog.List(_cfg,folder,requestedPage);if(files.Count==0)message="No files on this page. Go back or refresh after your torrent finishes.";}
                 catch{message="Could not load cloud files. Check the service connection, then press TRIANGLE to retry.";}
                 lock(_lock){if(generation!=_cloudGeneration)return;_cloudFiles=files??new List<CloudFile>();_cloudMessage=message;_settingsFocus=0;_cloudScroll=0;_cloudBusy=false;Invalidated=true;}
             });
@@ -92,24 +97,28 @@ namespace Orbis
         void QueuePersonalLink(string name,string link,bool cloud)
         {
             if(!cloud&&!CloudCatalog.ValidLink(link))throw new IOException("Enter a complete HTTP or HTTPS file URL");
-            string message;
-            _dlMgr.Enqueue(new GameHit{TitleId="",Name=string.IsNullOrWhiteSpace(name)?"My package":name,ImageUrl=""},
-                new PkgLink{Kind="package",Label="Personal file",Url=link},"personal","1","",cloud?"Cloud":"Personal","","",out message);
-            _cloudMessage=message;User.NotifyToast(message);
+            RunDownloadAction(()=>{
+                string message;
+                _dlMgr.Enqueue(new GameHit{TitleId="",Name=string.IsNullOrWhiteSpace(name)?"My package":name,ImageUrl=""},
+                    new PkgLink{Kind="package",Label="Personal file",Url=link},"personal","1","",cloud?"Cloud":"Personal","","",out message);
+                lock(_lock){_cloudMessage=message;Invalidated=true;}
+                User.NotifyToast(message);
+            });
         }
         void HandleMyFiles(DS4Button b)
         {
             if (_usbInstallOpen) { HandleUsbInstall(b); return; }
             if(_cloudBusy)return;
-            int count=_cloudFolder==""?(_cloudMenu?4:3):_cloudFiles.Count;
+            int count=_cloudFolder==""?(_cloudMenu?5:3):_cloudFiles.Count;
             if(b==DS4Button.SCE_PAD_BUTTON_UP)_settingsFocus=Math.Max(0,_settingsFocus-1);
             if(b==DS4Button.SCE_PAD_BUTTON_DOWN)_settingsFocus=Math.Min(Math.Max(0,count-1),_settingsFocus+1);
             if(_cloudFolder!=""&&(b==DS4Button.SCE_PAD_BUTTON_TRIANGLE||b==DS4Button.SCE_PAD_BUTTON_LEFT||b==DS4Button.SCE_PAD_BUTTON_RIGHT))
-            {LoadCloud(_cloudFolder,_cloudPage+(b==DS4Button.SCE_PAD_BUTTON_RIGHT?1:b==DS4Button.SCE_PAD_BUTTON_LEFT?-1:0));return;}
+            {if(b==DS4Button.SCE_PAD_BUTTON_TRIANGLE||_cloudFolder.IndexOf('/')<0)
+                LoadCloud(_cloudFolder,_cloudPage+(b==DS4Button.SCE_PAD_BUTTON_RIGHT?1:b==DS4Button.SCE_PAD_BUTTON_LEFT?-1:0));return;}
             if(b!=DS4Button.SCE_PAD_BUTTON_CROSS)return;
             if(_cloudFolder=="")
             {
-                if(_cloudMenu){LoadCloud(new[]{"rd-downloads","rd-torrents","tb-webdl","tb-torrents"}[_settingsFocus],0);return;}
+                if(_cloudMenu){LoadCloud(new[]{"rd-downloads","rd-torrents","ad-torrents","tb-webdl","tb-torrents"}[_settingsFocus],0);return;}
                 if(_settingsFocus==2){OpenUsbInstall();return;}
                 if(_settingsFocus==1){_cloudMenu=true;_settingsFocus=0;return;}
                 StartPairSession(true); _uiOverlay = UiOverlay.QrPair;
@@ -123,12 +132,12 @@ namespace Orbis
             TextPx(r,sheet.x,sheet.y+15,28,"Downloads",White);
             TextFit(r,sheet.x,sheet.y+61,18,sheet.w,"Queue your own files through the existing download and install pipeline.",Muted);
             if(_cloudFolder=="")
-            {string[] names=_cloudMenu?new[]{"Real-Debrid files","Real-Debrid torrents","TorBox files","TorBox torrents"}:new[]{"Paste a download link","Browse stored debrid files","Install from USB"};for(int i=0;i<names.Length;i++)DrawSettingsRow(r,sheet.x,sheet.y+112+i*96,sheet.w,84,i,names[i],!_cloudMenu&&i==0?"Direct PKG/archive URL or a supported hoster link":!_cloudMenu&&i==2?"Browse a connected drive and select packages or archives":"Ready files and cached torrents in your own account","Open");}
+            {string[] names=_cloudMenu?new[]{"Real-Debrid files","Real-Debrid torrents","AllDebrid torrents","TorBox files","TorBox torrents"}:new[]{"Paste a download link","Browse stored debrid files","Install from USB"};for(int i=0;i<names.Length;i++)DrawSettingsRow(r,sheet.x,sheet.y+112+i*96,sheet.w,84,i,names[i],!_cloudMenu&&i==0?"Direct PKG/archive, debrid share link, or supported hoster link":!_cloudMenu&&i==2?"Browse a connected drive and select packages or archives":"Ready files and completed torrents in your own account","Open");}
             else if(!_cloudBusy)
             {EnsureVisible(ref _cloudScroll,_settingsFocus,_cloudFiles.Count,5);for(int i=0;i<5&&_cloudScroll+i<_cloudFiles.Count;i++){int n=_cloudScroll+i;var f=_cloudFiles[n];DrawSettingsRow(r,sheet.x,sheet.y+112+i*96,sheet.w,84,n,f.Name,f.Detail,!f.Ready?"Not ready":f.Folder?"Open":"Queue");}}
             if(_cloudBusy)DrawActivityRail(r,new SDL_Rect{x=sheet.x,y=sheet.y+102,w=sheet.w,h=3});
             TextFit(r,sheet.x,sheet.y+617,18,sheet.w,_cloudMessage,Muted);
-            if(_cloudFolder!="")TextFit(r,sheet.x,sheet.y+666,18,sheet.w,"LEFT/RIGHT page "+(_cloudPage+1)+"  ·  TRIANGLE refresh  ·  CIRCLE back",Dim);
+            if(_cloudFolder!="")TextFit(r,sheet.x,sheet.y+666,18,sheet.w,(_cloudFolder.IndexOf('/')<0?"LEFT/RIGHT page "+(_cloudPage+1)+"  ·  ":"")+"TRIANGLE refresh  ·  CIRCLE back",Dim);
         }
     }
 }

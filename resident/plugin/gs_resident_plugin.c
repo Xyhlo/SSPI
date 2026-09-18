@@ -33,6 +33,19 @@
  * value is Linux-specific, so suppress SIGPIPE with the native socket option. */
 #define GS_SO_NOSIGPIPE 0x0800
 #define GS_HTTP_CLIENTS 8
+/* BGFT reads the served package from the same HDD it writes it back to, so every
+ * read/write head switch costs throughput. A console log measured ~28 MB/s for
+ * a single sequential loopback reader with 256 KiB reads while the install
+ * write was active. One bounded block per connection (8 MiB total for
+ * GS_HTTP_CLIENTS) cuts the switch rate; this is a bounded-change hypothesis,
+ * not a measured speedup. */
+#define GS_LOOPBACK_BLOCK (1024 * 1024)
+/* A peer that stops reading must not pin one of the connection slots forever.
+ * The budget is deliberately unchanged from the previous 90 s: BGFT may pause a
+ * response body while it prepares or verifies on the same disk, and only a
+ * hardware capture could prove a shorter bound safe. Any successful partial send
+ * resets the deadline, and g_stop still cancels within one 10 ms wakeup. */
+#define GS_LOOPBACK_STALL_US 90000000ULL
 #define GS_IPC_ROOT "/data/SSPI/resident"
 #define GS_IPC_ROOT_SHARED "/user/data/SSPI/resident"
 #define GS_SHARED_BOOT_PATH "/user/data/SSPI/resident/plugin-boot.txt"
@@ -251,7 +264,7 @@ static int send_all(int socket_id, const void *data, size_t size)
         ssize_t sent = send(socket_id, at, size, 0);
         if (sent < 0 && errno == EINTR) continue;
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_stop &&
-            sceKernelGetProcessTime() - stalled_at < 90000000) {
+            sceKernelGetProcessTime() - stalled_at < GS_LOOPBACK_STALL_US) {
             sceKernelUsleep(10000); continue;
         }
         if (sent <= 0) {
@@ -516,7 +529,7 @@ static void serve_client(int socket_id)
     if (job_route && gs_stream_slot >= 0) {
         info.st_size = gs_job.total;
         // A stdio read-ahead must not cache unwritten sparse bytes beyond a
-        // committed range. The explicit 256 KiB buffer already batches I/O.
+        // committed range. The explicit bounded buffer already batches I/O.
         setvbuf(file, NULL, _IONBF, 0);
     }
     if (manifest) {
@@ -586,7 +599,7 @@ static void serve_client(int socket_id)
         fclose(file);
         return;
     }
-    transfer_buffer = (unsigned char *)malloc(256 * 1024);
+    transfer_buffer = (unsigned char *)malloc(GS_LOOPBACK_BLOCK);
     if (!transfer_buffer) { fclose(file); return; }
     uint64_t body_started = sceKernelGetProcessTime(), body_logged_at = body_started;
     uint64_t read_us = 0, send_us = 0, wait_us = 0, gate_us = 0;
@@ -595,12 +608,13 @@ static void serve_client(int socket_id)
         uint64_t now = sceKernelGetProcessTime();
         if (job_route && now - body_logged_at >= 5000000) {
             body_logged_at = now;
-            gs_log_write("resident", "bgft-http-body job=%s fd=%d start=%lld sent=%lld remaining=%lld elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
+            gs_log_write("resident", "bgft-http-body job=%s fd=%d start=%lld sent=%lld remaining=%lld block=%u elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
                 gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining,
+                (unsigned)GS_LOOPBACK_BLOCK,
                 (unsigned long long)((now - body_started) / 1000), (unsigned long long)(read_us / 1000),
                 (unsigned long long)(send_us / 1000), (unsigned long long)(wait_us / 1000), (unsigned long long)(gate_us / 1000));
         }
-        size_t wanted = remaining < 256 * 1024 ? (size_t)remaining : 256 * 1024;
+        size_t wanted = remaining < GS_LOOPBACK_BLOCK ? (size_t)remaining : GS_LOOPBACK_BLOCK;
         if (job_route && gs_stream_slot >= 0) {
             uint64_t before = sceKernelGetProcessTime();
             int64_t available = gs_stage_stream_readable(end + 1 - remaining);
@@ -629,8 +643,8 @@ static void serve_client(int socket_id)
         remaining -= (int64_t)count;
     }
     free(transfer_buffer);
-    if (job_route) gs_log_write("resident", "bgft-http-end job=%s fd=%d start=%lld sent=%lld remaining=%lld canceled=%d paused=%d elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
-        gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining, gs_canceled, gs_paused,
+    if (job_route) gs_log_write("resident", "bgft-http-end job=%s fd=%d start=%lld sent=%lld remaining=%lld block=%u canceled=%d paused=%d elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
+        gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining, (unsigned)GS_LOOPBACK_BLOCK, gs_canceled, gs_paused,
         (unsigned long long)((sceKernelGetProcessTime() - body_started) / 1000), (unsigned long long)(read_us / 1000),
         (unsigned long long)(send_us / 1000), (unsigned long long)(wait_us / 1000), (unsigned long long)(gate_us / 1000));
     if (job_route) gs_record_served(start, end + 1 - remaining);

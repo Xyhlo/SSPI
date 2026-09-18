@@ -38,12 +38,33 @@ namespace Orbis
         static readonly uint[] CrcTable = BuildCrcTable();
         static readonly object RarGate = new object();
 
+        /// <summary>Phase evidence for a decoder failure. The decoder reports every header,
+        /// scan and payload boundary, so retryability is decided from where the failure
+        /// happened rather than from the wording of its message. The thrown exception type
+        /// stays System.IO.InvalidDataException, which is sealed and part of the existing
+        /// contract with the install pipeline.</summary>
+        internal sealed class RarFailureEvidence
+        {
+            internal int Code;
+            internal bool PayloadStarted;
+            internal bool HeaderPhaseReported;
+            internal string Password = "";
+        }
+
+        internal const string RarFailureKey = "sspi.rar.failure";
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        delegate void NativeRarDiagnostic(IntPtr stage, uint entry, int result, uint dictionary, uint method, ulong size);
+        internal delegate void NativeRarDiagnostic(IntPtr stage, uint entry, int result, uint dictionary, uint method, ulong size);
         [DllImport("libGameSearchResident.prx", CallingConvention = CallingConvention.Cdecl)]
         static extern int gs_extract_rar_password_diagnostic(IntPtr first, IntPtr destination,
             IntPtr names, IntPtr paths, int volumes, IntPtr packages, int capacity,
             NativeArchiveProgress progress, IntPtr password, NativeRarDiagnostic diagnostic);
+
+        /// <summary>Regression seam. Null in production, where the console's UnRAR module is
+        /// called directly; the managed harness substitutes a decoder double so the retry
+        /// policy below is executed rather than re-implemented.</summary>
+        internal static Func<IntPtr, IntPtr, IntPtr, IntPtr, int, IntPtr, int, NativeArchiveProgress, IntPtr,
+            NativeRarDiagnostic, int> NativeRarOverride;
 
         static IntPtr ArchiveUtf8(string value, List<IntPtr> allocations)
         {
@@ -66,6 +87,8 @@ namespace Orbis
             while (!System.Threading.Monitor.TryEnter(RarGate, 100)) CheckCancel(cancel);
             var allocations = new List<IntPtr>();
             Exception callbackError = null;
+            bool payloadStarted = false;
+            int headerPhaseResult = 0;
             var clock = System.Diagnostics.Stopwatch.StartNew();
             long reportedAt = -200, reportedTotal = -1, reportedDone = -1;
             NativeArchiveProgress callback = (done, total) => {
@@ -81,9 +104,17 @@ namespace Orbis
                 } catch (Exception ex) { callbackError = ex; return 1; }
             };
             NativeRarDiagnostic trace = (stage, entry, result, dictionary, method, size) => {
-                try { if (diagnostic != null) diagnostic("decoder=unrar stage=" + NativeArchiveText(stage) +
-                    " entry=" + entry + " result=" + result + " dictionary_kib=" + dictionary +
-                    " method=" + method + " unpacked=" + size); }
+                try {
+                    string name = NativeArchiveText(stage);
+                    // Phase evidence for the retry policy below: the decoder reports every
+                    // header/scan boundary and every payload boundary, so a failure can be
+                    // classified by where it happened instead of by its message text.
+                    if (name.StartsWith("process-", StringComparison.Ordinal)) payloadStarted = true;
+                    else if ((name == "open-failed" || name == "scan-complete") && result != 0) headerPhaseResult = result;
+                    if (diagnostic != null) diagnostic("decoder=unrar stage=" + name +
+                        " entry=" + entry + " result=" + result + " dictionary_kib=" + dictionary +
+                        " method=" + method + " unpacked=" + size);
+                }
                 catch (Exception ex) { callbackError = ex; }
             };
             try {
@@ -99,9 +130,14 @@ namespace Orbis
                 }
                 const int stride = 1032;
                 IntPtr packages = Marshal.AllocHGlobal(MaximumPackageEntries * stride); allocations.Add(packages);
-                int count = gs_extract_rar_password_diagnostic(Marshal.ReadIntPtr(nativePaths), ArchiveUtf8(destination, allocations),
-                    nativeNames, nativePaths, paths.Count, packages, MaximumPackageEntries, callback,
-                    ArchiveUtf8(password ?? "", allocations), trace);
+                IntPtr first = Marshal.ReadIntPtr(nativePaths);
+                IntPtr archiveDestination = ArchiveUtf8(destination, allocations);
+                IntPtr suppliedPassword = ArchiveUtf8(password ?? "", allocations);
+                int count = NativeRarOverride != null
+                    ? NativeRarOverride(first, archiveDestination, nativeNames, nativePaths, paths.Count,
+                        packages, MaximumPackageEntries, callback, suppliedPassword, trace)
+                    : gs_extract_rar_password_diagnostic(first, archiveDestination, nativeNames, nativePaths,
+                        paths.Count, packages, MaximumPackageEntries, callback, suppliedPassword, trace);
                 if (callbackError != null) throw callbackError;
                 if (count <= 0 || count > MaximumPackageEntries) {
                     string detail;
@@ -110,13 +146,25 @@ namespace Orbis
                         case 15: case 18: detail = "RAR volume could not be read; check that every volume finished downloading"; break;
                         case 11: case 25: detail = "RAR dictionary or expanded size exceeds the supported memory limit"; break;
                         case 16: case 19: detail = "RAR output could not be written; check storage space and the staging drive"; break;
-                        case 12: detail = "RAR integrity check failed; a volume is missing or damaged"; break;
+                        // UnRAR reports a broken or undecodable header block, and a wrong RAR4
+                        // header-decryption key, as ERAR_BAD_DATA (see dll.cpp:241, which tests
+                        // BrokenHeader before FailedHeaderDecryption, and arcread.cpp:538, which
+                        // sets BrokenHeader on a header CRC failure). The text names both
+                        // possibilities; which one applies is decided by phase evidence, never by
+                        // this wording.
+                        case 12: detail = "RAR header or data integrity check failed; the archive content is damaged or truncated, or its encrypted headers could not be unlocked"; break;
                         case 1001: detail = "RAR header scan timed out"; break;
                         case 1002: detail = "RAR was read successfully but contains no PKG files; check that the source supplied a PS4 package archive"; break;
                         case 1003: detail = "Another RAR extraction is still running; retry after it finishes"; break;
                         default: detail = "RAR decoder could not read this archive"; break;
                     }
-                    throw new InvalidDataException(detail + " (decoder " + count + "). Archive retained.");
+                    string failure = detail + " (decoder " + count + "). Archive retained.";
+                    var reported = new InvalidDataException(failure);
+                    try { reported.Data[RarFailureKey] = new RarFailureEvidence {
+                        Code = -count, PayloadStarted = payloadStarted,
+                        HeaderPhaseReported = headerPhaseResult != 0, Password = password ?? "" }; }
+                    catch (Exception) { }
+                    throw reported;
                 }
                 var entries = new List<PackageArchiveEntry>(count);
                 for (int i = 0; i < count; i++) {
@@ -140,7 +188,7 @@ namespace Orbis
         { return header != null && StartsWith(header, header.Length, SevenZipMagic); }
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        delegate int NativeArchiveProgress(long done, long total);
+        internal delegate int NativeArchiveProgress(long done, long total);
         [DllImport("libGameSearchResident.prx", CallingConvention = CallingConvention.Cdecl)]
         static extern int gs_7z_extract_local_ex([MarshalAs(UnmanagedType.LPStr)] string input,
             [MarshalAs(UnmanagedType.LPStr)] string destination, IntPtr packages, int capacity,
@@ -364,8 +412,15 @@ namespace Orbis
                     }
                     catch (Exception ex)
                     {
-                        if (!(ex is System.Security.Cryptography.CryptographicException) &&
-                            ex.Message.IndexOf("password", StringComparison.OrdinalIgnoreCase) < 0) throw;
+                        // Retryability is a classified decoder outcome, not a wording match:
+                        // RarPasswordRejectedException (native 22/24) and
+                        // RarEncryptedHeaderException (open/list failure before any payload,
+                        // with a password supplied) may spend another source password.
+                        // Payload CRC/data failures, cancellation, storage and I/O errors are
+                        // rethrown unchanged, so a failure after gigabytes of decoding can never
+                        // restart extraction. The bound is the initial attempt plus at most the
+                        // first three fallback entries, and duplicates are never repeated.
+                        if (!IsRetryablePasswordFailure(ex)) throw;
                         while (passwordFallbacks != null && next < Math.Min(3, passwordFallbacks.Length) &&
                             (string.IsNullOrEmpty(passwordFallbacks[next]) || tried.Contains(passwordFallbacks[next]))) next++;
                         if (passwordFallbacks == null || next >= Math.Min(3, passwordFallbacks.Length)) throw;
@@ -382,6 +437,24 @@ namespace Orbis
         static void CheckCancel(Func<bool> cancel)
         {
             if (cancel != null && cancel()) throw new OperationCanceledException();
+        }
+
+        /// <summary>Decides whether a decoder failure may spend another source password.
+        /// Executed by ExtractPackages and by the managed regression harness, so the
+        /// policy under test is the policy that ships. Only two things are retryable:
+        /// an explicit password rejection (native 22/24) and an open/list failure that
+        /// happened before any entry payload was decoded while a password was supplied.
+        /// A payload CRC or data failure after output work, cancellation, storage and
+        /// I/O errors are terminal, so a failure after gigabytes of decoding can never
+        /// restart extraction.</summary>
+        internal static bool IsRetryablePasswordFailure(Exception error)
+        {
+            if (error is System.Security.Cryptography.CryptographicException) return true;
+            var evidence = error?.Data?[RarFailureKey] as RarFailureEvidence;
+            if (evidence == null) return false;
+            if (evidence.Code == 22 || evidence.Code == 24) return true;
+            return evidence.Code == 12 && evidence.Password.Length > 0 &&
+                !evidence.PayloadStarted && evidence.HeaderPhaseReported;
         }
 
         static List<PackageArchiveEntry> ReadRar(IEnumerable<string> paths, string destination,
@@ -411,7 +484,13 @@ namespace Orbis
                         if (++entries > MaximumArchiveEntries) throw new InvalidDataException("Archive contains too many entries");
                         string name = ValidateEntryName(item.Key);
                         if (!item.IsComplete) throw new InvalidDataException("Missing or truncated RAR volume: " + name);
-                        if (item.IsEncrypted && string.IsNullOrEmpty(password)) throw new InvalidDataException("Archive password required; refresh this package from its source");
+                        if (item.IsEncrypted && string.IsNullOrEmpty(password))
+                        {
+                            var missingPassword = new InvalidDataException("Archive password required; refresh this package from its source");
+                            try { missingPassword.Data[RarFailureKey] = new RarFailureEvidence { Code = 22 }; }
+                            catch (Exception) { }
+                            throw missingPassword;
+                        }
                         if (item.IsDirectory) continue;
                         if (!names.Add(name)) throw new InvalidDataException("Duplicate archive entry: " + name);
                         // Solid decoding also consumes non-PKG entries. Bound their expansion too.

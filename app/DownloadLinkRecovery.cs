@@ -36,7 +36,7 @@ namespace Orbis
             if (transfer == null || durableBytes == null) throw new ArgumentNullException();
             string url = initialUrl;
             int renewals = 0;
-            long renewedAtBytes = -1;
+            long episodeBytes = -1;
             for (;;)
             {
                 CheckCanceled(canceled);
@@ -51,10 +51,10 @@ namespace Orbis
                 catch (Exception error)
                 {
                     CheckCanceled(canceled);
-                    if (!IsExpired(error) || renew == null || canRenew == null || !canRenew() ||
-                        renewals >= MaximumRenewals) throw;
+                    if (!IsExpired(error) || renew == null || canRenew == null || !canRenew()) throw;
                     long now = Math.Max(0, durableBytes());
-                    if (renewals > 0 && now <= renewedAtBytes) throw;
+                    if (episodeBytes < 0 || now > episodeBytes) { episodeBytes = now; renewals = 0; }
+                    if (renewals >= MaximumRenewals) throw;
                     if (renewing != null) renewing(renewals + 1);
                     if (renewals > 0) (wait ?? Wait)(1000 << (renewals - 1), canceled);
                     CheckCanceled(canceled);
@@ -63,7 +63,6 @@ namespace Orbis
                     if (string.IsNullOrWhiteSpace(fresh))
                         throw new InvalidOperationException("Link service returned an empty download link");
                     url = fresh;
-                    renewedAtBytes = now;
                     renewals++;
                 }
             }

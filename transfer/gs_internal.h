@@ -50,7 +50,7 @@ typedef pthread_t GsThread;
 #include <orbis/libkernel.h>
 typedef OrbisPthread GsThread;
 #endif
-typedef struct { int template_id, connection, request, status; int64_t start,end,total,length; char origin[512], effective[8192], location[8192], source[8192]; int retry_after, reused, aborted, ssl_error, native_errno, retire, recv_block, recv_block_rc; unsigned ssl_verify, open_wait_ms, interruptions; const char *stage; volatile int request_gate; } GsHttp;
+typedef struct { int template_id, connection, request, status; int64_t start,end,total,length; char origin[512], effective[8192], location[8192], source[8192]; int retry_after, retry_after_invalid_time, reused, aborted, ssl_error, native_errno, retire, recv_block, recv_block_rc; unsigned ssl_verify, open_wait_ms, interruptions; const char *stage; volatile int request_gate; } GsHttp;
 typedef struct {
     uint32_t magic, version, chunk_size, count;
     uint64_t total;
@@ -58,9 +58,17 @@ typedef struct {
     uint32_t single, crc;
 } GsMapHeader;
 typedef struct { unsigned char done, reserved[7], hash[32]; } GsChunk;
+typedef enum {
+    GS_FAILURE_NONE=0, GS_FAILURE_CANCELED, GS_FAILURE_ADMISSION,
+    GS_FAILURE_TRANSPORT, GS_FAILURE_COOLDOWN, GS_FAILURE_LINK,
+    GS_FAILURE_TLS, GS_FAILURE_PROTOCOL, GS_FAILURE_STORAGE
+} GsFailureClass;
 typedef struct {
     int handle, fd, active, limit, single, stop, finishing, preparing, lock_fd, resume_requested;
-    int checkpointing, checkpoint_dirty, checkpoint_waiters, target_limit, clean_chunks, verification_retries;
+    int checkpointing, checkpoint_dirty, checkpoint_waiters, checkpoint_failed, target_limit, clean_chunks, verification_retries;
+    int preparation_started, preparation_joining;
+    GsThread preparation_thread;
+    GsHttp preparation_http;
     unsigned stream_failed_lanes;
     char verification_error[220];
     char storage_error[220], storage_stage[32];
@@ -70,10 +78,14 @@ typedef struct {
     GsMapHeader header;
     GsChunk *chunks, *checkpoint_chunks;
     unsigned char *claims, *attempts;
-    uint64_t *retry_at;
+    uint64_t *retry_at, *accepted;
     uint64_t checkpoint_at, next_retry, recovery_at, checkpoint_ms;
     uint64_t failure_window, backoff_until;
     unsigned failed_lanes;
+    uint64_t useful_bytes, useful_progress_at, tls_failure_started, recovery_deadline;
+    unsigned tls_failures, tls_failed_lanes;
+    GsFailureClass recovery_class;
+    char recovery_detail[160];
     uint64_t request_ms, read_ms, write_ms, hash_ms, log_at;
     uint64_t read_calls, write_calls, write_bytes, buffer_wait_ms, read_interruptions;
     uint64_t write_jumps, write_jump_bytes, write_switches, write_max_ms;

@@ -314,11 +314,28 @@ namespace Orbis
         public static long DownloadFileResumable(string url, string destPath, long existingBytes,
             Action<long, long> progress, Func<bool> cancel, int timeoutMs = 0, string bearer = null,
             string expectedTitleId = null, string expectedPackageId = null, string expectedSha256 = null,
-            Action<long, long, long> telemetry = null, Action<string> phase = null)
+            Action<long, long, long> telemetry = null, Action<string> phase = null, Action<string> activity = null)
         {
+#if PARALLEL_TRANSFER_FIXTURE
+            return DownloadFileResumableFixture(url, destPath, existingBytes, progress, cancel,
+                timeoutMs <= 0 ? 30000 : timeoutMs, bearer, expectedTitleId, expectedPackageId, expectedSha256);
+#else
             return TransferClient.Download(url, destPath, progress, cancel, bearer,
-                expectedTitleId, expectedPackageId, expectedSha256, DownloadRangeCount, telemetry, phase);
+                expectedTitleId, expectedPackageId, expectedSha256, DownloadRangeCount, telemetry, phase, activity);
+#endif
         }
+
+#if PARALLEL_TRANSFER_FIXTURE
+        internal static long DownloadFileResumableFixture(string url, string destPath, long existingBytes,
+            Action<long, long> progress, Func<bool> cancel, int timeoutMs, string bearer,
+            string expectedTitleId, string expectedPackageId, string expectedSha256)
+        {
+            return ManagedDownloadResumable(url, destPath, existingBytes, progress, cancel, timeoutMs,
+                bearer, false, expectedTitleId,
+                DownloadTransferSettings.ConnectionsFor(url, DownloadRangeCount),
+                expectedPackageId, expectedSha256);
+        }
+#endif
 
         // Artwork is disposable, bounded data. It must not start package writer,
         // checkpoint or diagnostic threads for each small cover request.
@@ -1061,6 +1078,14 @@ namespace Orbis
                         output.Flush(true);
                     }
                 }
+            }
+            catch (WebException error)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                var failure = DownloadHttpException.Find(error);
+                if (error.Response != null) error.Response.Close();
+                if (failure != null) throw failure;
+                throw;
             }
             finally
             {

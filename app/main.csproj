@@ -92,6 +92,7 @@
     <Compile Include="DeepbridClient.cs" />
 
     <Compile Include="DownloadManager.cs" />
+    <Compile Include="QueueScheduler.cs" />
     <Compile Include="DownloadLinkParser.cs" />
     <Compile Include="DownloadTransferSettings.cs" />
     <Compile Include="DownloadLinkRecovery.cs" />

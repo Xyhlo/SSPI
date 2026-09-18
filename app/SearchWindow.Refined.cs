@@ -9,14 +9,11 @@ namespace Orbis
     public partial class SearchWindow
     {
         string _downloadFilesTitle;
-        uint _framePrevious, _frameWindowStart;
+        uint _framePrevious, _frameWindowStart, _downloadAudioAt;
         int _frameSamples, _frameMisses, _frameLongest;
         IntPtr _headerBrand;
         readonly System.Collections.Generic.Dictionary<string, IntPtr> _caseSizes = new System.Collections.Generic.Dictionary<string, IntPtr>();
         bool _headerBrandTried;
-        string _pocketProgressId;
-        double _pocketProgress;
-        uint _pocketAt;
 
         void DrawHeaderBrand(IntPtr renderer)
         {
@@ -53,7 +50,7 @@ namespace Orbis
             {
                 int elapsed = (int)unchecked(now - _framePrevious);
                 _frameSamples++;
-                if (elapsed > 20) _frameMisses++;
+                if (elapsed > 35) _frameMisses++;
                 _frameLongest = Math.Max(_frameLongest, elapsed);
             }
             _framePrevious = now;
@@ -61,7 +58,7 @@ namespace Orbis
             uint duration = unchecked(now - _frameWindowStart);
             if (duration < 10000) return;
             string report = "build=" + BuildIdentity.Label + " fps=" + (_frameSamples * 1000.0 / duration).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) +
-                " frames_over_20ms=" + _frameMisses + " longest_ms=" + _frameLongest + " renderer=software 1920x1080";
+                " target_fps=30 frames_over_35ms=" + _frameMisses + " longest_ms=" + _frameLongest + " renderer=software 1920x1080";
             if (BuildIdentity.OwnerDebug)
             {
                 try { report += " owner_debug=1 managed_heap_bytes=" + GC.GetTotalMemory(false) +
@@ -77,7 +74,11 @@ namespace Orbis
             foreach (var item in group.Items)
                 if (item.State == DlState.Downloading || item.State == DlState.Resolving || item.State == DlState.Finalizing || item.State == DlState.Installing) return item;
             foreach (var item in group.Items)
-                if (item.State == DlState.Failed || item.State == DlState.Paused || item.State == DlState.Queued) return item;
+                if (item.State == DlState.Failed) return item;
+            foreach (var item in group.Items)
+                if (item.State == DlState.Paused || item.ParkedForProvider) return item;
+            foreach (var item in group.Items)
+                if (item.State == DlState.Queued) return item;
             return group.Items.Count > 0 ? group.Items[0] : null;
         }
 
@@ -174,28 +175,30 @@ namespace Orbis
             MarkUiProgress("downloads-model");
             RefreshQueueModel();
             var rows = _queueRows; ClampDownloadFocus(rows);
+            bool drawerOpen = _downloadFilesTitle != null;
             int filterX = ContentX;
             for (int i = 0; i < QueueFilters.Length; i++)
             {
-                TextPx(renderer, filterX, 148, 22, QueueFilters[i], i == _queueFilter ? White : Muted);
-                if (i == _queueFilter) Fill(renderer, filterX, 189, 26, 2, White);
+                TextPx(renderer, filterX, drawerOpen ? 126 : 148, 22, QueueFilters[i], i == _queueFilter ? White : Muted);
+                if (i == _queueFilter) Fill(renderer, filterX, drawerOpen ? 165 : 189, 26, 2, White);
                 filterX += UiFont.MeasurePx(22, QueueFilters[i]) + 35;
             }
             if (rows.Count == 0) { TextPx(renderer, ContentX, 380, 32, "Nothing queued", White); return; }
             // Focus expands within the list; selection order remains stable while jobs update.
             if (_downloadFilesTitle != null) _dlScroll = _dlFocus;
             else EnsureVisible(ref _dlScroll, _dlFocus, rows.Count, 4);
-            int y = 224;
+            int y = drawerOpen ? 184 : 224;
             for (int i = _dlScroll; i < rows.Count && i < _dlScroll + 4; i++)
             {
                 var row = rows[i]; var group = row.Group; var item = row.Item;
                 bool focus = i == _dlFocus;
                 bool drawer = focus && group.Key == _downloadFilesTitle;
-                int height = focus ? (drawer ? 240 : 320) : 112;
+                int drawerHeight = drawer ? DownloadDrawerContentHeight(group) : 0;
+                int height = focus ? (drawer ? 232 : 320) : 112;
                 if (y + height > 948) break;
                 var area = new SDL_Rect { x = ContentX, y = y, w = ContentWidth, h = height };
                 var frame = area;
-                if (drawer) frame.h += DownloadDrawerHeight;
+                if (drawer) frame.h += drawerHeight;
                 MarkUiProgress("downloads-card");
                 SoftRect(renderer, frame, focus ? C(35, 36, 37) : Panel);
                 MarkUiProgress("downloads-artwork-lookup");
@@ -219,32 +222,35 @@ namespace Orbis
                 {
                     TextPx(renderer, tx, y + (drawer ? 77 : 102), 21, group.TitleId ?? "", Muted);
                     DrawGroupKinds(renderer, group, tx + 164, y + (drawer ? 77 : 102), true);
-                    var track = new SDL_Rect { x = tx, y = y + 176 + detailShift, w = ContentWidth - 252, h = 7 };
-                    Fill(renderer, track.x, track.y, track.w, track.h, C(81, 83, 85));
+                    var track = new SDL_Rect { x = tx, y = y + 176 + detailShift, w = ContentWidth - 252, h = 9 };
+                    DrawDownloadGroupProgress(renderer, group, track);
                     if (item != null)
                     {
-                        double target = item.Total > 0 ? Math.Min(1, Math.Max(0, item.Done / (double)item.Total)) : 0;
-                        uint now = UiTick();
-                        if (_pocketProgressId != item.Id || _cfg.ReduceMotion || target < _pocketProgress) _pocketProgress = target;
-                        else _pocketProgress += (target - _pocketProgress) * Math.Min(1, unchecked(now - _pocketAt) / 140.0);
-                        _pocketProgressId = item.Id; _pocketAt = now;
-                        Fill(renderer, track.x, track.y, Math.Max(1, (int)(track.w * _pocketProgress)), track.h, White);
-                        TextFit(renderer, tx, y + 205 + detailShift, 22, 440, TransferSizeLine(item), White);
+                        int metricsY = y + 145 + (drawer ? 0 : 60);
+                        TextFit(renderer, tx, metricsY, 21, 458, DownloadGroupSize(group), White);
+                        string counter = DownloadGroupCounter(group);
+                        int counterX = track.x + track.w - UiFont.MeasurePx(19, counter);
+                        TextPx(renderer, counterX, metricsY + 2, 19, counter, Muted);
                         if (_cfg.DownloadStatsMode != 1)
                         {
                             string rate = item.State == DlState.Failed ? "Files kept for retry" : TransferRateLine(item);
-                            if (item.State == DlState.Downloading)
+                            if (item.ParkedForProvider) rate = "Preparing in TorBox";
+                            if (item.State == DlState.Downloading || Extracting(item))
                             {
                                 string speed = item.BytesPerSec > 0 ? (item.BytesPerSec / 1000000.0).ToString("0.00") + " MB/s" : "Measuring speed…";
                                 string eta = item.EtaSeconds > 0 ? "ETA " + item.EtaSeconds / 60 + ":" + (item.EtaSeconds % 60).ToString("00") : "ETA —";
                                 rate = _cfg.DownloadStatsMode == 2 ? speed : _cfg.DownloadStatsMode == 3 ? eta : speed + "  ·  " + eta;
                             }
-                            TextFit(renderer, tx + 460, y + 205 + detailShift, 23, ContentWidth - 712, rate, White);
+                            int rateRight = counterX - 32;
+                            int rateWidth = Math.Max(0, rateRight - (tx + 478));
+                            int rateX = Math.Max(tx + 478, rateRight - UiFont.MeasurePx(21, rate));
+                            TextFit(renderer, rateX, metricsY, 21, rateWidth, rate, White);
                         }
                         if (_cfg.NerdStats && !drawer) DrawFocusedSparkline(renderer, new SDL_Rect { x = tx, y = y + 133, w = ContentWidth - 252, h = 31 }, item);
                         var failed = group.Items.Find(entry => entry.State == DlState.Failed);
                         if (failed != null) TextFit(renderer, tx, y + 258 + detailShift, 19, tw, "Needs attention · " + PackageTitle(failed.Kind) + " · " + FriendlyTransferFailure(failed.Error), Danger);
-                        else TextFit(renderer, tx, y + 258 + detailShift, 21, tw, ActiveTransferOwnerText(item), StateColor(item.State));
+                        else TextFit(renderer, tx, y + 258 + detailShift, 21, tw, ActiveTransferOwnerText(item),
+                            item.ParkedForProvider ? Warning : StateColor(item.State));
                     }
                     TextFit(renderer, area.x + area.w - 172, y + (drawer ? 186 : 265), 18, 150,
                         (drawer ? "L2  Close  ˄" : "R2  " + group.Items.Count + " files  ˅"), White);
@@ -255,7 +261,7 @@ namespace Orbis
                     TextFit(renderer, area.x + area.w - 252, y + 46, 21, 220, DownloadGroupStatus(group), Muted);
                 }
                 y += height;
-                if (drawer) { MarkUiProgress("downloads-drawer"); DrawDownloadDrawer(renderer, group, y); y += DownloadDrawerHeight; }
+                if (drawer) { MarkUiProgress("downloads-drawer"); DrawDownloadDrawer(renderer, group, y); y += drawerHeight; }
                 if (focus)
                 {
                     MarkUiProgress("downloads-outline");
@@ -269,7 +275,7 @@ namespace Orbis
                 }
                 y += 20;
             }
-            if (rows.Count > 4) DrawScrollBar(renderer, new SDL_Rect { x = ContentX + ContentWidth + 16, y = 224, w = 4, h = 716 }, rows.Count, 4, _dlScroll);
+            if (!drawerOpen && rows.Count > 4) DrawScrollBar(renderer, new SDL_Rect { x = ContentX + ContentWidth + 16, y = 224, w = 4, h = 716 }, rows.Count, 4, _dlScroll);
             MarkUiProgress("downloads-complete");
         }
 

@@ -3,7 +3,9 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Text;
+using System.Threading;
 
 namespace Orbis
 {
@@ -222,26 +224,71 @@ namespace Orbis
 
         static string Get(PackageSourceDescriptor descriptor, string url, DateTime deadline, ref int requests)
         {
-            if (++requests > MaxRequests)
-                throw new PackageSourceRemoteException(SourceFailureCode.LimitExceeded, "HTTP request limit exceeded");
-            if (DateTime.UtcNow >= deadline)
-                throw new PackageSourceRemoteException(SourceFailureCode.TimedOut, "Source deadline exceeded");
             Uri uri;
             if (!TryAbsoluteHttp(url, out uri) || !OriginAllowed(descriptor, uri))
                 throw new PackageSourceRemoteException(SourceFailureCode.PermissionDenied,
                     "Request origin is not permitted");
-            int remaining = (int)Math.Max(1, (deadline - DateTime.UtcNow).TotalMilliseconds);
-            string result;
-            try { result = NetHttp.GetString(uri.AbsoluteUri, remaining); }
-            catch (Exception ex)
+            for (int attempt = 0; ; attempt++)
             {
-                throw new PackageSourceRemoteException(SourceFailureCode.NetworkFailure,
-                    "Source request failed: " + ex.Message);
+                if (++requests > MaxRequests)
+                    throw new PackageSourceRemoteException(SourceFailureCode.LimitExceeded, "HTTP request limit exceeded");
+                if (DateTime.UtcNow >= deadline)
+                    throw new PackageSourceRemoteException(SourceFailureCode.TimedOut, "Source deadline exceeded");
+                int remaining = (int)Math.Max(1, (deadline - DateTime.UtcNow).TotalMilliseconds);
+                string result;
+                try { result = NetHttp.GetString(uri.AbsoluteUri, remaining); }
+                catch (Exception ex)
+                {
+                    int retryAfter;
+                    int status = HttpFailureStatus(ex, out retryAfter);
+                    SspiLog.Write("network", "source-request-failed source=" + descriptor.SourceId +
+                        " host=" + uri.IdnHost + " http=" + status + " attempt=" + (attempt + 1) +
+                        " exception=" + ex.GetType().Name);
+                    bool transient = status == 408 || status == 425 || status == 429 ||
+                        status == 500 || status == 502 || status == 503 || status == 504;
+                    int delay = Math.Max(1, Math.Min(2, retryAfter)) * 1000;
+                    // One bounded retry on the existing background source worker.
+                    // Long Retry-After values are shown to the user, never ignored.
+                    if (attempt == 0 && transient && retryAfter <= 2 && requests < MaxRequests &&
+                        (deadline - DateTime.UtcNow).TotalMilliseconds > delay + 1000)
+                    { Thread.Sleep(delay); continue; }
+                    throw new PackageSourceRemoteException(SourceFailureCode.NetworkFailure, HttpFailureMessage(status));
+                }
+                if (result == null || result.Length > MaxResponseChars)
+                    throw new PackageSourceRemoteException(SourceFailureCode.LimitExceeded,
+                        "Source response exceeds 2 MiB");
+                return result;
             }
-            if (result == null || result.Length > MaxResponseChars)
-                throw new PackageSourceRemoteException(SourceFailureCode.LimitExceeded,
-                    "Source response exceeds 2 MiB");
-            return result;
+        }
+
+        static int HttpFailureStatus(Exception error, out int retryAfter)
+        {
+            retryAfter = 0;
+            for (int depth = 0; error != null && depth < 8; depth++, error = error.InnerException)
+            {
+                var native = error as ServiceHttpException;
+                if (native != null) { retryAfter = native.RetryAfterSeconds; return native.StatusCode; }
+                var web = error as WebException;
+                var response = web == null ? null : web.Response as HttpWebResponse;
+                if (response != null)
+                {
+                    retryAfter = ServiceHttpException.ParseRetryAfter(response.Headers["Retry-After"], DateTime.UtcNow);
+                    return (int)response.StatusCode;
+                }
+            }
+            return 0;
+        }
+
+        static string HttpFailureMessage(int status)
+        {
+            string prefix = status > 0 ? "HTTP " + status + ": " : "Source connection failed: ";
+            if (status == 404 || status == 410)
+                return prefix + "Source unavailable. Replace it in Connections > Manage sources.";
+            if (status == 401 || status == 403)
+                return prefix + "Source access denied. Update or replace it in Manage sources.";
+            if (status == 429) return prefix + "Source busy. Retry shortly.";
+            if (status >= 500) return prefix + "Source server unavailable. Retry shortly.";
+            return prefix + "Check the connection or update this source in Manage sources.";
         }
 
         static bool OriginAllowed(PackageSourceDescriptor descriptor, Uri target)

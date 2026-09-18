@@ -250,7 +250,7 @@ namespace Orbis
         {
             RequireStartupRenderer(Renderer == null ? IntPtr.Zero : Renderer.Handler);
             Program.StartupStage("window-renderer-ready");
-            FPS = 60;
+            FPS = 30;
             ClearR = Bg.r; ClearG = Bg.g; ClearB = Bg.b;
             // Continue the branded PS4 launch screen while managed services initialize.
             try
@@ -427,7 +427,6 @@ namespace Orbis
             _landingContinue.Clear();
             _landingPebble = null;
             List<DlItem> items = ReadDownloadSnapshot();
-            PollDownloadAudio(items);
             if (items != null)
             {
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1937,6 +1936,7 @@ namespace Orbis
                 case DS4Button.SCE_PAD_BUTTON_R2:
                 case DS4Button.SCE_PAD_BUTTON_RIGHT: OpenDownloadDrawer(current.Group); return;
                 case DS4Button.SCE_PAD_BUTTON_CROSS: if (current.Item != null) ActOnDownload(current.Item); return;
+                case DS4Button.SCE_PAD_BUTTON_TRIANGLE: if (current.Item != null) PrioritizeDownload(current.Item); return;
                 case DS4Button.SCE_PAD_BUTTON_SQUARE:
                     _removeGroupIds = current.Group.Items.ConvertAll(item => item.Id).ToArray();
                     _overlayDownloadId = current.Item == null ? null : current.Item.Id;
@@ -2134,6 +2134,11 @@ namespace Orbis
             }
         }
 
+        void PrioritizeDownload(DlItem item)
+        {
+            RunDownloadAction(() => { string message = _dlMgr.DownloadNext(item.Id); SetStatus(message); User.NotifyToast(message); });
+        }
+
         void ActOnDownload(DlItem item)
         {
             if (item.State == DlState.Installed)
@@ -2201,7 +2206,16 @@ namespace Orbis
                 group.Items.Add(item);
             }
             foreach (var group in groups)
-                group.Items.Sort((a, b) => KindOrder(a.Kind).CompareTo(KindOrder(b.Kind)));
+            {
+                // Keep equal-kind packages in queue order so DLC rows and their
+                // header segments do not shuffle when a snapshot is refreshed.
+                var ordered = new List<DlItem>(group.Items.Count);
+                for (int kind = 0; kind <= 3; kind++)
+                    foreach (var item in group.Items)
+                        if (KindOrder(item.Kind) == kind) ordered.Add(item);
+                group.Items.Clear();
+                group.Items.AddRange(ordered);
+            }
             return groups;
         }
 
@@ -2226,7 +2240,8 @@ namespace Orbis
 
         static int KindOrder(string kind)
         {
-            if (string.Equals(kind, "game", StringComparison.OrdinalIgnoreCase)) return 0;
+            if (string.Equals(kind, "game", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(kind, "base", StringComparison.OrdinalIgnoreCase)) return 0;
             if (string.Equals(kind, "update", StringComparison.OrdinalIgnoreCase)) return 1;
             if (string.Equals(kind, "dlc", StringComparison.OrdinalIgnoreCase)) return 2;
             return 3;
@@ -2516,6 +2531,7 @@ namespace Orbis
                 catch (Exception ex)
                 {
                     Program.StartupStage("detail-resolve-failed");
+                    SspiLog.Write("network", "detail-resolve-failed title=" + sel.TitleId + " detail=" + ex.Message);
                     lock (_lock)
                     {
                         if (!OwnsDetailResolve(gen, sel)) return;
@@ -2526,7 +2542,7 @@ namespace Orbis
                         _expandedPackageGroups.Clear();
                         RebuildDetailRows();
                         _detailFocus = _detailScroll = 0;
-                        _resolveError = "Resolve failed: " + Clip(ex.Message, 60);
+                        _resolveError = "Resolve failed: " + Clip(ex.Message, 200);
                         _status = _resolveError;
                     }
                 }
@@ -3126,7 +3142,10 @@ namespace Orbis
             // Pair completion/expiry is network-driven; never wait for another button press.
             PollPairState();
             RefreshLinkStatusLookup();
-            if (UiElapsed(_landingModelAt) >= 1000)
+            if (UiElapsed(_downloadAudioAt) >= 1000) {
+                _downloadAudioAt = UiTick(); PollDownloadAudio(ReadDownloadSnapshot());
+            }
+            if (_tab == TopTab.Search && _screen == BrowseScreen.Search && !_settingsOpen && UiElapsed(_landingModelAt) >= 1000)
                 RefreshLandingModel();
             uint toastAge = _toastActive ? UiElapsed(_toastStartedAt) : 0;
             if (_toastActive && toastAge >= ToastEnterMs + ToastHoldMs + ToastExitMs)
@@ -3152,7 +3171,7 @@ namespace Orbis
                 busyAnim = _browseBusy;
                 sourceInstallAnim = _sourceInstallStage != SourceInstallStage.Idle;
             }
-            // The window owns the 16/17 ms presentation cadence. A second 100 ms
+            // The window owns the 33/34 ms presentation cadence. A second 100 ms
             // throttle previously reduced normal navigation and downloads to 10 FPS.
             Invalidated = true;
             _lastUiRefresh = FrameTime;
@@ -3320,6 +3339,7 @@ namespace Orbis
         static string ActiveTransferOwnerText(DlItem item)
         {
             if (item == null) return "Queued";
+            if (item.ParkedForProvider) return item.StatusText ?? "Preparing in TorBox · other downloads continue";
             if (item.State == DlState.Queued && (item.StatusText ?? "").StartsWith("Background mode waiting:", StringComparison.Ordinal))
                 return item.StatusText;
             if (item.State != DlState.Downloading && item.State != DlState.Finalizing &&
@@ -3510,6 +3530,7 @@ namespace Orbis
             else if (!_settingsOpen && _tab == TopTab.Downloads && _downloadFilesTitle != null)
             {
                 add("cross", "Package action");
+                add("triangle", "Download next");
                 add("square", "Remove package");
                 add("l2", "Close drawer");
             }
@@ -3561,7 +3582,9 @@ namespace Orbis
                             add("cross", "Pause");
                         else if (focused.State == DlState.Finalizing)
                             add("cross", "Wait");
-                        else if (focused.State == DlState.Paused || focused.State == DlState.Queued)
+                        else if (focused.State == DlState.Queued)
+                            add("cross", "Pause");
+                        else if (focused.State == DlState.Paused)
                             add("cross", "Resume");
                         else if (focused.State == DlState.Completed)
                             add("cross", "Install");
@@ -3573,6 +3596,8 @@ namespace Orbis
                             add("cross", "Action");
 
                         add("square", "Remove game");
+                        if (focused.State == DlState.Queued || focused.State == DlState.Paused || focused.State == DlState.Downloading || focused.State == DlState.Resolving)
+                            add("triangle", "Download next");
                     }
                     else
                     {
@@ -4504,6 +4529,7 @@ namespace Orbis
                 if (item.State == DlState.Installing || (item.StatusText ?? "").StartsWith("Installing packages")) return "Installing in order";
                 if (item.State == DlState.Downloading) return "Downloading";
                 if (item.State == DlState.Finalizing) return "Waiting to install";
+                if (item.ParkedForProvider) return "Waiting for TorBox preparation";
                 if (item.State == DlState.Resolving) return "Resolving links";
                 if (item.State == DlState.Installed) installed++;
                 if (item.State == DlState.Submitted) submitted++;
@@ -5041,6 +5067,7 @@ namespace Orbis
 
         static string StateLabel(DlItem item)
         {
+            if (item != null && item.ParkedForProvider) return "Preparing in TorBox";
             if (item != null && item.State == DlState.Completed && !string.IsNullOrEmpty(item.Error))
                 return "Install failed";
             return StateLabel(item == null ? DlState.Finalizing : item.State);

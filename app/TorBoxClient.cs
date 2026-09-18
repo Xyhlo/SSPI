@@ -15,6 +15,27 @@ namespace Orbis
         sealed class Pending { public string Id, FileId; public DateTime Until; }
         static readonly Dictionary<string, Pending> PendingDownloads = new Dictionary<string, Pending>();
 
+        /// <summary>Outcome of a single provider list poll for a prepared download.</summary>
+        internal enum PreparedPollKind { Ready, Preparing, Rejected, Terminal, Transient }
+
+        /// <summary>
+        /// One poll result. The blocking resolve loop and the queue's parked
+        /// preparation poller share this classification, so a parked TorBox item
+        /// is polled with exactly the parsing and error rules of a normal resolve.
+        /// </summary>
+        internal sealed class PreparedPollResult
+        {
+            internal PreparedPollKind Kind;
+            internal string FileId = "";
+            internal string StatusText = "";
+            internal string Metric = "";
+            internal string ProviderState = "";
+            internal string Error = "";
+            internal string RawJson = "";
+            internal bool Visible;
+            internal Exception Transport;
+        }
+
         // Preparation is bounded by a deadline and reported on every poll. The host
         // regression harness overrides both seams so the loop can be driven
         // deterministically without sleeping or waiting ten minutes.
@@ -28,12 +49,9 @@ namespace Orbis
             if (string.IsNullOrEmpty(hostUrl))
                 throw new Exception("Empty host URL");
 
-            string json = null, key;
-            using (var sha = SHA256.Create()) key = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(token.Trim() + "\n" + hostUrl)));
-            Pending pending;
-            lock (PendingDownloads) { PendingDownloads.TryGetValue(key, out pending); }
-            if (pending != null && pending.Until < DateTime.UtcNow) pending = null;
-            if (pending == null) pending = LoadPending(key);
+            string json = null;
+            string key = PendingKey(token, hostUrl);
+            Pending pending = LookupPending(key);
             if (cancel != null && cancel()) throw new OperationCanceledException();
             if (pending == null)
             {
@@ -53,14 +71,13 @@ namespace Orbis
             for (int poll = 0; string.IsNullOrEmpty(fileId) && elapsed.Elapsed < PreparationDeadline; poll++)
             {
                 if (cancel != null && cancel()) throw new OperationCanceledException();
-                string list;
-                try { list = NetHttp.GetString(Api + "/webdl/mylist?id=" + Uri.EscapeDataString(pending.Id) + "&bypass_cache=true", 15000, null, token.Trim()); }
-                catch (Exception ex)
+                var outcome = PollPrepared(token, hostUrl, cancel);
+                if (outcome.Kind == PreparedPollKind.Transient)
                 {
                     // A list query that never answered says nothing about the prepared
                     // download, so keep it and retry a bounded number of times before
                     // surfacing the transport detail.
-                    if (++transient > TransientListAttempts) throw DebridResolutionError.FromTransport("TorBox", hostUrl, ex);
+                    if (++transient > TransientListAttempts) throw DebridResolutionError.FromTransport("TorBox", hostUrl, outcome.Transport);
                     if (progress != null)
                         progress("TorBox preparing this file · list request retry " + transient + "/" + TransientListAttempts +
                             " · " + (int)elapsed.Elapsed.TotalSeconds + "s");
@@ -68,24 +85,16 @@ namespace Orbis
                     continue;
                 }
                 transient = 0;
-                var response = Response(list);
-                if (!Flag(response, "success"))
+                if (outcome.Kind == PreparedPollKind.Rejected)
+                    throw DebridResolutionError.FromResponse("TorBox", hostUrl, outcome.RawJson);
+                if (outcome.Kind == PreparedPollKind.Terminal) throw new Exception(outcome.Error);
+                if (outcome.Visible) listed++;
+                fileId = outcome.Kind == PreparedPollKind.Ready ? outcome.FileId : null;
+                if (!string.IsNullOrEmpty(fileId)) break;
+                if (outcome.Visible)
                 {
-                    if (MissingJob(Text(response, "error"))) ForgetPending(key);
-                    throw DebridResolutionError.FromResponse("TorBox", hostUrl, list);
-                }
-                Dictionary<string, object> job;
-                bool visible = TryFindJob(Value(response, "data"), pending.Id, out job);
-                if (visible) listed++;
-                fileId = visible ? ReadyFile(job) : null;
-                if (!string.IsNullOrEmpty(fileId)) { pending.FileId = fileId; SavePending(key, pending); break; }
-                if (visible)
-                {
-                    string state = Text(job, "download_state") ?? "preparing";
-                    lastState = state;
-                    if (state.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 || state.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0)
-                        { ForgetPending(key); throw new Exception("TorBox host download failed: " + state); }
-                    if (progress != null) progress(PreparationProgress(job, elapsed.Elapsed));
+                    lastState = outcome.ProviderState;
+                    if (progress != null) progress(PreparationProgress(outcome.Metric, elapsed.Elapsed));
                 }
                 else if (progress != null)
                 {
@@ -209,13 +218,157 @@ namespace Orbis
         }
         internal static string PreparationProgress(Dictionary<string, object> job, TimeSpan elapsed)
         {
-            string message = "TorBox preparing";
+            return PreparationProgress(MetricText(job), elapsed);
+        }
+
+        internal static string PreparationProgress(string metric, TimeSpan elapsed)
+        {
+            if (string.IsNullOrEmpty(metric)) return "TorBox preparing · " + (int)elapsed.TotalSeconds + "s";
+            return "TorBox preparing · " + metric;
+        }
+
+        /// <summary>Provider-reported metric only (no elapsed fallback), so the
+        /// queue can show a parked preparation without inventing a timer.</summary>
+        static string MetricText(Dictionary<string, object> job)
+        {
+            var parts = new List<string>();
             double progress = Number(job, "progress"), speed = Number(job, "download_speed"), eta = Number(job, "eta");
-            if (progress >= 0 && progress <= 1) message += " · " + (progress * 100).ToString("0", CultureInfo.InvariantCulture) + "%";
-            if (speed > 0) message += " · " + (speed / 1000000).ToString("0.0", CultureInfo.InvariantCulture) + " MB/s";
-            if (eta > 0 && eta < 86400) message += " · ETA " + TimeSpan.FromSeconds(eta).ToString(@"h\:mm\:ss");
-            else message += " · " + (int)elapsed.TotalSeconds + "s";
-            return message;
+            if (progress >= 0 && progress <= 1) parts.Add((progress * 100).ToString("0", CultureInfo.InvariantCulture) + "%");
+            if (speed > 0) parts.Add((speed / 1000000).ToString("0.0", CultureInfo.InvariantCulture) + " MB/s");
+            if (eta > 0 && eta < 86400) parts.Add("ETA " + TimeSpan.FromSeconds(eta).ToString(@"h\:mm\:ss"));
+            return string.Join(" · ", parts.ToArray());
+        }
+
+        static string PendingKey(string token, string hostUrl)
+        {
+            using (var sha = SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(token.Trim() + "\n" + hostUrl)));
+        }
+
+        static Pending LookupPending(string key)
+        {
+            Pending pending;
+            lock (PendingDownloads) { PendingDownloads.TryGetValue(key, out pending); }
+            if (pending != null && pending.Until < DateTime.UtcNow) pending = null;
+            if (pending == null) pending = LoadPending(key);
+            return pending;
+        }
+
+        /// <summary>The durable prepared record exists for this account and link.</summary>
+        internal static bool HasPreparedDownload(string token, string hostUrl)
+        {
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrEmpty(hostUrl)) return false;
+            return LookupPending(PendingKey(token, hostUrl)) != null;
+        }
+
+        /// <summary>
+        /// One list poll for the prepared download. Called by the blocking resolve
+        /// loop and by the queue's parked poller, so both use the same parsing,
+        /// same terminal-state rules and the same durable pending record. Never
+        /// creates a provider job; a missing record is a rejection, not a retry.
+        /// </summary>
+        internal static PreparedPollResult PollPrepared(string token, string hostUrl, Func<bool> cancel)
+        {
+            var result = new PreparedPollResult();
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrEmpty(hostUrl))
+            {
+                result.Kind = PreparedPollKind.Rejected;
+                result.Error = "TorBox token missing";
+                return result;
+            }
+            string key = PendingKey(token, hostUrl);
+            Pending pending = LookupPending(key);
+            if (pending == null)
+            {
+                result.Kind = PreparedPollKind.Rejected;
+                result.Error = "No prepared TorBox download; resolve the package again";
+                return result;
+            }
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            string list;
+            try { list = NetHttp.GetString(Api + "/webdl/mylist?id=" + Uri.EscapeDataString(pending.Id) + "&bypass_cache=true", 15000, null, token.Trim()); }
+            catch (Exception ex)
+            {
+                result.Kind = PreparedPollKind.Transient;
+                result.Transport = ex;
+                result.Error = ex.Message;
+                return result;
+            }
+            result.RawJson = list;
+            var response = Response(list);
+            if (!Flag(response, "success"))
+            {
+                if (MissingJob(Text(response, "error"))) ForgetPending(key);
+                result.Kind = PreparedPollKind.Rejected;
+                result.Error = Text(response, "error") ?? "the provider rejected the list request";
+                return result;
+            }
+            Dictionary<string, object> job;
+            bool visible = TryFindJob(Value(response, "data"), pending.Id, out job);
+            result.Visible = visible;
+            if (visible)
+            {
+                // Readiness is checked before the state wording, matching the
+                // original resolve loop: a listed file id wins over any state text.
+                string fileId = ReadyFile(job);
+                if (!string.IsNullOrEmpty(fileId))
+                {
+                    pending.FileId = fileId;
+                    SavePending(key, pending);
+                    result.Kind = PreparedPollKind.Ready;
+                    result.FileId = fileId;
+                    result.Metric = MetricText(job);
+                    result.StatusText = PreparationProgress(result.Metric, TimeSpan.Zero);
+                    return result;
+                }
+                string state = Text(job, "download_state") ?? "preparing";
+                result.ProviderState = state;
+                result.Metric = MetricText(job);
+                result.StatusText = PreparationProgress(result.Metric, TimeSpan.Zero);
+                if (state.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 || state.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    ForgetPending(key);
+                    result.Kind = PreparedPollKind.Terminal;
+                    result.Error = "TorBox host download failed: " + state;
+                    return result;
+                }
+            }
+            else
+            {
+                result.StatusText = "TorBox preparing";
+            }
+            result.Kind = PreparedPollKind.Preparing;
+            return result;
+        }
+
+        /// <summary>
+        /// Queue preflight before the blocking resolve. Guarantees a prepared
+        /// download exists (creating at most one cloud job on first sight),
+        /// performs at most one list poll, and returns Ready when the provider
+        /// already published a file. A Ready result here lets the normal resolve
+        /// skip its loop entirely, so no second provider job is ever created.
+        /// </summary>
+        internal static PreparedPollResult TryParkOrPrepare(string token, string hostUrl, Func<bool> cancel)
+        {
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrEmpty(hostUrl))
+                return new PreparedPollResult { Kind = PreparedPollKind.Rejected, Error = "TorBox token missing" };
+            string key = PendingKey(token, hostUrl);
+            Pending pending = LookupPending(key);
+            if (pending != null && !string.IsNullOrEmpty(pending.FileId))
+                return new PreparedPollResult { Kind = PreparedPollKind.Ready, FileId = pending.FileId };
+            if (pending == null)
+            {
+                string json = CreateWebDownload(token.Trim(), hostUrl, null, cancel);
+                var created = Object(Value(Response(json), "data"));
+                string id = First(created, "webdownload_id", "webdownloadId", "id");
+                if (!ValidId(id)) throw new Exception("TorBox returned an invalid web download ID");
+                pending = new Pending { Id = id, FileId = ReadyFile(created), Until = DateTime.UtcNow.AddHours(6) };
+                SavePending(key, pending);
+                lock (PendingDownloads) { if (PendingDownloads.Count >= 256) PendingDownloads.Clear(); PendingDownloads[key] = pending; }
+                if (!string.IsNullOrEmpty(pending.FileId))
+                    return new PreparedPollResult { Kind = PreparedPollKind.Ready, FileId = pending.FileId };
+            }
+            return PollPrepared(token, hostUrl, cancel);
         }
         static string CreateWebDownload(string token, string hostUrl, Action<string> progress, Func<bool> cancel)
         {

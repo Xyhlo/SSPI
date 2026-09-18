@@ -31,6 +31,9 @@ int sspi_xfer_probe(int http_context, const char *url, int64_t total,
 void sspi_xfer_set_module(int module);
 int sspi_xfer_start(const char *url, const char *bearer, const char *destination,
                     const char *title, const char *content, const char *sha256, int lanes);
+/* Start publishes a positive queued handle after input validation and slot
+ * reservation. Admission, source probing and resume verification run under
+ * that handle; poll.error may contain nonterminal preparation/recovery detail. */
 int sspi_xfer_poll(int handle, GsXferStatus *status);
 /* Contiguous completed bytes available at offset; never includes queued writes.
  * -1 means the stream identity failed or the handle no longer exists. */

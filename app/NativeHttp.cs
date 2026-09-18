@@ -91,6 +91,15 @@ namespace Orbis
             "E57B7E6F150C419102E8D5C055729FF967B9D1A829BF00CEC89CA604EBF4A86F";
         const string IsrgRootYeSha256 =
             "E14FFCAD5B0025731006CAA43A121A22D8E9700F4FB9CF852F02A708AA5D5666";
+        // Official Generation Y intermediates, verified against the pinned ISRG
+        // roots. Older NanoSSL firmware may not build even the shortened chain.
+        static readonly string[] GenerationYIntermediatePins =
+        {
+            "13949634D99CD6FD6AA80BC034FEFACCEB1969FEEF986586713ECDBB05758D3F",
+            "238B85A0099C65B970477D5724F1A1D475CE5058CFFE4EFA8733899BDB863C47",
+            "A2372D06431E9716365EEED47EC020351497D182FCC038E457E58168A03CAC07",
+            "97658DE8C68DFA98ACE1E5028A63D54A1AAE911B3E21471076C6850CD08CBAB4"
+        };
 
         public static bool Available
         {
@@ -287,6 +296,13 @@ namespace Orbis
                 if (!string.IsNullOrEmpty(generationYPath))
                     certificates.InsertRange(0, ReadPemCertificates(generationYPath, false, true));
                 _log.Append("native_gen_y=").Append(_nativeGenerationYRootCount).Append("; ");
+                string generationYIntermediates = FindGenerationYRoots("letsencrypt-generation-y-intermediates.pem");
+                if (!string.IsNullOrEmpty(generationYIntermediates))
+                {
+                    var supplement = ReadPemCertificates(generationYIntermediates, false, false, true);
+                    certificates.InsertRange(0, supplement);
+                    _log.Append("native_gen_y_intermediates=").Append(supplement.Count).Append("; ");
+                }
                 string realDebridIntermediatePath = FindRealDebridIntermediate();
                 if (!string.IsNullOrEmpty(realDebridIntermediatePath))
                 {
@@ -393,11 +409,10 @@ namespace Orbis
             return null;
         }
 
-        static string FindGenerationYRoots()
+        static string FindGenerationYRoots(string fileName = "letsencrypt-generation-y-roots.pem")
         {
             string baseDir = ".";
             try { baseDir = IO.GetAppBaseDirectory() ?? "."; } catch { }
-            const string fileName = "letsencrypt-generation-y-roots.pem";
             string[] paths =
             {
                 Path.Combine(baseDir, "assets", "certs", fileName),
@@ -411,7 +426,7 @@ namespace Orbis
         }
 
         static List<byte[]> ReadPemCertificates(string path, bool allowPinnedIntermediate,
-            bool allowGenerationYRoots = false)
+            bool allowGenerationYRoots = false, bool allowGenerationYIntermediates = false)
         {
             const string begin = "-----BEGIN CERTIFICATE-----";
             const string end = "-----END CERTIFICATE-----";
@@ -443,7 +458,7 @@ namespace Orbis
                 try
                 {
                     cert = new X509Certificate2(der);
-                    for (int i = 0; !allowGenerationYRoots && i < NativeRootSubjectMarkers.Length; i++)
+                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && i < NativeRootSubjectMarkers.Length; i++)
                     {
                         if (cert.Subject.IndexOf(NativeRootSubjectMarkers[i], StringComparison.OrdinalIgnoreCase) >= 0)
                         {
@@ -464,6 +479,9 @@ namespace Orbis
                         selected = true;
                         _nativeGenerationYRootCount++;
                     }
+                    if (!selected && allowGenerationYIntermediates)
+                        foreach (string pin in GenerationYIntermediatePins)
+                            if (HasSha256Fingerprint(der, pin)) { selected = true; break; }
                 }
                 catch
                 {

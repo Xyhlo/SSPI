@@ -128,11 +128,11 @@ namespace Orbis
         {
             long seconds;
             if (long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out seconds))
-                return (int)Math.Max(1, Math.Min(300, seconds));
+                return (int)Math.Max(1, Math.Min(int.MaxValue, seconds));
             DateTimeOffset date;
             if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out date))
-                return (int)Math.Max(1, Math.Min(300, Math.Ceiling((date.UtcDateTime - now).TotalSeconds)));
+                return (int)Math.Max(1, Math.Min(int.MaxValue, Math.Ceiling((date.UtcDateTime - now).TotalSeconds)));
             return 0;
         }
         internal static DownloadHttpException Find(Exception error)
@@ -155,13 +155,16 @@ namespace Orbis
         internal static bool TryGetRetry(Exception error, int attempt, DateTime now, out long retryAtUtcTicks)
         {
             retryAtUtcTicks = 0;
-            if (error is OperationCanceledException || attempt < 0 || attempt >= 3) return false;
+            if (error is OperationCanceledException || attempt < 0) return false;
             var http = Find(error);
             if (http == null) return false;
             switch (http.StatusCode)
             {
                 case 408: case 425: case 429: case 500: case 502: case 503: case 504:
-                    retryAtUtcTicks = now.AddSeconds(Math.Max(http.RetryAfterSeconds, 2 << attempt)).Ticks;
+                    int shift=Math.Min(attempt,5);
+                    long seconds=Math.Max((long)http.RetryAfterSeconds,Math.Min(60L,2L<<shift));
+                    retryAtUtcTicks=DateTime.MaxValue.Ticks-now.Ticks<TimeSpan.FromSeconds(seconds).Ticks
+                        ? DateTime.MaxValue.Ticks:now.AddSeconds(seconds).Ticks;
                     return true;
                 default: return false;
             }

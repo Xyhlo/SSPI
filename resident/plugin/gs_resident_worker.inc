@@ -593,6 +593,10 @@ static int gs_ca_selected(const unsigned char *der, size_t size, int policy)
     if (policy == 1) return !strcmp(hex, "E57B7E6F150C419102E8D5C055729FF967B9D1A829BF00CEC89CA604EBF4A86F") ||
         !strcmp(hex, "E14FFCAD5B0025731006CAA43A121A22D8E9700F4FB9CF852F02A708AA5D5666");
     if (policy == 2) return !strcmp(hex, "C06E307F7CFC1D32FA72A4C033C87B90019AF216F0775D64978A2ECA6C8A230E");
+    if (policy == 3) return !strcmp(hex, "13949634D99CD6FD6AA80BC034FEFACCEB1969FEEF986586713ECDBB05758D3F") ||
+        !strcmp(hex, "238B85A0099C65B970477D5724F1A1D475CE5058CFFE4EFA8733899BDB863C47") ||
+        !strcmp(hex, "A2372D06431E9716365EEED47EC020351497D182FCC038E457E58168A03CAC07") ||
+        !strcmp(hex, "97658DE8C68DFA98ACE1E5028A63D54A1AAE911B3E21471076C6850CD08CBAB4");
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) if (!strcmp(hex, roots[i])) return 1;
     return 0;
 }
@@ -670,7 +674,7 @@ static int gs_load_ca(const char *path, int policy)
         cert->next = gs_ca_allocations; gs_ca_allocations = cert;
         loaded++; at = end + strlen("-----END CERTIFICATE-----");
     }
-    free(pem); return loaded > 0 && (policy != 1 || loaded == 2) && (policy != 2 || loaded == 1) ? 0 : -1;
+    free(pem); return loaded > 0 && (policy != 1 || loaded == 2) && (policy != 2 || loaded == 1) && (policy != 3 || loaded == 4) ? 0 : -1;
 }
 
 static int gs_network_start(void)
@@ -711,7 +715,8 @@ static int gs_network_start(void)
     gs_http = gs_http_init(gs_network_pool, gs_ssl_context, 8 * 1024 * 1024);
     if (gs_http < 0) { gs_log_write("network", "Resident HTTP context failed code=0x%08X", (unsigned)gs_http); goto failed; }
     // Certificate verification stays enabled. Add the same shipped roots as the app.
-    if (gs_ipc_path(ca_path, sizeof(ca_path), "/certs/real-debrid-geotrust-tls-rsa-ca-g1.pem") || gs_load_ca(ca_path, 2) != 0 ||
+    if (gs_ipc_path(ca_path, sizeof(ca_path), "/certs/letsencrypt-generation-y-intermediates.pem") || gs_load_ca(ca_path, 3) != 0 ||
+        gs_ipc_path(ca_path, sizeof(ca_path), "/certs/real-debrid-geotrust-tls-rsa-ca-g1.pem") || gs_load_ca(ca_path, 2) != 0 ||
         gs_ipc_path(ca_path, sizeof(ca_path), "/certs/letsencrypt-generation-y-roots.pem") || gs_load_ca(ca_path, 1) != 0 ||
         gs_ipc_path(ca_path, sizeof(ca_path), "/certs/ca-certificates.crt") || gs_load_ca(ca_path, 0) != 0) goto failed;
     int cert_rc = gs_load_cert(gs_http, gs_ca_count, gs_ca_list, NULL, NULL);
@@ -842,10 +847,29 @@ static const char *gs_bgft_error(int code)
         case 0x8099002Cu: return "PS4 could not receive the package data (HTTP receive error)";
         case 0x80990086u: return "content already queued";
         case 0x80990088u: return "installed content conflict";
-        case 0x80F00633u: return "NP environment rejected registration";
+        case 0x80F00633u: return "NP environment rejected registration; a retry repeats the same system rejection";
         case 0x80991404u: return "package source unavailable";
         case 0x80020012u: return "cross-device path rejected";
         default: return "system error";
+    }
+}
+
+/* Deterministic platform rejections for this package, account and console state.
+ * A staged retry re-registers the same task with the same metadata and gets the
+ * same answer, so the queue must fail once and release the installer slot
+ * instead of repeating it. Recoverable conditions are deliberately absent:
+ * 0x80991404 (loopback source) and 0x8099002C (receive error) keep their own
+ * bounded source/stall retries, and 0x80990015/0x80990086 keep their duplicate
+ * recovery. Codes are recorded in the status text as BGFT_TERMINAL: so the
+ * staged poll classifies by evidence, not by a heuristic. */
+static int gs_bgft_error_terminal(int code)
+{
+    switch ((uint32_t)code) {
+        case 0x80F00633u: return 1; /* NP environment rejected registration */
+        case 0x80990004u: return 1; /* registration arguments rejected */
+        case 0x80990088u: return 1; /* installed content conflict */
+        case 0x80020012u: return 1; /* cross-device path rejected */
+        default: return 0;
     }
 }
 

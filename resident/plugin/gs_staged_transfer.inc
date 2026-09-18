@@ -221,7 +221,7 @@ static int gs_stage_validate(GsStage *stage, const char *path)
 
 static void *gs_stage_worker(void *opaque)
 {
-    GsStage *stage = opaque; int rc = -1, handle = -1, storage_lost = 0;
+    GsStage *stage = opaque; int rc = -1, handle = -1, storage_lost = 0, parked = 0;
     gs_worker_background_priority("stage");
     stage->fd = stage->journal_fd = -1;
     snprintf(stage->part, sizeof(stage->part), "%s.part", stage->job.destination);
@@ -292,6 +292,11 @@ static void *gs_stage_worker(void *opaque)
             snprintf(stage->error, sizeof(stage->error), "Selected staging drive disconnected; reconnect it and resume");
             break;
         }
+        /* Release the transfer lease only after the engine has drained its lanes.
+         * Keeping this worker alive while paused starved every other queued file. */
+        if (stage->paused && !__atomic_load_n(&stage->streaming, __ATOMIC_ACQUIRE)) {
+            sspi_xfer_pause(handle); parked = 1; break;
+        }
         if (stage->paused) sspi_xfer_pause(handle);
         else if (status.state == GS_PAUSED) sspi_xfer_resume(handle);
         if (status.total > 0 && status.total != stage->job.total) { snprintf(stage->error, sizeof(stage->error), "Provider returned a different total size"); break; }
@@ -333,6 +338,7 @@ static void *gs_stage_worker(void *opaque)
     if (storage_lost && !gs_stage_stopped(stage)) { stage->error[0] = 0; goto retry_storage; }
     stage->active = 0;
     if (stage->canceled || g_stop) gs_stage_status(stage, "canceled", NULL);
+    else if (parked) { stage->pending = 1; gs_stage_status(stage, stage->paused ? "paused" : "queued", "Verified chunks retained; transfer slot released"); }
     else if (!rc) gs_stage_status(stage, "staged", NULL);
     else gs_stage_status(stage, "failed", stage->error[0] ? stage->error : "Native transfer failed; committed chunks retained");
     __atomic_store_n(&stage->running, 0, __ATOMIC_RELEASE); return NULL;
@@ -571,6 +577,10 @@ static void gs_stage_install_poll(void)
                     strstr(message, "not yet confirmed") || strstr(message, "Close the running game") ||
                     strstr(message, "Not enough PS4 installation space") || strstr(message, "0x80990004") ||
                     strstr(message, "PS4 task stalled") || strstr(message, "BGFT_UNRESOLVED:") ||
+                    /* Deterministic platform rejections never change on retry. The
+                     * installer already parked the task and kept the package, so a
+                     * staged retry would only re-register and fail again. */
+                    strstr(message, "BGFT_TERMINAL:") ||
                     strstr(message, "0x80990015") || strstr(message, "0x80990086") ||
                     strstr(message, "Archive extraction was interrupted.") || strstr(message, "DLC_UNCONFIRMED:") ||
                     strstr(message, "ARCHIVE_FAILED:");
