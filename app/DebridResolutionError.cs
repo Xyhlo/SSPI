@@ -12,17 +12,32 @@ namespace Orbis
         internal readonly string Host;
         internal readonly string ProviderCode;
         internal readonly bool CanTryProvider;
+        readonly string Detail;
         internal bool IsRateLimited;
         internal int RetryAfterSeconds;
 
         DebridResolutionError(string provider, string host, string message, bool canTryMirror, string code = "", bool canTryProvider = false)
             : base(provider + ": " + message + " (" + host + ")")
-        { Provider = provider; Host = host; CanTryMirror = canTryMirror; ProviderCode = code; CanTryProvider = canTryProvider; }
+        { Provider = provider; Host = host; Detail = message; CanTryMirror = canTryMirror; ProviderCode = code; CanTryProvider = canTryProvider; }
+
+        internal DebridResolutionError ForArchivePart(int part, int count)
+        {
+            return new DebridResolutionError(Provider, Host, "Archive part " + part + "/" + count + ": " + Detail,
+                CanTryMirror, ProviderCode, CanTryProvider) { IsRateLimited = IsRateLimited, RetryAfterSeconds = RetryAfterSeconds };
+        }
 
         internal static string HostName(string url)
         {
             Uri uri;
             return Uri.TryCreate(url, UriKind.Absolute, out uri) ? uri.DnsSafeHost : "unknown host";
+        }
+
+        internal static DebridResolutionError HostSupport(string provider, string url, bool unknown)
+        {
+            return new DebridResolutionError(provider, HostName(url), unknown ?
+                "Host support could not be checked. Retry shortly or check Connections." :
+                "This host is not currently supported or its allowance is exhausted. Choose another supported mirror.",
+                !unknown, unknown ? "SUPPORT_UNAVAILABLE" : "HOST_UNAVAILABLE", true);
         }
 
         internal static DebridResolutionError FromResponse(string provider, string url, string json)
@@ -96,6 +111,8 @@ namespace Orbis
             }
             else if (code == "UNSUPPORTED_SITE")
             { message = "This host is unsupported. Choose another mirror."; alternate = true; }
+            else if (code == "DOWNLOAD_FAILED" || code == "DOWNLOAD_SERVER_ERROR")
+            { message = "TorBox host download failed. Try another provider or mirror."; alternate = true; }
             else if (code == "AUTH_ERROR")
                 message = "Token verification is temporarily unavailable at TorBox. Your saved key was kept; retry shortly.";
             else if (code == "BAD_TOKEN" || code == "INVALID_TOKEN")
@@ -104,6 +121,14 @@ namespace Orbis
                 message = "No API key reached the service. Reconnect TorBox in Connections.";
             else if (code == "PLAN_RESTRICTED_FEATURE" || code == "PLAN_RESTRICTED" || code == "NO_PREMIUM")
                 message = "The provider reports this feature is unavailable on the connected plan. Verify the connected account.";
+            else if (code == "ACTIVE_LIMIT")
+                message = "All TorBox download slots are busy. Wait for a cloud download to finish, then retry.";
+            else if (code == "COOLDOWN_LIMIT")
+                message = "TorBox requires a cooldown before another download. Wait before retrying.";
+            else if (code == "MONTHLY_LIMIT")
+                message = "Your TorBox monthly download allowance is exhausted. Check your account allowance.";
+            else if (code == "LINK_OFFLINE")
+            { message = "TorBox reports this file is offline. Choose another mirror."; alternate = true; }
             else if (code == "RATE_LIMITED" || code == "TOO_MANY_REQUESTS")
                 message = "Too many requests. Wait before retrying.";
             // Never include the raw provider body: it can echo a signed URL or token.
@@ -183,8 +208,21 @@ namespace Orbis
                     System.Globalization.CultureInfo.InvariantCulture, out nativeCode))
                     diagnostic = " HTTPS authorization header failed: 0x" + nativeCode.ToString("X8") + ".";
             }
+            var transport = System.Text.RegularExpressions.Regex.Match(text,
+                @"\AsceHttp (send|read) (0x[0-9A-Fa-f]{8})(?: host=[A-Za-z0-9.-]+)?(?: ssl=(0x[0-9A-Fa-f]+))?(?: verify=(0x[0-9A-Fa-f]+))?");
+            bool tls = transport.Success && transport.Groups[3].Success && transport.Groups[3].Value != "0x0" &&
+                transport.Groups[3].Value != "0x00000000";
+            uint verifyFlags;
+            bool rejectedHandshake = tls && transport.Groups[1].Value == "send" &&
+                uint.TryParse(transport.Groups[4].Value.Replace("0x", ""), System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture, out verifyFlags) && verifyFlags != 0;
+            if (diagnostic.Length == 0 && transport.Success)
+                diagnostic = " HTTPS " + transport.Groups[1].Value + " " + transport.Groups[2].Value +
+                    (tls ? " TLS=" + transport.Groups[3].Value : "") +
+                    (transport.Groups[4].Success ? " verify=" + transport.Groups[4].Value : "") + ".";
             return new DebridResolutionError(provider, HostName(url),
-                "The service request failed." + diagnostic + " Check the connection and retry.", false) {
+                (tls ? "The secure connection to the provider failed." : "The service request failed.") +
+                diagnostic + " Check the connection and retry.", false, "", rejectedHandshake) {
                 RetryAfterSeconds = retryAfter,
                 IsRateLimited = httpStatus == 429 || httpStatus == 503 ||
                     diagnostic.IndexOf("HTTP 429", StringComparison.Ordinal) >= 0 || diagnostic.IndexOf("HTTP 503", StringComparison.Ordinal) >= 0

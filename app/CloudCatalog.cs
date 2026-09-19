@@ -74,6 +74,47 @@ namespace Orbis
                 return "rd-link/" + Uri.EscapeDataString(url);
             if ((host == "alldebrid.com" || host == "www.alldebrid.com") && uri.AbsolutePath.StartsWith("/f/",StringComparison.OrdinalIgnoreCase))
                 return "ad-link/" + Uri.EscapeDataString(url);
+            if (host == "api.torbox.app" && uri.Scheme == "https" && uri.IsDefaultPort)
+            {
+                string kind = uri.AbsolutePath == "/v1/api/torrents/requestdl" ? "torrents" :
+                    uri.AbsolutePath == "/v1/api/webdl/requestdl" ? "webdl" : "";
+                if (kind.Length == 0) return null;
+                var query = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string part in uri.Query.TrimStart('?').Split('&'))
+                {
+                    int split = part.IndexOf('='); if (split < 1) continue;
+                    string key = Uri.UnescapeDataString(part.Substring(0,split));
+                    if (key != "torrent_id" && key != "web_id" && key != "file_id" && key != "zip_link") continue;
+                    if (query.ContainsKey(key)) return null;
+                    query.Add(key,Uri.UnescapeDataString(part.Substring(split+1)));
+                }
+                string job, file, zip;
+                if (!query.TryGetValue(kind == "torrents" ? "torrent_id" : "web_id",out job) ||
+                    !query.TryGetValue("file_id",out file) || !NumericId(job) || !NumericId(file) ||
+                    (query.TryGetValue("zip_link",out zip) && zip != "false" && zip != "0")) return null;
+                // Persist account item IDs, never a pasted API key or temporary CDN grant.
+                return "tb-file/" + kind + "/" + job + "/" + file;
+            }
+            return null;
+        }
+        static bool NumericId(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.Length > 20) return false;
+            foreach (char c in id) if (c < '0' || c > '9') return false;
+            return true;
+        }
+        internal static string ImportLocator(string url)
+        {
+            string locator = PersonalLocator(url);
+            if (locator != null) return locator;
+            if (ValidLink(url))
+            {
+                var uri = new Uri(url);
+                if (uri.Host.Equals("api.torbox.app",StringComparison.OrdinalIgnoreCase) ||
+                    uri.Host.Equals("torbox.app",StringComparison.OrdinalIgnoreCase) ||
+                    uri.Host.Equals("www.torbox.app",StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Use a single-file TorBox download link, or Downloads > Browse stored debrid files > TorBox torrents.");
+            }
             return null;
         }
         static void AddAllDebridFiles(List<CloudFile> output, object entries, string prefix, int depth)
@@ -158,6 +199,7 @@ namespace Orbis
                 var response=Get(Tb+"/"+parts[1]+"/mylist?id="+Id(parts[2]),cfg.TorBoxApiKey) as Dictionary<string,object>;
                 object data=Value(response,"data");var jobs=new List<object>();if(data is Dictionary<string,object>)jobs.Add(data);else foreach(var o in Rows(data))jobs.Add(o);
                 foreach(var o in jobs){var r=o as Dictionary<string,object>;
+                    if (Text(r,"id") != parts[2]) continue;
                     foreach(var f in Rows(Value(r,"files"))){var file=f as Dictionary<string,object>;
                         bool safe=!True(file,"infected");
                         output.Add(new CloudFile{Name=Text(file,"name"),Size=Bytes(file,"size"),Locator="tb-file/"+parts[1]+"/"+Id(parts[2])+"/"+Id(Text(file,"id")),Detail=safe?TorBoxReason(r):"Unavailable: provider flagged this file",Ready=safe&&TorBoxReady(r)});}}
@@ -177,11 +219,14 @@ namespace Orbis
             {string link=Uri.UnescapeDataString(locator.Substring(8));if(!ValidLink(link))throw new IOException("Invalid cloud link");return RealDebridClient.Unrestrict(cfg.RealDebridToken,link,cfg.RealDebridLocation);}
             string[] p=locator.Split('/');
             if(p.Length!=4||p[0]!="tb-file"||(p[1]!="torrents"&&p[1]!="webdl"))throw new IOException("Invalid cloud file");
+            if(string.IsNullOrWhiteSpace(cfg.TorBoxApiKey))throw new IOException("Connect TorBox in Connections first");
+            if(!NumericId(p[2])||!NumericId(p[3]))throw new IOException("Invalid TorBox file ID");
             string key=p[1]=="torrents"?"torrent_id":"web_id";
             var response=Get(Tb+"/"+p[1]+"/requestdl?token="+Uri.EscapeDataString(cfg.TorBoxApiKey.Trim())+"&"+key+"="+Id(p[2])+"&file_id="+Id(p[3])+"&zip_link=false",cfg.TorBoxApiKey);
             string url=response as string ?? Text(response as Dictionary<string,object>,"data");
             if(!ValidLink(url))throw new IOException("Cloud file is not ready to download; retry after it finishes preparing");
-            DownloadTransferSettings.RememberProviderLimit(url,DownloadTransferSettings.MaxRangeCount);return url;
+            if(cancel!=null&&cancel())throw new OperationCanceledException();
+            DownloadTransferSettings.RememberProviderLimit(url,4);return url;
         }
         internal static string OwningProvider(string locator)
         {
@@ -194,7 +239,9 @@ namespace Orbis
         internal static bool CanRenew(AppSettings cfg,string locator)
         {
             string provider=OwningProvider(locator);
-            return !string.IsNullOrEmpty(provider)&&UnlockProviders.IsEnabled(cfg,provider)&&
+            // The user explicitly chose this account file. Renewal must use its
+            // owner even when another service is preferred for source links.
+            return cfg!=null&&!string.IsNullOrEmpty(provider)&&
                 !string.IsNullOrWhiteSpace(UnlockProviders.ApiKey(cfg,provider));
         }
     }

@@ -57,13 +57,13 @@ namespace Orbis
                     result = pair.Value;
                     matchedLength = pair.Key.Length;
                 }
-            // Inventories can omit aliases and newly added hosters. Absence is not proof of rejection.
+            // Only an advertised domain or official alias confirms host support.
             if (matchedLength == 0)
             {
                 Rule rule = MatchRule(url, false);
                 if (rule != null) return rule.State;
             }
-            return result;
+            return matchedLength == 0 ? DebridHostState.Unsupported : result;
         }
 
         internal bool? Supports(string url)
@@ -113,7 +113,10 @@ namespace Orbis
                         if (d != null && result.States.ContainsKey(d))
                         {
                             if (LimitReached(row, "daily_link_limit", "daily_link_used") || LimitReached(row, "daily_bandwidth_limit", "daily_bandwidth_used"))
+                            {
                                 result.AccountNotes[d] = "Daily account allowance reached";
+                                Add(result, d, DebridHostState.Unavailable);
+                            }
                             else
                             {
                                 object note;
@@ -145,7 +148,10 @@ namespace Orbis
                     {
                         Add(result, domain as string, state);
                         string d = domain as string;
-                        if (limited && d != null && result.States.ContainsKey(d)) result.AccountNotes[d] = "Account host allowance reached";
+                        if (limited && d != null && result.States.ContainsKey(d)) {
+                            result.AccountNotes[d] = "Account host allowance reached";
+                            Add(result, d, DebridHostState.Unavailable);
+                        }
                     }
                 }
             }
@@ -328,7 +334,7 @@ namespace Orbis
             lock (Cache)
             {
                 if (Cache.Count > 16) Cache.Clear();
-                Cache[key] = new Cached { Hosts = hosts, Until = DateTime.UtcNow.AddSeconds(hosts == null ? 30 : 60) };
+                Cache[key] = new Cached { Hosts = hosts, Until = DateTime.UtcNow.AddSeconds(hosts == null ? 30 : 180) };
             }
             return hosts;
         }
@@ -351,9 +357,48 @@ namespace Orbis
 
         internal static List<PackageCandidate> Filter(AppSettings cfg, List<PackageCandidate> candidates, bool refresh, out string message)
         {
-            // Host status is advisory. All package links stay visible and selectable.
+            if (refresh) RefreshEnabled(cfg);
             message = null;
-            return candidates;
+            if (candidates == null) return null;
+            var result = candidates.FindAll(candidate => IsSupported(cfg, candidate));
+            if (result.Count < candidates.Count)
+                message = result.Count == 0 ? "No mirrors are currently supported by your enabled services. Check Connections or retry the support check." :
+                    "Showing mirrors supported by your enabled services.";
+            return result;
+        }
+
+        // Call on a worker. Rendering and cached result filtering never do network I/O.
+        internal static void RefreshEnabled(AppSettings cfg)
+        {
+            foreach (string provider in UnlockProviders.EnabledIds(cfg)) Load(cfg, provider, true);
+        }
+
+        internal static bool IsSupported(AppSettings cfg, PackageCandidate candidate)
+        {
+            if (candidate == null || !string.IsNullOrEmpty(candidate.ResolutionError)) return false;
+            if (!string.IsNullOrEmpty(candidate.ArchiveVolumes))
+            {
+                try {
+                    foreach (var volume in ArchiveVolumeSet.Decode(candidate.ArchiveVolumes))
+                        if (!SupportsUrl(cfg, volume.Url, string.Equals(volume.AccessType, "Direct", StringComparison.OrdinalIgnoreCase))) return false;
+                    return true;
+                } catch { return false; }
+            }
+            return SupportsUrl(cfg, candidate.Url, candidate.AccessType == PackageAccessType.Direct);
+        }
+
+        static bool SupportsUrl(AppSettings cfg, string url, bool direct)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https")) return false;
+            if (direct) return true;
+            if (cfg == null || !cfg.UseUnlockProvider) return FreeHosterClient.IsSupportedHoster(uri);
+            foreach (string provider in UnlockProviders.EnabledIds(cfg))
+            {
+                var hosts = Load(cfg, provider, false);
+                if (hosts != null && hosts.GetState(url) == DebridHostState.Supported) return true;
+            }
+            return false;
         }
     }
 }

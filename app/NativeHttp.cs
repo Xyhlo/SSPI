@@ -82,6 +82,10 @@ namespace Orbis
         // trust anchor. SHA-256 C06E...230E, valid through 2027-11-02.
         const string RealDebridGeoTrustIntermediateSha256 =
             "C06E307F7CFC1D32FA72A4C033C87B90019AF216F0775D64978A2ECA6C8A230E";
+        // Google's published WE1 cross-sign verifies the TorBox API leaf with
+        // the same key as its served WE1 chain without firmware chain discovery.
+        const string TorBoxGoogleIntermediateSha256 =
+            "A287FFAB762CC69A26D482037EDF701F653CE899025C62A7E5CB88BB9B419CBB";
         // AllDebrid's file CDN now uses Let's Encrypt Generation Y, while its
         // API uses Google Trust Services. Trust the official Y roots directly
         // so older firmware does not need to assemble their extra cross-sign.
@@ -304,6 +308,13 @@ namespace Orbis
                     _log.Append("native_gen_y_intermediates=").Append(supplement.Count).Append("; ");
                 }
                 string realDebridIntermediatePath = FindRealDebridIntermediate();
+                string torBoxIntermediatePath = FindGenerationYRoots("torbox-google-we1.pem");
+                if (!string.IsNullOrEmpty(torBoxIntermediatePath))
+                {
+                    var supplement = ReadPemCertificates(torBoxIntermediatePath, false, false, false, true);
+                    certificates.InsertRange(0, supplement);
+                    _log.Append("native_torbox_intermediate=").Append(supplement.Count).Append("; ");
+                }
                 if (!string.IsNullOrEmpty(realDebridIntermediatePath))
                 {
                     List<byte[]> realDebridIntermediates =
@@ -426,7 +437,7 @@ namespace Orbis
         }
 
         static List<byte[]> ReadPemCertificates(string path, bool allowPinnedIntermediate,
-            bool allowGenerationYRoots = false, bool allowGenerationYIntermediates = false)
+            bool allowGenerationYRoots = false, bool allowGenerationYIntermediates = false, bool allowTorBoxIntermediate = false)
         {
             const string begin = "-----BEGIN CERTIFICATE-----";
             const string end = "-----END CERTIFICATE-----";
@@ -458,7 +469,7 @@ namespace Orbis
                 try
                 {
                     cert = new X509Certificate2(der);
-                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && i < NativeRootSubjectMarkers.Length; i++)
+                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && !allowTorBoxIntermediate && i < NativeRootSubjectMarkers.Length; i++)
                     {
                         if (cert.Subject.IndexOf(NativeRootSubjectMarkers[i], StringComparison.OrdinalIgnoreCase) >= 0)
                         {
@@ -482,6 +493,8 @@ namespace Orbis
                     if (!selected && allowGenerationYIntermediates)
                         foreach (string pin in GenerationYIntermediatePins)
                             if (HasSha256Fingerprint(der, pin)) { selected = true; break; }
+                    if (!selected && allowTorBoxIntermediate)
+                        selected = HasSha256Fingerprint(der, TorBoxGoogleIntermediateSha256);
                 }
                 catch
                 {
