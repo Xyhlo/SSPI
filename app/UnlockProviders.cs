@@ -47,20 +47,30 @@ namespace Orbis
             return DisplayName(ids[0]) + (ids.Length == 2 ? " + " + DisplayName(ids[1]) : "");
         }
 
-        // Inventories rank choices; missing inventory entries never hide a link or block a request.
+        // Never send a host to a service that has not confirmed support for it.
         public static string[] RankedProviderIds(AppSettings cfg, string url)
         {
-            var supported = new List<string>(); var unknown = new List<string>(); var unavailable = new List<string>();
+            var supported = new List<string>();
             foreach (string id in EnabledIds(cfg))
             {
                 var hosts = DebridHostSupport.Load(cfg, id, false);
                 var state = hosts == null ? DebridHostState.Unknown : hosts.GetState(url);
                 if (state == DebridHostState.Supported) supported.Add(id);
-                else if (state == DebridHostState.Unknown) unknown.Add(id);
-                else unavailable.Add(id);
             }
-            supported.AddRange(unknown); supported.AddRange(unavailable);
             return supported.ToArray();
+        }
+
+        internal static bool HasSupportedAlternative(AppSettings cfg, IList<string> urls, string excluded)
+        {
+            if (urls == null || urls.Count == 0) return false;
+            foreach (string url in urls)
+            {
+                bool supported = false;
+                foreach (string id in RankedProviderIds(cfg, url))
+                    if (!string.Equals(id, excluded, StringComparison.OrdinalIgnoreCase)) { supported = true; break; }
+                if (!supported) return false;
+            }
+            return true;
         }
 
         public static string DisplayName(string id)
@@ -105,6 +115,7 @@ namespace Orbis
         {
             if (cfg == null) throw new Exception("No settings");
             if (!cfg.UseUnlockProvider || (cfg.EnabledUnlockProviders == null && cfg.UnlockProviderId == NoneId)) return hosterUrl;
+            DebridHostSupport.RefreshEnabled(cfg);
             string[] ids = RankedProviderIds(cfg, hosterUrl);
             int preferred = Array.IndexOf(ids, preferredProviderId ?? "");
             if (preferred > 0)
@@ -113,7 +124,10 @@ namespace Orbis
                 Array.Copy(ids, 0, ids, 1, preferred);
                 ids[0] = first;
             }
-            if (ids.Length == 0) throw new Exception("Connect and enable a link service in Connections");
+            if (ids.Length == 0) {
+                if (EnabledIds(cfg).Length == 0) throw new Exception("Connect and enable a link service in Connections");
+                throw DebridResolutionError.HostSupport("Enabled services", hosterUrl, false);
+            }
             Exception last = null;
             DebridResolutionError mirrorFailure = null;
             foreach (string selected in ids)
@@ -158,7 +172,9 @@ namespace Orbis
             lock (Accounts) { AccountCache cached; if (Accounts.TryGetValue(key, out cached) && cached.Until > DateTime.UtcNow) return cached.Status; }
             string status = ProbeUncached(cfg, id);
             if (status.StartsWith("ERROR", StringComparison.Ordinal)) status = "Status unavailable; downloads will still be attempted";
-            lock (Accounts) { if (Accounts.Count > 16) Accounts.Clear(); Accounts[key] = new AccountCache { Status = status, Until = DateTime.UtcNow.AddSeconds(status.StartsWith("Status unavailable") ? 30 : 300) }; }
+            bool temporary = status.StartsWith("Status unavailable", StringComparison.Ordinal) ||
+                status.StartsWith("RETRY:", StringComparison.Ordinal) || status.StartsWith("RATE_LIMITED:", StringComparison.Ordinal);
+            lock (Accounts) { if (Accounts.Count > 16) Accounts.Clear(); Accounts[key] = new AccountCache { Status = status, Until = DateTime.UtcNow.AddSeconds(temporary ? 30 : 300) }; }
             return status;
         }
 
@@ -215,8 +231,9 @@ namespace Orbis
             if (cfg == null) throw new Exception("No settings");
             if (!IsSupported(id) || !IsEnabled(cfg, id)) throw new Exception("This link service is not enabled in Connections");
             if (cancel != null && cancel()) throw new OperationCanceledException();
-            // Host inventories can lag behind aliases and provider support. Let the
-            // selected provider resolve the actual URL and report its own result.
+            var hosts = DebridHostSupport.Load(cfg, id, true);
+            if (hosts == null || hosts.GetState(hosterUrl) != DebridHostState.Supported)
+                throw DebridResolutionError.HostSupport(DisplayName(id), hosterUrl, hosts == null);
             if (string.Equals(id, DeepbridId, StringComparison.OrdinalIgnoreCase))
             {
                 if (!cfg.HasDeepbrid) throw new Exception("Connect Deepbrid in Settings");
