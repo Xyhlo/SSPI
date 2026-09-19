@@ -17,6 +17,9 @@ namespace Orbis
         const int MaxTextureBytes = 16 * 1024 * 1024;
         const int MaxPendingRequests = 24;
         const int FirstRetrySeconds = 6;
+        internal const int UploadBytesPerFrame = 256 * 1024;
+        static readonly Queue<string> PendingLogs = new Queue<string>();
+        static bool _logDrainScheduled;
 
         readonly object _lock = new object();
         readonly Queue<Req> _q = new Queue<Req>();
@@ -26,6 +29,9 @@ namespace Orbis
         readonly Dictionary<string, long> _failUntil = new Dictionary<string, long>();
         readonly Dictionary<string, int> _failCount = new Dictionary<string, int>();
         readonly Dictionary<string, long> _lastUse = new Dictionary<string, long>();
+        // Worker-only metadata cache; one title may be drawn at several sizes.
+        readonly Dictionary<string, string> _fallbackUrls = new Dictionary<string, string>();
+        readonly Dictionary<string, long> _fallbackUntil = new Dictionary<string, long>();
         readonly HashSet<string> _inflight = new HashSet<string>();
         readonly HashSet<string> _uploading = new HashSet<string>();
         readonly HashSet<IntPtr> _firstDraw = new HashSet<IntPtr>();
@@ -34,6 +40,15 @@ namespace Orbis
         int _viewGen;
         long _useClock;
         long _textureBytes;
+        Upload _pendingUpload;
+
+        sealed class Upload
+        {
+            public string Key;
+            public ReadyImage Image;
+            public IntPtr Texture;
+            public int Row;
+        }
 
         struct Req
         {
@@ -87,7 +102,12 @@ namespace Orbis
 
         public void Request(string titleId, string imageUrl)
         {
-            if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(imageUrl)) return;
+            if (string.IsNullOrEmpty(titleId)) return;
+            if (string.IsNullOrWhiteSpace(imageUrl))
+            {
+                if (ArtworkTitleId(titleId) != null) Enqueue(titleId.ToUpperInvariant(), "lookup|");
+                return;
+            }
             if (imageUrl.IndexOf("://", StringComparison.Ordinal) < 0 &&
                 (imageUrl.IndexOf('\\') >= 0 || imageUrl.StartsWith("/", StringComparison.Ordinal)))
             {
@@ -107,7 +127,7 @@ namespace Orbis
         public void RequestLocal(string titleId, string filePath)
         {
             if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(filePath)) return;
-            try { if (!File.Exists(filePath)) return; } catch { return; }
+            // Existence and decoding belong to Worker, never to a navigation frame.
             Enqueue(titleId.ToUpperInvariant(), "local|" + filePath);
         }
 
@@ -115,7 +135,11 @@ namespace Orbis
         {
             string key = ((titleId ?? "") + "@" + width + "x" + height + "-" + (url ?? "").GetHashCode().ToString("x8")).ToUpperInvariant();
             lock (_lock) if (_tex.ContainsKey(key) || _inflight.Contains(key) || _ready.ContainsKey(key) || _uploading.Contains(key)) return key;
-            if (string.IsNullOrEmpty(url)) return key;
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                if (ArtworkTitleId(titleId) != null) Enqueue(key, "lookup|", width, height);
+                return key;
+            }
             bool local = url.IndexOf("://", StringComparison.Ordinal) < 0 && (url.StartsWith("/") || url.IndexOf('\\') >= 0);
             string source = local ? "local|" + url : NormalizeUrl(url);
             if (!string.IsNullOrEmpty(source)) Enqueue(key, source, width, height);
@@ -139,50 +163,63 @@ namespace Orbis
         public void PumpReady(IntPtr renderer, int maxPerFrame = 1)
         {
             if (renderer == IntPtr.Zero) return;
-            int count = 0;
-            while (count < maxPerFrame)
+            int count = 0, budget = UploadBytesPerFrame;
+            while (count < maxPerFrame && budget > 0)
             {
-                string key = null;
-                ReadyImage image = null;
-                lock (_lock)
+                if (_pendingUpload == null)
                 {
-                    foreach (var kv in _ready)
+                    lock (_lock)
                     {
-                        key = kv.Key;
-                        image = kv.Value;
-                        break;
-                    }
-                    if (key != null)
-                    {
-                        _ready.Remove(key);
-                        _uploading.Add(key);
+                        foreach (var kv in _ready)
+                        {
+                            _pendingUpload = new Upload { Key = kv.Key, Image = kv.Value };
+                            break;
+                        }
+                        if (_pendingUpload != null)
+                        {
+                            _ready.Remove(_pendingUpload.Key);
+                            _uploading.Add(_pendingUpload.Key);
+                        }
                     }
                 }
-                if (image == null) break;
-
-                IntPtr texture = IntPtr.Zero;
+                Upload upload = _pendingUpload;
+                if (upload == null) break;
+                string key = upload.Key;
+                ReadyImage image = upload.Image;
+                bool finished = false;
                 GCHandle pin = default(GCHandle);
                 try
                 {
-                    if (image.Generation != _viewGen) continue;
+                    if (image.Generation != _viewGen) { finished = true; continue; }
                     if (image.Width <= 0 || image.Height <= 0 || image.Pixels == null ||
+                        image.Width > 1440 || image.Height > 512 ||
                         (long)image.Width * image.Height * 4 != image.Pixels.Length)
                         throw new InvalidDataException("Invalid cover pixel buffer");
-                    AppendLog(key + " texture-create begin " + image.Width + "x" + image.Height);
-                    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
-                        (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, image.Width, image.Height);
-                    if (texture == IntPtr.Zero)
-                        throw new Exception("SDL_CreateTexture: " + SDL_GetError());
-
+                    if (upload.Texture == IntPtr.Zero)
+                    {
+                        // Same byte layout, but opaque images need the exact
+                        // framebuffer format to select SDL's direct-copy path.
+                        upload.Texture = SDL_CreateTexture(renderer, image.Opaque ? SDL_PIXELFORMAT_BGR888 : SDL_PIXELFORMAT_ABGR8888,
+                            (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, image.Width, image.Height);
+                        if (upload.Texture == IntPtr.Zero)
+                            throw new Exception("SDL_CreateTexture: " + SDL_GetError());
+                        SDL_SetTextureBlendMode(upload.Texture, image.Opaque ? SDL_BlendMode.SDL_BLENDMODE_NONE : SDL_BlendMode.SDL_BLENDMODE_BLEND);
+                    }
+                    int pitch = image.Width * 4;
+                    int rows = Math.Min(image.Height - upload.Row, budget / pitch);
+                    if (rows == 0) break;
+                    var area = new SDL_Rect { x = 0, y = upload.Row, w = image.Width, h = rows };
                     pin = GCHandle.Alloc(image.Pixels, GCHandleType.Pinned);
-                    AppendLog(key + " texture-upload begin");
-                    int rc = SDL_UpdateTexture(texture, IntPtr.Zero, pin.AddrOfPinnedObject(), image.Width * 4);
+                    int rc = SDL_UpdateTexture(upload.Texture, ref area,
+                        IntPtr.Add(pin.AddrOfPinnedObject(), upload.Row * pitch), pitch);
                     if (rc != 0)
                         throw new Exception("SDL_UpdateTexture: " + SDL_GetError());
-                    SDL_SetTextureBlendMode(texture, image.Opaque ? SDL_BlendMode.SDL_BLENDMODE_NONE : SDL_BlendMode.SDL_BLENDMODE_BLEND);
-
+                    upload.Row += rows;
+                    budget -= rows * pitch;
+                    if (upload.Row != image.Height) break;
                     lock (_lock)
                     {
+                        if (image.Generation != _viewGen) { finished = true; continue; }
                         while (_tex.Count > 0 && (_tex.Count >= MaxTextures ||
                             _textureBytes + image.Pixels.Length > MaxTextureBytes)) EvictOne();
                         IntPtr old;
@@ -193,7 +230,7 @@ namespace Orbis
                             _firstDraw.Remove(old);
                             SDL_DestroyTexture(old);
                         }
-                        _tex[key] = texture;
+                        _tex[key] = upload.Texture;
                         _texSize[key] = new TextureSize
                         {
                             Width = image.Width,
@@ -201,25 +238,31 @@ namespace Orbis
                         };
                         _lastUse[key] = ++_useClock;
                         _textureBytes += image.Pixels.Length;
-                        _firstDraw.Add(texture);
+                        _firstDraw.Add(upload.Texture);
                         _failUntil.Remove(key);
                         _failCount.Remove(key);
                     }
-                    texture = IntPtr.Zero;
+                    upload.Texture = IntPtr.Zero;
+                    finished = true;
                     AppendLog(key + " texture-ready");
                 }
                 catch (Exception ex)
                 {
                     AppendLog(key + " texture FAIL " + ex.Message);
                     lock (_lock) RecordFailure(key);
+                    finished = true;
                 }
                 finally
                 {
                     if (pin.IsAllocated) pin.Free();
-                    if (texture != IntPtr.Zero) try { SDL_DestroyTexture(texture); } catch { }
-                    lock (_lock) _uploading.Remove(key);
+                    if (finished)
+                    {
+                        if (upload.Texture != IntPtr.Zero) try { SDL_DestroyTexture(upload.Texture); } catch { }
+                        lock (_lock) _uploading.Remove(key);
+                        _pendingUpload = null;
+                        count++;
+                    }
                 }
-                count++;
             }
         }
 
@@ -286,43 +329,23 @@ namespace Orbis
                     Thread.Sleep(100);
                     continue;
                 }
-                bool local = request.Url != null &&
-                    request.Url.StartsWith("local|", StringComparison.Ordinal);
                 string path = null;
                 bool ownsCacheFile = true;
                 try
                 {
-                    path = DiskPath(request.Key, request.Url);
                     AppendLog(request.Key + " request begin gen=" + request.Gen);
-                    if (local)
+                    ReadyImage decoded;
+                    try { decoded = LoadRequestImage(request, request.Url, ref path, ref ownsCacheFile); }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception original)
                     {
-                        string sourcePath = request.Url.Substring(6);
-                        if (!File.Exists(path) || new FileInfo(path).Length < 100)
-                        {
-                            try { File.Copy(sourcePath, path, true); }
-                            catch { path = sourcePath; ownsCacheFile = false; }
-                        }
+                        if (request.Gen != _viewGen) throw new OperationCanceledException();
+                        try { if (ownsCacheFile && File.Exists(path)) File.Delete(path); } catch { }
+                        string fallback = FindFallback(request.Key, request.Url);
+                        if (string.IsNullOrEmpty(fallback)) throw;
+                        AppendLog(request.Key + " fallback after " + original.GetType().Name + " to " + SafeUrl(fallback));
+                        decoded = LoadRequestImage(request, fallback, ref path, ref ownsCacheFile);
                     }
-                    else if (!File.Exists(path) || new FileInfo(path).Length < 100)
-                    {
-                        DownloadResumeInfo.DeletePartial(path + ".part");
-                        AppendLog(request.Key + " artwork-http begin");
-                        NetHttp.DownloadArtwork(request.Url, path, () => request.Gen != _viewGen, MaxEncodedBytes);
-                        AppendLog(request.Key + " artwork-http complete");
-                    }
-
-                    if (request.Gen != _viewGen)
-                        throw new OperationCanceledException("stale cover view");
-
-                    long encodedSize = new FileInfo(path).Length;
-                    if (encodedSize < 100 || encodedSize > MaxEncodedBytes)
-                        throw new Exception("encoded size " + encodedSize);
-
-                    var pixels = CoverImageDecoder.Decode(path, request.Width, request.Height,
-                        request.Key.EndsWith("-BACKDROP", StringComparison.Ordinal),
-                        stage => AppendLog(request.Key + " " + stage), request.Width > 0);
-                    var decoded = new ReadyImage { Pixels = pixels.Pixels, Width = pixels.Width,
-                        Height = pixels.Height, Opaque = pixels.Opaque, Generation = request.Gen };
                     string digest;
                     using (var sha = SHA256.Create())
                         digest = BitConverter.ToString(sha.ComputeHash(decoded.Pixels)).Replace("-", "").ToLowerInvariant();
@@ -336,7 +359,7 @@ namespace Orbis
                         _failCount.Remove(request.Key);
                     }
                     AppendLog(request.Key + " decode OK " + decoded.Width + "x" + decoded.Height +
-                              " bytes=" + encodedSize);
+                              " bytes=" + new FileInfo(path).Length);
                 }
                 catch (OperationCanceledException)
                 {
@@ -357,6 +380,96 @@ namespace Orbis
                     lock (_lock) _inflight.Remove(request.Key);
                 }
             }
+        }
+
+        ReadyImage LoadRequestImage(Req request, string source, ref string path, ref bool ownsCacheFile)
+        {
+            if (request.Gen != _viewGen) throw new OperationCanceledException();
+            // Cache the replacement under the original request so the next size or
+            // application launch does not repeat a failed URL or metadata lookup.
+            path = DiskPath(request.Key, request.Url);
+            ownsCacheFile = true;
+            if (!File.Exists(path) || new FileInfo(path).Length < 100)
+            {
+                if (source.StartsWith("lookup|", StringComparison.Ordinal)) throw new IOException("No source artwork supplied");
+                if (source.StartsWith("local|", StringComparison.Ordinal))
+                {
+                    string localPath = source.Substring(6);
+                    try { File.Copy(localPath, path, true); }
+                    catch { path = localPath; ownsCacheFile = false; }
+                }
+                else
+                {
+                    DownloadResumeInfo.DeletePartial(path + ".part");
+                    AppendLog(request.Key + " artwork-http begin");
+                    NetHttp.DownloadArtwork(source, path, () => request.Gen != _viewGen, MaxEncodedBytes);
+                    AppendLog(request.Key + " artwork-http complete");
+                }
+            }
+            if (request.Gen != _viewGen) throw new OperationCanceledException();
+            long size = new FileInfo(path).Length;
+            if (size < 100 || size > MaxEncodedBytes) throw new IOException("encoded size " + size);
+            var pixels = CoverImageDecoder.Decode(path, request.Width, request.Height,
+                request.Key.EndsWith("-BACKDROP", StringComparison.Ordinal),
+                stage => AppendLog(request.Key + " " + stage), request.Width > 0);
+            return new ReadyImage { Pixels = pixels.Pixels, Width = pixels.Width, Height = pixels.Height,
+                Opaque = pixels.Opaque, Generation = request.Gen };
+        }
+
+        string FindFallback(string key, string source)
+        {
+            string titleId = ArtworkTitleId(key);
+            if (titleId == null) return null;
+            string cacheKey = titleId + "|" + source;
+            long until;
+            if (_fallbackUntil.TryGetValue(cacheKey, out until) && until > DateTime.UtcNow.Ticks)
+                return _fallbackUrls[cacheKey];
+            string result = null;
+            foreach (string root in new[] { "/system_data/priv/appmeta/", "/user/appmeta/", "/mnt/ext0/user/appmeta/" })
+            {
+                string local = root + titleId + "/icon0.png";
+                if (File.Exists(local) && source != "local|" + local) { result = "local|" + local; break; }
+            }
+            if (result == null)
+            {
+                try { result = SelectFallbackArtwork(titleId, source, OrbisClient.Search(titleId, 8)); }
+                catch (Exception ex) { AppendLog(titleId + " artwork lookup failed " + ex.GetType().Name); }
+            }
+            if (_fallbackUrls.Count >= 128) { _fallbackUrls.Clear(); _fallbackUntil.Clear(); }
+            _fallbackUrls[cacheKey] = result;
+            _fallbackUntil[cacheKey] = DateTime.UtcNow.AddMinutes(result == null ? 2 : 30).Ticks;
+            return result;
+        }
+
+        internal static string ArtworkTitleId(string key)
+        {
+            string title = (key ?? "").ToUpperInvariant();
+            int variant = title.IndexOf('@');
+            if (variant >= 0) title = title.Substring(0, variant);
+            if (title.EndsWith("-BACKDROP", StringComparison.Ordinal)) title = title.Substring(0, title.Length - 9);
+            if (title.Length != 9 || !title.StartsWith("CUSA", StringComparison.Ordinal)) return null;
+            for (int i = 4; i < title.Length; i++) if (title[i] < '0' || title[i] > '9') return null;
+            return title;
+        }
+
+        internal static string SelectFallbackArtwork(string titleId, string source, IList<GameHit> hits)
+        {
+            if (ArtworkTitleId(titleId) == null || hits == null) return null;
+            foreach (var hit in hits)
+            {
+                if (hit == null || !string.Equals(hit.TitleId, titleId, StringComparison.OrdinalIgnoreCase) ||
+                    string.IsNullOrWhiteSpace(hit.ImageUrl)) continue;
+                string url = NormalizeUrl(hit.ImageUrl);
+                Uri parsed;
+                if (url != null && Uri.TryCreate(url, UriKind.Absolute, out parsed) &&
+                    string.IsNullOrEmpty(parsed.UserInfo) && !string.Equals(url, source, StringComparison.Ordinal)) return url;
+            }
+            return null;
+        }
+
+        public bool HasFailed(string key)
+        {
+            lock (_lock) return _failUntil.ContainsKey((key ?? "").ToUpperInvariant());
         }
 
         void RecordFailure(string key)
@@ -438,7 +551,26 @@ namespace Orbis
 
         static void AppendLog(string message)
         {
-            SspiLog.Write("startup", "cover " + message);
+            lock (PendingLogs)
+            {
+                // Diagnostic disk latency must not stall artwork upload/drawing.
+                if (PendingLogs.Count >= 256) return;
+                PendingLogs.Enqueue(message);
+                if (_logDrainScheduled) return;
+                _logDrainScheduled = true;
+            }
+            ThreadPool.QueueUserWorkItem(_ => {
+                while (true)
+                {
+                    string next;
+                    lock (PendingLogs)
+                    {
+                        if (PendingLogs.Count == 0) { _logDrainScheduled = false; return; }
+                        next = PendingLogs.Dequeue();
+                    }
+                    try { SspiLog.Write("startup", "cover " + next); } catch { }
+                }
+            });
         }
     }
 }

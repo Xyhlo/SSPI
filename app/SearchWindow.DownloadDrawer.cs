@@ -221,7 +221,7 @@ namespace Orbis
                 int fill = (int)Math.Round(width * DownloadDisplayProgress(complete, entry.Done, total));
                 if (fill <= 0) continue;
                 segment.w = Math.Min(width, fill);
-                SoftRect(r, segment, entry.State == DlState.Failed ? Danger : Accent);
+                SoftRect(r, segment, entry.State == DlState.Failed ? Danger : White);
             }
         }
 
@@ -324,7 +324,7 @@ namespace Orbis
                 SoftRect(r, bar, C(81, 83, 85));
                 bool complete = row.Installed || row.State == DlState.Completed || row.State == DlState.Installed;
                 int filled = (int)Math.Round(barWidth * DownloadDisplayProgress(complete, row.Done, row.Total));
-                if (filled > 0) { bar.w = Math.Min(barWidth, filled); SoftRect(r, bar, row.Error ? Danger : Accent); }
+                if (filled > 0) { bar.w = Math.Min(barWidth, filled); SoftRect(r, bar, row.Error ? Danger : White); }
                 string sizeText = row.Size ?? "";
                 string percent = DrawerPercentText(row);
                 int sizeWidth = UiFont.MeasurePx(17, sizeText);

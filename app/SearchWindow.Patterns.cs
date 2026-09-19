@@ -15,43 +15,49 @@ namespace Orbis
         byte[] _patternPixels;
         bool _patternBusy;
         readonly object _patternLock = new object();
+        string _patternDesiredKey = "", _patternUploadKey = "";
+        int _patternMode = -1, _patternColor, _patternUploadRow;
+        IntPtr _patternUploadTexture;
+        byte[] _patternUploadPixels;
+        bool _patternDisposed;
 
         bool DrawPattern(IntPtr renderer)
         {
+            if (_patternDisposed) return false;
             int mode = BackdropPattern.Index(_cfg.BackgroundMode);
             if (mode == 0)
             {
                 if (_patternTexture != IntPtr.Zero) { SDL_DestroyTexture(_patternTexture); _patternTexture = IntPtr.Zero; }
+                AbortPatternUpload();
+                lock (_patternLock) { _patternDesiredKey = ""; _patternPixels = null; }
+                _patternMode = 0;
                 _patternKey = ""; return false;
             }
             var color = Accent;
-            string key = mode + ":" + color.r + ":" + color.g + ":" + color.b;
+            int rgb = color.r << 16 | color.g << 8 | color.b;
+            if (_patternMode != mode || _patternColor != rgb)
+            {
+                _patternMode = mode; _patternColor = rgb;
+                lock (_patternLock) _patternDesiredKey = mode + ":" + rgb;
+            }
+            string key = _patternDesiredKey;
+            if (_patternUploadKey != key) AbortPatternUpload();
             lock (_patternLock)
             {
                 if (_patternPixels != null)
                 {
                     if (_patternPendingKey == key)
                     {
-                        if (_patternTexture != IntPtr.Zero) SDL_DestroyTexture(_patternTexture);
-                        _patternTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
-                            (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, W, H);
-                        if (_patternTexture != IntPtr.Zero)
-                        {
-                            var pin = GCHandle.Alloc(_patternPixels, GCHandleType.Pinned);
-                            try
-                            {
-                                if (SDL_UpdateTexture(_patternTexture, IntPtr.Zero, pin.AddrOfPinnedObject(), W * 4) != 0)
-                                { SDL_DestroyTexture(_patternTexture); _patternTexture = IntPtr.Zero; }
-                            }
-                            finally { pin.Free(); }
-                            if (_patternTexture != IntPtr.Zero) SDL_SetTextureBlendMode(_patternTexture, SDL_BlendMode.SDL_BLENDMODE_NONE);
-                        }
-                        if (_patternTexture == IntPtr.Zero) _patternFailedKey = key;
-                        else _patternKey = key;
+                        _patternUploadPixels = _patternPixels;
+                        _patternUploadKey = key;
                     }
                     _patternPixels = null;
                 }
-                if (_patternKey != key && _patternFailedKey != key && !_patternBusy)
+            }
+            PumpPatternUpload(renderer);
+            lock (_patternLock)
+            {
+                if (_patternKey != key && _patternUploadKey != key && _patternFailedKey != key && !_patternBusy)
                 {
                     _patternBusy = true;
                     ThreadPool.QueueUserWorkItem(_ => {
@@ -59,7 +65,8 @@ namespace Orbis
                         try
                         {
                             byte[] small = BackdropPattern.Render(mode, color.r, color.g, color.b);
-                            using (var image = Image.LoadPixelData<Rgba32>(small, BackdropPattern.Width, BackdropPattern.Height))
+                            using (var image = Image.LoadPixelData<Rgba32>(CoverImageDecoder.CreateConfiguration(),
+                                small, BackdropPattern.Width, BackdropPattern.Height))
                             {
                                 image.Mutate(x => x.Resize(W, H));
                                 pixels = new byte[W * H * 4]; image.CopyPixelDataTo(pixels);
@@ -68,20 +75,80 @@ namespace Orbis
                         catch { }
                         lock (_patternLock)
                         {
-                            if (pixels == null) _patternFailedKey = key;
-                            _patternPixels = pixels; _patternPendingKey = key; _patternBusy = false;
+                            if (!_patternDisposed && _patternDesiredKey == key)
+                            {
+                                if (pixels == null) _patternFailedKey = key;
+                                _patternPixels = pixels; _patternPendingKey = key;
+                            }
+                            _patternBusy = false;
                         }
                         Invalidated = true;
                     });
                 }
             }
-            if (_patternTexture != IntPtr.Zero && _patternKey == key)
+            // Keep the previous complete background visible while the replacement
+            // is prepared. Never publish partially uploaded rows.
+            if (_patternTexture != IntPtr.Zero)
             {
                 var destination = new SDL_Rect { x = 0, y = 0, w = W, h = H };
                 SDL_RenderCopy(renderer, _patternTexture, IntPtr.Zero, ref destination);
                 return true;
             }
             return false;
+        }
+
+        void PumpPatternUpload(IntPtr renderer)
+        {
+            if (_patternUploadPixels == null) return;
+            var pin = default(GCHandle);
+            try
+            {
+                if (_patternUploadPixels.Length != W * H * 4) throw new InvalidOperationException("Invalid pattern pixels");
+                if (_patternUploadTexture == IntPtr.Zero)
+                {
+                    _patternUploadTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGR888,
+                        (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, W, H);
+                    if (_patternUploadTexture == IntPtr.Zero ||
+                        SDL_SetTextureBlendMode(_patternUploadTexture, SDL_BlendMode.SDL_BLENDMODE_NONE) != 0)
+                        throw new InvalidOperationException("Pattern texture creation failed");
+                }
+                int pitch = W * 4;
+                int rows = Math.Min(H - _patternUploadRow, CoverCache.UploadBytesPerFrame / pitch);
+                var area = new SDL_Rect { x = 0, y = _patternUploadRow, w = W, h = rows };
+                pin = GCHandle.Alloc(_patternUploadPixels, GCHandleType.Pinned);
+                if (SDL_UpdateTexture(_patternUploadTexture, ref area,
+                    IntPtr.Add(pin.AddrOfPinnedObject(), _patternUploadRow * pitch), pitch) != 0)
+                    throw new InvalidOperationException("Pattern texture upload failed");
+                _patternUploadRow += rows;
+                if (_patternUploadRow == H)
+                {
+                    if (_patternTexture != IntPtr.Zero) SDL_DestroyTexture(_patternTexture);
+                    _patternTexture = _patternUploadTexture; _patternKey = _patternUploadKey;
+                    _patternUploadTexture = IntPtr.Zero;
+                    AbortPatternUpload();
+                }
+            }
+            catch
+            {
+                lock (_patternLock) _patternFailedKey = _patternUploadKey;
+                AbortPatternUpload();
+            }
+            finally { if (pin.IsAllocated) pin.Free(); }
+        }
+
+        void AbortPatternUpload()
+        {
+            if (_patternUploadTexture != IntPtr.Zero) SDL_DestroyTexture(_patternUploadTexture);
+            _patternUploadTexture = IntPtr.Zero; _patternUploadPixels = null;
+            _patternUploadKey = ""; _patternUploadRow = 0;
+        }
+
+        void ReleasePattern()
+        {
+            lock (_patternLock) { _patternDisposed = true; _patternPixels = null; _patternDesiredKey = ""; }
+            AbortPatternUpload();
+            if (_patternTexture != IntPtr.Zero) SDL_DestroyTexture(_patternTexture);
+            _patternTexture = IntPtr.Zero;
         }
     }
 }

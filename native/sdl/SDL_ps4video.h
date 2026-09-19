@@ -53,6 +53,13 @@ typedef struct SDL_VideoData
 	uint32_t egl_refcount;      /* OpenGL ES reference count              */
 #endif
 
+    /* Each scanout buffer may be several surface updates behind. */
+    SDL_Window *framebufferWindow;
+    SDL_Surface *framebufferSurface;
+    SDL_Rect framebufferWindowRect;
+    int framebufferSurfaceWidth, framebufferSurfaceHeight;
+    SDL_Rect framebufferDamage[VOUT_NUM_BUFFERS];
+    Uint8 framebufferClear[VOUT_NUM_BUFFERS];
 
 } SDL_VideoData;
 
