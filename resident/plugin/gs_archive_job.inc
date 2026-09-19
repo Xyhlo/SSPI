@@ -228,7 +228,10 @@ static int gs_verify_package(const char *path, int kind)
     if (kind == 8 && (gs_pkg_sfo(path, "CATEGORY", category, sizeof(category)) || strcmp(category, "gp") ||
         gs_pkg_sfo(path, "TITLE_ID", title, sizeof(title)) || strcmp(title, gs_job.title) ||
         gs_pkg_sfo(path, "APP_VER", version, sizeof(version)) || gs_version_number(version) < 0)) goto done;
-    if (!gs_pkg_sfo(path, "SYSTEM_VER", required, sizeof(required))) {
+    // A base can require a newer launch firmware while its matching backport
+    // supplies compatible executables. Let BGFT decide whether it can install
+    // that base; rejecting it here prevents the backport from ever following.
+    if (kind != 6 && !gs_pkg_sfo(path, "SYSTEM_VER", required, sizeof(required))) {
         unsigned char sw[0x28] = {0}; *(size_t *)sw = sizeof(sw);
         if (!sceKernelGetSystemSwVersion((OrbisKernelSwVersion *)sw)) {
             uint32_t have = 0; memcpy(&have, sw + 0x24, 4);
@@ -637,7 +640,7 @@ static int gs_bgft_receipt_matches(const char *path, const char *content, int ki
     int fields = fscanf(file, "%48s %d %d %d %d %d", id, &saved, &done, &pending, &version, &subtype); fclose(file);
     // Base and patch share a content ID. Legacy records cannot prove the subtype
     // of a recycled task number and must never authorize cross-job removal.
-    if (fields != 6 || subtype != kind || (version != 4 && version != 5 && version != 6) ||
+    if (fields != 6 || subtype != kind || (version != 4 && version != 5 && version != 6 && !(version == 7 && kind == 6)) ||
         saved != task || strcmp(id, content) || (done != 0 && done != 1) || pending < 0 || pending > 3) return 0;
     *complete = done; return 1;
 }
@@ -737,9 +740,11 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     file = fopen(journal, "rb");
     if (file) {
         int saved_kind = 0;
-        int fields = fscanf(file, "%48s %d %d %d %d %d", id, &task, &complete, &pending, &route_version, &saved_kind); fclose(file);
+        char extra;
+        int fields = fscanf(file, "%48s %d %d %d %d %d %c", id, &task, &complete, &pending, &route_version, &saved_kind, &extra); fclose(file);
         if ((fields != 4 && fields != 5 && fields != 6) || (fields == 6 && saved_kind != kind) ||
-            (fields >= 5 && route_version != 4 && route_version != 5 && route_version != 6) ||
+            (fields >= 5 && route_version != 4 && route_version != 5 && route_version != 6 && !(fields == 6 && route_version == 7 && kind == 6)) ||
+            task < -1 || (complete != 0 && complete != 1) || pending < 0 || pending > 3 ||
             strcmp(id, gs_job.content) || (pending && task < 0 && !(kind == 7 && pending == 2))) return -1;
         if (complete && kind == 7 && gs_installed_addon_matches(gs_job.destination, 1)) return 0;
         if (complete && kind == 8) {
@@ -803,10 +808,13 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     if (kind != 6 && !exists) return -1;
     if (task < 0) {
         if (g_stop || gs_canceled) return -1;
-        // Persist intent before registration; an interrupted register is never blindly retried.
+        // Route 7 registers a completed internal base directly from storage.
+        // Patches, external drives and live streams keep their HTTP handoff.
+        struct { GsBgftParam param; uint32_t slot; } storage_param;
+        _Static_assert(sizeof(storage_param) == 112, "BGFT storage parameter ABI");
+        int (*storage_reg)(void *, int *) = NULL, (*get_slot)(const char *, uint32_t *);
+        char storage_path[1100]; storage_path[0] = 0;
         gs_package_legacy_route = 0; route_version = 6;
-        snprintf(record, sizeof(record), "%s -1 0 1 6 %d", gs_job.content, kind);
-        if (write_atomic(journal, record)) return -1;
         gs_package_url(route, sizeof(route), "http://127.0.0.1:8742");
         // BGFT registration consumes reference-package JSON, not raw PKG bytes.
         // The piece URL inside this document remains the stable .pkg route.
@@ -825,10 +833,44 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         // Match IntInit with the internal registration ABI (PS4RPI's 0x80990004 fix).
         const char *api = kind == 6 ? "sceBgftServiceIntDownloadRegisterTask" : "sceBgftServiceIntDebugDownloadRegisterPkg";
         if (gs_bind(bgft, api, &reg)) return -1;
-        rc = reg(&param, &task);
-        gs_log_write("resident", "bgft-register api=%s rc=0x%08X job=%s task=%d content=%s subtype=%d bytes=%lld path=%s local_http_endpoint=%s streaming=%d user=%d",
-            api, (unsigned)rc, gs_job.id, task, gs_job.content, kind, (long long)gs_job.total, gs_job.destination, route + 7, gs_stream_slot >= 0, user);
-        if ((uint32_t)rc == 0x80F00633u && task < 0 && kind == 6 &&
+        if (kind == 6 && !gs_job.native_bgft && gs_stream_slot < 0 &&
+            (!strncmp(gs_job.destination, "/data/SSPI/", 11) || !strncmp(gs_job.destination, "/user/data/SSPI/", 16)) &&
+            !gs_bind(bgft, "sceBgftServiceIntDownloadRegisterTaskByStorageEx", &storage_reg) &&
+            !gs_bind(app, "sceAppInstUtilGetPrimaryAppSlot", &get_slot)) {
+            memset(&storage_param, 0, sizeof(storage_param));
+            int slot_rc = get_slot(gs_job.title, &storage_param.slot);
+            if (!slot_rc || (uint32_t)slot_rc == 0x80A3000Eu) {
+                if (slot_rc) storage_param.slot = 0;
+                int length = snprintf(storage_path, sizeof(storage_path), "%s%s",
+                    !strncmp(gs_job.destination, "/data/", 6) ? "/user" : "", gs_job.destination);
+                if (length < 0 || length >= (int)sizeof(storage_path)) return -1;
+                storage_param.param = param;
+                storage_param.param.id = ""; storage_param.param.url = storage_path;
+                storage_param.param.type = ""; storage_param.param.subtype = "";
+                api = "sceBgftServiceIntDownloadRegisterTaskByStorageEx";
+                route_version = 7;
+            } else gs_log_write("resident", "bgft-storage-unavailable job=%s slot_rc=0x%08X fallback=http", gs_job.id, (unsigned)slot_rc);
+        }
+        // Persist intent before either registration; an interrupted call is
+        // unconfirmed ownership and must never create a second task on restart.
+        snprintf(record, sizeof(record), "%s -1 0 1 %d %d", gs_job.content, route_version, kind);
+        if (write_atomic(journal, record)) return -1;
+        rc = route_version == 7 ? storage_reg(&storage_param, &task) : reg(&param, &task);
+        gs_log_write("resident", "bgft-register api=%s rc=0x%08X job=%s task=%d content=%s subtype=%d bytes=%lld path=%s mode=%s streaming=%d user=%d",
+            api, (unsigned)rc, gs_job.id, task, gs_job.content, kind, (long long)gs_job.total,
+            route_version == 7 ? storage_path : route, route_version == 7 ? "storage" : "http", gs_stream_slot >= 0, user);
+        // Fall back only on a rejected, taskless storage registration. An
+        // accepted task, ambiguous success or start failure retains its owner.
+        if (route_version == 7 && task < 0 && ((uint32_t)rc == 0x80990004u ||
+                (uint32_t)rc == 0x80020012u || (uint32_t)rc == 0x8002004Eu)) {
+            gs_log_write("resident", "bgft-storage-fallback job=%s rc=0x%08X reason=unsupported-storage-registration", gs_job.id, (unsigned)rc);
+            route_version = 6; api = "sceBgftServiceIntDownloadRegisterTask";
+            snprintf(record, sizeof(record), "%s -1 0 1 6 %d", gs_job.content, kind);
+            if (write_atomic(journal, record)) return -1;
+            rc = reg(&param, &task);
+            gs_log_write("resident", "bgft-register api=%s rc=0x%08X job=%s task=%d mode=http reason=storage-fallback", api, (unsigned)rc, gs_job.id, task);
+        }
+        if (route_version != 7 && (uint32_t)rc == 0x80F00633u && task < 0 && kind == 6 &&
             !gs_bind(bgft, "sceBgftServiceIntDebugDownloadRegisterPkg", &reg)) {
             api = "sceBgftServiceIntDebugDownloadRegisterPkg";
             rc = reg(&param, &task);
@@ -838,11 +880,15 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         if (task < 0 && ((uint32_t)rc == 0x80990015u || (uint32_t)rc == 0x80990086u) &&
             gs_recover_duplicate_bgft(bgft, gs_job.content, kind)) {
             // Exactly one new registration, now using the current validated PKG route.
-            rc = reg(&param, &task);
+            rc = route_version == 7 ? storage_reg(&storage_param, &task) : reg(&param, &task);
             gs_log_write("resident", "bgft-register-recovered api=%s rc=0x%08X task=%d content=%s subtype=%d",
                 api, (unsigned)rc, task, gs_job.content, kind);
         }
         if (task < 0) {
+            if (!rc) {
+                gs_write_status("failed", "BGFT_UNRESOLVED:PS4 accepted registration without returning a task ID. Install intent and PKG retained; inspect PS4 Notifications before retrying.");
+                return -1;
+            }
             char error[384]; snprintf(error, sizeof(error), "%s%s. PKG retained. API=%s rc=0x%08X task=%d",
                 gs_bgft_error_terminal(rc) ? "BGFT_TERMINAL:" : "", gs_bgft_error(rc), api, (unsigned)rc, task);
             if ((uint32_t)rc == 0x80990015u || (uint32_t)rc == 0x80990086u)
@@ -871,8 +917,9 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     if (g_stop || gs_canceled) return -1;
     if (gs_start_owned_bgft(bgft, task)) return -1;
     // BGFT posts its own added/install notices. Do not duplicate them here.
-    uint64_t logged_at = 0;
-    GsBgftWatch watch = {0}; int stall_retries = 0;
+    uint64_t logged_at = 0, install_started = sceKernelGetProcessTime(), phase_started = install_started;
+    const char *last_phase = "";
+    GsBgftWatch watch = {0}; int stall_retries = 0, storage_copy_progress = 0;
     while (!g_stop && !gs_canceled) {
         if (gs_stream_slot >= 0 && gs_stage_stream_finished() < 0) {
             gs_write_status("failed", "Resident stream interrupted or validation failed; completed data retained"); return -1;
@@ -911,6 +958,20 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         }
         poll_misses = 0;
         uint64_t now = sceKernelGetProcessTime();
+        uint64_t phase_length = p.length_total ? p.length_total : p.length;
+        uint64_t phase_done = p.length_total ? p.transferred_total : p.transferred;
+        if (route_version == 7 && p.copy > 0 && p.copy < 100) storage_copy_progress = 1;
+        int copy_finished = p.copy >= 100 && ((phase_length && phase_done >= phase_length) ||
+            (route_version == 7 && !phase_length && storage_copy_progress));
+        const char *phase = copy_finished ? "confirming" : phase_length && phase_done < phase_length ? "receiving" :
+            p.copy > 0 && p.copy < 100 ? "copying" : p.preparing < 100 ? "preparing" : "finalizing";
+        if (strcmp(phase, last_phase)) {
+            gs_log_write("resident", "bgft-phase job=%s task=%d mode=%s phase=%s previous=%s elapsed_ms=%llu previous_ms=%llu bytes=%llu total=%llu prepare=%d copy=%d",
+                gs_job.id, task, route_version == 7 ? "storage" : "http", phase, last_phase,
+                (unsigned long long)((now - install_started) / 1000), (unsigned long long)((now - phase_started) / 1000),
+                (unsigned long long)phase_done, (unsigned long long)phase_length, p.preparing, p.copy);
+            last_phase = phase; phase_started = now;
+        }
         if (!logged_at || now - logged_at >= 5000000 || p.error) {
             logged_at = now;
             gs_log_write("resident", "bgft-progress api=sceBgftServiceDownloadGetProgress job=%s task=%d rc=0x%08X error=0x%08X bytes=%llu total=%llu prepare=%d copy=%d bits=0x%08X stream=%d piece_bytes=%llu piece_total=%llu all_bytes=%llu all_total=%llu index=%u count=%u seconds=%u seconds_total=%u idle_ms=%llu",
@@ -928,7 +989,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                 gs_stage_stream_finished() >= 0 && gs_storage_matches(gs_job.storage_root, gs_job.storage_token)) {
                 int (*stop_task)(int);
                 if (!gs_bind(bgft, "sceBgftServiceDownloadStopTask", &stop_task) && !stop_task(task)) {
-                    source_retries++; stable = 0; memset(&watch, 0, sizeof(watch));
+                    source_retries++; stable = 0; storage_copy_progress = 0; memset(&watch, 0, sizeof(watch));
                     gs_write_status("installing", "PS4 source handoff interrupted; retrying the same task with downloaded data retained");
                     gs_log_write("resident", "bgft-source-retry job=%s task=%d attempt=%d", gs_job.id, task, source_retries);
                     for (int wait = 0; wait < 20 * source_retries && !g_stop && !gs_canceled; wait++) sceKernelUsleep(100000);
@@ -947,7 +1008,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                 (unsigned long long)p.length_total, p.preparing, p.copy);
             int (*stop_task)(int);
             if (stall_retries < 1 && !gs_bind(bgft, "sceBgftServiceDownloadStopTask", &stop_task) && !stop_task(task)) {
-                stall_retries++; stable = 0; memset(&watch, 0, sizeof(watch));
+                stall_retries++; stable = 0; storage_copy_progress = 0; memset(&watch, 0, sizeof(watch));
                 gs_write_status("installing", "PS4 download stopped advancing; resuming the same task with progress retained");
                 for (int wait = 0; wait < 30 && !g_stop && !gs_canceled; wait++) sceKernelUsleep(100000);
                 if (g_stop || gs_canceled) return -1;
@@ -965,17 +1026,30 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         uint64_t reported_done = p.length_total ? p.transferred_total : p.transferred;
         int native_downloading = gs_job.native_bgft && !(reported_length && reported_done >= reported_length);
         int streaming = (gs_stream_slot >= 0 && !gs_stage_stream_finished()) || native_downloading;
+        char install_detail[180];
+        if (copy_finished) snprintf(install_detail, sizeof(install_detail), "PS4 finished copying; confirming installed package");
+        else if (reported_length && reported_done < reported_length)
+            snprintf(install_detail, sizeof(install_detail), "PS4 is importing the downloaded package (%llu / %llu MiB)",
+                (unsigned long long)(reported_done / (1024 * 1024)), (unsigned long long)(reported_length / (1024 * 1024)));
+        else if (p.copy > 0 && p.copy < 100) snprintf(install_detail, sizeof(install_detail), "PS4 is copying the package (%d%%)", p.copy);
+        else if (p.preparing < 100) snprintf(install_detail, sizeof(install_detail), "PS4 is preparing installation (%d%%); download retained", p.preparing < 0 ? 0 : p.preparing);
+        else snprintf(install_detail, sizeof(install_detail), "PS4 is finalizing installation; download retained");
         gs_write_status(streaming ? "feeding" : "installing", streaming
             ? (gs_job.native_bgft ? "PS4 is downloading the package directly" : p.preparing < 100 ? "Downloading; PS4 is preparing the install task" : "Downloading; streaming the local package to PS4")
-            : (p.preparing < 100 ? "PS4 is preparing installation; download retained" : NULL));
+            : install_detail);
         // Copy percentage alone has produced false completion on hardware. Require
         // the whole PKG to have been served or counted by this owned BGFT task.
         uint64_t transferred = p.transferred_total ? p.transferred_total : p.transferred;
         uint64_t payload = p.length_total ? p.length_total : p.length;
+        // Storage tasks may leave network lengths at zero. Observe an actual
+        // copy progression before accepting 100: BGFT can report 100 at startup.
+        // A restart without that evidence stays unconfirmed and retains input.
+        int storage_copy_complete = route_version == 7 && kind == 6 && !payload && storage_copy_progress && p.copy >= 100;
         int base_payload_complete = kind == 6 && payload > 0 && transferred >= payload;
         if (gs_stage_stream_finished() == 1 && p.preparing >= 100 && p.copy >= 100 &&
             ((payload > 0 && transferred >= payload) || gs_served || transferred >= (uint64_t)gs_job.total)) copy_confirmed = 1;
-        if (gs_stage_stream_finished() == 1 && p.preparing >= 100 && p.copy >= 100 && (base_payload_complete || gs_served || transferred >= (uint64_t)gs_job.total)) stable++;
+        if (gs_stage_stream_finished() == 1 && p.copy >= 100 &&
+            (storage_copy_complete || (p.preparing >= 100 && (base_payload_complete || gs_served || transferred >= (uint64_t)gs_job.total)))) stable++;
         else stable = 0;
         if (stable >= 8) {
             // Updates require the exact installed image identity and metadata
@@ -990,7 +1064,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
             }
             snprintf(record, sizeof(record), "%s %d 1 0 %d %d", gs_job.content, task, route_version, kind);
             int saved = write_atomic(journal, record);
-            if (!saved) gs_archive_task = -1;
+            if (!saved) { gs_archive_task = -1; gs_done = gs_job.total; }
             return saved;
         }
         sceKernelUsleep(500000);
@@ -1011,11 +1085,21 @@ static int gs_cancel_task(void)
 {
     int (*stop)(int), (*remove)(int); int module;
     if (gs_archive_task < 0 && gs_archive_journal[0]) {
-        char id[49]; int task, complete, pending, version;
+        char id[49], extra; int task, complete, pending, version, kind = gs_job.expected_kind;
         FILE *journal = fopen(gs_archive_journal, "rb");
         if (journal) {
-            int fields = fscanf(journal, "%48s %d %d %d %d", id, &task, &complete, &pending, &version); fclose(journal);
-            if (fields == 5 && !strcmp(id, gs_job.content) && pending == 2 && !complete) return -1;
+            int fields = fscanf(journal, "%48s %d %d %d %d %d %c", id, &task, &complete, &pending, &version, &kind, &extra); fclose(journal);
+            if ((fields != 5 && fields != 6) || strcmp(id, gs_job.content)) return -1;
+            if (pending == 2 && !complete) {
+                // AppInstUtil add-ons have no BGFT task to cancel. An explicit
+                // Remove can release tracking; the manager retains unconfirmed
+                // DLC inputs and this receipt so it cannot submit twice on retry.
+                if (gs_release && gs_job.expected_kind == 7 && kind == 7 && task == -1 && version == 6) {
+                    gs_log_write("resident", "addon-tracking-released job=%s outcome=unconfirmed", gs_job.id);
+                    return 0;
+                }
+                return -1;
+            }
         }
     }
     if (gs_archive_task < 0) return 0;
@@ -1056,16 +1140,26 @@ static int gs_retire_parked_package(const char *job_id, const char *content, int
     FILE *file = fopen(path, "rb");
     if (!file) return errno == ENOENT ? 0 : -1;
     int fields = fscanf(file, "%48s %d %d %d %d %d %c", id, &task, &complete, &pending, &version, &saved_kind, &extra); fclose(file);
-    if ((fields != 5 && fields != 6) || saved_kind != kind || strcmp(id, content) || version != 6 || task < -1 ||
+    if ((fields != 5 && fields != 6) || saved_kind != kind || strcmp(id, content) ||
+        (version != 6 && !(fields == 6 && version == 7 && kind == 6)) || task < -1 ||
         (complete != 0 && complete != 1) || pending < 0 || pending > 3) return -1;
     // Release SSPI tracking after its worker exits, without claiming to cancel a PS4 add-on operation.
     // Preserve acceptance so a retry checks completion instead of submitting twice.
     if (kind == 7 && task == -1 && pending == 2) {
         gs_log_write("resident", "addon-tracking-released job=%s outcome=unconfirmed", job_id); return 0;
     }
-    if (pending && task < 0) return -1;
-    if (complete || task < 0) return 0;
-    int (*stop)(int), (*remove)(int), module = gs_module("/system/common/lib/libSceBgft.sprx");
+    if (complete || (!pending && task < 0)) return 0;
+    int (*stop)(int), (*remove)(int), (*find)(const char *, int, int *);
+    int module = gs_module("/system/common/lib/libSceBgft.sprx"), current = -1;
+    if (gs_bind(module, "sceBgftServiceDownloadFindTaskByContentId", &find)) return -1;
+    int lookup = find(content, kind, &current);
+    if ((uint32_t)lookup == 0x80990019u || (!lookup && current < 0)) {
+        // A deleted PS4 task or interrupted registration has no remaining reader.
+        // Persist that acknowledgement instead of waiting forever on a stale ID.
+        snprintf(record, sizeof(record), "%s -1 0 0 6", id);
+        return write_atomic(path, record);
+    }
+    if (lookup || current != task || task < 0) return -1;
     if (gs_bind(module, "sceBgftServiceDownloadStopTask", &stop) ||
         gs_bind(module, "sceBgftServiceIntDownloadUnregisterTask", &remove)) return -1;
     stop(task);

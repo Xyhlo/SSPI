@@ -160,6 +160,9 @@ namespace Orbis
         public string CdnHost;
         public string TransferMode;
         public bool InstallConfirmed;
+        // Accepted installation without package-level completion proof. Cancellation
+        // may stop queue tracking, but must not delete input still held by the PS4.
+        public bool InstallSubmitted;
         public bool Background;
         public bool BgftLoopback;
         public bool BgftResident;
@@ -374,6 +377,7 @@ namespace Orbis
         bool TryParkProviderPreparation(DlItem job, int attempt, out HashSet<string> unavailableProviders)
         {
             unavailableProviders = null;
+            DebridHostSupport.RefreshEnabled(_cfg);
             if (!AllDebridIsFirstProvider(_cfg, job.HosterUrl))
                 return TryParkTorBoxPreparation(job, attempt, out unavailableProviders);
             AllDebridClient.PreparedPollResult poll;
@@ -384,7 +388,7 @@ namespace Orbis
             }
             catch (DebridResolutionError rejection)
             {
-                if (rejection.CanTryProvider && UnlockProviders.EnabledIds(_cfg).Length > 1)
+                if (rejection.CanTryProvider && UnlockProviders.HasSupportedAlternative(_cfg, new[] { job.HosterUrl }, UnlockProviders.AllDebridId))
                 { unavailableProviders = new HashSet<string>(StringComparer.Ordinal) { UnlockProviders.AllDebridId }; return false; }
                 throw;
             }
@@ -392,7 +396,7 @@ namespace Orbis
             if (poll.Kind == AllDebridClient.PreparedPollKind.Ready) return false;
             if (poll.Kind == AllDebridClient.PreparedPollKind.Rejected || poll.Kind == AllDebridClient.PreparedPollKind.Terminal)
             {
-                if (UnlockProviders.EnabledIds(_cfg).Length > 1)
+                if (UnlockProviders.HasSupportedAlternative(_cfg, new[] { job.HosterUrl }, UnlockProviders.AllDebridId))
                 { unavailableProviders = new HashSet<string>(StringComparer.Ordinal) { UnlockProviders.AllDebridId }; return false; }
                 throw new Exception(string.IsNullOrEmpty(poll.Error) ? "AllDebrid preparation failed" : poll.Error);
             }
@@ -428,6 +432,11 @@ namespace Orbis
             out string message)
         {
             if (game == null || link == null) throw new Exception("Bad download");
+            if (accessType == "Personal")
+            {
+                string locator = CloudCatalog.ImportLocator(link.Url);
+                if (locator != null) { link.Url = locator; accessType = "Cloud"; }
+            }
             message = "Queued " + link.Kind;
             string existingId = null;
             bool revived = false;
@@ -858,6 +867,7 @@ namespace Orbis
                         Error = i.Error,
                         StatusText = i.StatusText,
                         InstallConfirmed = i.InstallConfirmed,
+                        InstallSubmitted = i.InstallSubmitted,
                         Background = i.Background,
                         ParkedForProvider = i.ParkedForProvider,
                         BgftLoopback = i.BgftLoopback,
@@ -1165,20 +1175,36 @@ namespace Orbis
                     error = "Already finished — use Remove";
                     return false;
                 }
-                if (!it.Background && it.State == DlState.Installing && _activeIds.Contains(it.Id))
+                if (!it.Background && it.State == DlState.Installing)
                 {
-                    error = "Local install is already in progress";
-                    return false;
+                    bool previous = it.CancelRequested;
+                    it.CancelRequested = true;
+                    if (!SaveManifest()) { it.CancelRequested = previous; error = "Could not save the cancellation request"; return false; }
+                    it.StatusText = "Canceling installation; waiting for PS4 acknowledgement";
+                    return true;
                 }
                 if (it.Background && it.ResidentArchive)
                 {
-                    if (!ResidentDownloadService.TryCancel(it.Id, out error)) return false;
+                    bool previous = it.CancelRequested;
+                    if (RetainUnconfirmedAddonFiles(it)) it.InstallSubmitted = true;
                     it.CancelRequested = true;
                     it.StatusText = "Canceling background job...";
-                    SaveManifest(); return true;
+                    if (!SaveManifest())
+                    { it.CancelRequested = previous; error = "Could not save the cancellation request"; return false; }
+                    if (!ResidentDownloadService.TryCancel(it.Id, out error))
+                    {
+                        it.StatusText = "Cancellation saved; waiting to reach the background worker";
+                        error = null;
+                    }
+                    return true;
                 }
-                if (it.Background)
+                if (it.Background || (it.State == DlState.Submitted && it.BgftTaskId >= 0))
                 {
+                    bool previous = it.CancelRequested;
+                    it.CancelRequested = true;
+                    if (it.State == DlState.Submitted) it.InstallSubmitted = true;
+                    if (!SaveManifest())
+                    { it.CancelRequested = previous; error = "Could not save the cancellation request"; return false; }
                     int activeTask;
                     string cancelError;
                     if (PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
@@ -1186,13 +1212,14 @@ namespace Orbis
                     {
                         ClearBackground(it);
                         it.State = DlState.Canceled;
-                        it.StatusText = "Canceled";
+                        it.CancelRequested = false;
+                        it.StatusText = "Canceled; downloaded files retained";
                     }
                     else
                     {
                         it.BgftTaskId = activeTask;
-                        it.StatusText = cancelError;
-                        error = cancelError;
+                        // The durable request is retried by the worker and after restart.
+                        it.StatusText = "Cancellation saved; " + (cancelError ?? "waiting for PS4 acknowledgement");
                     }
                     SaveManifest();
                     return error == null;
@@ -1201,13 +1228,23 @@ namespace Orbis
                     (it.State == DlState.Resolving || it.State == DlState.Downloading ||
                      it.State == DlState.Finalizing))
                 {
+                    bool previousCancel = it.CancelRequested, previousPause = it.PauseRequested;
                     it.CancelRequested = true;
                     it.PauseRequested = false;
                     it.StatusText = "Canceling...";
-                    SaveManifest();
+                    if (!SaveManifest())
+                    {
+                        it.CancelRequested = previousCancel; it.PauseRequested = previousPause;
+                        error = "Could not save the cancellation request"; return false;
+                    }
                     return true;
                 }
                 if (_activeIds.Contains(it.Id)) it.AttemptId++;
+                if (it.State == DlState.Submitted) it.InstallSubmitted = true;
+                bool wasCancelRequested = it.CancelRequested;
+                it.CancelRequested = true;
+                if (!SaveManifest())
+                { it.CancelRequested = wasCancelRequested; error = "Could not save the cancellation request"; return false; }
                 if (!TryCleanupFanOutPending(it))
                 {
                     error = "Extracted package cleanup failed";
@@ -1216,7 +1253,7 @@ namespace Orbis
                 it.State = DlState.Canceled;
                 it.CancelRequested = false;
                 it.PauseRequested = false;
-                it.StatusText = "Canceled";
+                it.StatusText = it.InstallSubmitted ? "Stopped tracking installation; unconfirmed package retained" : "Canceled";
                 DeleteDownloadFiles(it);
                 SaveManifest();
                 return true;
@@ -1261,6 +1298,7 @@ namespace Orbis
                     error = "Download not found";
                     return false;
                 }
+                if (it.State == DlState.Submitted) it.InstallSubmitted = true;
                 if (it.Background && (it.ResidentStaged || it.ResidentArchive))
                 {
                     bool wasPending = it.ResidentRemovePending, wasCanceled = it.CancelRequested;
@@ -1276,13 +1314,24 @@ namespace Orbis
                     ResidentDownloadService.Release(it.Id);
                     return true;
                 }
-                if (it.Background && !_activeIds.Contains(it.Id))
+                if ((it.Background || (it.State == DlState.Submitted && it.BgftTaskId >= 0)) &&
+                    !_activeIds.Contains(it.Id))
                 {
+                    bool requested = it.RemoveRequested, canceled = it.CancelRequested;
+                    it.RemoveRequested = it.CancelRequested = true;
+                    if (!SaveManifest())
+                    { it.RemoveRequested = requested; it.CancelRequested = canceled; error = "Could not save the removal request"; return false; }
                     int activeTask;
                     if (!PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
                         out activeTask, out error))
-                    { it.BgftTaskId = activeTask; return false; }
+                    {
+                        it.BgftTaskId = activeTask;
+                        it.StatusText = "Removal saved; waiting for PS4 acknowledgement";
+                        error = null;
+                        return true;
+                    }
                     ClearBackground(it);
+                    it.CancelRequested = false;
                     it.State = DlState.Canceled;
                     it.StatusText = "Canceled";
                 }
@@ -1290,18 +1339,23 @@ namespace Orbis
                     it.State == DlState.Downloading || it.State == DlState.Finalizing ||
                     it.State == DlState.Installing)
                 {
-                    if (it.State == DlState.Installing) { error = "Installation is already running"; return false; }
                     bool requested = it.RemoveRequested, canceled = it.CancelRequested;
                     it.RemoveRequested = it.CancelRequested = true;
-                    if (SaveManifest()) { it.StatusText = "Removing; waiting for file writer to stop"; return true; }
+                    if (SaveManifest()) { it.StatusText = it.State == DlState.Installing
+                        ? "Removing; waiting for PS4 installer acknowledgement" : "Removing; waiting for file writer to stop"; return true; }
                     it.RemoveRequested = requested; it.CancelRequested = canceled;
                     error = "Could not save the removal request"; return false;
                 }
-                if (!IsTerminal(it.State) && it.State != DlState.Queued && it.State != DlState.Paused)
+                if (!IsTerminal(it.State) && it.State != DlState.Queued && it.State != DlState.Paused &&
+                    it.State != DlState.Submitted)
                 {
                     error = "Cannot remove now";
                     return false;
                 }
+                bool wasRemoveRequested = it.RemoveRequested;
+                it.RemoveRequested = true;
+                if (!SaveManifest())
+                { it.RemoveRequested = wasRemoveRequested; error = "Could not save the removal request"; return false; }
                 // Queued/Paused: treat as remove-from-queue (cancel leftovers).
                 if (it.State == DlState.Queued || it.State == DlState.Paused)
                 {
@@ -1507,6 +1561,7 @@ namespace Orbis
                 if (!AcceptInstallCallback(it, attempt)) return;
                 it.State = DlState.Submitted;
                 it.InstallConfirmed = false;
+                it.InstallSubmitted = true;
                 it.InstallOrderReady = false;
                 it.Error = null;
                 it.StatusText = msg ?? "Sent to PS4 — verify · PKG kept";
@@ -1514,6 +1569,14 @@ namespace Orbis
                 it.EtaSeconds = 0;
                 if (bgftTaskId >= 0)
                     it.BgftTaskId = bgftTaskId;
+                // AppInstUtil exposes no stop handle. Honor a request made during
+                // registration by releasing tracking, retaining its accepted input.
+                if (bgftTaskId < 0 && (it.CancelRequested || it.RemoveRequested))
+                {
+                    it.State = DlState.Canceled;
+                    it.CancelRequested = false;
+                    it.StatusText = "Stopped tracking installation; unconfirmed package retained";
+                }
                 if (!string.IsNullOrEmpty(it.DestPath) && File.Exists(it.DestPath))
                     it.Done = it.Total = new FileInfo(it.DestPath).Length;
                 SaveManifest();
@@ -1565,6 +1628,9 @@ namespace Orbis
                     error = "Install is not awaiting verification";
                     return false;
                 }
+                if (it.Background || it.BgftTaskId >= 0)
+                { error = "Use Remove to stop the owned PS4 task before retrying"; return false; }
+                it.InstallSubmitted = true;
                 it.AttemptId++;
                 it.InstallConfirmed = false;
                 it.InstallOrderReady = false;
@@ -1765,20 +1831,21 @@ namespace Orbis
                 if (!string.IsNullOrEmpty(item.InstallAfterId))
                 {
                     DlItem previous = Find(item.InstallAfterId);
-                    if (!item.InstallAfterConfirmed && !InstallPrerequisiteReady(previous))
+                    bool replacedPatch = CanReplaceFailedPatch(previous, item);
+                    if (!replacedPatch && !item.InstallAfterConfirmed && !InstallPrerequisiteReady(previous))
                     {
                         item.StatusText = previous != null && (previous.State == DlState.Failed || !string.IsNullOrEmpty(previous.Error))
                             ? "Waiting: previous package failed · retry it first" : "Waiting for previous package installation";
                         return false;
                     }
-                    item.InstallAfterConfirmed = true;
+                    if (!replacedPatch) item.InstallAfterConfirmed = true;
                 }
                 foreach (var other in _items)
                 {
                     if (other == item || !string.Equals(item.TitleId, other.TitleId, StringComparison.OrdinalIgnoreCase) ||
                         string.IsNullOrEmpty(item.TitleId) || InstallPrerequisiteReady(other) ||
-                        other.State == DlState.Canceled) continue;
-                    if (InstallPrecedes(other, item) || (other.Background && !other.ResidentStaged) || other.State == DlState.Installing)
+                        other.State == DlState.Canceled || CanReplaceFailedPatch(other, item)) continue;
+                    if (InstallPrecedes(other, item))
                     {
                         item.StatusText = other.State == DlState.Failed || !string.IsNullOrEmpty(other.Error)
                             ? "Waiting: a required package failed" : "Waiting for this title's earlier package";
@@ -1810,17 +1877,39 @@ namespace Orbis
                 string.Equals(next.Kind, "backport", StringComparison.OrdinalIgnoreCase);
         }
 
+        // A failed ordinary full update is not a prerequisite for its matching
+        // backport. The backport still passes actual base/content/key validation
+        // before installation; no installed state is inferred for the failed row.
+        bool CanReplaceFailedPatch(DlItem previous, DlItem next)
+        {
+            if (previous == null || next == null || previous.Background ||
+                previous.InstallSubmitted || InstallRank(previous.Kind) != 1 ||
+                string.Equals(previous.Kind, "backport", StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(next.Kind, "backport", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrEmpty(next.TitleId) ||
+                !string.Equals(previous.TitleId, next.TitleId, StringComparison.OrdinalIgnoreCase) ||
+                !(previous.State == DlState.Failed || (previous.State == DlState.Completed && !string.IsNullOrEmpty(previous.Error))))
+                return false;
+            if (_activeIds.Contains(previous.Id)) return false;
+            Version a, b;
+            if (!Version.TryParse((previous.PackageVersion ?? "").TrimStart('v', 'V'), out a) ||
+                !Version.TryParse((next.PackageVersion ?? "").TrimStart('v', 'V'), out b) || a != b) return false;
+            return string.IsNullOrEmpty(previous.ExpectedContentId) || string.IsNullOrEmpty(next.ExpectedContentId) ||
+                string.Equals(previous.ExpectedContentId, next.ExpectedContentId, StringComparison.OrdinalIgnoreCase);
+        }
+
         string ResidentDependencyId(DlItem item)
         {
             lock (_lock)
             {
-                if (!item.InstallAfterConfirmed && !string.IsNullOrEmpty(item.InstallAfterId)) return item.InstallAfterId;
+                if (!item.InstallAfterConfirmed && !string.IsNullOrEmpty(item.InstallAfterId) &&
+                    !CanReplaceFailedPatch(Find(item.InstallAfterId), item)) return item.InstallAfterId;
                 DlItem latest = null;
                 foreach (var other in _items)
                 {
                     if (other == item || string.IsNullOrEmpty(item.TitleId) ||
                         !string.Equals(item.TitleId, other.TitleId, StringComparison.OrdinalIgnoreCase) ||
-                        other.State == DlState.Canceled || InstallPrerequisiteReady(other)) continue;
+                        other.State == DlState.Canceled || InstallPrerequisiteReady(other) || CanReplaceFailedPatch(other, item)) continue;
                     if (!InstallPrecedes(other, item)) continue;
                     if (latest == null || InstallPrecedes(latest, other)) latest = other;
                 }
@@ -1899,9 +1988,11 @@ namespace Orbis
                 lock (_lock)
                 {
                     foreach (var pending in _items.ToArray())
-                        if (pending.RemoveRequested && !pending.Background && !_activeIds.Contains(pending.Id) && pending.State != DlState.Installing)
+                        if (pending.RemoveRequested && !pending.CancelRequested && pending.BgftTaskId < 0 &&
+                            !pending.Background && !_activeIds.Contains(pending.Id) && pending.State != DlState.Installing)
                         {
-                            pending.State = DlState.Canceled;
+                            if (!IsTerminal(pending.State) && pending.State != DlState.Submitted)
+                                pending.State = DlState.Canceled;
                             string removalError;
                             if (!Remove(pending.Id, out removalError)) pending.StatusText = removalError;
                         }
@@ -1990,22 +2081,27 @@ namespace Orbis
         bool TryParkTorBoxPreparation(DlItem job, int attempt, out HashSet<string> unavailableProviders)
         {
             unavailableProviders = null;
-            if (!TorBoxIsFirstProvider(_cfg, job.HosterUrl)) return false;
+            DebridHostSupport.RefreshEnabled(_cfg);
+            var urls = TorBoxPreparationUrls(job);
+            if (urls.Count == 0 || urls.Exists(url => !TorBoxIsFirstProvider(_cfg, url))) return false;
             // A provider job is created at most once: TryParkOrPrepare reuses the
             // durable pending record and only polls when one already exists.
             TorBoxClient.PreparedPollResult poll;
             try
             {
-                poll = TorBoxClient.TryParkOrPrepare(_cfg.TorBoxApiKey, job.HosterUrl,
-                    () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested);
+                Func<bool> canceled = () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested || job.RemoveRequested;
+                Action<string> progress = text => { lock (_lock) { if (!canceled()) job.StatusText = text; } };
+                poll = string.IsNullOrEmpty(job.ArchiveVolumes)
+                    ? TorBoxClient.TryParkOrPrepare(_cfg.TorBoxApiKey, job.HosterUrl, canceled, progress)
+                    : TorBoxClient.PrepareMany(_cfg.TorBoxApiKey, urls, 0, canceled, progress);
             }
             catch (DebridResolutionError rejection)
             {
                 // A definite TorBox rejection keeps the previous multi-provider
                 // fallback: resolve again with TorBox excluded rather than failing
-                // the job. Without another configured provider the rejection is
+                // the job. Without another supported provider the rejection is
                 // reported unchanged.
-                if (rejection.CanTryProvider && UnlockProviders.EnabledIds(_cfg).Length > 1)
+                if (rejection.CanTryProvider && UnlockProviders.HasSupportedAlternative(_cfg, urls, UnlockProviders.TorBoxId))
                 {
                     unavailableProviders = new HashSet<string>(StringComparer.Ordinal) { UnlockProviders.TorBoxId };
                     return false;
@@ -2018,7 +2114,15 @@ namespace Orbis
             }
             if (poll.Kind == TorBoxClient.PreparedPollKind.Ready) return false;
             if (poll.Kind == TorBoxClient.PreparedPollKind.Rejected || poll.Kind == TorBoxClient.PreparedPollKind.Terminal)
-                throw new Exception(string.IsNullOrEmpty(poll.Error) ? "TorBox preparation failed" : poll.Error);
+            {
+                var rejection = TorBoxClient.PreparationFailure(poll.FailedUrl ?? job.HosterUrl, poll);
+                if (rejection.CanTryProvider && UnlockProviders.HasSupportedAlternative(_cfg, urls, UnlockProviders.TorBoxId))
+                {
+                    unavailableProviders = new HashSet<string>(StringComparer.Ordinal) { UnlockProviders.TorBoxId };
+                    return false;
+                }
+                throw rejection;
+            }
             long nowTicks = DateTime.UtcNow.Ticks;
             lock (_lock)
             {
@@ -2030,7 +2134,8 @@ namespace Orbis
                 job.ParkPollCount = 1;
                 job.ParkTransientFailures = poll.Kind == TorBoxClient.PreparedPollKind.Transient ? 1 : 0;
                 job.ParkLastState = poll.ProviderState ?? "";
-                job.ParkPollDueUtcTicks = nowTicks + TimeSpan.FromMilliseconds(QueueScheduler.NextPollDelayMs(0)).Ticks;
+                job.ParkPollDueUtcTicks = nowTicks + TimeSpan.FromMilliseconds(Math.Max(
+                    QueueScheduler.NextPollDelayMs(0), (long)poll.RetryAfterSeconds * 1000)).Ticks;
                 job.BytesPerSec = 0;
                 job.EtaSeconds = 0;
                 job.StatusText = ParkedPreparationStatus(poll);
@@ -2044,6 +2149,15 @@ namespace Orbis
             // single-flight latch bound it; no polling happens when nothing parks.
             EnsureParkPollTimer();
             return true;
+        }
+
+        static List<string> TorBoxPreparationUrls(DlItem job)
+        {
+            var urls = new List<string>();
+            if (string.IsNullOrEmpty(job.ArchiveVolumes)) urls.Add(job.HosterUrl);
+            else foreach (var volume in ArchiveVolumeSet.Decode(job.ArchiveVolumes))
+                if (!IsDirectAccess(volume.AccessType) && !urls.Contains(volume.Url)) urls.Add(volume.Url);
+            return urls;
         }
 
         void EnsureParkPollTimer()
@@ -2111,7 +2225,7 @@ namespace Orbis
                     bool allDebrid = string.Equals(candidate.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase);
                     bool hasPending = allDebrid
                         ? AllDebridClient.HasPreparedDownload(_cfg.AllDebridApiKey, candidate.HosterUrl)
-                        : TorBoxClient.HasPreparedDownload(_cfg.TorBoxApiKey, candidate.HosterUrl);
+                        : !string.IsNullOrEmpty(candidate.ArchiveVolumes) || TorBoxClient.HasPreparedDownload(_cfg.TorBoxApiKey, candidate.HosterUrl);
                     if (!hasPending)
                     {
                         candidate.ParkedForProvider = false;
@@ -2165,7 +2279,11 @@ namespace Orbis
                     else
                     {
                         TorBoxClient.PreparedPollResult poll = null;
-                        try { poll = TorBoxClient.PollPrepared(token, hostUrl, () => !IsParkedPollCurrent(target, attempt)); }
+                        try { poll = string.IsNullOrEmpty(target.ArchiveVolumes)
+                            ? TorBoxClient.PollPrepared(token, hostUrl, () => !IsParkedPollCurrent(target, attempt))
+                            : TorBoxClient.PrepareMany(token, TorBoxPreparationUrls(target), target.ParkPollCount,
+                                () => !IsParkedPollCurrent(target, attempt),
+                                text => { lock (_lock) { if (IsParkedPollCurrent(target, attempt)) target.StatusText = text; } }); }
                         catch (OperationCanceledException) { }
                         catch (Exception ex) { failure = ex; }
                         if (poll != null || failure != null) ApplyParkedPollResult(target, attempt, poll, failure);
@@ -2180,7 +2298,8 @@ namespace Orbis
             lock (_lock)
             {
                 return object.ReferenceEquals(Find(target.Id), target) && target.AttemptId == attempt &&
-                    target.ParkedForProvider && target.State == DlState.Queued;
+                    target.ParkedForProvider && target.State == DlState.Queued &&
+                    !target.PauseRequested && !target.CancelRequested && !target.RemoveRequested;
             }
         }
 
@@ -2218,7 +2337,7 @@ namespace Orbis
                             target.ParkTransientFailures = 0;
                             target.ParkLastState = poll.ProviderState ?? "";
                             target.ParkPollDueUtcTicks = DateTime.UtcNow.Ticks +
-                                TimeSpan.FromMilliseconds(ParkPollDelayMs(target)).Ticks;
+                                TimeSpan.FromMilliseconds(Math.Max(ParkPollDelayMs(target), (long)poll.RetryAfterSeconds * 1000)).Ticks;
                             target.StatusText = ParkedPreparationStatus(poll);
                             changed = true;
                             break;
@@ -2228,7 +2347,7 @@ namespace Orbis
                             break;
                         default:
                             target.ParkedForProvider = false;
-                            failMessage = string.IsNullOrEmpty(poll.Error) ? "TorBox preparation failed" : poll.Error;
+                            failMessage = TorBoxClient.PreparationFailure(poll.FailedUrl ?? target.HosterUrl, poll).Message;
                             changed = true;
                             break;
                     }
@@ -2354,7 +2473,9 @@ namespace Orbis
                 if (CommitRequestedStop(job, attempt)) return;
                 if (!string.IsNullOrEmpty(job.ArchiveVolumes))
                 {
-                    DownloadArchiveVolumes(job, attempt);
+                    HashSet<string> unavailable;
+                    if (TryParkTorBoxPreparation(job, attempt, out unavailable)) return;
+                    DownloadArchiveVolumes(job, attempt, unavailable);
                     return;
                 }
                 if (File.Exists(job.DestPath) && PackageArchive.Detect(job.DestPath) != PackageObjectKind.Pkg)
@@ -2393,8 +2514,11 @@ namespace Orbis
                 }
                 string direct = job.HosterUrl;
                 string foregroundStatus = "Downloading in SSPI...";
-                if (job.AccessType == "Personal" && CloudCatalog.PersonalLocator(job.HosterUrl) != null)
-                    job.AccessType = "Cloud";
+                if (job.AccessType == "Personal")
+                {
+                    string locator = CloudCatalog.ImportLocator(job.HosterUrl);
+                    if (locator != null) { job.HosterUrl = locator; job.AccessType = "Cloud"; }
+                }
                 if (job.AccessType == "Personal")
                 {
                     // Resolve routing on the worker, never while drawing the link overlay.
@@ -2436,8 +2560,14 @@ namespace Orbis
                     // the worker advances another eligible game instead of holding the
                     // single transfer slot; the park poller re-queues it when ready.
                     HashSet<string> torboxUnavailable;
-                    if (TryParkProviderPreparation(job, attempt, out torboxUnavailable)) return;
-                    direct = ResolveJobHost(job, attempt, torboxUnavailable);
+                    DebridResolutionError prepareFailure = null;
+                    try { if (TryParkProviderPreparation(job, attempt, out torboxUnavailable)) return; }
+                    catch (DebridResolutionError ex) {
+                        if (!ex.CanTryMirror) throw;
+                        torboxUnavailable = null;
+                        prepareFailure = ex;
+                    }
+                    direct = ResolveJobHost(job, attempt, torboxUnavailable, prepareFailure);
                     foregroundStatus = "Downloading (" + UnlockProviders.DisplayName(job.ResolvedProviderId) + ")...";
                 }
                 else
@@ -3414,7 +3544,7 @@ namespace Orbis
             return paths;
         }
 
-        bool TryHandoffArchive(DlItem job, int attempt, List<ArchiveVolume> volumes, List<string> paths)
+        bool TryHandoffArchive(DlItem job, int attempt, List<ArchiveVolume> volumes, List<string> paths, ISet<string> unavailable = null)
         {
             ApplySourceArchivePassword(job, new byte[] { 0x52, 0x61, 0x72, 0x21 });
             job.ContainerFormat = "rar";
@@ -3439,7 +3569,8 @@ namespace Orbis
                         Size = localSize, Sha256 = volume.Sha256, AccessType = volume.AccessType });
                     continue;
                 }
-                string direct = ResolveVolume(volume);
+                string direct = ResolveVolume(volume, job, attempt, volumeIndex, volumes.Count, unavailable);
+                lock (_lock) { if (job.AttemptId == attempt) job.StatusText = "Checking RAR part " + (volumeIndex + 1) + "/" + volumes.Count + " · file size and header"; }
                 HttpRangeResult probe = NetHttp.ReadRangeDirect(direct, 0, 8, 60000);
                 if (probe == null || probe.Total <= 0 || probe.Data == null || probe.Data.Length < 7 ||
                     probe.Data[0] != 0x52 || probe.Data[1] != 0x61 || probe.Data[2] != 0x72 || probe.Data[3] != 0x21 ||
@@ -3472,23 +3603,30 @@ namespace Orbis
             return true;
         }
 
-        string ResolveVolume(ArchiveVolume volume)
+        string ResolveVolume(ArchiveVolume volume, DlItem job, int attempt, int index, int count, ISet<string> unavailable)
         {
+            Func<bool> canceled = () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested;
+            if (canceled()) throw new OperationCanceledException();
             if (IsDirectAccess(volume.AccessType)) return volume.Url;
             if (_cfg.UseUnlockProvider && UnlockProviders.EnabledIds(_cfg).Length > 0)
-                return UnlockProviders.Unrestrict(_cfg, volume.Url);
+                return UnlockProviders.Unrestrict(_cfg, volume.Url,
+                    text => { lock (_lock) { if (!canceled()) job.StatusText = "RAR part " + (index + 1) + "/" + count + " · " + text; } },
+                    canceled, id => { lock (_lock) { if (!canceled()) job.ResolvedProviderId = id; } }, null, unavailable);
             return FreeHosterClient.ResolveDirect(volume.Url,
                 string.Equals(volume.AccessType, "HosterLanding", StringComparison.OrdinalIgnoreCase));
         }
 
-        string ResolveJobHost(DlItem job, int attempt, ISet<string> unavailable = null)
+        string ResolveJobHost(DlItem job, int attempt, ISet<string> unavailable = null, DebridResolutionError prepareFailure = null)
         {
             var unavailableProviders = unavailable ?? new HashSet<string>(StringComparer.Ordinal);
             Func<bool> cancelled = () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested;
             Action<string> progress = text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } };
             return PackageMirrorFallback.Resolve(job.HosterUrl, job.MirrorCandidates,
-                url => UnlockProviders.Unrestrict(_cfg, url, progress, cancelled,
-                    provider => { lock (_lock) { if (!cancelled()) job.ResolvedProviderId = provider; } }, null, unavailableProviders),
+                url => {
+                    if (prepareFailure != null && url == job.HosterUrl) throw prepareFailure;
+                    return UnlockProviders.Unrestrict(_cfg, url, progress, cancelled,
+                        provider => { lock (_lock) { if (!cancelled()) job.ResolvedProviderId = provider; } }, null, unavailableProviders);
+                },
                 () => !cancelled() && string.IsNullOrEmpty(job.ArchiveVolumes) &&
                     !File.Exists(job.DestPath) && !File.Exists(job.DestPath + ".part") &&
                     !File.Exists(job.DestPath + ".ranges") && !File.Exists(job.DestPath + ".resume"),
@@ -3513,13 +3651,13 @@ namespace Orbis
                 }, progress, cancelled);
         }
 
-        void DownloadArchiveVolumes(DlItem job, int attempt)
+        void DownloadArchiveVolumes(DlItem job, int attempt, ISet<string> unavailable = null)
         {
             var volumes = ArchiveVolumeSet.Decode(job.ArchiveVolumes);
             var paths = ArchivePaths(job);
             lock (_transferRouteGate)
             {
-                if (!OtherForegroundTransfer(job) && TryHandoffArchive(job, attempt, volumes, paths)) return;
+                if (!OtherForegroundTransfer(job) && TryHandoffArchive(job, attempt, volumes, paths, unavailable)) return;
                 if (WaitForSelectedBackground(job, attempt, "Archive handoff is waiting for resident capacity") ||
                     DeferWhileResidentTransfers(job, attempt)) return;
                 lock (_lock) job.ForegroundTransfer = true;
@@ -3539,7 +3677,7 @@ namespace Orbis
                 if (!File.Exists(path))
                 {
                     lock (_lock) { job.State = DlState.Downloading; job.StatusText = "RAR volume " + (i + 1) + "/" + volumes.Count + " · Keep SSPI open"; }
-                    string direct = ResolveVolume(volume);
+                    string direct = ResolveVolume(volume, job, attempt, i, volumes.Count, unavailable);
                     string part = path + ".part";
                     long offset = File.Exists(part) ? new FileInfo(part).Length : 0;
                     long baseBytes = 0;
@@ -4675,6 +4813,7 @@ namespace Orbis
                     MarkInstallAccepted(job.Id, "Sent to PS4 — verification pending · PKG kept", -1, attempt);
                     return;
                 }
+                TrackLocalInstallTask(job.Id, attempt, taskId);
                 string checkTitleId = !string.IsNullOrEmpty(installedTitleId)
                     ? installedTitleId : actualTitleId;
                 bool localCopyComplete;
@@ -4693,7 +4832,8 @@ namespace Orbis
                                 job.Done = job.Total;
                             }
                         }
-                    }, out localCopyComplete, out waitError);
+                    }, out localCopyComplete, out waitError, () => TryInterruptLocalInstall(job, attempt));
+                lock (_lock) if (job.State == DlState.Canceled || job.State == DlState.Queued) return;
                 if (completed)
                 {
                     lock (_lock) { if (AcceptInstallCallback(job, attempt)) job.InstallOrderReady = localCopyComplete; }
@@ -4715,6 +4855,7 @@ namespace Orbis
                 else MarkInstallFailed(job.Id, waitError ?? "Local PKG install failed", attempt);
                 return;
             }
+            if (CommitRequestedStop(job, attempt)) return;
             if (outcome == InstallOutcome.AlreadyInstalled)
             {
                 if (actualKind == PkgContentKind.AddOn && PkgInstaller.IsAddonInstalled(job.DestPath, true))
@@ -4724,6 +4865,58 @@ namespace Orbis
             }
             if (outcome == InstallOutcome.NotReady && RetryLocalInstall(job, attempt, error)) return;
             MarkInstallFailed(job.Id, error ?? "Local PKG install failed", attempt);
+        }
+
+        public void TrackLocalInstallTask(string id, int attempt, int taskId)
+        {
+            lock (_lock)
+            {
+                var item = Find(id);
+                if (item == null || item.AttemptId != attempt || taskId < 0) return;
+                string content;
+                if (PkgValidator.TryGetContentId(item.DestPath, out content)) item.BgftContentId = content;
+                item.BgftTaskId = taskId;
+                item.BgftSubType = PkgValidator.BgftSubTypeForKind(item.Kind);
+                item.BgftExpectedSize = item.Total;
+                item.InstallSubmitted = true;
+                item.BgftLocalInstall = true;
+                SaveManifest();
+            }
+        }
+
+        public bool TryInterruptLocalInstall(string id, int attempt)
+        {
+            lock (_lock) return TryInterruptLocalInstall(Find(id), attempt);
+        }
+
+        bool TryInterruptLocalInstall(DlItem item, int attempt)
+        {
+            lock (_lock)
+            {
+                if (item == null || !object.ReferenceEquals(Find(item.Id), item) || item.AttemptId != attempt) return true;
+                if (item.State == DlState.Canceled || (item.State == DlState.Queued && !item.BgftLocalInstall)) return true;
+                bool stop = item.CancelRequested || item.RemoveRequested;
+                // A late base/update may become a prerequisite after this task
+                // was registered. Release the PS4 task before yielding the queue;
+                // its complete local PKG remains available for the later retry.
+                if (!stop && InstallDependencyReady(item)) return false;
+                if (string.IsNullOrEmpty(item.BgftContentId) || item.BgftSubType <= 0) return false;
+                int activeTask; string error;
+                if (!PkgInstaller.CancelBackground(item.BgftTaskId, item.BgftContentId, item.BgftSubType, out activeTask, out error))
+                {
+                    item.BgftTaskId = activeTask;
+                    item.StatusText = (stop ? "Stopping installation; " : "Yielding to required package; ") + error;
+                    return false;
+                }
+                ClearBackground(item);
+                item.InstallSubmitted = item.InstallConfirmed = item.InstallOrderReady = false;
+                item.CancelRequested = false;
+                item.State = stop ? DlState.Canceled : DlState.Queued;
+                item.Error = null; item.BytesPerSec = 0; item.EtaSeconds = 0;
+                item.StatusText = stop ? "Installation stopped; downloaded file retained" : "Waiting for required package; downloaded file retained";
+                SaveManifest();
+                return true;
+            }
         }
 
         bool RetryLocalInstall(DlItem job, int attempt, string reason)
@@ -4886,7 +5079,7 @@ namespace Orbis
         bool TryFindInstalledUpdate(DlItem item, out string installedPath, out string version)
         {
             installedPath = version = null;
-            if (item == null || !item.Background || item.State == DlState.Canceled ||
+            if (item == null || (!item.Background && item.State != DlState.Submitted) || item.State == DlState.Canceled ||
                 !string.IsNullOrEmpty(item.ArchiveVolumes) || PkgValidator.BgftSubTypeForKind(item.Kind) != 8) return false;
             if (string.IsNullOrEmpty(item.PackageVersion))
             {
@@ -4897,24 +5090,31 @@ namespace Orbis
             foreach (string root in new[] { "/user/patch/", "/mnt/ext0/user/patch/" })
             {
                 string installed = root + item.TitleId + "/patch.pkg";
-                try
-                {
-                    bool sameContainer = PkgInstallPolicy.MatchesInstalledContainer(item.DestPath, installed);
-                    long expected = item.BgftExpectedSize > 0 ? item.BgftExpectedSize : item.Total;
-                    if (!sameContainer && !item.BgftDownloadPhaseConfirmed &&
-                        !(item.BgftLocalInstall && expected > 0 && item.Done >= expected)) continue;
-                    byte[] sfo = PkgIntegrity.Entry(installed, 0x1000);
-                    string installedContent;
-                    if (!PkgValidator.TryGetContentId(installed, out installedContent)) continue;
-                    string candidate = PkgIntegrity.SfoValue(sfo, "APP_VER");
-                    string content = !string.IsNullOrEmpty(item.BgftContentId) ? item.BgftContentId : item.ExpectedContentId;
-                    if (!MatchesInstalledUpdateIdentity(content, item.PackageVersion, item.TitleId, installedContent,
-                        candidate, PkgIntegrity.SfoValue(sfo, "TITLE_ID"), PkgIntegrity.SfoValue(sfo, "CATEGORY"))) continue;
-                    version = candidate; installedPath = installed; break;
-                }
-                catch { }
+                if (!TryMatchInstalledUpdate(item, installed, out version)) continue;
+                installedPath = installed; break;
             }
             return version != null;
+        }
+
+        internal static bool TryMatchInstalledUpdate(DlItem item, string installed, out string version)
+        {
+            version = null;
+            try
+            {
+                // An older normal update may share both content ID and APP_VER
+                // with a backport. Transfer completion cannot prove replacement.
+                if (item == null || !PkgInstallPolicy.MatchesInstalledContainer(item.DestPath, installed)) return false;
+                byte[] sfo = PkgIntegrity.Entry(installed, 0x1000);
+                string installedContent;
+                if (!PkgValidator.TryGetContentId(installed, out installedContent)) return false;
+                string candidate = PkgIntegrity.SfoValue(sfo, "APP_VER");
+                string content = !string.IsNullOrEmpty(item.BgftContentId) ? item.BgftContentId : item.ExpectedContentId;
+                if (!MatchesInstalledUpdateIdentity(content, item.PackageVersion, item.TitleId, installedContent,
+                    candidate, PkgIntegrity.SfoValue(sfo, "TITLE_ID"), PkgIntegrity.SfoValue(sfo, "CATEGORY"))) return false;
+                version = candidate;
+                return true;
+            }
+            catch { return false; }
         }
 
         bool ConfirmInstalledUpdate(DlItem item)
@@ -4930,7 +5130,7 @@ namespace Orbis
             if (!PkgIntegrity.ValidatePatch(installedPath, item.TitleId, "", null, null, out verificationError))
             { item.BgftInstalledProofPolls = 0; return false; }
             lock (_lock) {
-                if (!object.ReferenceEquals(Find(item.Id), item) || !item.Background ||
+                if (!object.ReferenceEquals(Find(item.Id), item) || (!item.Background && item.State != DlState.Submitted) ||
                     !AcceptInstallCallback(item, attempt)) return false;
                 item.State = DlState.Installed; item.InstallConfirmed = true; item.InstallOrderReady = true;
                 item.Error = null;
@@ -5005,11 +5205,29 @@ namespace Orbis
                 return;
             }
             ResidentDownloadStatus status;
+            if (item.CancelRequested)
+            {
+                // Reissue the saved command: a crash may have happened between the
+                // manifest commit and IPC publication, or the worker may have restarted.
+                string cancelError;
+                ResidentDownloadService.TryCancel(item.Id, out cancelError);
+            }
             if (!ResidentDownloadService.TryGetStatus(item.Id, item.ResidentGeneration, out status))
             {
                 lock (_lock) {
                     if (!object.ReferenceEquals(Find(item.Id), item) || !AcceptInstallCallback(item, attempt)) return;
-                    item.StatusText = ResidentDownloadService.HasDownloader
+                    if (item.CancelRequested && !_activeIds.Contains(item.Id) &&
+                        ResidentDownloadService.HasDownloader && !ResidentDownloadService.HasJob(item.Id))
+                    {
+                        if (RetainUnconfirmedAddonFiles(item)) item.InstallSubmitted = true;
+                        ClearBackground(item); item.ResidentArchive = false;
+                        item.CancelRequested = false; item.State = DlState.Canceled;
+                        item.Error = null; item.BytesPerSec = 0; item.EtaSeconds = 0;
+                        item.StatusText = "Canceled; downloaded files retained";
+                        SaveManifest();
+                        return;
+                    }
+                    item.StatusText = item.CancelRequested ? "Cancellation saved; waiting for background acknowledgement" : ResidentDownloadService.HasDownloader
                         ? "Waiting for shell download acknowledgement" : "Waiting for GoldHEN shell downloader";
                 }
                 return;
@@ -5088,7 +5306,9 @@ namespace Orbis
                 }
                 else if (status.State == "submitted")
                 {
-                    item.State = DlState.Submitted; item.InstallConfirmed = false; item.InstallOrderReady = false;
+                    item.State = item.CancelRequested ? DlState.Canceled : DlState.Submitted;
+                    item.CancelRequested = false; item.InstallConfirmed = false; item.InstallOrderReady = false;
+                    item.InstallSubmitted = true;
                     item.Background = false; item.BgftResident = false;
                     item.StatusText = "Packages sent to PS4 in order; files retained";
                     release = true; changed = true;
@@ -5098,10 +5318,13 @@ namespace Orbis
                     item.BytesPerSec = 0; item.EtaSeconds = 0;
                     item.State = status.State == "canceled" ? DlState.Canceled : DlState.Failed;
                     item.Error = status.Error;
+                    if ((status.Error ?? "").StartsWith("DLC_UNCONFIRMED:", StringComparison.Ordinal))
+                        item.InstallSubmitted = true;
                     item.StatusText = !string.IsNullOrEmpty(status.Error) ? status.Error :
                         status.State == "canceled" ? "Resident download canceled; files retained" : "Resident download failed; files retained";
                     if (status.State == "canceled")
                     {
+                        if (RetainUnconfirmedAddonFiles(item)) item.InstallSubmitted = true;
                         item.Background = false; item.BgftResident = false; item.CancelRequested = false;
                         release = true;
                     }
@@ -5197,7 +5420,10 @@ namespace Orbis
                 foreach (var item in _items)
                 {
                     if (!item.Background) {
-                        if (item.State == DlState.Submitted && PkgValidator.BgftSubTypeForKind(item.Kind) == 7) active.Add(item);
+                        if ((item.CancelRequested && !_activeIds.Contains(item.Id) &&
+                                (item.BgftTaskId >= 0 || !string.IsNullOrEmpty(item.BgftContentId))) ||
+                            (item.State == DlState.Submitted && (PkgValidator.BgftSubTypeForKind(item.Kind) == 7 ||
+                                PkgValidator.BgftSubTypeForKind(item.Kind) == 8))) active.Add(item);
                         continue;
                     }
                     if (item.ResidentArchive || item.ResidentStaged || item.State == DlState.Downloading || item.State == DlState.Resolving ||
@@ -5208,7 +5434,28 @@ namespace Orbis
 
             foreach (var item in active)
             {
+                if (item.CancelRequested && !item.ResidentStaged && !item.ResidentArchive)
+                {
+                    lock (_lock)
+                    {
+                        if (!object.ReferenceEquals(Find(item.Id), item) || !item.CancelRequested) continue;
+                        int activeTask;
+                        string cancelError;
+                        if (PkgInstaller.CancelBackground(item.BgftTaskId, item.BgftContentId, item.BgftSubType,
+                            out activeTask, out cancelError))
+                        {
+                            ClearBackground(item);
+                            item.State = DlState.Canceled; item.CancelRequested = false;
+                            item.BytesPerSec = 0; item.EtaSeconds = 0; item.Error = null;
+                            item.StatusText = "Canceled; downloaded files retained";
+                            SaveManifest();
+                        }
+                        else { item.BgftTaskId = activeTask; item.StatusText = "Cancellation saved; " + cancelError; }
+                    }
+                    continue;
+                }
                 if (!item.Background && item.State == DlState.Submitted) {
+                    if (PkgValidator.BgftSubTypeForKind(item.Kind) == 8) { ConfirmInstalledUpdate(item); continue; }
                     if (!PkgInstaller.IsAddonInstalled(item.DestPath, false)) { item.BgftInstalledProofPolls = 0; continue; }
                     if (++item.BgftInstalledProofPolls < 3) continue;
                     if (PkgInstaller.IsAddonInstalled(item.DestPath, true)) {
@@ -5218,6 +5465,7 @@ namespace Orbis
                     continue;
                 }
                 if (item.ResidentStaged) { RefreshResidentArchive(item); continue; }
+                if (item.BgftLocalInstall && TryInterruptLocalInstall(item, item.AttemptId)) continue;
                 if (ConfirmInstalledUpdate(item)) continue;
                 if (item.BgftInstalledProofPolls > 0) continue;
                 if (item.ResidentArchive) { RefreshResidentArchive(item); continue; }
@@ -5701,6 +5949,8 @@ namespace Orbis
                         sb.Append("\"resident_staged\":").Append(it.ResidentStaged ? "true" : "false").Append(',');
                         sb.Append("\"resident_remove_pending\":").Append(it.ResidentRemovePending ? "true" : "false").Append(',');
                         sb.Append("\"remove_requested\":").Append(it.RemoveRequested ? "true" : "false").Append(',');
+                        sb.Append("\"cancel_requested\":").Append(it.CancelRequested ? "true" : "false").Append(',');
+                        sb.Append("\"install_submitted\":").Append(it.InstallSubmitted ? "true" : "false").Append(',');
                         sb.Append("\"resident_link_renewals\":").Append(it.ResidentLinkRenewals).Append(',');
                         sb.Append("\"resident_last_renewal_bytes\":").Append(it.ResidentLastRenewalBytes).Append(',');
                         sb.Append("\"resident_retry_pending\":").Append(it.ResidentRetryPending ? "true" : "false").Append(',');
@@ -5805,6 +6055,12 @@ namespace Orbis
                 item.CancelRequested = true;
                 item.State = DlState.Paused; storedState = "Paused";
                 item.StatusText = "Removing background job; waiting for worker acknowledgement";
+                return;
+            }
+            if (item.CancelRequested)
+            {
+                item.State = DlState.Resolving; storedState = "Resolving";
+                item.StatusText = "Recovering saved cancellation request";
                 return;
             }
             if (item.ResidentRetryPending && item.ResidentStaged)
@@ -6281,6 +6537,9 @@ namespace Orbis
                         ResidentStaged = JsonLite.GetBool(obj, "resident_staged"),
                         ResidentRemovePending = JsonLite.GetBool(obj, "resident_remove_pending"),
                         RemoveRequested = JsonLite.GetBool(obj, "remove_requested"),
+                        CancelRequested = JsonLite.GetBool(obj, "cancel_requested"),
+                        InstallSubmitted = JsonLite.GetBool(obj, "install_submitted") ||
+                            string.Equals(JsonLite.GetString(obj, "state"), "Submitted", StringComparison.OrdinalIgnoreCase),
                         ResidentLinkRenewals = Math.Max(0, ParseInt(JsonLite.GetString(obj, "resident_link_renewals"), 0)),
                         ResidentLastRenewalBytes = Math.Max(0, ParseLong(JsonLite.GetString(obj, "resident_last_renewal_bytes"))),
                         ResidentRetryPending = JsonLite.GetBool(obj, "resident_retry_pending"),
@@ -6338,6 +6597,13 @@ namespace Orbis
                         migrated = true;
                     }
                     string st = JsonLite.GetString(obj, "state") ?? "Paused";
+                    if (it.CancelRequested && it.BgftTaskId >= 0) it.Background = true;
+                    if (it.CancelRequested && !it.Background && !it.BgftLoopback && it.BgftTaskId < 0)
+                    {
+                        st = "Canceled";
+                        it.CancelRequested = false;
+                        it.ParkedForProvider = false;
+                    }
                     string identity = (it.TitleId ?? "") + "\n" + (it.Kind ?? "") + "\n" +
                         (it.HosterUrl ?? "");
                     if (it.Background || it.BgftLoopback)
@@ -6702,7 +6968,8 @@ namespace Orbis
 
         static void DeleteDownloadFiles(DlItem item)
         {
-            if (item != null && !item.LocalSource) DeleteDownloadFiles(item.DestPath);
+            if (item != null && !item.LocalSource && (!item.InstallSubmitted || item.InstallConfirmed))
+                DeleteDownloadFiles(item.DestPath);
         }
 
         static void DeleteDownloadFiles(string finalPath)

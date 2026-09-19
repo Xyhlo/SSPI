@@ -358,7 +358,7 @@ namespace Orbis
         }
 
         public static bool WaitForInstall(int taskId, string titleId, PkgContentKind contentKind,
-            Action<int> progress, out bool localCopyComplete, out string error)
+            Action<int> progress, out bool localCopyComplete, out string error, Func<bool> interrupt = null)
         {
             error = null;
             localCopyComplete = false;
@@ -378,6 +378,7 @@ namespace Orbis
                 // Local BGFT installs can take a long time for large games.
                 for (int i = 0; i < 28800; i++)
                 {
+                    if (interrupt != null && interrupt()) { error = "Installation stopped by queue"; return false; }
                     BgftTaskProgress state;
                     int rc = sceBgftServiceDownloadGetProgress(taskId, out state);
                     if (rc != 0)
