@@ -21,8 +21,22 @@ namespace Orbis
         static readonly object Gate = new object();
         static readonly Dictionary<TextureKey, CacheEntry> Cache = new Dictionary<TextureKey, CacheEntry>();
         static readonly Dictionary<MeasureKey, int> WidthCache = new Dictionary<MeasureKey, int>();
+        static readonly Dictionary<FitKey, string> FitCache = new Dictionary<FitKey, string>();
         const int MaxCache = 256;
         const int MaxWidthCache = 1024;
+        const int MaxFitCache = 512;
+
+        struct FitKey : IEquatable<FitKey>
+        {
+            public int Px, Width;
+            public string Text;
+            public bool Equals(FitKey other)
+            {
+                return Px == other.Px && Width == other.Width && string.Equals(Text, other.Text, StringComparison.Ordinal);
+            }
+            public override bool Equals(object obj) { return obj is FitKey && Equals((FitKey)obj); }
+            public override int GetHashCode() { return ((Px * 397) ^ Width) * 397 ^ Text.GetHashCode(); }
+        }
 
         struct MeasureKey : IEquatable<MeasureKey>
         {
@@ -197,6 +211,20 @@ namespace Orbis
         public static string EllipsizePx(string text, int px, int maxWidth)
         {
             if (string.IsNullOrEmpty(text) || maxWidth <= 0) return "";
+            var key = new FitKey { Px = px, Width = maxWidth, Text = text };
+            string fitted;
+            lock (Gate) if (FitCache.TryGetValue(key, out fitted)) return fitted;
+            fitted = FitText(text, px, maxWidth);
+            lock (Gate)
+            {
+                if (FitCache.Count >= MaxFitCache) FitCache.Clear();
+                FitCache[key] = fitted;
+            }
+            return fitted;
+        }
+
+        static string FitText(string text, int px, int maxWidth)
+        {
             if (MeasurePx(px, text) <= maxWidth) return text;
             const string suffix = "...";
             int suffixWidth = MeasurePx(px, suffix);
@@ -298,8 +326,10 @@ namespace Orbis
                 w = Math.Min(Math.Max(8, adv + 4), 3600);
                 h = Math.Min(height, 128);
 
+                // Match the PS4 BGR888 framebuffer's RGB masks so SDL can use
+                // its packed alpha blitter instead of converting every glyph pixel.
                 IntPtr surf = SDL_CreateRGBSurface(0, w, h, 32,
-                    0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u);
+                    0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u);
                 if (surf == IntPtr.Zero) return false;
                 var surface = (SDL_Surface*)surf.ToPointer();
                 SDL_FillRect(surf, IntPtr.Zero, SDL_MapRGBA(surface->format, 0, 0, 0, 0));
@@ -328,11 +358,17 @@ namespace Orbis
                 // Glyph coverage is already stored in alpha; colour-keying clips dark glyph edges.
                 // Glyphs are rasterized at their final display size. Never resample them.
                 SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
-                tex = SDL_CreateTextureFromSurface(renderer, surf);
+                // SDL 2.0.9's FromSurface chooses its first advertised alpha
+                // format, which would convert this back to ARGB8888.
+                tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
+                    (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, w, h);
                 SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+                if (tex != IntPtr.Zero && SDL_UpdateTexture(tex, IntPtr.Zero, surface->pixels, surface->pitch) != 0)
+                { SDL_DestroyTexture(tex); tex = IntPtr.Zero; }
                 SDL_FreeSurface(surf);
                 if (tex == IntPtr.Zero) return false;
-                SDL_SetTextureBlendMode(tex, SDL_BlendMode.SDL_BLENDMODE_BLEND);
+                if (SDL_SetTextureBlendMode(tex, SDL_BlendMode.SDL_BLENDMODE_BLEND) != 0)
+                { SDL_DestroyTexture(tex); tex = IntPtr.Zero; return false; }
                 // Keep the actual surface width: changing it here scales the entire texture.
                 return true;
             }
@@ -387,9 +423,9 @@ namespace Orbis
                     byte a = src[row * pitch + col];
                     if (a < 8) continue;
                     int di = dy * sp + dx * 4;
-                    dst[di + 0] = color.b;
+                    dst[di + 0] = color.r;
                     dst[di + 1] = color.g;
-                    dst[di + 2] = color.r;
+                    dst[di + 2] = color.b;
                     dst[di + 3] = a;
                 }
             }

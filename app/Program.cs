@@ -10,6 +10,7 @@ namespace Orbis
     internal class Program
     {
         private static SearchWindow Window;
+        private static readonly NavigationRepeat Navigation = new NavigationRepeat();
 
         public static void Main()
         {
@@ -54,6 +55,7 @@ namespace Orbis
                 StartupStage("window-create");
                 Window = new SearchWindow();
                 Window.JoyButtonEvent += OnJoy;
+                Window.JoyRemovedEvent += (sender, args) => Navigation.Clear();
                 StartupStage("window-ready");
             }
             catch (Exception ex)
@@ -165,10 +167,30 @@ namespace Orbis
 
         private static void OnJoy(object sender, JoyButtonEvent e)
         {
-            if (e.ButtonState != JoyButtonEvent.Type.Up)
-                return;
-            try { Window.HandleButton(e.Button); }
+            try
+            {
+                bool direction = e.Button == DS4Button.SCE_PAD_BUTTON_UP || e.Button == DS4Button.SCE_PAD_BUTTON_DOWN ||
+                    e.Button == DS4Button.SCE_PAD_BUTTON_LEFT || e.Button == DS4Button.SCE_PAD_BUTTON_RIGHT;
+                if (direction)
+                {
+                    if (e.ButtonState == JoyButtonEvent.Type.Down)
+                    {
+                        if (Navigation.Press((int)e.Button, e.DeviceID, Environment.TickCount))
+                            Window.HandleButton(e.Button);
+                    }
+                    else Navigation.Release((int)e.Button, e.DeviceID);
+                    return;
+                }
+                Navigation.Clear();
+                if (e.ButtonState == JoyButtonEvent.Type.Up) Window.HandleButton(e.Button);
+            }
             catch (Exception ex) { RecordFailure(ex); }
+        }
+
+        internal static void RepeatNavigation()
+        {
+            int button = Navigation.Poll(Environment.TickCount);
+            if (button >= 0) Window.HandleButton((DS4Button)button);
         }
 
         internal static string FindBundledAssembly(string name, string location, string mountedRoot, string domainRoot)
@@ -186,6 +208,27 @@ namespace Orbis
                 catch { }
             }
             return null;
+        }
+    }
+
+    internal sealed class NavigationRepeat
+    {
+        int button = -1, device, next;
+        internal bool Press(int value, int deviceId, int now)
+        {
+            if (button == value && device == deviceId) return false;
+            button = value; device = deviceId; next = unchecked(now + 400);
+            return true;
+        }
+        internal void Release(int value, int deviceId)
+        { if (button == value && device == deviceId) Clear(); }
+        internal void Clear() { button = -1; }
+        internal int Poll(int now)
+        {
+            if (button < 0 || unchecked(now - next) < 0) return -1;
+            // Never catch up a stalled frame with a burst of old button presses.
+            next = unchecked(now + 90);
+            return button;
         }
     }
 }

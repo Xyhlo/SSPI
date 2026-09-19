@@ -9,8 +9,10 @@ namespace Orbis
     public partial class SearchWindow
     {
         string _downloadFilesTitle;
-        uint _framePrevious, _frameWindowStart, _downloadAudioAt;
-        int _frameSamples, _frameMisses, _frameLongest;
+        uint _downloadAudioAt;
+        readonly double[] _frameIntervals = new double[1024];
+        int _frameSamples, _frameMisses, _frameStalls, _frameMissRun, _frameLongestRun;
+        double _frameDuration, _frameLongest, _frameUpdateMax, _frameDrawMax, _framePresentMax;
         IntPtr _headerBrand;
         readonly System.Collections.Generic.Dictionary<string, IntPtr> _caseSizes = new System.Collections.Generic.Dictionary<string, IntPtr>();
         bool _headerBrandTried;
@@ -44,35 +46,61 @@ namespace Orbis
             return (int)Math.Round(3 * Math.Sin(t * Math.PI));
         }
 
-        void RecordFrameTiming(uint now)
+        protected override void OnFramePresented(double intervalMs, double updateMs, double drawMs, double presentMs)
         {
-            if (_framePrevious != 0)
-            {
-                int elapsed = (int)unchecked(now - _framePrevious);
-                _frameSamples++;
-                if (elapsed > 35) _frameMisses++;
-                _frameLongest = Math.Max(_frameLongest, elapsed);
+            if (intervalMs <= 0) return;
+            _frameIntervals[_frameSamples % _frameIntervals.Length] = intervalMs;
+            _frameSamples++;
+            _frameDuration += intervalMs;
+            _frameLongest = Math.Max(_frameLongest, intervalMs);
+            _frameUpdateMax = Math.Max(_frameUpdateMax, updateMs);
+            _frameDrawMax = Math.Max(_frameDrawMax, drawMs);
+            _framePresentMax = Math.Max(_framePresentMax, presentMs);
+            if (intervalMs > 1000.0 / FPS + 2) {
+                _frameMisses++; _frameMissRun++;
+                _frameLongestRun = Math.Max(_frameLongestRun, _frameMissRun);
             }
-            _framePrevious = now;
-            if (_frameWindowStart == 0) _frameWindowStart = now;
-            uint duration = unchecked(now - _frameWindowStart);
-            if (duration < 10000) return;
-            string report = "build=" + BuildIdentity.Label + " fps=" + (_frameSamples * 1000.0 / duration).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) +
-                " target_fps=30 frames_over_35ms=" + _frameMisses + " longest_ms=" + _frameLongest + " renderer=software 1920x1080";
+            else _frameMissRun = 0;
+            if (intervalMs > 50) _frameStalls++;
+            if (_frameDuration < 10000) return;
+            int count = Math.Min(_frameSamples, _frameIntervals.Length);
+            Array.Sort(_frameIntervals, 0, count);
+            var culture = System.Globalization.CultureInfo.InvariantCulture;
+            string report = "build=" + BuildIdentity.Label + " fps=" + (_frameSamples * 1000.0 / _frameDuration).ToString("0.0", culture) +
+                " target_fps=" + FPS + " scope=ui_present_call p50_ms=" + FramePercentile(_frameIntervals, count, 50).ToString("0.00", culture) +
+                " p95_ms=" + FramePercentile(_frameIntervals, count, 95).ToString("0.00", culture) +
+                " p99_ms=" + FramePercentile(_frameIntervals, count, 99).ToString("0.00", culture) +
+                " longest_ms=" + _frameLongest.ToString("0.00", culture) + " late_frames=" + _frameMisses +
+                " longest_late_run=" + _frameLongestRun + " stalls_over_50ms=" + _frameStalls +
+                " update_max_ms=" + _frameUpdateMax.ToString("0.00", culture) +
+                " draw_max_ms=" + _frameDrawMax.ToString("0.00", culture) +
+                " present_max_ms=" + _framePresentMax.ToString("0.00", culture) + " renderer=software 1920x1080";
             if (BuildIdentity.OwnerDebug)
             {
                 try { report += " owner_debug=1 managed_heap_bytes=" + GC.GetTotalMemory(false) +
                     " gc0=" + GC.CollectionCount(0) + " gc1=" + GC.CollectionCount(1) + " gc2=" + GC.CollectionCount(2); }
                 catch (Exception ex) { report += " owner_debug=1 managed_heap_probe_error=" + ex.GetType().Name; }
             }
-            _frameSamples = _frameMisses = _frameLongest = 0; _frameWindowStart = now;
+            _frameSamples = _frameMisses = _frameStalls = _frameMissRun = _frameLongestRun = 0;
+            _frameDuration = _frameLongest = _frameUpdateMax = _frameDrawMax = _framePresentMax = 0;
             ThreadPool.QueueUserWorkItem(_ => SspiLog.Write("startup", "frame_sample " + report));
+        }
+
+        internal static double FramePercentile(double[] sorted, int count, int percentile)
+        {
+            if (sorted == null || count <= 0) return 0;
+            count = Math.Min(count, sorted.Length);
+            if (count == 0) return 0;
+            int rank = (int)Math.Ceiling(count * Math.Max(0, Math.Min(100, percentile)) / 100.0) - 1;
+            return sorted[Math.Max(0, Math.Min(count - 1, rank))];
         }
 
         static DlItem PrimaryTransfer(DownloadGroup group)
         {
             foreach (var item in group.Items)
                 if (item.State == DlState.Downloading || item.State == DlState.Resolving || item.State == DlState.Finalizing || item.State == DlState.Installing) return item;
+            foreach (var item in group.Items)
+                if (item.ParkedForProvider && DownloadRingAnimating(item)) return item;
             foreach (var item in group.Items)
                 if (item.State == DlState.Failed) return item;
             foreach (var item in group.Items)
@@ -97,7 +125,17 @@ namespace Orbis
             IntPtr texture; int width, height;
             string key = game == null ? "" : _covers.RequestSized(game.TitleId, game.ImageUrl, art.w, art.h);
             if (_covers.TryGet(key, out texture, out width, out height)) CopyCoverFill(renderer, texture, width, height, art);
-            else Fill(renderer, art.x, art.y, art.w, art.h, C(28, 30, 34));
+            else
+            {
+                Fill(renderer, art.x, art.y, art.w, art.h, C(28, 30, 34));
+                if (art.w >= 100)
+                {
+                    var label = new SDL_Rect { x = art.x + 6, y = art.y + art.h / 2 - 18, w = art.w - 12, h = 22 };
+                    TextCentered(renderer, label, 13, game == null ? "" : game.TitleId ?? "", Muted);
+                    label.y += 24;
+                    TextCentered(renderer, label, 12, _covers.HasFailed(key) ? "Cover unavailable" : "Loading cover…", Dim);
+                }
+            }
             if (frame != IntPtr.Zero) SDL_RenderCopy(renderer, frame, IntPtr.Zero, ref box);
             else if (_caseFrame != IntPtr.Zero) SDL_RenderCopy(renderer, _caseFrame, IntPtr.Zero, ref box);
         }
@@ -266,8 +304,7 @@ namespace Orbis
                 {
                     MarkUiProgress("downloads-outline");
                     SDL_Color stateTone = DownloadRingColor(item);
-                    bool moving = item != null && (item.State == DlState.Downloading || item.State == DlState.Resolving ||
-                        item.State == DlState.Finalizing || item.State == DlState.Installing);
+                    bool moving = DownloadRingAnimating(item);
                     double pulse = !_cfg.ReduceMotion && moving ? .65 + .35 * (.5 + .5 * Math.Sin(UiTick() * Math.PI / 1600.0)) : 1;
                     var halo = new SDL_Rect { x = frame.x - 2, y = frame.y - 2, w = frame.w + 4, h = frame.h + 4 };
                     StrokeRect(renderer, halo, C((byte)(stateTone.r * pulse / 3), (byte)(stateTone.g * pulse / 3), (byte)(stateTone.b * pulse / 3)), 1);
@@ -279,9 +316,17 @@ namespace Orbis
             MarkUiProgress("downloads-complete");
         }
 
+        internal static bool DownloadRingAnimating(DlItem item)
+        {
+            return item != null && !item.PauseRequested && !item.CancelRequested && !item.RemoveRequested &&
+                ((item.ParkedForProvider && item.State == DlState.Queued) || item.State == DlState.Downloading ||
+                item.State == DlState.Resolving || item.State == DlState.Finalizing || item.State == DlState.Installing);
+        }
+
         static SDL_Color DownloadRingColor(DlItem item)
         {
             if (item == null) return C(146, 153, 163);
+            if (item.ParkedForProvider && DownloadRingAnimating(item)) return C(180, 155, 220);
             switch (item.State)
             {
                 case DlState.Downloading: return C(87, 196, 220);

@@ -19,7 +19,7 @@
   3. This notice may not be removed or altered from any source distribution.
 */
 
-/* SSPI modification: bounded display memory, actual kernel errors and failure cleanup. */
+/* SSPI modification: bounded display memory, damage tracking and deferred VSYNC. */
 #include "../../SDL_internal.h"
 #include "SDL_timer.h"
 #include <orbis/libkernel.h>
@@ -127,19 +127,30 @@ static int WaitOnFlip(_THIS)
     }
 }
 
-static void SubmitFlip(_THIS)
+static int SubmitFlip(_THIS)
 {
     int rc = sceVideoOutSubmitFlip(Handle(_this), VData->currBuffer, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
-    if (rc != 0) { FlipWarning("submit", rc); return; }
+    if (rc != 0) { FlipWarning("submit", rc); return -1; }
     VData->currBuffer = ((VData->currBuffer + 1) % BufferCount(_this));
-    WaitOnFlip(_this);
+    /* The next update waits before writing. Rendering the next SDL surface can
+       overlap this pending flip without touching either scanout buffer. */
+    return 0;
+}
+
+static void InvalidateFramebuffer(_THIS)
+{
+    VData->framebufferWindow = NULL;
+    VData->framebufferSurface = NULL;
+    memset(VData->framebufferDamage, 0, sizeof(VData->framebufferDamage));
+    memset(VData->framebufferClear, 1, sizeof(VData->framebufferClear));
 }
 
 /* Only the PS4 backend owns these fields; preserve the existing SDL ABI prefix. */
 static void FreeFramebuffers(_THIS)
 {
     if (VData->registered) {
-        sceVideoOutUnregisterBuffers(VData->h_vout, 0);
+        int rc = sceVideoOutUnregisterBuffers(VData->h_vout, 0);
+        if (rc != 0) { FlipWarning("unregister", rc); return; }
         VData->registered = 0;
     }
     if (VData->mapAddr) {
@@ -151,6 +162,8 @@ static void FreeFramebuffers(_THIS)
         VData->allocated = 0;
     }
     memset(VData->addrList, 0, sizeof(VData->addrList));
+    VData->currBuffer = 0;
+    InvalidateFramebuffer(_this);
 }
 
 static int framebuffer_error(const char *stage, int code, size_t bytes, size_t limit)
@@ -195,13 +208,25 @@ static int AllocFramebuffers(_THIS)
 
 static void vout_cleanup(_THIS)
 {
+    if (VData->registered) WaitOnFlip(_this);
     FreeFramebuffers(_this);
+    if (VData->registered) {
+        /* Unregister can fail while a timed-out flip owns the buffers. A
+           successful close releases them; a failed close keeps all ownership
+           and the event queue intact for a later cleanup attempt. */
+        int rc = sceVideoOutClose(VData->h_vout);
+        if (rc != 0) { FlipWarning("close", rc); return; }
+        VData->h_vout = 0;
+        VData->registered = 0;
+        FreeFramebuffers(_this);
+    }
     if (VData->flipQueue) {
         sceKernelDeleteEqueue(VData->flipQueue);
         VData->flipQueue = 0;
     }
     if (VData->h_vout > 0) {
-        sceVideoOutClose(VData->h_vout);
+        int rc = sceVideoOutClose(VData->h_vout);
+        if (rc != 0) { FlipWarning("close", rc); return; }
         VData->h_vout = 0;
     }
 }
@@ -452,6 +477,8 @@ int  PS4_CreateWindowFramebuffer(_THIS, SDL_Window * window, Uint32 * format, vo
     SDL_WindowData *data = (SDL_WindowData *) window->driverdata;
     surface = data->surface;
     SDL_FreeSurface(surface);
+    data->surface = NULL;
+    InvalidateFramebuffer(_this);
 
     /* Create a new one */
     SDL_PixelFormatEnumToMasks(surface_format, &bpp, &Rmask, &Gmask, &Bmask, &Amask);
@@ -471,47 +498,137 @@ int  PS4_CreateWindowFramebuffer(_THIS, SDL_Window * window, Uint32 * format, vo
     return 0;
 }
 
+/* Clip in surface coordinates before translating to scanout coordinates. The
+   wide intermediates also handle negative/offscreen windows and large rects. */
+static SDL_Rect FramebufferRect(_THIS, SDL_Window *window, SDL_Surface *surface, const SDL_Rect *rect)
+{
+    SDL_Rect result = { 0, 0, 0, 0 };
+    int64_t left = rect ? rect->x : 0;
+    int64_t top = rect ? rect->y : 0;
+    int64_t right = left + (rect ? rect->w : window->w);
+    int64_t bottom = top + (rect ? rect->h : window->h);
+    int64_t width = window->w < surface->w ? window->w : surface->w;
+    int64_t height = window->h < surface->h ? window->h : surface->h;
+    int64_t screenRight = (int64_t)VData->width - window->x;
+    int64_t screenBottom = (int64_t)VData->height - window->y;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (left < -(int64_t)window->x) left = -(int64_t)window->x;
+    if (top < -(int64_t)window->y) top = -(int64_t)window->y;
+    if (right > width) right = width;
+    if (bottom > height) bottom = height;
+    if (right > screenRight) right = screenRight;
+    if (bottom > screenBottom) bottom = screenBottom;
+    if (right <= left || bottom <= top) return result;
+    result.x = (int)(left + window->x);
+    result.y = (int)(top + window->y);
+    result.w = (int)(right - left);
+    result.h = (int)(bottom - top);
+    return result;
+}
+
+static void AddFramebufferDamage(SDL_Rect *damage, SDL_Rect rect)
+{
+    if (rect.w <= 0 || rect.h <= 0) return;
+    if (damage->w <= 0 || damage->h <= 0) {
+        *damage = rect;
+        return;
+    }
+    int right = damage->x + damage->w;
+    int bottom = damage->y + damage->h;
+    if (right < rect.x + rect.w) right = rect.x + rect.w;
+    if (bottom < rect.y + rect.h) bottom = rect.y + rect.h;
+    if (damage->x > rect.x) damage->x = rect.x;
+    if (damage->y > rect.y) damage->y = rect.y;
+    damage->w = right - damage->x;
+    damage->h = bottom - damage->y;
+}
+
+static void ClearFramebufferBorders(_THIS, uint8_t *pixels, SDL_Rect view)
+{
+    size_t pitch = (size_t)VData->width * 4;
+    if (view.w <= 0 || view.h <= 0) {
+        memset(pixels, 0, BufferSize(_this));
+        return;
+    }
+    if (view.y > 0) memset(pixels, 0, (size_t)view.y * pitch);
+    size_t bottom = (size_t)view.y + view.h;
+    if (bottom < VData->height)
+        memset(pixels + bottom * pitch, 0, (VData->height - bottom) * pitch);
+    if (view.x == 0 && (uint32_t)view.w == VData->width) return;
+    size_t right = ((size_t)view.x + view.w) * 4;
+    for (int y = view.y; y < view.y + view.h; y++) {
+        uint8_t *row = pixels + (size_t)y * pitch;
+        if (view.x > 0) memset(row, 0, (size_t)view.x * 4);
+        if (right < pitch) memset(row + right, 0, pitch - right);
+    }
+}
+
 int  PS4_UpdateWindowFramebuffer(_THIS, SDL_Window * window, const SDL_Rect * rects, int numrects)
 {
-//	D_FN();
-
-    SDL_Surface *surface;
-
     SDL_WindowData *data = (SDL_WindowData *) window->driverdata;
-    surface = data->surface;
+    SDL_Surface *surface = data->surface;
     if (!surface) {
         return SDL_SetError("Couldn't find framebuffer surface for window");
     }
-    /* Never reuse a scanout buffer after a timed-out or failed flip wait. */
+    if (!surface->pixels || surface->w <= 0 || surface->h <= 0 || surface->pitch <= 0 ||
+        (size_t)surface->w > (size_t)surface->pitch / 4)
+        return SDL_SetError("Invalid PS4 framebuffer surface layout");
+
+    SDL_Rect view = FramebufferRect(_this, window, surface, NULL);
+    SDL_Rect *previous = &VData->framebufferWindowRect;
+    if (VData->framebufferWindow != window || VData->framebufferSurface != surface ||
+        previous->x != window->x || previous->y != window->y ||
+        previous->w != window->w || previous->h != window->h ||
+        VData->framebufferSurfaceWidth != surface->w || VData->framebufferSurfaceHeight != surface->h) {
+        VData->framebufferWindow = window;
+        VData->framebufferSurface = surface;
+        previous->x = window->x;
+        previous->y = window->y;
+        previous->w = window->w;
+        previous->h = window->h;
+        VData->framebufferSurfaceWidth = surface->w;
+        VData->framebufferSurfaceHeight = surface->h;
+        for (unsigned i = 0; i < VOUT_NUM_BUFFERS; i++) {
+            VData->framebufferClear[i] = 1;
+            VData->framebufferDamage[i] = view;
+        }
+    } else {
+        int count = rects && numrects > 0 ? numrects : 1;
+        for (int r = 0; r < count; r++) {
+            SDL_Rect rect = rects && numrects > 0 ? FramebufferRect(_this, window, surface, &rects[r]) : view;
+            for (unsigned i = 0; i < VOUT_NUM_BUFFERS; i++)
+                AddFramebufferDamage(&VData->framebufferDamage[i], rect);
+        }
+    }
+
+    unsigned index = VData->currBuffer;
+    SDL_Rect damage = VData->framebufferDamage[index];
+    if (!VData->framebufferClear[index] && (damage.w <= 0 || damage.h <= 0)) return 0;
+    /* Save damage before waiting: a dropped update must reach both buffers on
+       recovery. Never write the old scanout until the pending flip completes. */
     if (WaitOnFlip(_this) != 0) return 0;
-    /* Send the data to the display */
-
-
-
-	uint32_t * pDst = (uint32_t*)CurrentBuffer(_this);
-	if (!pDst) {
-		SDL_SetError("GOT INVALID FB PTR");
-		return -1;
-	}
-	memset(pDst, 0, BufferSize(_this));
-
-	/// annoyances ...  calculate actual window coords and clip
-
-	PS4_VideoData;	// videoData *
-	uint32_t xOffs = window->x, yOffs = window->y;
-	uint32_t drawW = window->w, drawH = window->h;
-
-	xOffs = (xOffs < videoData->width) ? xOffs : videoData->width - 1;
-	yOffs = (yOffs < videoData->height)? yOffs : videoData->height- 1;
-
-	drawW = ((xOffs + drawW) <= videoData->width) ? drawW : (videoData->width - xOffs);
-	drawH = ((yOffs + drawH) <= videoData->height)? drawH : (videoData->height- yOffs);
-
-	for (uint32_t y = 0; y < drawH; y++)
-		memcpy(&pDst[videoData->width * (yOffs+y) + xOffs], &((uint8_t*)surface->pixels)[y*surface->pitch], sizeof(uint32_t)*drawW);	// surface->pitch);
-
-	SubmitFlip(_this);
-
+    uint8_t *dst = CurrentBuffer(_this);
+    if (!dst) return SDL_SetError("GOT INVALID FB PTR");
+    if (VData->framebufferClear[index]) ClearFramebufferBorders(_this, dst, view);
+    if (damage.w > 0 && damage.h > 0) {
+        size_t dstPitch = (size_t)VData->width * 4;
+        size_t rowBytes = (size_t)damage.w * 4;
+        size_t srcX = (size_t)((int64_t)damage.x - window->x);
+        size_t srcY = (size_t)((int64_t)damage.y - window->y);
+        const uint8_t *src = (const uint8_t *)surface->pixels + srcY * surface->pitch + srcX * 4;
+        dst += (size_t)damage.y * dstPitch + (size_t)damage.x * 4;
+        if (rowBytes == dstPitch && rowBytes == (size_t)surface->pitch && srcX == 0) {
+            memcpy(dst, src, rowBytes * damage.h);
+        } else {
+            for (int y = 0; y < damage.h; y++)
+                memcpy(dst + (size_t)y * dstPitch, src + (size_t)y * surface->pitch, rowBytes);
+        }
+    }
+    if (SubmitFlip(_this) == 0) {
+        memset(&VData->framebufferDamage[index], 0, sizeof(SDL_Rect));
+        VData->framebufferClear[index] = 0;
+    }
     return 0;
 }
 
@@ -523,6 +640,7 @@ void PS4_DestroyWindowFramebuffer(_THIS, SDL_Window * window)
 
     SDL_FreeSurface(data->surface);
     data->surface = NULL;
+    InvalidateFramebuffer(_this);
 }
 
 

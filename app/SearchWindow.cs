@@ -250,7 +250,9 @@ namespace Orbis
         {
             RequireStartupRenderer(Renderer == null ? IntPtr.Zero : Renderer.Handler);
             Program.StartupStage("window-renderer-ready");
-            FPS = 30;
+            FPS = 60;
+            // Every normal and launch screen paints an opaque full background.
+            ClearBeforeDraw = false;
             ClearR = Bg.r; ClearG = Bg.g; ClearB = Bg.b;
             // Continue the branded PS4 launch screen while managed services initialize.
             try
@@ -2032,7 +2034,8 @@ namespace Orbis
                         string groupError;
                         if (_dlMgr.Remove(id, out groupError) || groupError == "Download not found") removed++; else detail = groupError;
                     }
-                    User.NotifyToast(detail == null ? "Removal requested for " + removed + " packages" : "Removed " + removed + "; " + Clip(detail, 60));
+                    User.NotifyToast(detail == null ? "Removal requested for " + removed + " packages" :
+                        (removed > 0 ? "Removal requested for " + removed + "; " : "Could not remove: ") + Clip(detail, 60));
                     });
                     return;
                 }
@@ -2262,7 +2265,7 @@ namespace Orbis
             if (q.Length > 0) RememberQuery(q);
             string sourceStamp = _packageSources.CatalogFingerprint();
             List<GameHit> cached;
-            if (QueryCache.TrySearch(q, out cached, sourceStamp) && cached != null && cached.Count > 0)
+            if (!_packageSources.HasSearchRefresh() && QueryCache.TrySearch(q, out cached, sourceStamp) && cached != null && cached.Count > 0)
             {
                 _covers.BumpGeneration();
                 lock (_lock)
@@ -2400,7 +2403,8 @@ namespace Orbis
         {
             if (selection == null || results == null || string.IsNullOrEmpty(selection.TitleId)) return null;
             string region = ResolveSelectionRegion(selection.Region);
-            foreach (var result in results)
+            foreach (var group in results)
+            foreach (var result in group.Variants ?? new List<SourceTitleResult> { group })
             {
                 if (!string.Equals(selection.TitleId, result.TitleId, StringComparison.OrdinalIgnoreCase)) continue;
                 string sourceRegion = ResolveSelectionRegion(result.Region);
@@ -2578,6 +2582,8 @@ namespace Orbis
 
         string ResolveEmptyHeading()
         {
+            if (string.IsNullOrEmpty(_resolveError) && _links.Count > 0 && _detailTypeCounts[0] == 0)
+                return _linkStatusLookup != null && _linkStatusLookup.IsChecking ? "Checking supported mirrors" : "No supported mirrors";
             return !string.IsNullOrEmpty(_resolveError) ? "Packages unavailable" :
                 _links.Count == 0 ? "No packages published" : "No matching packages";
         }
@@ -2585,6 +2591,8 @@ namespace Orbis
         string ResolveEmptyDescription()
         {
             if (!string.IsNullOrEmpty(_resolveError)) return _resolveError;
+            if (_links.Count > 0 && _detailTypeCounts[0] == 0)
+                return "Only hosts supported by your enabled services are shown. Retry the check, choose another region, or check Connections.";
             if (_links.Count > 0) return "Choose another package type, host or version.";
             return "This source has no published packages for the selected title and region. Try another title or region.";
         }
@@ -2614,6 +2622,8 @@ namespace Orbis
                     if (candidates == null)
                         throw new Exception(string.IsNullOrEmpty(sourceError)
                             ? "Package Source resolve failed" : sourceError);
+                    string supportMessage;
+                    candidates = DebridHostSupport.Filter(_cfg, candidates, true, out supportMessage);
                     lock (_lock) { if (gen != _resolveGeneration) return; }
                     int queued = QueueRecommendedCandidates(game, candidates);
                     lock (_lock)
@@ -2659,6 +2669,9 @@ namespace Orbis
         int QueueRecommendedCandidates(GameHit game, IList<PackageCandidate> candidates)
         {
             if (game == null || candidates == null || candidates.Count == 0) return 0;
+            var supported = new List<PackageCandidate>();
+            foreach (var candidate in candidates) if (DebridHostSupport.IsSupported(_cfg, candidate)) supported.Add(candidate);
+            candidates = supported;
             int baseIndex = PreferredCandidate(candidates, "base", false);
             int updateIndex = PreferredRecommendedPatch(candidates, _firmwareVersion);
             int queued = 0;
@@ -2670,10 +2683,14 @@ namespace Orbis
         bool QueueCandidate(GameHit game, PackageCandidate candidate, IList<PackageCandidate> mirrors)
         {
             if (candidate == null) return false;
+            if (!DebridHostSupport.IsSupported(_cfg, candidate)) {
+                SetStatus("This mirror is not currently supported. Retry the check or choose another mirror.");
+                return false;
+            }
             bool needsLinkService = candidate.AccessType != PackageAccessType.Direct;
             if (needsLinkService && _cfg.UseUnlockProvider &&
                 !string.Equals(_cfg.UnlockProviderId, UnlockProviders.NoneId, StringComparison.OrdinalIgnoreCase) &&
-                !UnlockProviders.IsConfigured(_cfg, _cfg.UnlockProviderId))
+                !_cfg.HasActiveUnlock)
             {
                 SetStatus("Configure " + UnlockProviders.DisplayName(_cfg.UnlockProviderId) + " in Settings");
                 return false;
@@ -2805,6 +2822,7 @@ namespace Orbis
             var summaryGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var meta in _linkPresentation)
             {
+                if (!PackageSupported(meta.Candidate)) continue;
                 if (summaryGroups.Add(DetailGroupKey(meta)))
                 {
                     _detailTypeCounts[0]++;
@@ -2895,10 +2913,13 @@ namespace Orbis
             bool needsLinkService = candidate.AccessType != PackageAccessType.Direct;
             if (needsLinkService && _cfg.UseUnlockProvider &&
                 !string.Equals(_cfg.UnlockProviderId, UnlockProviders.NoneId, StringComparison.OrdinalIgnoreCase) &&
-                !UnlockProviders.IsConfigured(_cfg, _cfg.UnlockProviderId))
+                !_cfg.HasActiveUnlock)
             {
-                SetStatus("Configure " + UnlockProviders.DisplayName(_cfg.UnlockProviderId) + " in Settings");
                 OpenSettings();
+                _settingsPage = 1;
+                _settingsFocus = Math.Max(0, Array.IndexOf(ConnectionProviderIds, _cfg.UnlockProviderId));
+                SetStatus("This mirror needs a connected service. Save its key and enable it in Connections.");
+                User.NotifyToast("Connect a download service for this mirror. SSPI and package sources are separate from service subscriptions.");
                 return;
             }
             try
@@ -3019,6 +3040,7 @@ namespace Orbis
                                 break;
                             }
                             SetStatus("Installing " + tid + "...");
+                            _dlMgr.TrackLocalInstallTask(id, installAttempt, taskId);
                             User.NotifyToast("Install started");
                             string waitError;
                             bool localCopyComplete;
@@ -3027,7 +3049,8 @@ namespace Orbis
                             {
                                 _dlMgr.UpdateInstallProgress(id, percent, installAttempt);
                                 if (percent >= 0) SetStatus("Installing " + checkId + "  " + percent + "%");
-                            }, out localCopyComplete, out waitError);
+                            }, out localCopyComplete, out waitError, () => _dlMgr.TryInterruptLocalInstall(id, installAttempt));
+                            if (waitError == "Installation stopped by queue") break;
                             if (completed)
                             {
                                 // Never delete the source PKG automatically. BGFT can still need
@@ -3129,6 +3152,7 @@ namespace Orbis
             ObservePresentedFrame();
             PollResidentLaunchMaintenance();
             if (!_startupServicesReady) { Invalidated = true; return; }
+            Program.RepeatNavigation();
             if (_launchFinished && !_audioStarted)
             {
                 _audioStarted = true;
@@ -3164,21 +3188,13 @@ namespace Orbis
                     PlayToastSound(nextToast);
                 }
             }
-            bool busyAnim;
-            bool sourceInstallAnim;
-            lock (_lock)
-            {
-                busyAnim = _browseBusy;
-                sourceInstallAnim = _sourceInstallStage != SourceInstallStage.Idle;
-            }
-            // The window owns the 33/34 ms presentation cadence. A second 100 ms
-            // throttle previously reduced normal navigation and downloads to 10 FPS.
+            // One monotonic 60 Hz deadline owns cadence; data polling keeps its
+            // existing lower rate independently of navigation and animation.
             Invalidated = true;
             _lastUiRefresh = FrameTime;
             MarkUiProgress("artwork-upload");
             _covers.PumpReady(Renderer.Handler, 1);
             MarkUiProgress("update-complete");
-            RecordFrameTiming(FrameTime);
         }
 
         void PollResidentLaunchMaintenance()
@@ -3194,7 +3210,10 @@ namespace Orbis
             // one consistent model for the entire frame, including footer hints.
             MarkUiProgress("draw-wait");
             try { lock (_lock) DrawFrame(FrameTime); }
-            catch (Exception ex) when (_startupServicesReady) { RecoverUi(ex, "draw"); }
+            catch (Exception ex) when (_startupServicesReady) {
+                Fill(Renderer.Handler, 0, 0, W, H, Bg);
+                RecoverUi(ex, "draw");
+            }
             MarkUiProgress("present");
             _frameAwaitingPresentation = true;
         }
@@ -3725,7 +3744,7 @@ namespace Orbis
                 TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 330, w = left.w - 40, h = 60 }, 18, _pairUiStage == PairUiStage.Waiting ? "Starting local pairing…" : "Press SQUARE to start pairing", Muted);
             }
             TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 500, w = left.w - 40, h = 34 }, 18, "Scan on the same Wi-Fi or wired network.", Muted);
-            TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 540, w = left.w - 40, h = 34 }, 17, "Your settings stay on this PS4.", Dim);
+            TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 540, w = left.w - 40, h = 34 }, 17, "SSPI is free. Service plans are separate.", Dim);
             int rx = sheet.x + 524, rw = sheet.w - 524;
             TextPx(r, rx, left.y + 8, 28, "Your connections", White);
             for (int i = 0; i < ConnectionProviderIds.Length; i++)
@@ -4042,7 +4061,7 @@ namespace Orbis
             TextPx(r, pebble.x + 64, pebble.y + 36, 15, rate + "  ·  " + pct + "%", Muted);
             int trackX = pebble.x + colW - 220;
             Fill(r, trackX, pebble.y + 30, 188, 6, Raised);
-            if (pct > 0) Fill(r, trackX, pebble.y + 30, 188 * pct / 100, 6, Accent);
+            if (pct > 0) Fill(r, trackX, pebble.y + 30, 188 * pct / 100, 6, White);
         }
 
         void DrawSoftKeyboardModal(IntPtr r, string label, string value, string action)
@@ -4706,14 +4725,14 @@ namespace Orbis
             if (determinate)
             {
                 int width = (int)Math.Max(0, Math.Min(track.w, item.Done * (double)track.w / item.Total));
-                if (width > 0) Fill(r, track.x, track.y, width, track.h, Accent);
+                if (width > 0) Fill(r, track.x, track.y, width, track.h, White);
             }
-            else if (item.State == DlState.Resolving || item.State == DlState.Finalizing || item.State == DlState.Installing || item.State == DlState.Downloading)
+            else if (DownloadRingAnimating(item))
             {
                 int segment = Math.Max(1, Math.Min(180, track.w / 4));
                 int x = _cfg.ReduceMotion ? 0 : (int)((_frameTime / 5) % (uint)Math.Max(1, track.w + segment)) - segment;
                 int first = Math.Max(0, x), last = Math.Min(track.w, x + segment);
-                if (last > first) Fill(r, track.x + first, track.y, last - first, track.h, Accent);
+                if (last > first) Fill(r, track.x + first, track.y, last - first, track.h, White);
             }
         }
 

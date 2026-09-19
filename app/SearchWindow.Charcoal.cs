@@ -145,11 +145,12 @@ namespace Orbis
         bool PackageMatches(int index)
         {
             var meta = _linkPresentation[index];
+            if (!PackageSupported(meta.Candidate)) return false;
             if (_packageFilter > 0 && (_packageFilter == 4 ? !string.Equals(meta.Kind, "backport", StringComparison.OrdinalIgnoreCase) : PackageKindOrder(meta.Kind) != _packageFilter - 1)) return false;
             if (_hostFilter > 0 && (_hostFilter > _detailHosts.Count || !string.Equals(meta.Hoster, _detailHosts[_hostFilter - 1], StringComparison.OrdinalIgnoreCase))) return false;
             if (_latestUpdateOnly && SamePackageKind(meta.Kind, "update"))
                 for (int i = 0; i < _linkPresentation.Count; i++)
-                    if (SamePackageKind(_linkPresentation[i].Kind, "update") && ComparePackageVersions(_linkPresentation[i].Version, meta.Version) > 0) return false;
+                    if (PackageSupported(_linkPresentation[i].Candidate) && SamePackageKind(_linkPresentation[i].Kind, "update") && ComparePackageVersions(_linkPresentation[i].Version, meta.Version) > 0) return false;
             return true;
         }
 
@@ -436,7 +437,9 @@ namespace Orbis
 
             if (_detailRows.Count == 0)
             {
-                DesignIcon(r, string.IsNullOrEmpty(_resolveError) ? "download" : "error", rightX + rightW / 2 - 20, 503, 40, Dim);
+                bool checking = string.IsNullOrEmpty(_resolveError) && _linkStatusLookup != null && _linkStatusLookup.IsChecking;
+                if (checking) DrawProviderCheckingDots(r, rightX + rightW / 2 - 14, 522);
+                else DesignIcon(r, string.IsNullOrEmpty(_resolveError) ? "download" : "error", rightX + rightW / 2 - 20, 503, 40, Dim);
                 TextCentered(r, new SDL_Rect { x = rightX, y = 574, w = rightW, h = 45 }, 27,
                     ResolveEmptyHeading(), White);
                 TextWrappedCentered(r, rightX + 90, 633, 19, rightW - 180,
@@ -579,6 +582,9 @@ namespace Orbis
             // read "Measuring speed." forever. Show the resolver's own progress
             // instead: an uncached provider preparing the file reports continuously.
             if (item.State == DlState.Resolving && !string.IsNullOrEmpty(item.StatusText)) return item.StatusText;
+            if (item.State == DlState.Downloading && item.BytesPerSec <= 0 && !string.IsNullOrEmpty(item.StatusText) &&
+                (item.StatusText.StartsWith("RAR part ", StringComparison.Ordinal) ||
+                 item.StatusText.StartsWith("Checking RAR part ", StringComparison.Ordinal))) return item.StatusText;
             if (item.State != DlState.Downloading && item.State != DlState.Resolving && !Extracting(item)) return item.StatusText ?? VisibleState(item);
             string rate = item.BytesPerSec > 0 ? (item.BytesPerSec / 1000000.0).ToString("0.00") + " MB/s" : "Measuring speed…";
             string eta = item.EtaSeconds > 0 ? "ETA " + (item.EtaSeconds / 60) + ":" + (item.EtaSeconds % 60).ToString("00") : "ETA —";
@@ -600,7 +606,9 @@ namespace Orbis
             int task;
             if ((record.Length < 4 || record.Length > 6) || !int.TryParse(record[1], out task)) return "Waiting for dependency";
             bool validKind = record.Length < 6 || record[5] == "6" || record[5] == "7" || record[5] == "8";
-            if (record.Length >= 5 && record[4] == "6" && record[2] == "1" && validKind) return "Installed";
+            bool verifiedRoute = record.Length >= 5 && record[4] == "6" && validKind;
+            verifiedRoute |= record.Length == 6 && record[4] == "7" && record[5] == "6" && task >= 0;
+            if (verifiedRoute && record[2] == "1" && record[3] == "0") return "Installed";
             if (failed) return "Failed · " + (error ?? "Installation not confirmed");
             return task >= 0 || record[3] == "2" ? "Installing" : "Waiting to install";
         }

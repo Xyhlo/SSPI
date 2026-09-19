@@ -255,6 +255,7 @@ namespace Orbis
             StopLinkStatusLookup();
             UiAudio.Shutdown();
             FinishLaunchBranding();
+            ReleasePattern();
             foreach (var frame in _caseSizes.Values) if (frame != IntPtr.Zero) SDL_DestroyTexture(frame);
             _caseSizes.Clear();
             if (_caseFrame != IntPtr.Zero) { SDL_DestroyTexture(_caseFrame); _caseFrame = IntPtr.Zero; }
