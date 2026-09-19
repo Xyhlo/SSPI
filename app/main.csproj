@@ -121,6 +121,8 @@
     <Compile Include="SourceHttps.cs" />
     <Compile Include="PackageSourceEngineRemote.cs" />
     <Compile Include="PackageSourceEngineStatic.cs" />
+    <Compile Include="PackageSourceEngineStatic.Refresh.cs" />
+    <Compile Include="PackageSourceEngineStatic.RefreshParser.cs" />
     <Compile Include="PackageSourceModels.cs" />
     <Compile Include="PackageSourcePackage.cs" />
     <Compile Include="PackageSourceRuntime.cs" />

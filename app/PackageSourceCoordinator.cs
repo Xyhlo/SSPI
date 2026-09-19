@@ -152,7 +152,8 @@ namespace Orbis
         { return Resolve(titleId, name, region, catalogUrl, "", "", limit, null); }
 
         public List<PackageCandidate> Resolve(string titleId, string name, string region,
-            string catalogUrl, string sourceId, string sourceVersion, int limit, Func<bool> cancel)
+            string catalogUrl, string sourceId, string sourceVersion, int limit, Func<bool> cancel,
+            string excludedSourceId = "")
         {
             if (limit <= 0) limit = PackageSourceEngineRemote.MaxPackages;
             if (limit > PackageSourceEngineRemote.MaxPackages) limit = PackageSourceEngineRemote.MaxPackages;
@@ -168,9 +169,9 @@ namespace Orbis
             var seen = new HashSet<string>(StringComparer.Ordinal);
             var reports = new List<SourceExecutionReport>();
 
-            Func<IPackageSourceRuntime, bool> selected = runtime => string.IsNullOrEmpty(sourceId) ||
+            Func<IPackageSourceRuntime, bool> selected = runtime => runtime.Source.SourceId != excludedSourceId && (string.IsNullOrEmpty(sourceId) ||
                 (runtime.Source.SourceId == sourceId && (string.IsNullOrEmpty(sourceVersion) ||
-                (runtime.Source.Descriptor != null && runtime.Source.Descriptor.Version == sourceVersion)));
+                (runtime.Source.Descriptor != null && runtime.Source.Descriptor.Version == sourceVersion))));
             var calls = BeginCalls(runtime => runtime.Resolve(request), cancel, selected);
             foreach (var runtime in _runtimes)
             {
@@ -187,7 +188,8 @@ namespace Orbis
                     foreach (var candidate in results)
                     {
                         if (!IsUsable(candidate, request.TitleId)) continue;
-                        if (!string.IsNullOrEmpty(request.Region) && PackageSourceEngineStatic.NormalizeRegion(candidate.Region) !=
+                        if (excludedSourceId.Length > 0 && !string.Equals(candidate.TitleId, request.TitleId, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!string.IsNullOrEmpty(request.Region) && !string.IsNullOrEmpty(candidate.Region) && PackageSourceEngineStatic.NormalizeRegion(candidate.Region) !=
                             PackageSourceEngineStatic.NormalizeRegion(request.Region)) continue;
                         Stamp(candidate, runtime.Source);
                         string key = CandidateKey(candidate);
@@ -270,7 +272,7 @@ namespace Orbis
         }
 
         static bool IsStatic(IPackageSourceRuntime runtime)
-        { return runtime.Source.Descriptor != null && runtime.Source.Descriptor.Engine != null && runtime.Source.Descriptor.Engine.Type == PackageSourceEngineStatic.EngineType; }
+        { return runtime.Source.Descriptor != null && runtime.Source.Descriptor.Engine != null && PackageSourceEngineStatic.IsCatalog(runtime.Source.Descriptor.Engine.Type); }
         static void ThrowIfCanceled(Func<bool> cancel)
         { if (cancel != null && cancel()) throw new OperationCanceledException(); }
 

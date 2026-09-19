@@ -165,6 +165,8 @@
 !/app/CloudCatalog.cs
 !/app/CommunitySources.cs
 !/app/PackageSourceEngineStatic.cs
+!/app/PackageSourceEngineStatic.Refresh.cs
+!/app/PackageSourceEngineStatic.RefreshParser.cs
 !/app/SearchWindow.Community.cs
 !/app/SearchWindow.MyFiles.cs
 !/app/SspiDataMigration.cs
@@ -173,6 +175,7 @@
 !/https/http_range.h
 !/native/sdl/SDL_ps4video.c
 !/native/sdl/SDL_ps4video.h
+!/native/sdl/WindowLoop.inc
 !/native/sspi_data_fs.h
 !/native/sspi_log.h
 !/resident/native/shell_loader.h
