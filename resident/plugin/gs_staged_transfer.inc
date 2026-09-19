@@ -536,6 +536,24 @@ static void gs_stage_idle_status(GsStage *stage, const char *state, const char *
         gs_stage_status(stage, state, error);
 }
 
+static void gs_stage_install_detail(const GsStage *stage, char *detail, size_t capacity)
+{
+    char path[128], line[1000], id[192], generation[80], decoded[640];
+    detail[0] = 0;
+    if (gs_ipc_path(path, sizeof(path), "/status.txt")) return;
+    FILE *file = fopen(path, "rb"); if (!file) return;
+    int valid = !gs_line(file, line, sizeof(line)) && !strcmp(line, "1") &&
+        !gs_encoded_line(file, id, sizeof(id)) && !strcmp(id, stage->job.id);
+    // State, byte counts and served flag precede the detail. Read the atomic
+    // worker snapshot so staged telemetry keeps the actual PS4 install phase.
+    for (int i = 0; valid && i < 4; i++) valid = !gs_line(file, line, sizeof(line));
+    valid = valid && !gs_encoded_line(file, decoded, sizeof(decoded)) &&
+        !gs_line(file, line, sizeof(line)) && !gs_line(file, generation, sizeof(generation)) &&
+        !strcmp(generation, stage->job.generation);
+    fclose(file);
+    if (valid) snprintf(detail, capacity, "%s", decoded);
+}
+
 static void gs_stage_install_poll(void)
 {
     if (gs_job.id[0] && gs_job.local_only) {
@@ -600,10 +618,11 @@ static void gs_stage_install_poll(void)
                 }
                 gs_stage_install_after = sceKernelGetProcessTime() + 3000000;
             } else if (gs_worker_running && gs_job.native_bgft) {
+                char detail[640]; gs_stage_install_detail(stage, detail, sizeof(detail));
                 stage->done = gs_done; stage->wire_bytes = gs_network_bytes;
                 int downloading = !strcmp(gs_state, "feeding");
                 gs_stage_status(stage, gs_paused ? "paused" : downloading ? "feeding" : "installing",
-                    downloading ? "PS4 is downloading the package directly" : "PS4 is completing installation");
+                    detail[0] ? detail : downloading ? "PS4 is downloading the package directly" : "PS4 is completing installation");
             } else if (gs_worker_running && gs_stream_slot < 0) {
                 const char *phase = !strcmp(gs_state, "extracting") ? "extracting" :
                     !strcmp(gs_state, "validating") ? "validating" : "installing";
@@ -613,7 +632,10 @@ static void gs_stage_install_poll(void)
                     else if (!gs_done) snprintf(message, sizeof(message), "Opening archive and reading package headers");
                     else snprintf(message, sizeof(message), "Extracted %lld MiB", (long long)(gs_done / (1024 * 1024)));
                     gs_stage_status(stage, phase, message);
-                } else gs_stage_idle_status(stage, phase, NULL);
+                } else {
+                    char detail[640]; gs_stage_install_detail(stage, detail, sizeof(detail));
+                    gs_stage_idle_status(stage, phase, detail);
+                }
             }
             else if (gs_worker_running && gs_stream_slot == stage->slot) {
                 gs_stage_lock(&stage->lock);
@@ -659,7 +681,7 @@ static void gs_stage_download_poll(void)
      * retained update waiting for its base must still let that base download. */
     for (int i = 0; i < GS_STAGE_COUNT; i++) {
         GsStage *stage = &gs_stages[i];
-        if (stage->job.auto_install && !stage->pending && !stage->canceled &&
+        if (stage->job.auto_install && !stage->pending && !stage->canceled && !stage->paused &&
             (!strcmp(stage->state, "staged") || !strcmp(stage->state, "waiting") || !strcmp(stage->state, "installing")) &&
             gs_stage_dependency_ready(stage)) return;
     }

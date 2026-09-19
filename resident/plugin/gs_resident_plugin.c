@@ -44,7 +44,8 @@
  * The budget is deliberately unchanged from the previous 90 s: BGFT may pause a
  * response body while it prepares or verifies on the same disk, and only a
  * hardware capture could prove a shorter bound safe. Any successful partial send
- * resets the deadline, and g_stop still cancels within one 10 ms wakeup. */
+ * resets the deadline. Short socket waits let shutdown or package cancellation
+ * interrupt that budget without truncating a merely slow, active receiver. */
 #define GS_LOOPBACK_STALL_US 90000000ULL
 #define GS_IPC_ROOT "/data/SSPI/resident"
 #define GS_IPC_ROOT_SHARED "/user/data/SSPI/resident"
@@ -254,13 +255,13 @@ static int wait_for_storage(void)
     return -1;
 }
 
-static int send_all(int socket_id, const void *data, size_t size)
+static int send_until(int socket_id, const void *data, size_t size, const volatile int *canceled)
 {
     const unsigned char *at = (const unsigned char *)data;
     uint64_t stalled_at = sceKernelGetProcessTime();
     while (size > 0)
     {
-        if (g_stop) return -1;
+        if (g_stop || (canceled && *canceled)) return -1;
         ssize_t sent = send(socket_id, at, size, 0);
         if (sent < 0 && errno == EINTR) continue;
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_stop &&
@@ -277,6 +278,9 @@ static int send_all(int socket_id, const void *data, size_t size)
     }
     return 0;
 }
+
+static int send_all(int socket_id, const void *data, size_t size)
+{ return send_until(socket_id, data, size, NULL); }
 
 static int send_head(int socket_id, int status, const char *reason, const char *extra)
 {
@@ -637,7 +641,7 @@ static void serve_client(int socket_id)
             break;
         }
         before = sceKernelGetProcessTime();
-        int send_result = send_all(socket_id, transfer_buffer, (size_t)count);
+        int send_result = send_until(socket_id, transfer_buffer, (size_t)count, job_route ? &gs_canceled : NULL);
         send_us += sceKernelGetProcessTime() - before;
         if (send_result != 0) break;
         remaining -= (int64_t)count;
@@ -672,7 +676,7 @@ static void *client_thread(void *argument)
         gs_log_write("resident", "bgft-http-recv-timeout fd=%d errno=%d", socket_id, errno);
         goto done;
     }
-    timeout.tv_sec = 30;
+    timeout.tv_sec = 1;
     if (setsockopt(socket_id, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))) {
         gs_log_write("resident", "bgft-http-send-timeout fd=%d errno=%d", socket_id, errno);
         goto done;
