@@ -4,13 +4,26 @@
 
 **Super Simple Package Installer** is a package manager for homebrew-enabled PlayStation 4 consoles. Search sources, compare packages, manage downloads and install content from a controller-friendly interface.
 
-**Current release: 5.11.1 beta · Build `8629117696fb`**
+**Current release: 5.11.2b beta · Build `13ca8ab42e3b`**
 
-[Download the 5.11.1 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.1-beta) · [Read the guide](https://xyhlo.github.io/SSPI/) · [Join Discord](https://discord.gg/hF2vw7ybRs) · [Report a bug](https://github.com/Xyhlo/SSPI/issues)
+[Download the 5.11.2b beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.2b) · [Read the guide](https://xyhlo.github.io/SSPI/) · [Join Discord](https://discord.gg/hF2vw7ybRs) · [Report a bug](https://github.com/Xyhlo/SSPI/issues)
 
-Download `sspi5.11.1.pkg` from the release assets. GitHub source archives are not installable PS4 packages. This release retains the in-app version label `BETA 5.11`; the build ID identifies the updated package.
+Download `sspi5.11.2b.pkg` from the release assets. GitHub source archives are not installable PS4 packages. This release retains the in-app version label `BETA 5.11`; the build ID identifies the updated package.
 
-## Changes in 5.11.1
+## Changes in 5.11.2b
+
+- **Queue ordering and recovery.** Base, update and DLC dependencies work when added out of order. Provider preparation can wait while ready downloads continue. Pause, cancel and remove requests survive reopening SSPI, with task-ownership checks before stopping an installation or releasing files.
+- **Clearer installation stages.** Eligible completed base packages on internal storage can use direct BGFT storage registration. Preparation, copying and confirmation are shown separately. Accepted installations retain their recovery records until completion is confirmed; the PS4 still performs its own installation work.
+- **Transfer stability.** Temporary interruptions use paced recovery, provider cooldowns are respected and connection counts can recover after a slowdown. Resume identity checks preserve existing data, interrupted lock records can recover, and TLS verification remains enabled with updated chain inputs.
+- **Cloud files and multipart preparation.** Stored-file imports retain the owning account and cloud file identity. TorBox reports sent and ready part counts, reuses existing jobs and waits through temporary capacity limits. AllDebrid delayed links also yield the queue while preparing.
+- **Provider support.** Usable mirrors are filtered against enabled services' reported support. Checks show three animated dots, individual unsupported services stay red, and failures identify the affected archive part instead of hiding the provider's error.
+- **Package lookup and catalog refresh.** Matching-title fallback, regional lookup and numeric/Roman-numeral searches improve discovery. Compatible sources can refresh new entries and cache them while keeping existing results available.
+- **Archive and drawer feedback.** RAR password retry decisions use decoder-phase evidence. Part checks name the current volume. The drawer has compact rows, longer bars and a size-weighted summary; progress fills stay neutral when changing the accent.
+- **Navigation and artwork.** The existing software renderer targets 60 FPS, with improved frame pacing, controller repeat handling, framebuffer copying and staged artwork uploads. Missing covers try an installed icon and exact-title metadata. A locked 60 FPS on every console remains unverified.
+
+See the [complete 5.11.2b changelog](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.2b) for every fix, updated controls, package checksum and testing details.
+
+## Included from 5.11.1
 
 - **Downloads drawer.** Press R2 to open Packages, Files and Errors directly under the selected game. Controls stay in the drawer until L2 closes it. Rounded cards keep their state-colored outline, and the separate transfer circle has been removed. Thanks to The Fantastic Loki for the drawer idea.
 - **Clearer errors and actions.** Failed jobs open on Errors, with scrollable error text and an attention strip. Updated action and confirmation dialogs show what will happen. Square on a game removes its queued packages together; Square inside the drawer targets the selected package. Installed games and original USB files are kept.
@@ -36,9 +49,9 @@ See the [release notes](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.1-beta)
 - **Clearer download status.** Progress shows resident ownership, transfer rate and remaining time. In 5.11.1, state colors and optional pulsing are carried by the rounded card and drawer outline. Reduce Motion disables pulsing.
 - **Startup and interface fixes.** Data migration retains conflicts, resident loading preserves the shell filesystem context, and framebuffer handling bounds waits and memory use. Cover decoding, cache identity, input handling and optional audio have also been refined.
 
-## Installing and using 5.11.1
+## Installing and using 5.11.2b
 
-Install `sspi5.11.1.pkg` over the existing SSPI application. Launch SSPI once to stage the updated resident, fully restart the PS4, re-enable GoldHEN and reopen SSPI. Check for `BETA 5.11 / 8629117696fb` in the footer. Closing SSPI alone leaves the previous resident loaded.
+Install `sspi5.11.2b.pkg` over the existing SSPI application. Launch SSPI once to stage the updated resident, fully restart the PS4, re-enable GoldHEN and reopen SSPI. Check for `BETA 5.11 / 13ca8ab42e3b` in the footer. Closing SSPI alone leaves the previous resident loaded.
 
 1. Open **Settings → Connections** and scan the pairing QR code with a phone on the same network. Save your service keys and enable the services you want to use.
 2. Open **Manage sources** and enable your installed package sources.
@@ -46,7 +59,7 @@ Install `sspi5.11.1.pkg` over the existing SSPI application. Launch SSPI once to
 4. Open **Downloads** and press **R2** for the file drawer. Use **Left/Right** for Packages, Files and Errors, **Up/Down** to select or scroll, and **L2** to close. With the drawer closed, the touchpad opens direct links, stored debrid files and USB installs.
 5. Use **Settings → Storage** to choose a staging location or browse stored files. Keep a selected USB drive connected until installation finishes.
 
-Match updates and DLC to the installed title ID. Missing version or firmware information is shown as unknown. A listed host or mirror does not guarantee service support or account availability.
+Match updates and DLC to the installed title ID. Missing version or firmware information is shown as unknown. Reported host support does not guarantee that a particular file is available. Cloud preparation and transfer to the PS4 are separate stages; a multipart set needs every volume.
 
 Runtime data is stored under `/data/SSPI`. Older `/data/GameSearch` data is migrated without overwriting conflicting files. Settings and service keys stay on the console.
 
@@ -69,7 +82,7 @@ The action row at the bottom of each screen shows the current bindings.
 
 ## Beta status
 
-The managed/native build, package verification and focused regression checks passed for this release. Console screenshots confirm the new region controls, drawer and appearance options on build `8629117696fb`. This does not establish universal firmware compatibility or prove every reported freeze and installation failure is resolved; further console testing remains necessary.
+The managed/native build, package verification and focused regression checks passed for this release. Host tests cover queue recovery, provider preparation, source refresh, installation routing, artwork and frame pacing; native PS4 APIs are mocked in those tests. Console testing under download and extraction load is still needed to measure sustained frame rate, transfer speed and installation time across models and firmware versions.
 
 Background work requires a matching resident worker and the console capabilities it uses. Large archives need room for downloaded volumes and extracted files. Transfer speed depends on the console, storage, network, host and service; a displayed rate is not a sustained-speed guarantee. Installation is complete only after the installer confirms it.
 
