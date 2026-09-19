@@ -9,10 +9,12 @@ using System.Text.RegularExpressions;
 
 namespace Orbis
 {
-    // Data-only catalog reader. No HTTP client, process, reflection or provider access.
-    internal static class PackageSourceEngineStatic
+    // Local catalog reader. Optional refresh lives in the separate bounded adapter.
+    internal static partial class PackageSourceEngineStatic
     {
         internal const string EngineType = "embedded-catalog-v1";
+        internal const string RefreshEngineType = "embedded-catalog-refresh-v1";
+        internal static bool IsCatalog(string type) { return type == EngineType || type == RefreshEngineType; }
         internal const int MaxTitles = 30000;
         const int MaxJsonBytes = 2 * 1024 * 1024;
         const int MaxShardBytes = 1500000;
@@ -44,6 +46,8 @@ namespace Orbis
             internal Func<string, byte[]> Read;
             internal PackageSourceDescriptor Descriptor;
             internal long PublishedTitles, PublishedReady, PublishedReleases;
+            internal RefreshConfiguration Refresh;
+            internal RefreshState Updates;
         }
 
         internal static void Invalidate()
@@ -73,9 +77,29 @@ namespace Orbis
             if (query.Length == 0) return 4;
             if (id == query) return 0;
             if (name == query) return 1;
+            if (words.Length == 1 && words[0].Length == 1 && char.IsLetter(words[0][0]))
+                return text.IndexOf(query, StringComparison.Ordinal) < 0 ? -1 : name.StartsWith(query, StringComparison.Ordinal) ? 2 : 3;
+            foreach (string word in words) if (!SearchWordMatches(text, word)) return -1;
             if (name.StartsWith(query, StringComparison.Ordinal)) return 2;
-            foreach (string word in words) if (text.IndexOf(word, StringComparison.Ordinal) < 0) return -1;
             return 3;
+        }
+
+        static readonly string[] RomanNumbers = { "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+            "xi", "xii", "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx" };
+        static string NumberWord(string word)
+        {
+            for (int i = 0; i < RomanNumbers.Length; i++)
+                if (word == RomanNumbers[i]) return (i + 1).ToString(CultureInfo.InvariantCulture);
+            return word;
+        }
+        static bool SearchWordMatches(string text, string word)
+        {
+            string number = NumberWord(word); int value;
+            if (!int.TryParse(number, NumberStyles.None, CultureInfo.InvariantCulture, out value))
+                return text.IndexOf(word, StringComparison.Ordinal) >= 0;
+            // Sequel numbers are whole words: II matches 2, but never III or 2026.
+            foreach (string token in text.Split(' ')) if (NumberWord(token) == number) return true;
+            return false;
         }
 
         internal static List<SourceTitleResult> Search(InstalledPackageSource source, string path, SourceSearchRequest request)
@@ -90,11 +114,13 @@ namespace Orbis
                 CheckCanceled(request.Cancel);
                 if (region.Length > 0 && record.Title.Region != region) continue;
                 int rank = Rank(record.NormalizedId, record.NormalizedName, record.SearchText, query, words);
+                rank = RefreshAliasRank(catalog, record.Title.TitleId, record.Title.DisplayName, request.Query, rank);
                 if (rank >= 0) matches.Add(new KeyValuePair<int, Record>(rank, record));
             }
             matches.Sort((a, b) => { int order = a.Key.CompareTo(b.Key); return order != 0 ? order : CompareTitle(a.Value.Title, b.Value.Title); });
             var result = new List<SourceTitleResult>(matches.Count);
             foreach (var match in matches) { var title = CloneTitle(match.Value.Title); title.SearchRankHint = match.Key; result.Add(title); }
+            AppendRefreshMatches(catalog, request, result);
             return result; // Coordinator selects a page only after all index records were searched.
         }
 
@@ -103,7 +129,7 @@ namespace Orbis
             CheckCanceled(request.Cancel);
             Catalog catalog = GetCatalog(source, path, request.Cancel);
             Record record; string id = (request.TitleId ?? "").Trim();
-            if (!catalog.ById.TryGetValue(id, out record)) return new List<PackageCandidate>();
+            if (!catalog.ById.TryGetValue(id, out record)) return ResolveRefresh(catalog, request);
             string region = NormalizeRegion(request.Region);
             if (region.Length > 0 && record.Title.Region.Length > 0 && region != record.Title.Region) return new List<PackageCandidate>();
             lock (catalog.ShardGate)
@@ -119,7 +145,7 @@ namespace Orbis
                 if (!shard.Titles.TryGetValue(record.Title.TitleId, out rows)) throw Bad("Selected title has no published package choices");
                 var result = new List<PackageCandidate>(rows.Count);
                 foreach (PackageCandidate row in rows)
-                    if (region.Length == 0 || row.Region == region) result.Add(CloneCandidate(row));
+                    if (region.Length == 0 || row.Region.Length == 0 || row.Region == region) result.Add(CloneCandidate(row));
                 return result;
             }
         }
@@ -182,9 +208,12 @@ namespace Orbis
             };
             var declared = new HashSet<string>(files.Keys, StringComparer.Ordinal); declared.Add("source.json");
             Catalog loaded = LoadIndex(source.Descriptor, read, declared, cancel);
+            InitializeRefresh(loaded);
             lock (Gate)
             {
                 if (epoch != Epoch) throw new OperationCanceledException("Source changed during catalog loading");
+                Catalog concurrent;
+                if (Catalogs.TryGetValue(key, out concurrent)) return concurrent;
                 Catalogs[key] = loaded; CatalogOrder.Remove(key); CatalogOrder.AddFirst(key);
                 while (CatalogOrder.Count > 2) { Catalogs.Remove(CatalogOrder.Last.Value); CatalogOrder.RemoveLast(); }
             }
@@ -193,8 +222,8 @@ namespace Orbis
 
         static Catalog LoadIndex(PackageSourceDescriptor descriptor, Func<string, byte[]> read, HashSet<string> declared, Func<bool> cancel)
         {
-            if (descriptor.Engine.Type != EngineType || descriptor.Engine.EntryFile != "catalog.json") throw Bad("Static engine entry must be catalog.json");
-            if (descriptor.Permissions.NetworkOrigins.Count != 0 || descriptor.Permissions.RedirectOrigins.Count != 0) throw Bad("Static catalogs cannot declare network origins");
+            if (!IsCatalog(descriptor.Engine.Type) || descriptor.Engine.EntryFile != "catalog.json") throw Bad("Static engine entry must be catalog.json");
+            if (descriptor.Engine.Type == EngineType && (descriptor.Permissions.NetworkOrigins.Count != 0 || descriptor.Permissions.RedirectOrigins.Count != 0)) throw Bad("Static catalogs cannot declare network origins");
             string[] version = descriptor.Version.Split('.'); int component;
             if (version.Length < 2 || version.Length > 4) throw Bad("Static catalog version must use numeric components");
             foreach (string item in version) if (!int.TryParse(item, NumberStyles.None, CultureInfo.InvariantCulture, out component) || component < 0) throw Bad("Static catalog version component is invalid");
@@ -210,6 +239,7 @@ namespace Orbis
             Integer(counts, "multipartGroups", true); Integer(counts, "unresolved", true);
             var catalog = new Catalog { Descriptor = descriptor, Read = read, PackageFiles = packageFiles,
                 PublishedTitles = Integer(counts, "titles", true), PublishedReady = Integer(counts, "readyTitles", true), PublishedReleases = Integer(counts, "releases", true) };
+            if (descriptor.Engine.Type == RefreshEngineType) catalog.Refresh = ReadRefreshConfiguration(root, descriptor);
             long indexBytes = 0;
             foreach (string file in indexFiles)
             {

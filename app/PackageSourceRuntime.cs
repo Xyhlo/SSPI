@@ -57,7 +57,7 @@ namespace Orbis
         public List<SourceTitleResult> Search(SourceSearchRequest request)
         {
             if (request == null) request = new SourceSearchRequest();
-            if (_engineType == PackageSourceEngineStatic.EngineType)
+            if (PackageSourceEngineStatic.IsCatalog(_engineType))
                 return PackageSourceEngineStatic.Search(_source, _versionPath, request);
             if (string.Equals(_engineType, "remote-api-v1", StringComparison.OrdinalIgnoreCase))
                 return PackageSourceEngineRemote.Search(_source, _versionPath, request.Query ?? "");
@@ -75,7 +75,7 @@ namespace Orbis
         public List<PackageCandidate> Resolve(SourceResolveRequest request)
         {
             if (request == null) request = new SourceResolveRequest();
-            if (_engineType == PackageSourceEngineStatic.EngineType)
+            if (PackageSourceEngineStatic.IsCatalog(_engineType))
                 return PackageSourceEngineStatic.Resolve(_source, _versionPath, request);
             if (string.Equals(_engineType, "remote-api-v1", StringComparison.OrdinalIgnoreCase))
                 return PackageSourceEngineRemote.Resolve(_source.Descriptor, _versionPath,
@@ -159,6 +159,13 @@ namespace Orbis
                 catch { }
             }
             return new PackageSourceCoordinator(runtimes);
+        }
+
+        internal bool HasSearchRefresh()
+        {
+            foreach (var entry in Store().GetEnabledSources())
+                if (entry.EngineType == PackageSourceEngineStatic.RefreshEngineType) return true;
+            return false;
         }
 
         internal string CatalogFingerprint()
@@ -271,8 +278,11 @@ namespace Orbis
                 string fingerprint = CatalogFingerprint(); int generation = _generation;
                 Func<bool> canceled = () => generation != _generation || (cancel != null && cancel());
                 if (canceled()) throw new OperationCanceledException();
+                var refreshSources = new List<PackageSourceRegistryEntry>();
+                if (offset == 0) foreach (var entry in Store().GetEnabledSources())
+                    if (entry.EngineType == PackageSourceEngineStatic.RefreshEngineType) refreshSources.Add(entry);
                 string snapshotKey = fingerprint + "\n" + (query ?? "").Trim() + "\n" + PackageSourceEngineStatic.NormalizeRegion(region);
-                SourceSearchPage cached = freshSearch ? null : CachedPage(snapshotKey, offset, limit);
+                SourceSearchPage cached = freshSearch || refreshSources.Count > 0 ? null : CachedPage(snapshotKey, offset, limit);
                 if (cached != null)
                 {
                     if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
@@ -285,9 +295,27 @@ namespace Orbis
                 Action<SourceSearchPage> publish = page => {
                     if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
                     page.Fingerprint = fingerprint; page.Warning = FailedSourceMessage(coordinator.LastReports);
+                    if (refreshSources.Count > 0) page.IsComplete = false;
                     if (progress != null) progress(page);
                 };
                 SourceSearchPage results = coordinator.SearchPage(query, offset, limit, publish, canceled, region);
+                if (refreshSources.Count > 0)
+                {
+                    bool changed = false;
+                    foreach (var entry in refreshSources)
+                    {
+                        if (canceled()) throw new OperationCanceledException();
+                        var runtime = new PackageSourceRuntimeAdapter(entry);
+                        changed |= PackageSourceEngineStatic.RefreshOnce(runtime.Source, entry.Path, canceled, query);
+                    }
+                    refreshSources.Clear();
+                    if (changed)
+                    {
+                        lock (_gate) _searchSnapshots.Clear();
+                        results = coordinator.SearchPage(query, offset, limit, publish, canceled, region);
+                    }
+                    else { results.IsComplete = true; if (progress != null) progress(results); }
+                }
                 if (canceled() || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during search");
                 results.Fingerprint = fingerprint;
                 LastPartialWarning = results.TotalMatches > 0
@@ -333,11 +361,21 @@ namespace Orbis
                 }
                 List<PackageCandidate> results = coordinator.Resolve(titleId, name, region, catalogUrl, sourceId, sourceVersion,
                     PackageSourceEngineRemote.MaxPackages, () => generation != _generation);
+                var reports = coordinator.LastReports;
+                if (results.Count == 0 && !string.IsNullOrWhiteSpace(titleId) && !string.IsNullOrEmpty(sourceId) && generation == _generation)
+                {
+                    // A grouped game's selected source may have disappeared. Try
+                    // other enabled sources for the exact title/region only; a
+                    // source-specific catalog URL must never cross this boundary.
+                    results = coordinator.Resolve(titleId, name, region, "", "", "",
+                        PackageSourceEngineRemote.MaxPackages, () => generation != _generation, sourceId);
+                    reports.AddRange(coordinator.LastReports);
+                }
                 if (generation != _generation || fingerprint != CatalogFingerprint()) throw new OperationCanceledException("Source changed during package lookup");
                 LastPartialWarning = results.Count > 0
-                    ? FailedSourceMessage(coordinator.LastReports) : null;
+                    ? FailedSourceMessage(reports) : null;
                 if (results.Count == 0)
-                    error = FailedSourceMessage(coordinator.LastReports);
+                    error = FailedSourceMessage(reports);
                 return string.IsNullOrEmpty(error) ? results : null;
             }
             catch (Exception ex) { error = RootMessage(ex); return null; }

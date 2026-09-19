@@ -210,14 +210,14 @@ namespace Orbis
             var root = rootValue as Dictionary<string, object>;
             if (root == null) throw new InvalidDataException("source.json must be a JSON object");
             Descriptor = ParseDescriptor(root);
-            if (Descriptor.Engine.Type != PackageSourceEngineStatic.EngineType) {
+            if (!PackageSourceEngineStatic.IsCatalog(Descriptor.Engine.Type)) {
                 long expanded = 0; foreach (var file in _files.Values) expanded += file.Length;
                 if (expanded > MaximumNonCatalogExpandedBytes) throw new InvalidDataException("Expanded non-catalog package exceeds 16 MiB");
             }
             if (Descriptor.Engine.EntryFile != "source.json" && !_files.ContainsKey(Descriptor.Engine.EntryFile))
                 throw new InvalidDataException("Engine entry file is missing: " + Descriptor.Engine.EntryFile);
             VerifyDeclaredFiles(root);
-            if (Descriptor.Engine.Type == PackageSourceEngineStatic.EngineType)
+            if (PackageSourceEngineStatic.IsCatalog(Descriptor.Engine.Type))
                 PackageSourceEngineStatic.ValidatePackage(this);
 
             // Wave 2 has no audited Ed25519 implementation. Never represent this as verified:
@@ -293,7 +293,7 @@ namespace Orbis
                 ? engineValue as Dictionary<string, object> : null;
             string engineType = engine != null ? FirstString(engine, "type") : (engineValue as string ?? "");
             if (engineType.Length == 0) engineType = FirstString(root, "engineType");
-            if (engineType != "remote-api-v1" && engineType != "recipe-v1" && engineType != "recipe-v2" && engineType != PackageSourceEngineStatic.EngineType)
+            if (engineType != "remote-api-v1" && engineType != "recipe-v1" && engineType != "recipe-v2" && !PackageSourceEngineStatic.IsCatalog(engineType))
                 throw new InvalidDataException("Unsupported source engine; update SSPI to use this source");
             string entry = engine != null ? FirstString(engine, "entryFile", "entry")
                                           : FirstString(root, "entryFile", "entry");
