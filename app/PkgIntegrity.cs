@@ -206,13 +206,10 @@ namespace Orbis
                 Version version;
                 if (!Version.TryParse(SfoValue(sfo, "APP_VER"), out version))
                     throw new IOException("Update has no valid application version");
-                string requiredHex = SfoValue(sfo, "SYSTEM_VER");
-                if (requiredHex.Length == 8)
-                {
-                    string required = int.Parse(requiredHex.Substring(0, 2)).ToString() + "." + requiredHex.Substring(2, 2);
-                    string label = FirmwareLabel(required, firmware);
-                    if (label.StartsWith("Needs backport")) throw new IOException(label + ". Choose the matching backport.");
-                }
+                // Backports can retain the original SYSTEM_VER while replacing the
+                // executables that require it. The metadata cannot prove whether
+                // the installer will accept the package on this firmware.
+                // Keep identity/version checks here and let BGFT report eligibility.
                 return true;
             }
             catch (OperationCanceledException) { throw; }

@@ -2,30 +2,32 @@
 #include "gs_unrar.h"
 #include <dirent.h>
 #define GS_MAX_VOLUMES 512
-typedef struct { char name[241], url[8192], path[1024], sha[65]; int64_t size; } GsVolume;
+/* Source names are UTF-8, not on-disk leaves. The app accepts 240 UTF-16
+ * characters and writes each volume to a separate, bounded staging path. */
+typedef struct { char name[1024], url[8192], path[1024], sha[65]; int64_t size; } GsVolume;
 static GsVolume *gs_volumes;
 static int gs_volume_count;
 
 
-static int gs_volume_record(FILE *file, GsVolume *volume)
+static const char *gs_volume_record(FILE *file, GsVolume *volume)
 {
     char line[64]; const char *end; const char *p;
     char root[1024];
-    if (gs_encoded_line(file, volume->name, sizeof(volume->name)) ||
-        gs_encoded_line(file, volume->url, sizeof(volume->url)) ||
-        gs_encoded_line(file, volume->path, sizeof(volume->path)) ||
-        gs_encoded_line(file, volume->sha, sizeof(volume->sha)) ||
-        gs_line(file, line, sizeof(line)) || parse_number(line, &volume->size, &end) || *end ||
-        volume->size <= 0 || volume->size > (int64_t)8 * 1024 * 1024 * 1024 * 1024) return -1;
+    if (gs_encoded_line(file, volume->name, sizeof(volume->name))) return "name-encoding";
+    if (gs_encoded_line(file, volume->url, sizeof(volume->url))) return "url-encoding";
+    if (gs_encoded_line(file, volume->path, sizeof(volume->path))) return "path-encoding";
+    if (gs_encoded_line(file, volume->sha, sizeof(volume->sha))) return "checksum-encoding";
+    if (gs_line(file, line, sizeof(line)) || parse_number(line, &volume->size, &end) || *end ||
+        volume->size <= 0 || volume->size > (int64_t)8 * 1024 * 1024 * 1024 * 1024) return "size";
     if (!volume->name[0] || strchr(volume->name, '/') || strchr(volume->name, '\\') ||
-        strchr(volume->name, ':') || strstr(volume->name, "..") ||
-        gs_staging_root(volume->path, root, sizeof(root)) < 0 || strcmp(root, gs_job.storage_root) ||
-        (strncmp(volume->url, "http://", 7) && strncmp(volume->url, "https://", 8))) return -1;
+        strchr(volume->name, ':') || !strcmp(volume->name, ".") || !strcmp(volume->name, "..")) return "name";
+    if (gs_staging_root(volume->path, root, sizeof(root)) < 0 || strcmp(root, gs_job.storage_root)) return "storage-path";
+    if (strncmp(volume->url, "http://", 7) && strncmp(volume->url, "https://", 8)) return "url-scheme";
     if (volume->sha[0]) {
-        if (strlen(volume->sha) != 64) return -1;
-        for (p = volume->sha; *p; p++) if (!strchr("0123456789abcdefABCDEF", *p)) return -1;
+        if (strlen(volume->sha) != 64) return "checksum";
+        for (p = volume->sha; *p; p++) if (!strchr("0123456789abcdefABCDEF", *p)) return "checksum";
     }
-    return 0;
+    return NULL;
 }
 
 static int gs_read_volumes(void)
@@ -79,7 +81,13 @@ static int gs_read_volumes(void)
     if (gs_line(file, line, sizeof(line)) || parse_number(line, &count, &end) || *end || count < 1 || count > GS_MAX_VOLUMES) goto error;
     gs_volumes = (GsVolume *)calloc((size_t)count, sizeof(GsVolume));
     if (!gs_volumes) goto error;
-    for (i = 0; i < count; i++) if (gs_volume_record(file, &gs_volumes[i])) goto error;
+    for (i = 0; i < count; i++) {
+        const char *error = gs_volume_record(file, &gs_volumes[i]);
+        if (error) {
+            gs_log_write("resident", "archive-metadata-rejected job=%s volume=%d field=%s", gs_job.id, i + 1, error);
+            goto error;
+        }
+    }
     gs_volume_count = (int)count; fclose(file); return 0;
 error:
     free(gs_volumes); gs_volumes = NULL; gs_volume_count = 0; fclose(file); return -1;
@@ -228,17 +236,11 @@ static int gs_verify_package(const char *path, int kind)
     if (kind == 8 && (gs_pkg_sfo(path, "CATEGORY", category, sizeof(category)) || strcmp(category, "gp") ||
         gs_pkg_sfo(path, "TITLE_ID", title, sizeof(title)) || strcmp(title, gs_job.title) ||
         gs_pkg_sfo(path, "APP_VER", version, sizeof(version)) || gs_version_number(version) < 0)) goto done;
-    // A base can require a newer launch firmware while its matching backport
-    // supplies compatible executables. Let BGFT decide whether it can install
-    // that base; rejecting it here prevents the backport from ever following.
-    if (kind != 6 && !gs_pkg_sfo(path, "SYSTEM_VER", required, sizeof(required))) {
-        unsigned char sw[0x28] = {0}; *(size_t *)sw = sizeof(sw);
-        if (!sceKernelGetSystemSwVersion((OrbisKernelSwVersion *)sw)) {
-            uint32_t have = 0; memcpy(&have, sw + 0x24, 4);
-            uint32_t need = (uint32_t)strtoul(required, NULL, 16);
-            if (have && need > have) { gs_write_status("failed", "Package requires newer firmware; select its backport"); goto done; }
-        }
-    }
+    // Backports may keep the original SYSTEM_VER in their metadata. BGFT must
+    // decide install eligibility for both the base and the patch; this value
+    // alone cannot prove that their executables need newer firmware.
+    if (!gs_pkg_sfo(path, "SYSTEM_VER", required, sizeof(required)))
+        gs_log_write("resident", "package-firmware job=%s declared=%s eligibility=installer", gs_job.id, required);
     if (kind != 7 && !gs_be64(h + 0x418)) goto done;
     int64_t package_size = gs_job.native_bgft && !strcmp(path, gs_job.destination) ? gs_job.total : st.st_size;
     const char *error = gs_pkg_header_error(h, package_size, 0, gs_job.title, NULL);
@@ -246,7 +248,7 @@ static int gs_verify_package(const char *path, int kind)
     result = 0;
 done:
     fclose(file);
-    if (result && strcmp(gs_state, "failed")) gs_write_status("failed", "PKG type, metadata or firmware requirement is invalid; file retained");
+    if (result && strcmp(gs_state, "failed")) gs_write_status("failed", "PKG type or metadata is invalid; file retained");
     return result;
 }
 
@@ -1506,6 +1508,7 @@ static int gs_run_archive(void)
         else if (!zip && count == -1001) snprintf(error, sizeof(error), "RAR header reading timed out; input retained. Remove the queue entry or retry after checking the archive.");
         else if (!zip && count == -1002) snprintf(error, sizeof(error), "RAR was read successfully but contains no PKG files; archive retained. Check that the source supplied a PS4 package archive.");
         else if (!zip && count == -1003) snprintf(error, sizeof(error), "Another RAR extraction is still running; input retained. Retry after it finishes.");
+        else if (!zip && count == -1005) snprintf(error, sizeof(error), "RAR decoder initialization failed; archive retained. Restart the console after updating SSPI and its background worker.");
         else if (!zip && count == -24) snprintf(error, sizeof(error), "RAR password is incorrect; archive retained. Update its password and retry.");
         else if (!zip && count == -22) snprintf(error, sizeof(error), "RAR password is required; archive retained. Enter its password and retry.");
         else if (!zip && count == -15) snprintf(error, sizeof(error), "RAR input could not be opened; archive retained. Check that its storage and all supplied volumes are accessible.");

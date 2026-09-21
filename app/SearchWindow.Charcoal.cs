@@ -188,15 +188,47 @@ namespace Orbis
         void RefreshQueueModel(bool force = false)
         {
             if (!force && _queueModelReady && UiElapsed(_queueModelAt) < 250) return;
-            string focusKey = _dlFocus >= 0 && _dlFocus < _queueRows.Count ? _queueRows[_dlFocus].Group.Key : null;
+            var previousGroup = _dlFocus >= 0 && _dlFocus < _queueRows.Count ? _queueRows[_dlFocus].Group : null;
+            string focusKey = previousGroup == null ? null : previousGroup.Key;
             _queueModelAt = UiTick(); _queueModelReady = true;
             _queueSnapshot = ReadDownloadSnapshot();
             _queueGroups = BuildDownloadGroups(_queueSnapshot);
+            // Follow a newly failed focused job into Attention instead of making
+            // its card disappear as soon as it leaves the Active filter.
+            if (_queueFilter == 1 && focusKey != null)
+            {
+                var focused = _queueGroups.Find(group => group.Key == focusKey);
+                if (focused != null && HasNewQueueFailure(previousGroup.Items, focused.Items))
+                {
+                    _queueFilter = 2;
+                    _dlScroll = 0;
+                    if (_downloadFilesTitle == focusKey)
+                    {
+                        _drawerTab = 2;
+                        _drawerFocus = _drawerScroll = 0;
+                        _drawerRowsDirty = true;
+                    }
+                }
+            }
             _queueRows = BuildDownloadRows(_queueGroups);
             int focus = _queueRows.FindIndex(row => row.Group.Key == (_downloadFilesTitle ?? focusKey));
             if (focus >= 0) _dlFocus = focus;
             if (_downloadFilesTitle != null && !_queueGroups.Exists(group => group.Key == _downloadFilesTitle)) CloseDownloadDrawer();
             _downloadView = _queueSnapshot;
+        }
+
+        internal static bool HasNewQueueFailure(IList<DlItem> previous, IList<DlItem> current)
+        {
+            if (previous == null || current == null) return false;
+            foreach (var item in current)
+            {
+                if (item.State != DlState.Failed) continue;
+                foreach (var old in previous)
+                    if (old.Id == item.Id && (old.State == DlState.Downloading ||
+                        old.State == DlState.Resolving || old.State == DlState.Finalizing ||
+                        old.State == DlState.Installing)) return true;
+            }
+            return false;
         }
 
         bool QueueGroupMatches(DownloadGroup group)

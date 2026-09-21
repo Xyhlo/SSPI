@@ -247,6 +247,8 @@ namespace Orbis
         volatile bool _run = true;
         long _saveVersion;
         long _savedVersion;
+        int _installRevision;
+        public int InstallRevision { get { lock (_lock) return _installRevision; } }
         int _residentPreparationAttempted;
         int _parkPollBusy;
         int _parkTimerStarted;
@@ -1565,6 +1567,8 @@ namespace Orbis
                 it.InstallOrderReady = false;
                 it.Error = null;
                 it.StatusText = msg ?? "Sent to PS4 — verify · PKG kept";
+                SspiLog.Write("download", "event=install-verification-pending title=" + it.TitleId +
+                    " kind=" + it.Kind + " task=" + bgftTaskId + " job=" + it.Id);
                 it.BytesPerSec = 0;
                 it.EtaSeconds = 0;
                 if (bgftTaskId >= 0)
@@ -1596,6 +1600,7 @@ namespace Orbis
                 it.InstallOrderReady = true;
                 if (!string.IsNullOrEmpty(it.DestPath) && File.Exists(it.DestPath))
                     it.Done = it.Total = new FileInfo(it.DestPath).Length;
+                _installRevision++;
                 SaveManifest();
             }
         }
@@ -1667,6 +1672,8 @@ namespace Orbis
                 it.InstallConfirmed = true;
                 _nextInstallHandoffAt = TransferClockMs() + 3000;
                 it.InstallOrderReady = true;
+                PreserveConfirmedDependency(it);
+                _installRevision++;
                 it.Error = null;
                 it.StatusText = msg ?? "Installed";
                 it.BytesPerSec = 0;
@@ -1692,6 +1699,8 @@ namespace Orbis
                 else if (deleteLocalPackage && !deleted)
                     it.StatusText = (msg ?? "Installed") + "; PKG retained";
                 SaveManifest();
+                SspiLog.Write("download", "event=install-confirmed title=" + it.TitleId + " kind=" + it.Kind +
+                    " job=" + it.Id + " bytes=" + it.Total + " input_deleted=" + deleted);
                 return deleted;
             }
         }
@@ -3503,7 +3512,8 @@ namespace Orbis
             if (changed)
             {
                 SaveManifest();
-                User.NotifyToast("DL fail");
+                User.NotifyToast("Needs attention: " + Clip(job.Name ?? job.TitleId ?? "Download", 40) +
+                    ". Open Downloads > Attention for the error. Files kept for retry.");
             }
         }
 
@@ -3893,6 +3903,7 @@ namespace Orbis
             string staging = Path.Combine(AppSettings.DownloadDir, ".extract", UrlTag(job.Id));
             var pending = new List<PendingLocalChild>();
             bool committed = false;
+            long downloadedBytes = job.Done, downloadTotal = job.Total;
             try
             {
                 // Resume after pause: moved PKGs survive (never deleted on pause),
@@ -3905,8 +3916,13 @@ namespace Orbis
                     }
                     goto AdoptedPlan;
                 }
-                PrepareExtractionDirectory(staging);
                 var paths = ArchivePaths(job);
+                // Older failed scans saved 0/0 or expanded-byte counters. Recover
+                // the compressed size from retained inputs before callbacks run.
+                long retainedBytes = 0;
+                foreach (string path in paths) retainedBytes = checked(retainedBytes + new FileInfo(path).Length);
+                downloadedBytes = downloadTotal = retainedBytes;
+                PrepareExtractionDirectory(staging);
                 lock (_lock) {
                     if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested) { CommitRequestedStop(job, attempt); return; }
                     job.State = DlState.Finalizing; job.StatusText = "Extracting packages...";
@@ -4117,13 +4133,32 @@ namespace Orbis
                 if (!committed)
                 {
                     TryCleanupFanOutPending(job);
-                    if (!CommitRequestedStop(job, attempt)) SetFailureIfCurrent(job, attempt, ex.Message);
+                    if (!CommitRequestedStop(job, attempt))
+                    {
+                        lock (_lock)
+                        {
+                            if (job.AttemptId == attempt)
+                                RestoreRetainedArchiveProgress(job, downloadedBytes, downloadTotal);
+                        }
+                        SetFailureIfCurrent(job, attempt, ex.Message);
+                    }
                 }
             }
             finally
             {
                 try { DeleteExtractionDirectory(staging); } catch { }
             }
+        }
+
+        internal static void RestoreRetainedArchiveProgress(DlItem job, long downloadedBytes, long downloadTotal)
+        {
+            // Extraction counts expanded bytes and starts at zero. A failed scan
+            // must not erase the completed compressed download from the queue.
+            job.Done = Math.Max(0, downloadedBytes);
+            job.Total = Math.Max(job.Done, downloadTotal);
+            job.StatsInitialized = false;
+            job.BytesPerSec = 0;
+            job.EtaSeconds = 0;
         }
 
         void FanOutLinks(DlItem job, int attempt)
@@ -4832,16 +4867,16 @@ namespace Orbis
                                 job.Done = job.Total;
                             }
                         }
-                    }, out localCopyComplete, out waitError, () => TryInterruptLocalInstall(job, attempt));
+                    }, out localCopyComplete, out waitError, () => TryInterruptLocalInstall(job, attempt), job.DestPath);
                 lock (_lock) if (job.State == DlState.Canceled || job.State == DlState.Queued) return;
                 if (completed)
                 {
                     lock (_lock) { if (AcceptInstallCallback(job, attempt)) job.InstallOrderReady = localCopyComplete; }
                     bool confirmedBase = actualKind == PkgContentKind.BaseGame &&
                         localCopyComplete && !string.IsNullOrEmpty(checkTitleId) &&
-                        PkgInstaller.IsTitleInstalled(checkTitleId);
+                        PkgInstaller.IsBasePackageInstalled(job.DestPath, checkTitleId);
                     if (confirmedBase)
-                        MarkInstalled(job.Id, "Installed " + checkTitleId + " — local PKG kept", false, attempt);
+                        MarkInstalled(job.Id, "Installed " + checkTitleId, true, attempt);
                     else
                         MarkInstallAccepted(job.Id,
                             actualKind == PkgContentKind.Patch || actualKind == PkgContentKind.AddOn
@@ -5133,10 +5168,15 @@ namespace Orbis
                 if (!object.ReferenceEquals(Find(item.Id), item) || (!item.Background && item.State != DlState.Submitted) ||
                     !AcceptInstallCallback(item, attempt)) return false;
                 item.State = DlState.Installed; item.InstallConfirmed = true; item.InstallOrderReady = true;
+                PreserveConfirmedDependency(item);
+                _installRevision++;
+                _nextInstallHandoffAt = TransferClockMs() + 3000;
                 item.Error = null;
                 item.StatusText = "Installed update v" + version; item.Done = item.Total; item.BytesPerSec = 0; item.EtaSeconds = 0;
                 if (item.ResidentArchive) { ResidentDownloadService.Release(item.Id); item.ResidentArchive = false; }
                 ClearBackground(item);
+                SspiLog.Write("download", "event=install-confirmed title=" + item.TitleId + " kind=" + item.Kind +
+                    " job=" + item.Id + " version=" + version);
             }
             SaveManifest(); return true;
         }
@@ -5422,7 +5462,8 @@ namespace Orbis
                     if (!item.Background) {
                         if ((item.CancelRequested && !_activeIds.Contains(item.Id) &&
                                 (item.BgftTaskId >= 0 || !string.IsNullOrEmpty(item.BgftContentId))) ||
-                            (item.State == DlState.Submitted && (PkgValidator.BgftSubTypeForKind(item.Kind) == 7 ||
+                            (item.State == DlState.Submitted && (PkgValidator.BgftSubTypeForKind(item.Kind) == 6 ||
+                                PkgValidator.BgftSubTypeForKind(item.Kind) == 7 ||
                                 PkgValidator.BgftSubTypeForKind(item.Kind) == 8))) active.Add(item);
                         continue;
                     }
@@ -5456,6 +5497,12 @@ namespace Orbis
                 }
                 if (!item.Background && item.State == DlState.Submitted) {
                     if (PkgValidator.BgftSubTypeForKind(item.Kind) == 8) { ConfirmInstalledUpdate(item); continue; }
+                    if (PkgValidator.BgftSubTypeForKind(item.Kind) == 6) {
+                        if (!PkgInstaller.IsBasePackageInstalled(item.DestPath, item.TitleId)) { item.BgftInstalledProofPolls = 0; continue; }
+                        if (++item.BgftInstalledProofPolls < 8) continue;
+                        MarkInstalled(item.Id, "Base game installation confirmed by PS4 content", true, item.AttemptId);
+                        continue;
+                    }
                     if (!PkgInstaller.IsAddonInstalled(item.DestPath, false)) { item.BgftInstalledProofPolls = 0; continue; }
                     if (++item.BgftInstalledProofPolls < 3) continue;
                     if (PkgInstaller.IsAddonInstalled(item.DestPath, true)) {
@@ -6468,12 +6515,25 @@ namespace Orbis
 
         internal void RestoreLocalFileForProcessing(DlItem item, string storedState, long size)
         {
-            ClearBackground(item);
             item.Done = item.Total = size;
             item.InstallConfirmed = false;
             item.BytesPerSec = 0; item.EtaSeconds = 0;
             DlState previous;
             if (!Enum.TryParse(storedState, true, out previous)) previous = DlState.Paused;
+            if (item.InstallSubmitted && (previous == DlState.Submitted || previous == DlState.Installing ||
+                (previous == DlState.Completed && !item.InstallOrderReady)))
+            {
+                // The PS4 task survives closing SSPI. Keep its identity and keep
+                // checking the installed package instead of orphaning dependencies
+                // or registering a second installation of the same input.
+                item.State = DlState.Submitted;
+                item.Background = false;
+                item.InstallOrderReady = false;
+                item.Error = null;
+                item.StatusText = "Checking previous PS4 installation; local PKG retained";
+                return;
+            }
+            ClearBackground(item);
             switch (previous)
             {
                 case DlState.Failed: case DlState.Canceled: case DlState.Paused:

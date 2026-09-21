@@ -103,6 +103,7 @@ namespace Orbis
         private int _libraryScanGen;
         private volatile bool _libraryScanBusy;
         private uint _consoleScanAt;
+        private int _libraryInstallRevision;
         private readonly List<GameHit> _consoleInstalled = new List<GameHit>(12);
         private readonly List<GameHit> _cloudPool = new List<GameHit>(18);
         private uint _landingModelAt;
@@ -486,6 +487,13 @@ namespace Orbis
 
         void RebuildLibraryGames(List<DlItem> items)
         {
+            int installRevision = _dlMgr != null ? _dlMgr.InstallRevision : 0;
+            if (installRevision != _libraryInstallRevision)
+            {
+                _libraryInstallRevision = installRevision;
+                _consoleScanAt = 0;
+                _libraryScanKey = "";
+            }
             var scanned = _pendingConsoleInstalled;
             if (scanned != null)
             {
@@ -526,13 +534,10 @@ namespace Orbis
                 DlItem item = items[i];
                 if (item == null || string.IsNullOrEmpty(item.TitleId)) continue;
                 if (PkgInstallPolicy.IsAddonOrPatchName(item.Kind)) continue;
-                if (item.State != DlState.Installed && item.State != DlState.Completed &&
-                    item.State != DlState.Submitted)
-                    continue;
+                if (item.State != DlState.Installed) continue;
                 if (!seen.Add(item.TitleId)) continue;
                 // The background console scan above supplies installed titles. A
                 // render/update must never enter the native installer to check one.
-                if (item.State != DlState.Installed) continue;
                 var hit = new GameHit
                 {
                     TitleId = item.TitleId,
@@ -3049,24 +3054,21 @@ namespace Orbis
                             {
                                 _dlMgr.UpdateInstallProgress(id, percent, installAttempt);
                                 if (percent >= 0) SetStatus("Installing " + checkId + "  " + percent + "%");
-                            }, out localCopyComplete, out waitError, () => _dlMgr.TryInterruptLocalInstall(id, installAttempt));
+                            }, out localCopyComplete, out waitError, () => _dlMgr.TryInterruptLocalInstall(id, installAttempt), path);
                             if (waitError == "Installation stopped by queue") break;
                             if (completed)
                             {
-                                // Never delete the source PKG automatically. BGFT can still need
-                                // the file after LocalCopyPercent hits 100, and early delete was
-                                // failing installs. User clears finished rows with SQUARE/TRIANGLE.
-                                // Only base-game title presence can confirm install.
-                                // Patch/DLC LocalCopy 100% is not proof — keep Submitted + PKG.
+                                // A dashboard entry can exist before installation finishes.
+                                // Use the same promoted-package proof as the automatic queue.
                                 bool confirmedBase = packageKind == PkgContentKind.BaseGame &&
                                     localCopyComplete &&
                                     !string.IsNullOrEmpty(checkId) &&
-                                    PkgInstaller.IsTitleInstalled(checkId);
+                                    PkgInstaller.IsBasePackageInstalled(path, checkId);
                                 if (confirmedBase)
                                 {
                                     _dlMgr.MarkInstalled(id,
-                                        "Installed " + checkId + " — PKG kept (SQUARE removes)", false, installAttempt);
-                                    SetStatus("Install complete: " + checkId + " — PKG kept");
+                                        "Installed " + checkId, true, installAttempt);
+                                    SetStatus("Install complete: " + checkId);
                                     User.NotifyToast("Install complete");
                                 }
                                 else

@@ -19,6 +19,8 @@
 #endif
 
 static const uint64_t maximum_expanded_bytes = 512ULL * 1024 * 1024 * 1024;
+// UnRAR's CRC lookup tables are populated by a C++ module constructor.
+extern unsigned int CRC32(unsigned int, const void *, size_t);
 static int extraction_busy;
 struct ExtractionLease {
     bool held;
@@ -285,6 +287,11 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
         volume_count > 512 || capacity < 1) return -ERAR_BAD_DATA;
     ExtractionLease lease;
     if (!lease.held) return -1003;
+    if ((CRC32(0xffffffffU, "123456789", 9) ^ 0xffffffffU) != 0xcbf43926U) {
+        rar_checkpoint(diagnostic, "runtime-init-failed", 0, 1005);
+        return -1005;
+    }
+    rar_checkpoint(diagnostic, "runtime-ready", 0, 0);
     if (capacity > 256) capacity = 256;
     Extraction ctx = { names, paths, volume_count, NULL, 0, 0, 0, progress, password ? password : "", {}, 0, diagnostic, 0, true, false };
     ActiveExtraction active(&ctx);
