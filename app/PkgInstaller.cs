@@ -358,7 +358,8 @@ namespace Orbis
         }
 
         public static bool WaitForInstall(int taskId, string titleId, PkgContentKind contentKind,
-            Action<int> progress, out bool localCopyComplete, out string error, Func<bool> interrupt = null)
+            Action<int> progress, out bool localCopyComplete, out string error, Func<bool> interrupt = null,
+            string sourcePath = null)
         {
             error = null;
             localCopyComplete = false;
@@ -369,8 +370,10 @@ namespace Orbis
             int lastInstallPhase = -1;
             int stableCopyPolls = 0;
             int titlePresentPolls = 0;
-            // LocalCopyPercent can report 100 before BGFT finishes reading the source PKG.
-            // Require a stable 100% window and (for base games) title presence before success.
+            long expectedBytes = 0;
+            try { if (!string.IsNullOrEmpty(sourcePath)) expectedBytes = new FileInfo(sourcePath).Length; } catch { }
+            // Completed local bytes are valid even when copy percentage stays at
+            // zero. Also confirm the promoted base before releasing its input.
             const int MinStableCopyPolls = 8; // ~4s
             const int MinTitlePresentPolls = 4; // ~2s after title appears
             try
@@ -381,18 +384,15 @@ namespace Orbis
                     if (interrupt != null && interrupt()) { error = "Installation stopped by queue"; return false; }
                     BgftTaskProgress state;
                     int rc = sceBgftServiceDownloadGetProgress(taskId, out state);
+                    if (i % 20 == 0 || (rc != 0 && consecutivePollFails == 0) || state.ErrorResult != 0)
+                        LogInstall("local-progress title=" + (titleId ?? "") + " expected=" + expectedBytes +
+                            " installed_proof_polls=" + titlePresentPolls + " rc=" + Hex(rc) + " " +
+                            FormatBackgroundProgress(MapBackgroundProgress(taskId, state)));
                     if (rc != 0)
                     {
                         consecutivePollFails++;
-                        // If we already saw a durable install, treat poll loss as success.
-                        if (!string.IsNullOrEmpty(titleId) &&
-                            contentKind == PkgContentKind.BaseGame &&
-                            IsTitleInstalled(titleId) &&
-                            ++titlePresentPolls >= MinTitlePresentPolls)
-                        {
-                            localCopyComplete = true;
-                            return true;
-                        }
+                        // AppExists also reports incomplete dashboard placeholders.
+                        // Losing the task cannot prove that its source was installed.
                         if (consecutivePollFails >= 120)
                         {
                             error = "BGFT progress 0x" + rc.ToString("X");
@@ -426,7 +426,8 @@ namespace Orbis
                         if (progress != null) progress(percent);
                     }
 
-                    bool copyDone = state.LocalCopyPercent >= 100;
+                    bool copyDone = PkgInstallPolicy.LocalInstallCopyComplete(expectedBytes,
+                        state.Length, state.Transferred, state.LengthTotal, state.TransferredTotal, state.LocalCopyPercent);
                     if (copyDone)
                         stableCopyPolls++;
                     else
@@ -435,7 +436,8 @@ namespace Orbis
                     bool titleOk = true;
                     if (!string.IsNullOrEmpty(titleId) && contentKind == PkgContentKind.BaseGame)
                     {
-                        if (IsTitleInstalled(titleId))
+                        if (copyDone && (!string.IsNullOrEmpty(sourcePath)
+                            ? IsBasePackageInstalled(sourcePath, titleId) : IsTitleInstalled(titleId)))
                             titlePresentPolls++;
                         else
                             titlePresentPolls = 0;
@@ -449,16 +451,15 @@ namespace Orbis
                         titleOk = true;
                     }
 
-                    // Local storage installs often leave LengthTotal=0; allow completion via
-                    // stable LocalCopyPercent (+ base title for games).
-                    bool transferOk = transferComplete || total == 0;
-                    if (stableCopyPolls >= MinStableCopyPolls && titleOk && transferOk)
+                    if (stableCopyPolls >= MinStableCopyPolls && titleOk)
                     {
+                        LogInstall("local-copy-confirmed title=" + (titleId ?? "") + " task=" + taskId +
+                            " " + FormatBackgroundProgress(MapBackgroundProgress(taskId, state)));
                         localCopyComplete = true;
                         return true;
                     }
 
-                    if ((transferComplete || copyDone) && stableCopyPolls < MinStableCopyPolls)
+                    if (transferComplete || copyDone)
                     {
                         if (installPhase != lastInstallPhase)
                         {
@@ -675,6 +676,19 @@ namespace Orbis
                         return true;
                     }
                 } catch { }
+            }
+            return false;
+        }
+
+        internal static bool IsBasePackageInstalled(string source, string titleId)
+        {
+            if (!System.Text.RegularExpressions.Regex.IsMatch(titleId ?? "", "^[A-Z]{4}[0-9]{5}$")) return false;
+            foreach (string root in new[] { "/user/app/", "/mnt/ext0/user/app/" })
+            {
+                string path = root + titleId + "/app.pkg";
+                if (!PkgInstallPolicy.MatchesInstalledContainer(source, path)) continue;
+                string error;
+                if (PkgIntegrity.CheckMetadata(path, titleId, "gd", out error)) return true;
             }
             return false;
         }

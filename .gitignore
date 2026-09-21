@@ -122,6 +122,7 @@
 !/resident/native/filesystem_context.h
 !/resident/native/module_inventory.h
 !/resident/native/resident_bridge.c
+!/resident/native/resident_crt.c
 !/resident/native/storage_space.h
 !/resident/plugin/crypto/sha256.c
 !/resident/plugin/crypto/sha256.h

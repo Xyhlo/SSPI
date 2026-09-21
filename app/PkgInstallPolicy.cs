@@ -34,6 +34,20 @@ namespace Orbis
             return kind == PkgContentKind.Patch || kind == PkgContentKind.AddOn;
         }
 
+        internal static bool LocalInstallCopyComplete(long expectedBytes, ulong length, ulong transferred,
+            ulong lengthTotal, ulong transferredTotal, int localCopyPercent)
+        {
+            // Storage BGFT can finish copying without updating localCopyPercent.
+            // Never combine a transferred counter with a different length field.
+            if (expectedBytes > 0 &&
+                ((length == (ulong)expectedBytes && transferred == length) ||
+                 (lengthTotal == (ulong)expectedBytes && transferredTotal == lengthTotal))) return true;
+            if (localCopyPercent != 100) return false;
+            if (length > 0 && transferred < length) return false;
+            if (lengthTotal > 0 && transferredTotal < lengthTotal) return false;
+            return (length == 0 && lengthTotal == 0) || expectedBytes <= 0;
+        }
+
         public static bool UseStorageBgft(PkgContentKind kind)
         {
             // Storage BGFT identifies an update by the already-installed base title and can

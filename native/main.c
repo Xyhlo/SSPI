@@ -58,16 +58,48 @@ static int load_system_module(const char* name)
     if (sceKernelGetModuleList(modules, sizeof(modules) / sizeof(modules[0]), &count) != 0)
         return handle;
     if (count > sizeof(modules) / sizeof(modules[0])) count = sizeof(modules) / sizeof(modules[0]);
+    char prxName[256];
+    snprintf(prxName, sizeof(prxName), "%s.prx", name);
     for (size_t i = 0; i < count; i++) {
         OrbisKernelModuleInfo info; memset(&info, 0, sizeof(info)); info.size = sizeof(info);
         if (sceKernelGetModuleInfo(modules[i], &info) != 0 ||
             !memchr(info.name, 0, sizeof(info.name))) continue;
-        if (!strcmp(info.name, name) || !strcmp(info.name, path)) {
+        if (!strcmp(info.name, name) || !strcmp(info.name, path) || !strcmp(info.name, prxName)) {
             klogf("Using already loaded system module %s (0x%x)", name, (unsigned)modules[i]);
             return (int)modules[i];
         }
     }
     return handle;
+}
+
+static int load_mono_runtime(const char* path)
+{
+    // Preload the pinned runtime's DT_NEEDED imports so a dependency failure is
+    // logged separately from a rejection of the Mono module itself.
+    static const char* dependencies[] = {
+        "libkernel", "libSceSsl", "libSceNet", "libSceSysmodule",
+        "libSceRegMgr", "libSceLibcInternal"
+    };
+    struct stat runtime;
+    if (!path || stat(path, &runtime) != 0 || !S_ISREG(runtime.st_mode) || runtime.st_size <= 0) {
+        boot_stage("mono-runtime-file-unavailable", -1);
+        return -1;
+    }
+    gs_log_write("startup", "mono runtime bytes=%llu packaged_sdk=0x06720001",
+        (unsigned long long)runtime.st_size);
+    for (size_t i = 0; i < sizeof(dependencies) / sizeof(dependencies[0]); i++) {
+        int module = load_system_module(dependencies[i]);
+        gs_log_write("startup", "mono dependency=%s code=0x%08x", dependencies[i], (unsigned)module);
+        if (module < 0) {
+            boot_stage("mono-dependency-unavailable", module);
+        }
+    }
+    int startResult = 0;
+    boot_stage("mono-module-load", 0);
+    int module = sceKernelLoadStartModule(path, 0, NULL, 0, NULL, &startResult);
+    gs_log_write("startup", "mono load_result=0x%08x start_result=0x%08x",
+        (unsigned)module, (unsigned)startResult);
+    return module;
 }
 
 static int require_export(int module, const char* name, void** pointer)
@@ -79,6 +111,22 @@ static int require_export(int module, const char* name, void** pointer)
         return 0;
     }
     return 1;
+}
+
+static void log_package_build(void)
+{
+    char path[sizeof(baseDir) + 32];
+    char build[16] = {0};
+    snprintf(path, sizeof(path), "%s/build-id.txt", baseDir);
+    FILE* file = fopen(path, "rb");
+    if (!file) return;
+    size_t length = fread(build, 1, sizeof(build), file);
+    fclose(file);
+    if (length != 12 && !(length == 13 && build[12] == '\n')) return;
+    for (size_t i = 0; i < 12; i++)
+        if (!strchr("0123456789abcdef", build[i]) || !build[i]) return;
+    build[12] = 0;
+    gs_log_write("startup", "package_build=%s", build);
 }
 
 #define REQUIRE_EXPORT(module, name) \
@@ -365,6 +413,13 @@ int main()
 	
     int libKernel = load_system_module("libkernel");
     if (libKernel < 0) return boot_failure("module-kernel", libKernel);
+
+    OrbisKernelSwVersion systemVersion;
+    memset(&systemVersion, 0, sizeof(systemVersion));
+    systemVersion.Size = sizeof(systemVersion);
+    int versionResult = sceKernelGetSystemSwVersion(&systemVersion);
+    gs_log_write("startup", "firmware=0x%08x query_result=0x%08x",
+        (unsigned)systemVersion.Version, (unsigned)versionResult);
 	
     int jailbreakResult = jailbreak(0);
     boot_stage("jailbreak-result", jailbreakResult);
@@ -416,6 +471,7 @@ int main()
 	
     if (!file_exists(mainExe)) return boot_failure("application-mount", -1);
     boot_stage("application-mount-ready", 0);
+    log_package_build();
     char pkgLib[0x100] = "\x0";
     sprintf(&pkgLib, "%s/sce_module/libmonosgen-2.0.prx", baseDir);
 	
@@ -423,8 +479,7 @@ int main()
 	int libSceNet = load_system_module("libSceNet");
 	int libSceSystemService = load_system_module("libSceSystemService");
     int libSceUserService = load_system_module("libSceUserService");
-	boot_stage("mono-module-load", 0);
-	int mono_framework = sceKernelLoadStartModule(pkgLib, 0, NULL, 0, 0, 0);
+	int mono_framework = load_mono_runtime(pkgLib);
 
 #ifdef RESIDENT_DAEMON
     if (!(libSceSystemService & 0x80000000))

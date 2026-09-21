@@ -156,6 +156,7 @@ namespace Orbis
                         case 1001: detail = "RAR header scan timed out"; break;
                         case 1002: detail = "RAR was read successfully but contains no PKG files; check that the source supplied a PS4 package archive"; break;
                         case 1003: detail = "Another RAR extraction is still running; retry after it finishes"; break;
+                        case 1005: detail = "RAR decoder initialization failed; restart SSPI after installing the updated package"; break;
                         default: detail = "RAR decoder could not read this archive"; break;
                     }
                     string failure = detail + " (decoder " + count + "). Archive retained.";
