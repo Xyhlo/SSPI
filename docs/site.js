@@ -1,215 +1,133 @@
 (() => {
-  'use strict';
-  document.documentElement.classList.add('js');
-  const $ = id => document.getElementById(id);
-  const sections = [...document.querySelectorAll('main section[id]')];
-  const links = [...document.querySelectorAll('.sidebar nav a')];
-  const menu = $('menu-toggle');
-  const sidebar = $('sidebar');
-  const viewport = $('page-scroll');
-  const intro = document.querySelector('.intro-strip');
-  const pageTitles = new Map(links.map(link => [link.hash.slice(1), link.textContent.replace(/^\s*\d+\s*/, '').trim()]));
-  const scrollPositions = new Map();
-  let activeSection = null;
-  let currentHash = '';
-  let tocItems = [];
-  for (const section of sections) {
-    section.querySelectorAll('h3').forEach((heading, i) => {
-      if (!heading.id) heading.id = section.id + '--' + heading.textContent.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-' + (i + 1);
-    });
+  "use strict";
+  const panels = [...document.querySelectorAll("main > .panel")];
+  const tabs = [...document.querySelectorAll(".tab[data-panel]")];
+  const untilFound = "onbeforematch" in document.body;
+  let current = null;
+
+  function panelFor(id) {
+    if (!id) return panels[0];
+    const el = document.getElementById(id);
+    if (!el) return panels[0];
+    return el.classList.contains("panel") ? el : el.closest(".panel") || panels[0];
   }
-  function closeMenu() {
-    sidebar.classList.remove('open');
-    menu.setAttribute('aria-expanded', 'false');
-  }
-  menu.addEventListener('click', () => {
-    const open = sidebar.classList.toggle('open');
-    menu.setAttribute('aria-expanded', String(open));
-  });
-  links.forEach(link => link.addEventListener('click', closeMenu));
-  document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && sidebar.classList.contains('open')) {
-      closeMenu(); menu.focus();
+
+  function show(panel, target, focus) {
+    if (panel !== current) {
+      panels.forEach(p => {
+        const on = p === panel;
+        if (on) p.removeAttribute("hidden");
+        else p.setAttribute("hidden", untilFound ? "until-found" : "");
+      });
+      tabs.forEach(t => {
+        const on = t.dataset.panel === panel.id;
+        if (on) t.setAttribute("aria-current", "page"); else t.removeAttribute("aria-current");
+      });
+      document.title = panel.id === "start" ? "SSPI PS4 guide" : `${panel.dataset.title} · SSPI PS4 guide`;
+      current = panel;
+      const active = tabs.find(t => t.dataset.panel === panel.id);
+      if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
-  });
-  function buildOutline(section) {
-    tocItems = [{ id: section.id, title: 'Overview', element: section }];
-    section.querySelectorAll('h3, details[id]').forEach(element => {
-      tocItems.push({ id: element.id, title: element.matches('details') ? element.querySelector('summary').childNodes[0].textContent.trim() : element.textContent.trim(), element });
-    });
-    for (const container of [$('page-toc'), $('mobile-toc')]) {
-      container.replaceChildren();
-      for (const item of tocItems) {
-        const link = document.createElement('a'); link.href = '#' + item.id; link.textContent = item.title;
-        container.append(link);
+    if (target && target !== panel) {
+      target.scrollIntoView({ block: "start" });
+    } else {
+      window.scrollTo(0, 0);
+    }
+    if (focus) {
+      const heading = (target && target !== panel ? target : panel).querySelector("h1, h2, h3");
+      if (heading) {
+        if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
+        heading.focus({ preventScroll: true });
       }
     }
   }
-  let framePending = false;
-  function updateReading() {
-    framePending = false;
-    if (!activeSection) return;
-    const boundary = viewport.getBoundingClientRect().top + 100;
-    let active = tocItems[0];
-    for (const item of tocItems) if (item.element.getBoundingClientRect().top <= boundary) active = item;
-    document.querySelectorAll('#page-toc a, #mobile-toc a').forEach(link => {
-      if (link.hash === '#' + active.id) link.setAttribute('aria-current', 'location');
-      else link.removeAttribute('aria-current');
-    });
-    const max = viewport.scrollHeight - viewport.clientHeight;
-    $('reading-progress').style.transform = 'scaleX(' + (max > 0 ? Math.min(1, viewport.scrollTop / max) : 1) + ')';
+
+  function route(focus) {
+    const id = decodeURIComponent(location.hash.slice(1));
+    const target = id ? document.getElementById(id) : null;
+    show(panelFor(id), target, focus);
   }
-  function navigate(hash, options = {}) {
-    let id;
-    try { id = decodeURIComponent((hash || '#overview').slice(1)); } catch { id = 'overview'; }
-    const requested = $(id);
-    const section = requested?.closest('main section[id]') || sections[0];
-    const target = section.contains(requested) ? requested : section;
-    if (activeSection && activeSection !== section) scrollPositions.set(activeSection.id, viewport.scrollTop);
-    activeSection = section;
-    sections.forEach(item => item.hidden = item !== section);
-    intro.hidden = section.id !== 'overview';
-    const pageIndex = sections.indexOf(section);
-    const title = pageTitles.get(section.id);
-    document.title = section.id === 'overview' ? 'SSPI — The PS4 field guide' : title + ' — SSPI';
-    const link = links[pageIndex];
-    $('page-group').textContent = link.closest('.nav-group').querySelector('p').textContent.toLowerCase();
-    $('page-name').textContent = title;
-    $('page-count').textContent = String(pageIndex + 1).padStart(2, '0') + ' / ' + sections.length;
-    links.forEach(item => {
-      if (item === link) item.setAttribute('aria-current', 'page');
-      else item.removeAttribute('aria-current');
-    });
-    for (const [button, destination] of [[$('previous-page'), sections[pageIndex - 1]], [$('next-page'), sections[pageIndex + 1]]]) {
-      button.hidden = !destination;
-      if (destination) { button.href = '#' + destination.id; button.querySelector('strong').textContent = pageTitles.get(destination.id); }
-    }
-    buildOutline(section);
-    const detail = target.closest('details'); if (detail) detail.open = true;
-    closeMenu(); $('mobile-outline').open = false;
-    if (options.push && location.hash !== '#' + target.id) history.pushState(null, '', '#' + target.id);
-    currentHash = location.hash;
-    if (target === section) viewport.scrollTop = options.restore ? scrollPositions.get(section.id) || 0 : 0;
-    else viewport.scrollTop += target.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 24;
-    if (options.focus) {
-      const focusTarget = target === section ? section.querySelector('h1, h2') : target.matches('details') ? target.querySelector('summary') : target;
-      if (focusTarget) { focusTarget.setAttribute('tabindex', '-1'); focusTarget.focus({ preventScroll: true }); }
-    }
-    updateReading();
-  }
-  document.addEventListener('click', event => {
-    const link = event.target instanceof Element ? event.target.closest('a[href^="#"]') : null;
-    if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || link.hash === '#content') return;
-    event.preventDefault(); navigate(link.hash, { push: true, focus: true });
+
+  window.addEventListener("hashchange", () => route(true));
+  // Plain previous / next buttons at the end of each section.
+  panels.forEach((p, i) => {
+    const nav = document.createElement("nav");
+    nav.className = "pager";
+    nav.setAttribute("aria-label", "More sections");
+    const link = (target, cls, label) => {
+      const a = document.createElement("a");
+      a.href = "#" + target.id;
+      a.className = cls;
+      a.innerHTML = `<small>${label}</small><span></span>`;
+      a.querySelector("span").textContent = target.dataset.title;
+      return a;
+    };
+    if (i > 0) nav.appendChild(link(panels[i - 1], "prev", "Previous"));
+    if (i < panels.length - 1) nav.appendChild(link(panels[i + 1], "next", "Next"));
+    p.appendChild(nav);
   });
-  viewport.addEventListener('scroll', () => {
-    if (!framePending) { framePending = true; requestAnimationFrame(updateReading); }
-  }, { passive: true });
-  window.addEventListener('resize', updateReading);
-  window.addEventListener('load', updateReading);
-  window.addEventListener('popstate', () => navigate(location.hash, { restore: true }));
-  window.addEventListener('hashchange', () => { if (location.hash !== currentHash) navigate(location.hash); });
-  navigate(location.hash);
-
-  const checks = [...document.querySelectorAll('[data-check]')];
-  const storageKey = 'sspi-guide-checklist-v1';
-  try {
-    const stored = JSON.parse(localStorage.getItem(storageKey) || '{}');
-    checks.forEach(input => input.checked = stored?.[input.dataset.check] === true);
-  } catch { /* The guide works when browser storage is unavailable. */ }
-  function saveChecks() {
-    try { localStorage.setItem(storageKey, JSON.stringify(Object.fromEntries(checks.map(input => [input.dataset.check, input.checked])))); } catch { /* Optional reading aid. */ }
-  }
-  checks.forEach(input => input.addEventListener('change', saveChecks));
-  $('reset-checks').addEventListener('click', () => { checks.forEach(input => input.checked = false); saveChecks(); });
-
-  $('connection-speed').addEventListener('input', event => {
-    const value = event.target.valueAsNumber;
-    const output = $('speed-result');
-    output.replaceChildren();
-    if (!Number.isFinite(value) || value < 0 || value > 100000) {
-      output.textContent = 'Enter a valid speed'; return;
-    }
-    output.append(new Intl.NumberFormat('en', { maximumFractionDigits: 3 }).format(value / 8) + ' ');
-    const unit = document.createElement('span'); unit.textContent = 'MB/s'; output.append(unit);
-  });
-
-  $('copy-report').addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText($('report-template').textContent.trim());
-      $('copy-status').textContent = 'Copied. Fill in your details and remove any secrets before posting.';
-    } catch {
-      const selection = window.getSelection();
-      const range = document.createRange(); range.selectNodeContents($('report-template'));
-      selection.removeAllRanges(); selection.addRange(range);
-      $('copy-status').textContent = 'Template selected. Copy it using your browser’s copy command.';
-    }
-  });
-
-  const dialog = $('search-dialog');
-  const input = $('search-input');
-  const results = $('search-results');
-  function searchableText(section) {
-    const walker = document.createTreeWalker(section, NodeFilter.SHOW_TEXT);
-    const parts = [];
-    while (walker.nextNode()) parts.push(walker.currentNode.textContent);
-    return parts.join(' ').replace(/\s+/g, ' ').trim();
-  }
-  const index = sections.map(section => ({
-    id: section.id,
-    title: section.dataset.title,
-    text: searchableText(section)
+  // Find in page can reveal text inside a hidden section; switch to that section.
+  panels.forEach(p => p.addEventListener("beforematch", () => {
+    history.replaceState(null, "", "#" + p.id);
+    show(p, null, false);
   }));
-  let selected = 0;
-  let resultLinks = [];
-  function markSelected() {
-    resultLinks.forEach((link, i) => link.dataset.selected = String(i === selected));
+  route(false);
+
+  // ---- Walkthrough chapters ----
+  const video = document.getElementById("walkthrough-video");
+  const list = document.getElementById("chapters");
+  const buttons = list ? [...list.querySelectorAll("button[data-t]")] : [];
+  function seek(t) {
+    if (!video) return;
+    const go = () => { video.currentTime = t; video.play().catch(() => {}); };
+    if (video.readyState >= 1) go(); else video.addEventListener("loadedmetadata", go, { once: true });
+    if (video.preload === "none" || video.readyState === 0) video.load();
   }
-  function showResults() {
-    const query = input.value.trim().toLowerCase();
-    const terms = query.split(/\s+/).filter(Boolean);
-    results.replaceChildren(); resultLinks = []; selected = 0;
-    if (!query) { $('search-summary').textContent = 'Type a word or phrase to find a section.'; return; }
-    const matches = index.map(entry => {
-      const title = entry.title.toLowerCase();
-      const text = entry.text.toLowerCase();
-      return { ...entry, score: terms.every(term => text.includes(term)) ? terms.reduce((n, term) => n + (title.includes(term) ? 5 : 1), 0) : 0 };
-    }).filter(entry => entry.score > 0).sort((a,b) => b.score - a.score).slice(0,10);
-    $('search-summary').textContent = matches.length ? matches.length + ' matching section' + (matches.length === 1 ? '' : 's') + '.' : 'No matching sections. Try a shorter term, such as “source” or “install”.';
-    for (const entry of matches) {
-      const link = document.createElement('a'); link.href = '#' + entry.id;
-      const title = document.createElement('strong'); title.textContent = entry.title;
-      const snippet = document.createElement('span');
-      const at = Math.max(0, entry.text.toLowerCase().indexOf(terms[0]) - 45);
-      snippet.textContent = (at ? '…' : '') + entry.text.slice(at, at + 160) + (at + 160 < entry.text.length ? '…' : '');
-      link.append(title, snippet);
-      link.addEventListener('click', () => { dialog.close(); closeMenu(); });
-      results.append(link); resultLinks.push(link);
-    }
-    markSelected();
+  buttons.forEach(b => b.addEventListener("click", () => seek(Number(b.dataset.t))));
+  if (video && buttons.length) {
+    video.addEventListener("timeupdate", () => {
+      let active = buttons[0];
+      buttons.forEach(b => { if (video.currentTime + 0.25 >= Number(b.dataset.t)) active = b; });
+      buttons.forEach(b => b.setAttribute("aria-current", b === active ? "true" : "false"));
+    });
   }
-  function openSearch() { closeMenu(); dialog.showModal(); input.focus(); showResults(); }
-  $('search-open').addEventListener('click', openSearch);
-  $('search-close').addEventListener('click', () => dialog.close());
-  input.addEventListener('input', showResults);
-  input.addEventListener('keydown', event => {
-    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-      if (!resultLinks.length) return;
-      event.preventDefault();
-      selected = (selected + (event.key === 'ArrowDown' ? 1 : -1) + resultLinks.length) % resultLinks.length;
-      markSelected(); resultLinks[selected].scrollIntoView({ block: 'nearest' });
-    } else if (event.key === 'Enter' && resultLinks[selected]) {
-      event.preventDefault(); resultLinks[selected].click();
-    }
+  document.querySelectorAll(".chapter-link[data-chapter]").forEach(link => {
+    const b = buttons.find(x => x.dataset.index === link.dataset.chapter);
+    if (!b) { link.hidden = true; return; }
+    link.addEventListener("click", () => {
+      history.pushState(null, "", "#walkthrough");
+      show(panelFor("walkthrough"), document.getElementById("walkthrough"), false);
+      seek(Number(b.dataset.t));
+    });
   });
-  dialog.addEventListener('click', event => { if (event.target === dialog) {
-    const box = dialog.getBoundingClientRect();
-    if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) dialog.close();
-  }});
-  document.addEventListener('keydown', event => {
-    const editing = event.target instanceof Element && event.target.closest('input, textarea, select, [contenteditable="true"]');
-    if ((event.key === '/' && !editing) || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k')) {
-      event.preventDefault(); if (!dialog.open) openSearch();
-    }
+
+  // ---- Screenshot lightbox ----
+  const box = document.getElementById("lightbox");
+  const boxImg = document.getElementById("lightbox-img");
+  const boxCap = document.getElementById("lightbox-caption");
+  // Every guide image can be enlarged, including setting rows and phone screens.
+  document.querySelectorAll("main img").forEach(img => {
+    if (img.closest("button.zoom, .hero")) return;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "zoom";
+    img.parentNode.insertBefore(b, img);
+    b.appendChild(img);
   });
+  document.querySelectorAll("button.zoom").forEach(z => {
+    const img = z.querySelector("img");
+    if (!img) return;
+    z.setAttribute("aria-label", "Enlarge: " + img.alt);
+    z.addEventListener("click", () => {
+      if (!box || !box.showModal) { window.open(img.currentSrc || img.src, "_blank", "noopener"); return; }
+      boxImg.src = img.currentSrc || img.src;
+      boxImg.alt = img.alt;
+      boxCap.textContent = img.alt;
+      box.showModal();
+    });
+  });
+  if (box) {
+    document.getElementById("lightbox-close").addEventListener("click", () => box.close());
+    box.addEventListener("click", e => { if (e.target === box || e.target === boxImg) box.close(); });
+  }
 })();
