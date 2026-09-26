@@ -23,12 +23,23 @@ namespace Orbis
     /// </summary>
     internal sealed class PackageSourceCoordinator
     {
+        const int DefaultResolveTimeoutMilliseconds = 15000;
+        const int DefaultResolveGraceMilliseconds = 1000;
         readonly List<IPackageSourceRuntime> _runtimes = new List<IPackageSourceRuntime>();
         readonly List<SourceExecutionReport> _lastReports = new List<SourceExecutionReport>();
         readonly object _sync = new object();
+        readonly int _resolveTimeoutMilliseconds;
+        readonly int _resolveGraceMilliseconds;
 
         public PackageSourceCoordinator(IEnumerable<IPackageSourceRuntime> runtimes)
+            : this(runtimes, DefaultResolveTimeoutMilliseconds, DefaultResolveGraceMilliseconds)
+        { }
+
+        internal PackageSourceCoordinator(IEnumerable<IPackageSourceRuntime> runtimes,
+            int resolveTimeoutMilliseconds, int resolveGraceMilliseconds)
         {
+            _resolveTimeoutMilliseconds = Math.Max(1, resolveTimeoutMilliseconds);
+            _resolveGraceMilliseconds = Math.Max(0, resolveGraceMilliseconds);
             if (runtimes == null) return;
             foreach (var runtime in runtimes)
                 if (runtime != null) _runtimes.Add(runtime);
@@ -68,21 +79,34 @@ namespace Orbis
             var merged = new List<SourceTitleResult>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
             var reports = new List<SourceExecutionReport>();
-            var calls = BeginCalls(runtime => runtime.Search(request), cancel, null);
+            Dictionary<IPackageSourceRuntime, Action> cancelCalls;
+            var calls = BeginCalls((runtime, callCancel) => runtime.Search(new SourceSearchRequest
+            {
+                Query = request.Query, Region = request.Region, Limit = request.Limit,
+                TitleId = request.TitleId, Name = request.Name, Cursor = request.Cursor,
+                Cancel = () => callCancel() || IsCanceled(request.Cancel)
+            }), cancel, null, out cancelCalls);
             while (calls.Count > 0)
             {
-                ThrowIfCanceled(cancel);
+                if (IsCanceled(cancel)) { CancelCalls(cancelCalls); ThrowIfCanceled(cancel); }
                 IPackageSourceRuntime runtime = null;
-                foreach (var item in calls) if (item.Value.IsCompleted) { runtime = item.Key; break; }
+                DateTime earliestCompletion = DateTime.MaxValue;
+                foreach (var item in calls)
+                {
+                    if (!item.Value.IsCompleted) continue;
+                    DateTime completedAt = item.Value.GetAwaiter().GetResult().CompletedUtc;
+                    if (runtime == null || completedAt < earliestCompletion)
+                    { runtime = item.Key; earliestCompletion = completedAt; }
+                }
                 if (runtime == null)
                 {
-                    var pending = new List<Task>(); foreach (var call in calls.Values) pending.Add(call);
+                    var pending = new List<Task>(); foreach (var pendingCall in calls.Values) pending.Add(pendingCall);
                     Task.WaitAny(pending.ToArray(), 100); continue;
                 }
-                DateTime started = DateTime.UtcNow;
+                var call = calls[runtime].GetAwaiter().GetResult();
+                DateTime started = call.StartedUtc;
                 try
                 {
-                    var call = calls[runtime].GetAwaiter().GetResult();
                     if (call.Error != null) throw call.Error;
                     List<SourceTitleResult> results = call.Results ?? new List<SourceTitleResult>();
                     int accepted = 0;
@@ -172,43 +196,157 @@ namespace Orbis
             Func<IPackageSourceRuntime, bool> selected = runtime => runtime.Source.SourceId != excludedSourceId && (string.IsNullOrEmpty(sourceId) ||
                 (runtime.Source.SourceId == sourceId && (string.IsNullOrEmpty(sourceVersion) ||
                 (runtime.Source.Descriptor != null && runtime.Source.Descriptor.Version == sourceVersion))));
-            var calls = BeginCalls(runtime => runtime.Resolve(request), cancel, selected);
-            foreach (var runtime in _runtimes)
+            Dictionary<IPackageSourceRuntime, Action> cancelCalls;
+            var calls = BeginCalls((runtime, callCancel) => runtime.Resolve(new SourceResolveRequest
             {
-                if (!IsEnabled(runtime) || !selected(runtime)) continue;
-                ThrowIfCanceled(cancel);
-                DateTime started = DateTime.UtcNow;
-                try
+                TitleId = request.TitleId, Name = request.Name, Region = request.Region,
+                CatalogUrl = request.CatalogUrl, Limit = request.Limit, Cursor = request.Cursor,
+                Cancel = () => callCancel() || IsCanceled(request.Cancel)
+            }), cancel, selected, out cancelCalls);
+            var callOrder = new List<IPackageSourceRuntime>(calls.Keys);
+            callOrder.Sort(CompareRuntime);
+            var completed = new Dictionary<IPackageSourceRuntime, SourceCall<PackageCandidate>>();
+            var preparedResults = new Dictionary<IPackageSourceRuntime, List<PackageCandidate>>();
+            DateTime resolveStarted = DateTime.UtcNow;
+            DateTime resolveDeadline = resolveStarted.AddMilliseconds(_resolveTimeoutMilliseconds);
+            DateTime? usefulResultDeadline = null;
+            while (calls.Count > 0)
+            {
+                if (IsCanceled(cancel)) { CancelCalls(cancelCalls); ThrowIfCanceled(cancel); }
+
+                IPackageSourceRuntime runtime = null;
+                DateTime earliestCompletion = DateTime.MaxValue;
+                var pendingRuntimes = new List<IPackageSourceRuntime>();
+                var pendingTasks = new List<Task<SourceCall<PackageCandidate>>>();
+                foreach (IPackageSourceRuntime candidate in callOrder)
                 {
-                    var call = calls[runtime].GetAwaiter().GetResult();
-                    if (call.Error != null) throw call.Error;
-                    List<PackageCandidate> results = call.Results ?? new List<PackageCandidate>();
-                    if (!IsStatic(runtime)) results = GroupArchiveVolumes(results);
-                    int accepted = 0;
-                    foreach (var candidate in results)
+                    Task<SourceCall<PackageCandidate>> task;
+                    if (!calls.TryGetValue(candidate, out task)) continue;
+                    if (task.IsCompleted)
                     {
-                        if (!IsUsable(candidate, request.TitleId)) continue;
-                        if (excludedSourceId.Length > 0 && !string.Equals(candidate.TitleId, request.TitleId, StringComparison.OrdinalIgnoreCase)) continue;
-                        if (!string.IsNullOrEmpty(request.Region) && !string.IsNullOrEmpty(candidate.Region) && PackageSourceEngineStatic.NormalizeRegion(candidate.Region) !=
-                            PackageSourceEngineStatic.NormalizeRegion(request.Region)) continue;
-                        Stamp(candidate, runtime.Source);
-                        string key = CandidateKey(candidate);
-                        if (!seen.Add(key)) continue;
-                        merged.Add(candidate);
-                        accepted++;
-                        if (merged.Count >= limit) break;
+                        DateTime completedAt = task.GetAwaiter().GetResult().CompletedUtc;
+                        if (runtime == null || completedAt < earliestCompletion)
+                        { runtime = candidate; earliestCompletion = completedAt; }
+                        continue;
                     }
-                    reports.Add(Report(runtime.Source, started, true, SourceFailureCode.None, "", accepted));
+                    pendingRuntimes.Add(candidate);
+                    pendingTasks.Add(task);
                 }
-                catch (Exception ex)
+                if (runtime == null)
                 {
-                    reports.Add(Report(runtime.Source, started, false, MapFailure(ex), SafeMessage(ex), 0));
+                    DateTime now = DateTime.UtcNow;
+                    DateTime waitDeadline = resolveDeadline;
+                    if (usefulResultDeadline.HasValue && usefulResultDeadline.Value < waitDeadline)
+                        waitDeadline = usefulResultDeadline.Value;
+                    if (now >= waitDeadline)
+                    {
+                        bool overallTimeout = now >= resolveDeadline;
+                        foreach (IPackageSourceRuntime waiting in pendingRuntimes)
+                        {
+                            Action stop;
+                            if (cancelCalls.TryGetValue(waiting, out stop)) stop();
+                            DateTime started = resolveStarted;
+                            reports.Add(Report(waiting.Source, started, false,
+                                overallTimeout ? SourceFailureCode.TimedOut : SourceFailureCode.Canceled,
+                                overallTimeout ? "Source resolution timed out" : "Source resolution stopped after other sources returned candidates", 0));
+                            calls.Remove(waiting);
+                            cancelCalls.Remove(waiting);
+                        }
+                        break;
+                    }
+                    int remaining = (int)Math.Max(1, Math.Min(100, (waitDeadline - now).TotalMilliseconds));
+                    int finished = Task.WaitAny(pendingTasks.ToArray(), remaining);
+                    if (finished >= 0) runtime = pendingRuntimes[finished];
+                    else continue;
                 }
-                if (merged.Count >= limit) break;
+
+                SourceCall<PackageCandidate> call = calls[runtime].GetAwaiter().GetResult();
+                completed[runtime] = call;
+                calls.Remove(runtime);
+                cancelCalls.Remove(runtime);
+                if (call.Error != null)
+                    reports.Add(Report(runtime.Source, call.StartedUtc, false, MapFailure(call.Error), SafeMessage(call.Error), 0));
+                else
+                {
+                    reports.Add(Report(runtime.Source, call.StartedUtc, true, SourceFailureCode.None, "", 0));
+                    try { preparedResults[runtime] = PrepareResolveResults(runtime, call.Results, request, excludedSourceId); }
+                    catch (Exception ex)
+                    {
+                        call.Error = ex;
+                        reports[reports.Count - 1].Success = false;
+                        reports[reports.Count - 1].FailureCode = MapFailure(ex);
+                        reports[reports.Count - 1].Message = SafeMessage(ex);
+                    }
+                    merged.Clear(); seen.Clear();
+                    MergeCompletedResolveResults(callOrder, completed, preparedResults,
+                        limit, merged, seen, reports);
+                    if (merged.Count >= limit) break;
+                    if (merged.Count > 0 && !usefulResultDeadline.HasValue)
+                        usefulResultDeadline = DateTime.UtcNow.AddMilliseconds(_resolveGraceMilliseconds);
+                }
             }
+
+            if (calls.Count > 0)
+            {
+                foreach (var waiting in calls.Keys)
+                {
+                    Action stop;
+                    if (cancelCalls.TryGetValue(waiting, out stop)) stop();
+                }
+            }
+            merged.Clear(); seen.Clear();
+            MergeCompletedResolveResults(callOrder, completed, preparedResults,
+                limit, merged, seen, reports);
             PublishReports(reports);
             ThrowIfCanceled(cancel);
             return merged;
+        }
+
+        static List<PackageCandidate> PrepareResolveResults(IPackageSourceRuntime runtime,
+            List<PackageCandidate> results, SourceResolveRequest request, string excludedSourceId)
+        {
+            results = results ?? new List<PackageCandidate>();
+            if (!IsStatic(runtime)) results = GroupArchiveVolumes(results);
+            var prepared = new List<PackageCandidate>();
+            foreach (PackageCandidate candidate in results)
+            {
+                if (!IsUsable(candidate, request.TitleId)) continue;
+                if (excludedSourceId.Length > 0 && !string.Equals(candidate.TitleId, request.TitleId, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!string.IsNullOrEmpty(request.Region) && !string.IsNullOrEmpty(candidate.Region) && PackageSourceEngineStatic.NormalizeRegion(candidate.Region) !=
+                    PackageSourceEngineStatic.NormalizeRegion(request.Region)) continue;
+                Stamp(candidate, runtime.Source);
+                prepared.Add(candidate);
+            }
+            return prepared;
+        }
+
+        static void MergeCompletedResolveResults(List<IPackageSourceRuntime> callOrder,
+            Dictionary<IPackageSourceRuntime, SourceCall<PackageCandidate>> completed,
+            Dictionary<IPackageSourceRuntime, List<PackageCandidate>> preparedResults, int limit,
+            List<PackageCandidate> merged, HashSet<string> seen, List<SourceExecutionReport> reports)
+        {
+            foreach (SourceExecutionReport report in reports)
+                if (report.Success) report.ResultCount = 0;
+            foreach (IPackageSourceRuntime runtime in callOrder)
+            {
+                SourceCall<PackageCandidate> call;
+                if (!completed.TryGetValue(runtime, out call) || call.Error != null) continue;
+                List<PackageCandidate> results;
+                if (!preparedResults.TryGetValue(runtime, out results)) continue;
+                int accepted = 0;
+                foreach (PackageCandidate candidate in results)
+                {
+                    string key = CandidateKey(candidate);
+                    if (!seen.Add(key)) continue;
+                    merged.Add(candidate);
+                    accepted++;
+                    if (merged.Count >= limit) break;
+                }
+                for (int i = reports.Count - 1; i >= 0; i--)
+                    if (reports[i].SourceId == runtime.Source.SourceId && reports[i].Success)
+                    { reports[i].ResultCount = accepted; break; }
+                if (merged.Count >= limit) break;
+            }
         }
 
         static List<PackageCandidate> GroupArchiveVolumes(List<PackageCandidate> candidates)
@@ -235,7 +373,8 @@ namespace Orbis
                     AccessType = candidate.AccessType.ToString(), Sha256 = candidate.ExpectedSha256,
                     Size = candidate.ExpectedByteSize ?? 0 });
                 // Ambiguous/missing sequences stay separate; do not combine alternate mirrors.
-                try { volumes = ArchiveVolumeSet.Validate(volumes); } catch (System.IO.InvalidDataException) { foreach (var invalid in group) removed.Add(invalid); continue; }
+                try { volumes = ArchiveVolumeSet.Validate(volumes); }
+                catch (System.IO.InvalidDataException) { continue; }
                 PackageCandidate first = group.Find(c => c.Url == volumes[0].Url);
                 first.ArchiveVolumes = ArchiveVolumeSet.Encode(volumes);
                 first.Label = volumes[0].Name + " (" + volumes.Count + " volumes)";
@@ -247,24 +386,34 @@ namespace Orbis
 
         static readonly SemaphoreSlim SourceSlots = new SemaphoreSlim(2, 2);
         static readonly SemaphoreSlim LocalSourceSlots = new SemaphoreSlim(2, 2);
-        sealed class SourceCall<T> { public List<T> Results; public Exception Error; }
-        Dictionary<IPackageSourceRuntime, Task<SourceCall<T>>> BeginCalls<T>(Func<IPackageSourceRuntime, List<T>> run,
-            Func<bool> cancel, Func<IPackageSourceRuntime, bool> include)
+        sealed class SourceCall<T> { public List<T> Results; public Exception Error; public DateTime StartedUtc; public DateTime CompletedUtc; }
+        Dictionary<IPackageSourceRuntime, Task<SourceCall<T>>> BeginCalls<T>(Func<IPackageSourceRuntime, Func<bool>, List<T>> run,
+            Func<bool> cancel, Func<IPackageSourceRuntime, bool> include,
+            out Dictionary<IPackageSourceRuntime, Action> cancelCalls)
         {
             var calls = new Dictionary<IPackageSourceRuntime, Task<SourceCall<T>>>();
+            cancelCalls = new Dictionary<IPackageSourceRuntime, Action>();
             foreach (var runtime in _runtimes)
             {
                 if (!IsEnabled(runtime) || (include != null && !include(runtime))) continue;
                 var captured = runtime;
+                int abandoned = 0;
+                Func<bool> callCancel = () => Volatile.Read(ref abandoned) != 0 || IsCanceled(cancel);
+                cancelCalls[captured] = () => Interlocked.Exchange(ref abandoned, 1);
                 calls[captured] = Task.Run(() => {
                     bool slot = false;
+                    DateTime started = DateTime.UtcNow;
                     SemaphoreSlim slots = IsStatic(captured) ? LocalSourceSlots : SourceSlots;
                     try {
-                        while (!slots.Wait(100)) ThrowIfCanceled(cancel); slot = true;
-                        ThrowIfCanceled(cancel);
-                        return new SourceCall<T> { Results = run(captured) };
+                        while (!slots.Wait(100)) ThrowIfCanceled(callCancel); slot = true;
+                        ThrowIfCanceled(callCancel);
+                        started = DateTime.UtcNow;
+                        var result = new SourceCall<T> { StartedUtc = started };
+                        result.Results = run(captured, callCancel);
+                        result.CompletedUtc = DateTime.UtcNow;
+                        return result;
                     }
-                    catch (Exception ex) { return new SourceCall<T> { Error = ex }; }
+                    catch (Exception ex) { return new SourceCall<T> { StartedUtc = started, CompletedUtc = DateTime.UtcNow, Error = ex }; }
                     finally { if (slot) slots.Release(); }
                 });
             }
@@ -275,6 +424,12 @@ namespace Orbis
         { return runtime.Source.Descriptor != null && runtime.Source.Descriptor.Engine != null && PackageSourceEngineStatic.IsCatalog(runtime.Source.Descriptor.Engine.Type); }
         static void ThrowIfCanceled(Func<bool> cancel)
         { if (cancel != null && cancel()) throw new OperationCanceledException(); }
+
+        static bool IsCanceled(Func<bool> cancel)
+        { return cancel != null && cancel(); }
+
+        static void CancelCalls(Dictionary<IPackageSourceRuntime, Action> cancelCalls)
+        { foreach (Action cancel in cancelCalls.Values) cancel(); }
 
         static bool IsEnabled(IPackageSourceRuntime runtime)
         {

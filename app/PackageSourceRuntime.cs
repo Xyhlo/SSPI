@@ -60,7 +60,7 @@ namespace Orbis
             if (PackageSourceEngineStatic.IsCatalog(_engineType))
                 return PackageSourceEngineStatic.Search(_source, _versionPath, request);
             if (string.Equals(_engineType, "remote-api-v1", StringComparison.OrdinalIgnoreCase))
-                return PackageSourceEngineRemote.Search(_source, _versionPath, request.Query ?? "");
+                return PackageSourceEngineRemote.Search(_source, _versionPath, request.Query ?? "", request.Cancel);
             if ((string.Equals(_engineType, "recipe-v1", StringComparison.OrdinalIgnoreCase) || string.Equals(_engineType, "recipe-v2", StringComparison.OrdinalIgnoreCase)))
             {
                 string error;
@@ -79,7 +79,7 @@ namespace Orbis
                 return PackageSourceEngineStatic.Resolve(_source, _versionPath, request);
             if (string.Equals(_engineType, "remote-api-v1", StringComparison.OrdinalIgnoreCase))
                 return PackageSourceEngineRemote.Resolve(_source.Descriptor, _versionPath,
-                    request.TitleId ?? "", request.Name ?? "", request.Region ?? "");
+                    request.TitleId ?? "", request.Name ?? "", request.Region ?? "", request.Cancel);
             if ((string.Equals(_engineType, "recipe-v1", StringComparison.OrdinalIgnoreCase) || string.Equals(_engineType, "recipe-v2", StringComparison.OrdinalIgnoreCase)))
             {
                 string error;
@@ -135,10 +135,10 @@ namespace Orbis
                 if (_store == null)
                 {
                     var store = new PackageSourceStore();
-                    try { store.ApplyBundledSources(_bundledSourcesDirectory); }
+                    try { store.RetireBundledSources(); }
                     catch (Exception ex)
                     {
-                        // An interrupted or invalid bundled update must not take
+                        // An interrupted bundled-source retirement must not take
                         // already-working installed catalogs offline.
                         BundledSourceError = ex.Message;
                         try { AtomicFile.WriteText(Path.Combine(AppSettings.DataDir, "source-bundle-error.txt"), ex.GetType().Name + ": " + ex.Message); } catch { }

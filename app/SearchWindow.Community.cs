@@ -17,6 +17,10 @@ namespace Orbis
         readonly Stack<string> _communityPages = new Stack<string>();
         volatile bool _sourceBrowserBusy;
         Action _sourceBrowserComplete;
+        // Written by the background fetch while it retries; drawn under "Please wait...".
+        volatile string _communityProgress = "";
+        // Set when a refresh failed and the last good copy of the page is shown instead.
+        string _communityNotice = "";
 
         string SourceUsbName(string mount)
         {
@@ -60,10 +64,20 @@ namespace Orbis
         {
             if (_sourceBrowserBusy) return;
             _sourceBrowseMode = 3; _settingsFocus = 0; _sourceBrowserBusy = true; _sourceBrowseError = "";
+            _communityNotice = ""; _communityProgress = "";
             ThreadPool.QueueUserWorkItem(_ => {
-                try { string next; var rows = CommunitySources.List(after, out next);
-                    Interlocked.Exchange(ref _sourceBrowserComplete, () => { _communityEntries = rows; _communityAfter=after; _communityNext=next; _sourceBrowserBusy=false; Invalidated=true; });
-                } catch { Interlocked.Exchange(ref _sourceBrowserComplete, () => { _sourceBrowserBusy=false; _communityEntries.Clear(); _communityNext=""; _sourceBrowseError="Community directory unavailable. Triangle retries."; Invalidated=true; }); }
+                // Browse retries, classifies and logs failures itself and does not throw;
+                // the guard only keeps an unforeseen fault from leaving the page busy.
+                CommunityDirectoryPage page;
+                try { page = CommunitySources.Browse(after, text => _communityProgress = text ?? ""); }
+                catch (Exception ex) { page = new CommunityDirectoryPage { Failure = CommunitySources.Classify(ex, false) }; }
+                Interlocked.Exchange(ref _sourceBrowserComplete, () => {
+                    // Keep the requested page even on failure, so Triangle retries that page.
+                    _communityEntries = page.Entries; _communityAfter = after ?? ""; _communityNext = page.Next ?? "";
+                    _communityNotice = page.Failure != null && page.Saved ? page.Failure.SavedNotice : "";
+                    _sourceBrowseError = page.Failure != null && !page.Saved ? page.Failure.Message : "";
+                    _communityProgress = ""; _sourceBrowserBusy = false; Invalidated = true;
+                });
             });
         }
         bool SourceBrowserBack()
@@ -101,7 +115,7 @@ namespace Orbis
             UpdateSourceInstall(SourceInstallStage.Downloading,0,0,entry==null?"Reading USB source...":"Receiving encrypted source...");
             ThreadPool.QueueUserWorkItem(_ => {
                 try {
-                    byte[] bytes=entry!=null?CommunitySources.Download(entry):null;
+                    byte[] bytes=entry!=null?DownloadCommunitySource(entry):null;
                     UpdateSourceInstall(SourceInstallStage.Validating,0,0,"Checking source format and limits...");
                     string error;bool installed=bytes!=null?_packageSources.Install(bytes,out error):_packageSources.Install(path,out error);
                     if (!installed) throw new IOException(error);
@@ -112,14 +126,32 @@ namespace Orbis
                 }
             });
         }
+        // The source is always downloaded live and verified (identity, size, hash and
+        // format) by CommunitySources.Download; only the wording of network failures changes.
+        static byte[] DownloadCommunitySource(CommunitySourceEntry entry)
+        {
+            try { return CommunitySources.Download(entry); }
+            catch (Exception ex)
+            {
+                string text = CommunitySources.DescribeDownloadFailure(ex);
+                if (text == null) throw;
+                throw new IOException(text, ex);
+            }
+        }
         void DrawSourceBrowser(IntPtr r, SDL_Rect sheet)
         {
             int x=sheet.x,w=sheet.w;bool community=_sourceBrowseMode==3;
             TextPx(r,x,sheet.y+15,28,community?"Community sources":"Install source from USB",White);
             string usbName=SourceUsbName(_sourceUsbRoot);
             string usbLocation = usbName + (_sourceUsbPath.Length>_sourceUsbRoot.Length ? " / " + _sourceUsbPath.Substring(_sourceUsbRoot.Length).TrimStart('/') : "");
-            TextPx(r,x,sheet.y+60,18,community?"Shared by the community · sources are checked before installation":_sourceBrowseMode==1?"Choose a connected USB drive":Clip(usbLocation,100),Muted);
-            if (_sourceBrowserBusy) { TextPx(r,x,sheet.y+130,23,"Please wait...",Muted);return; }
+            if (community && _communityNotice.Length>0) TextFit(r,x,sheet.y+60,18,w,_communityNotice,Warning);
+            else TextPx(r,x,sheet.y+60,18,community?"Shared by the community · sources are checked before installation":_sourceBrowseMode==1?"Choose a connected USB drive":Clip(usbLocation,100),Muted);
+            if (_sourceBrowserBusy) {
+                TextPx(r,x,sheet.y+130,23,"Please wait...",Muted);
+                string progress=_communityProgress;
+                if (community && progress.Length>0) TextFit(r,x,sheet.y+175,18,w,progress,Dim);
+                return;
+            }
             int count=community?_communityEntries.Count+(_communityNext.Length>0?1:0):_sourcePaths.Count;
             int start=Math.Max(0,_settingsFocus-4);
             for(int i=0;i<5 && start+i<count;i++) {
@@ -129,7 +161,7 @@ namespace Orbis
                 else {string p=_sourcePaths[n];name=_sourceBrowseMode==1?SourceUsbName(p):Path.GetFileName(p);detail=_sourceBrowseMode==1?"USB drive "+(p[8]-'0'+1)+" · Browse source files":Directory.Exists(p)?"Open folder":"Package source file";action=Directory.Exists(p)?"Open":"Install";}
                 DrawSettingsRow(r,x,sheet.y+115+i*97,w,86,n,name,detail,action);
             }
-            if(count==0)TextPx(r,x,sheet.y+160,23,_sourceBrowseError.Length>0?_sourceBrowseError:community?DistributionSettings.EmptyDirectoryMessage:"No sources found. Connect a USB drive with .gssource files.",Muted);
+            if(count==0)TextWrapped(r,x,sheet.y+160,23,w,_sourceBrowseError.Length>0?_sourceBrowseError:community?DistributionSettings.EmptyDirectoryMessage:"No sources found. Connect a USB drive with .gssource files.",Muted);
             if(community && _settingsFocus<_communityEntries.Count) {
                 var e=_communityEntries[_settingsFocus];TextPx(r,x,sheet.y+630,17,Clip(e.Message,135),Muted);
                 TextPx(r,x,sheet.y+665,14,DistributionSettings.ReportLabel+e.Id,Dim);

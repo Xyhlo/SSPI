@@ -215,7 +215,8 @@ namespace Orbis
                                 int remaining = (int)Math.Max(1000,
                                     Math.Min(30000, (deadline - DateTime.UtcNow).TotalMilliseconds));
                                 body = ResolverPageCache.Get(descriptor.SourceId + "@" + descriptor.Version, uri.AbsoluteUri, remaining,
-                                    string.IsNullOrEmpty(referer) ? null : referer, null, ua);
+                                    string.IsNullOrEmpty(referer) ? null : referer, null, ua,
+                                    target => OriginAllowed(descriptor, target));
                             }
                             catch (Exception ex)
                             {
@@ -268,7 +269,8 @@ namespace Orbis
                             try
                             {
                                 body = ResolverPageCache.Get(descriptor.SourceId + "@" + descriptor.Version, uri.AbsoluteUri, 30000,
-                                    string.IsNullOrEmpty(referer) ? null : referer, null, ua) ?? "";
+                                    string.IsNullOrEmpty(referer) ? null : referer, null, ua,
+                                    target => OriginAllowed(descriptor, target)) ?? "";
                             }
                             catch
                             {
@@ -418,7 +420,8 @@ namespace Orbis
                         try
                         {
                             body = ResolverPageCache.Get(descriptor.SourceId + "@" + descriptor.Version, uri.AbsoluteUri, remaining,
-                                string.IsNullOrEmpty(referer) ? null : referer, null, ua);
+                                string.IsNullOrEmpty(referer) ? null : referer, null, ua,
+                                target => OriginAllowed(descriptor, target));
                         }
                         catch (Exception ex)
                         {

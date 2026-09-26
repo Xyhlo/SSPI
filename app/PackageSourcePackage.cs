@@ -294,7 +294,10 @@ namespace Orbis
             string engineType = engine != null ? FirstString(engine, "type") : (engineValue as string ?? "");
             if (engineType.Length == 0) engineType = FirstString(root, "engineType");
             if (engineType != "remote-api-v1" && engineType != "recipe-v1" && engineType != "recipe-v2" && !PackageSourceEngineStatic.IsCatalog(engineType))
-                throw new InvalidDataException("Unsupported source engine; update SSPI to use this source");
+                // Most reports were older builds meeting a current source, so lead
+                // with that condition; a malformed engine name is equally possible.
+                throw new InvalidDataException("Unsupported source engine " + EngineDiagnosticName(engineType) +
+                    ": sources made for a newer SSPI need its latest release. Check its compatibility with this build.");
             string entry = engine != null ? FirstString(engine, "entryFile", "entry")
                                           : FirstString(root, "entryFile", "entry");
             if (entry.Length == 0) entry = "source.json"; // embedded remote-api configuration
@@ -342,6 +345,19 @@ namespace Orbis
                 descriptor.Publisher.PublicKeyFingerprint = FirstString(publisher, "fingerprint");
             }
             return descriptor;
+        }
+
+        static string EngineDiagnosticName(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return "(missing)";
+            var safe = new StringBuilder();
+            foreach (char c in value)
+            {
+                if (safe.Length == 48) break;
+                safe.Append((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ? c : '?');
+            }
+            return "'" + safe + (value.Length > 48 ? "..." : "") + "'";
         }
 
         static List<string> ReadOrigins(Dictionary<string, object> obj, string key)

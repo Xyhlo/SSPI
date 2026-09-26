@@ -7,6 +7,6 @@
   "dataDirectory": "/data/GameSearch",
   "packageTimestampUtc": "2026-09-06T02:56:27Z",
   "releaseChannel": "beta",
-  "betaRevision": 2,
+  "betaRevision": 3,
   "outputRoot": "../Build-Output/PS4"
 }

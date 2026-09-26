@@ -106,9 +106,22 @@ namespace Orbis
             if (lb < 0) return list;
             int depth = 0;
             int start = -1;
+            bool inString = false, escaped = false;
             for (int i = lb + 1; i < json.Length; i++)
             {
                 char c = json[i];
+                if (inString)
+                {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') inString = false;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    inString = true;
+                    continue;
+                }
                 if (c == '{')
                 {
                     if (depth == 0) start = i;
