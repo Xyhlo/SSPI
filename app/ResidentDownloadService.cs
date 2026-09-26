@@ -7,6 +7,61 @@ using System.Threading;
 
 namespace Orbis
 {
+    internal sealed class LegacyBgftAttachCoordinator
+    {
+        readonly object _gate = new object();
+
+        internal bool ExecuteSerialized(Func<bool> action)
+        {
+            lock (_gate) return action();
+        }
+
+        internal bool TryRetireForeignOwner(string requestedId, string ownerId, int taskId,
+            Func<string, int, bool> cleanup, Action<string, int> retain)
+        {
+            if (taskId < 0 || string.IsNullOrEmpty(ownerId) ||
+                string.Equals(requestedId, ownerId, StringComparison.Ordinal)) return true;
+            lock (_gate)
+            {
+                bool cleaned = false;
+                try { cleaned = cleanup(ownerId, taskId); } catch { }
+                if (cleaned) return true;
+                try { retain(ownerId, taskId); } catch { }
+                return false;
+            }
+        }
+
+        internal bool TryAttach(Func<bool> stillCurrent, Func<int> register,
+            Func<int, bool> publish, Func<int, bool> cleanup, Action<int> retain,
+            out int taskId)
+        {
+            taskId = -1;
+            lock (_gate)
+            {
+                if (!stillCurrent()) return false;
+                int created = register();
+                if (created < 0) return false;
+                taskId = created;
+                if (!stillCurrent())
+                {
+                    bool cleaned = false;
+                    try { cleaned = cleanup(created); } catch { }
+                    if (cleaned) taskId = -1;
+                    else retain(created);
+                    return false;
+                }
+                bool published = false;
+                try { published = publish(created); } catch { }
+                if (!published)
+                {
+                    retain(created);
+                    return false;
+                }
+                return true;
+            }
+        }
+    }
+
     internal sealed class ResidentDownloadStatus
     {
         public string Id;
@@ -40,7 +95,7 @@ namespace Orbis
         const string HostDaemonTitleId = "NPXS20119";
         const int LncAppNotFound = unchecked((int)0x80940005);
         const long SystemAuthId = 0x3800000000000010;
-        const string DaemonTitleId = "SRCHD0001";
+        const string DaemonTitleId = "SRCH00002";
         const string DaemonRoot = "/system/vsh/app/" + DaemonTitleId;
         static string _packageRoot;
         static bool _bridgeBound;
@@ -75,7 +130,9 @@ namespace Orbis
         static int _activationAttemptSerial, _activationAttemptInProgress, _manualActivationRetryQueued;
         static string _bgftAttachId;
         static int _bgftAttachTask = -1;
+        static string _bgftAttachGeneration;
         static int _bgftAttachInFlight;
+        static readonly LegacyBgftAttachCoordinator LegacyBgftAttach = new LegacyBgftAttachCoordinator();
         static DateTime _nextBgftAttachAttemptUtc;
         static int _launchMaintenanceStarted;
         static int _launchMaintenanceStopped;
@@ -98,6 +155,7 @@ namespace Orbis
         static string StatusPath { get { return Path.Combine(IpcRoot, "status.txt"); } }
         static string ControlPath { get { return Path.Combine(IpcRoot, "control.txt"); } }
         static string BgftPath { get { return Path.Combine(IpcRoot, "bgft.txt"); } }
+        static string BgftOwnerPath { get { return Path.Combine(IpcRoot, "bgft_owner.txt"); } }
 
         /// <summary>Maps an IPC file under the application's resident root to the
         /// equivalent path under the shell worker's shared root. Returns null for
@@ -375,6 +433,56 @@ namespace Orbis
         static string StagedGeneration(int slot)
         { return ReadStagedGeneration(StagedPath(slot, "job")); }
 
+        internal static bool TryGetStagedJobIdentity(string id, string destination, out string generation)
+        {
+            generation = null;
+            int slot = FindStagedSlot(id);
+            if (slot < 0) return false;
+            try
+            {
+                string[] record = File.ReadAllLines(StagedPath(slot, "job"));
+                if (!IsStagedRecord(record) || Decode(record[1]) != id || Decode(record[3]) != destination)
+                    return false;
+                if ((record[0] == "10" || record[0] == "13" || record[0] == "16" || record[0] == "18") &&
+                    record.Length > 11 && IsGeneration(record[11])) generation = record[11];
+                return true;
+            }
+            catch { return false; }
+        }
+
+        internal static bool TryGetJobIdentity(string id, string destination, out string generation)
+        {
+            if (TryGetStagedJobIdentity(id, destination, out generation)) return true;
+            generation = null;
+            try
+            {
+                string[] record = File.ReadAllLines(JobPath);
+                if (record.Length < 4 || Decode(record[1]) != id || Decode(record[3]) != destination) return false;
+                if (record[0] == "12" || record[0] == "14")
+                {
+                    int count;
+                    if (!int.TryParse(record[9], NumberStyles.Integer, CultureInfo.InvariantCulture, out count) || count < 1 || count > 512) return false;
+                    int index = 10 + count * 5;
+                    bool password = record[0] == "14";
+                    if ((password ? ValidPasswordTrailer(record, index + 3) : record.Length == index + 2) &&
+                        IsGeneration(record[index]) && (!password || ValidEncodedPassword(record[index + 2])))
+                        generation = record[index];
+                    return generation != null;
+                }
+                if (record[0] == "9" || record[0] == "11" || record[0] == "15" || record[0] == "17" || record[0] == "19")
+                {
+                    int index = 10;
+                    bool password = record[0] == "15" || record[0] == "19";
+                    if ((password ? ValidPasswordTrailer(record, index + 3) : record.Length == index + 2) &&
+                        IsGeneration(record[index]) && (!password || ValidEncodedPassword(record[index + 2])))
+                        generation = record[index];
+                    return generation != null;
+                }
+                return record[0] == "8";
+            }
+            catch { return false; }
+        }
+
         static string ReadStagedGeneration(string jobPath)
         {
             try
@@ -554,7 +662,18 @@ namespace Orbis
             string afterJobId, string password, out string error, out bool busy, string[] passwordFallbacks = null)
         {
             return TryPublishStagedPackage(id, url, destination, titleId, sha256, contentId, size,
-                expectedKind, rangeCount, autoInstall, afterJobId, password, false, false, out error, out busy, passwordFallbacks);
+                expectedKind, rangeCount, autoInstall, afterJobId, password, false, false,
+                null, out error, out busy, passwordFallbacks);
+        }
+
+        internal static bool TryStartStagedPackageWithPasswordGeneration(string id, string url, string destination, string titleId,
+            string sha256, string contentId, long size, int expectedKind, int rangeCount, bool autoInstall,
+            string afterJobId, string password, string generation, out string error, out bool busy,
+            string[] passwordFallbacks = null)
+        {
+            return TryPublishStagedPackage(id, url, destination, titleId, sha256, contentId, size,
+                expectedKind, rangeCount, autoInstall, afterJobId, password, false, false,
+                generation, out error, out busy, passwordFallbacks);
         }
 
         public static bool TryStartNativeBgftPackage(string id, string url, string destination, string titleId,
@@ -562,23 +681,46 @@ namespace Orbis
             string afterJobId, out string error, out bool busy)
         {
             return TryPublishStagedPackage(id, url, destination, titleId, "", contentId, size,
-                expectedKind, rangeCount, autoInstall, afterJobId, null, true, false, out error, out busy);
+                expectedKind, rangeCount, autoInstall, afterJobId, null, true, false,
+                null, out error, out busy);
+        }
+
+        internal static bool TryStartNativeBgftPackageWithGeneration(string id, string url, string destination, string titleId,
+            string contentId, long size, int expectedKind, int rangeCount, bool autoInstall,
+            string afterJobId, string generation, out string error, out bool busy)
+        {
+            return TryPublishStagedPackage(id, url, destination, titleId, "", contentId, size,
+                expectedKind, rangeCount, autoInstall, afterJobId, null, true, false,
+                generation, out error, out busy);
         }
 
         public static bool TryStartLocalSource(string id, string source, string titleId, string contentId,
             long size, int expectedKind, string afterJobId, string password, out string error, out bool busy, string[] passwordFallbacks = null)
         {
             return TryPublishStagedPackage(id, "", source, titleId, "", contentId, size,
-                expectedKind, 1, true, afterJobId, password, false, true, out error, out busy, passwordFallbacks);
+                expectedKind, 1, true, afterJobId, password, false, true,
+                null, out error, out busy, passwordFallbacks);
+        }
+
+        internal static bool TryStartLocalSourceWithGeneration(string id, string source, string titleId, string contentId,
+            long size, int expectedKind, string afterJobId, string password, string generation,
+            out string error, out bool busy, string[] passwordFallbacks = null)
+        {
+            return TryPublishStagedPackage(id, "", source, titleId, "", contentId, size,
+                expectedKind, 1, true, afterJobId, password, false, true,
+                generation, out error, out busy, passwordFallbacks);
         }
 
         static bool TryPublishStagedPackage(string id, string url, string destination, string titleId,
             string sha256, string contentId, long size, int expectedKind, int rangeCount, bool autoInstall,
-            string afterJobId, string password, bool nativeBgft, bool localSource, out string error, out bool busy, string[] passwordFallbacks = null)
+            string afterJobId, string password, bool nativeBgft, bool localSource, string generation,
+            out string error, out bool busy, string[] passwordFallbacks = null)
         {
             error = null; busy = false;
             if (!ValidArchivePassword(password) || (expectedKind != 0 && (!string.IsNullOrEmpty(password) || (passwordFallbacks != null && passwordFallbacks.Length > 0))))
             { error = "Resident archive password metadata is invalid"; return false; }
+            if (!string.IsNullOrEmpty(generation) && !IsGeneration(generation))
+            { error = "Resident staged generation is invalid"; return false; }
             Uri address; string storageRoot = null, canonical;
             bool sourceValid = localSource ? LocalInstallSource.TryNormalizePath(destination, out canonical)
                 : TryStagingRoot(destination, out storageRoot);
@@ -608,6 +750,18 @@ namespace Orbis
                 int slot = FindStagedSlot(id);
                 if (slot >= 0)
                 {
+                    string[] current;
+                    try { current = File.ReadAllLines(StagedPath(slot, "job")); }
+                    catch { busy = true; error = "Another resident job is active"; return false; }
+                    string existingGeneration = (IsStagedRecord(current) && current.Length > 11 &&
+                        (current[0] == "10" || current[0] == "13" || current[0] == "16" || current[0] == "18") &&
+                        IsGeneration(current[11])) ? current[11] : null;
+                    if (!IsStagedRecord(current) || Decode(current[1]) != id || Decode(current[3]) != destination ||
+                        (!string.IsNullOrEmpty(generation) &&
+                            !string.Equals(existingGeneration ?? "", generation, StringComparison.Ordinal)))
+                    {
+                        busy = true; error = "Another resident job is active"; return false;
+                    }
                     ResidentDownloadStatus existing;
                     bool retiring = TryGetStagedStatus(id, out existing) && existing.Terminal;
                     try
@@ -640,11 +794,11 @@ namespace Orbis
                         AppSettings.RequireStaging(storageRoot);
                     }
                     string storageToken = StorageToken(storageRoot);
+                    if (string.IsNullOrEmpty(generation)) generation = Guid.NewGuid().ToString("N");
                     File.Delete(StagedPath(slot, "status"));
                     File.Delete(StagedPath(slot, "control"));
                     // A retry with the same job ID must earn a new installation receipt.
                     File.Delete(Path.Combine(IpcRoot, "installed-" + id + ".txt"));
-                    string generation = Guid.NewGuid().ToString("N");
                     string record = localSource
                         ? CreateLocalSourceRecord(id, destination, titleId, contentId, size, expectedKind,
                             afterJobId, generation, storageToken, password)
@@ -726,90 +880,154 @@ namespace Orbis
                 return false;
             }
 
-            lock (Gate)
+            ResidentDownloadStatus previousStatus;
+            if (TryReadStatus(out previousStatus) &&
+                (previousStatus.State == "failed" || previousStatus.State == "canceled"))
             {
-                if (!EnsureAvailableLocked(out error)) return false;
-
-                if (StagedTransfersActive)
-                { busy = true; error = "Resident range transfers are active"; return false; }
-
-                ResidentDownloadStatus current;
-                if (TryReadStatus(out current) &&
-                    (current.State == "failed" || current.State == "canceled"))
+                WriteControl(previousStatus.Id, "release");
+                DateTime releasedBy = DateTime.UtcNow.AddSeconds(3);
+                while (DateTime.UtcNow < releasedBy)
                 {
-                    WriteControl(current.Id, "release");
-                    DateTime releasedBy = DateTime.UtcNow.AddSeconds(3);
-                    while (DateTime.UtcNow < releasedBy)
-                    {
-                        ResidentDownloadStatus released;
-                        if (!TryReadStatus(out released) || released.State == "idle") break;
-                        Thread.Sleep(100);
-                    }
-                }
-                if (TryReadStatus(out current) && current.State != "idle" &&
-                    !string.Equals(current.Id, id, StringComparison.Ordinal))
-                {
-                    busy = true;
-                    error = "Another PS4 system download owns the resident feeder";
-                    return false;
-                }
-
-                try
-                {
-                    Directory.CreateDirectory(IpcRoot);
-                    // Never reuse a BGFT attachment published for an earlier attempt.
-                    File.Delete(BgftPath);
-                    WriteAtomic(JobPath, string.Join("\n", new[]
-                    {
-                        "2",
-                        Encode(id),
-                        Encode(url),
-                        Encode(destination),
-                        Encode(titleId),
-                        Encode(expectedSha256),
-                        Encode(contentId),
-                        total.ToString(CultureInfo.InvariantCulture),
-                        DownloadTransferSettings.ConnectionsFor(url, rangeCount)
-                            .ToString(CultureInfo.InvariantCulture)
-                    }));
-                }
-                catch (Exception ex)
-                {
-                    error = "Resident job write failed: " + ex.Message;
-                    _lastError = error;
-                    return false;
-                }
-
-                DateTime until = DateTime.UtcNow.AddSeconds(15);
-                while (DateTime.UtcNow < until)
-                {
-                    ResidentDownloadStatus status;
-                    if (TryReadStatus(out status) && string.Equals(status.Id, id,
-                        StringComparison.Ordinal))
-                    {
-                        if (status.State == "failed" || status.State == "canceled")
-                        {
-                            error = string.IsNullOrEmpty(status.Error)
-                                ? "Resident feeder failed to start" : status.Error;
-                            _lastError = error;
-                            return false;
-                        }
-                        if (status.State == "ready" || status.State == "feeding" ||
-                            status.State == "paused" || status.State == "validating" ||
-                            status.State == "awaiting-bgft" || status.State == "complete")
-                        {
-                            routeUrl = "http://127.0.0.1:" + LoopbackPkgServer.Port +
-                                "/pkg/" + Uri.EscapeDataString(id) + ".pkg";
-                            _lastError = "ok";
-                            return true;
-                        }
-                    }
+                    ResidentDownloadStatus released;
+                    if (!TryReadStatus(out released) || released.State == "idle") break;
                     Thread.Sleep(100);
                 }
-                error = "Resident feeder did not accept the job";
-                _lastError = error;
-                return false;
             }
+
+            string publishError = null;
+            bool publishBusy = false;
+            bool jobPublished = LegacyBgftAttach.ExecuteSerialized(() =>
+            {
+                string ownerError;
+                if (!RetirePreviousLegacyBgftOwner(out ownerError))
+                { publishError = ownerError; return false; }
+
+                lock (Gate)
+                {
+                    if (!EnsureAvailableLocked(out publishError)) return false;
+
+                    if (StagedTransfersActive)
+                    { publishBusy = true; publishError = "Resident range transfers are active"; return false; }
+
+                    ResidentDownloadStatus current;
+                    if (TryReadStatus(out current) && current.State != "idle" &&
+                        !string.Equals(current.Id, id, StringComparison.Ordinal))
+                    {
+                        publishBusy = true;
+                        publishError = "Another PS4 system download owns the resident feeder";
+                        return false;
+                    }
+
+                    try
+                    {
+                        Directory.CreateDirectory(IpcRoot);
+                        // The serialized ownership check above retires any prior task before
+                        // its durable receipt is cleared for this new attempt.
+                        File.Delete(BgftPath);
+                        File.Delete(BgftOwnerPath);
+                        WriteAtomic(JobPath, string.Join("\n", new[]
+                        {
+                            "2",
+                            Encode(id),
+                            Encode(url),
+                            Encode(destination),
+                            Encode(titleId),
+                            Encode(expectedSha256),
+                            Encode(contentId),
+                            total.ToString(CultureInfo.InvariantCulture),
+                            DownloadTransferSettings.ConnectionsFor(url, rangeCount)
+                                .ToString(CultureInfo.InvariantCulture)
+                        }));
+                    }
+                    catch (Exception ex)
+                    {
+                        publishError = "Resident job write failed: " + ex.Message;
+                        _lastError = publishError;
+                        return false;
+                    }
+                }
+                return true;
+            });
+            error = publishError;
+            busy = publishBusy;
+            if (!jobPublished) return false;
+
+            DateTime until = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < until)
+            {
+                ResidentDownloadStatus status;
+                if (TryReadStatus(out status) && string.Equals(status.Id, id,
+                    StringComparison.Ordinal))
+                {
+                    if (status.State == "failed" || status.State == "canceled")
+                    {
+                        error = string.IsNullOrEmpty(status.Error)
+                            ? "Resident feeder failed to start" : status.Error;
+                        _lastError = error;
+                        return false;
+                    }
+                    if (status.State == "ready" || status.State == "feeding" ||
+                        status.State == "paused" || status.State == "validating" ||
+                        status.State == "awaiting-bgft" || status.State == "complete")
+                    {
+                        routeUrl = "http://127.0.0.1:" + LoopbackPkgServer.Port +
+                            "/pkg/" + Uri.EscapeDataString(id) + ".pkg";
+                        _lastError = "ok";
+                        return true;
+                    }
+                }
+                Thread.Sleep(100);
+            }
+            error = "Resident feeder did not accept the job";
+            _lastError = error;
+            return false;
+        }
+
+        static bool RetirePreviousLegacyBgftOwner(out string error)
+        {
+            string failure = null;
+            bool retired = LegacyBgftAttach.ExecuteSerialized(() =>
+            {
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    string owner = null, generation = null;
+                    int task = -1;
+                    lock (Gate)
+                    {
+                        if (_bgftAttachTask >= 0)
+                        {
+                            owner = _bgftAttachId;
+                            generation = _bgftAttachGeneration;
+                            task = _bgftAttachTask;
+                        }
+                    }
+                    if (task < 0 && !TryReadAttachedBgft(out owner, out task))
+                    {
+                        if (!File.Exists(BgftPath) && !File.Exists(BgftOwnerPath)) return true;
+                        failure = "The previous BGFT attachment receipt is invalid; refusing to replace it";
+                        return false;
+                    }
+                    if (task < 0 || string.IsNullOrEmpty(owner))
+                    {
+                        failure = "The previous BGFT attachment owner is unknown; refusing to replace it";
+                        return false;
+                    }
+                    if (!CleanupLegacyBgftTask(owner, task))
+                    {
+                        RetainLegacyBgftTask(owner, generation, task);
+                        failure = "The previous BGFT task still owns the attachment receipt";
+                        return false;
+                    }
+                }
+                if (File.Exists(BgftPath) || File.Exists(BgftOwnerPath))
+                {
+                    failure = "The previous BGFT attachment receipt could not be retired";
+                    return false;
+                }
+                return true;
+            });
+            error = failure;
+            return retired;
         }
 
         public static bool TryStartArchive(string id, string destination, string titleId, string expectedContentId,
@@ -1008,8 +1226,15 @@ namespace Orbis
             if (status == "shell-capabilities-unavailable") return "Resident is loaded, but transfer or BGFT initialization is unavailable. See logs/resident.log";
             if (status == "shell-no-heartbeat") return "GoldHEN accepted the load request, but the worker did not start. Retry or restart PS4; see logs/resident.log";
             if (!string.IsNullOrEmpty(status) && status.StartsWith("shell-api-rejected:", StringComparison.Ordinal))
-                return "Resident API query returned " + status.Substring("shell-api-rejected:".Length).Trim() +
-                    ". Module load was not attempted. See logs/combined.log";
+            {
+                string detail = status.Substring("shell-api-rejected:".Length).Trim();
+                // ENOSYS (78): the running jailbreak (for example HEN) has no GoldHEN
+                // plugin loader, so background mode cannot start on this boot.
+                if (detail.Contains("(-78)"))
+                    return "Background mode needs GoldHEN's plugin loader, which this jailbreak does not provide (API query " + detail +
+                        "). Use In-app download mode and keep SSPI open while downloading";
+                return "Resident API query returned " + detail + ". Module load was not attempted. See logs/combined.log";
+            }
             if (!string.IsNullOrEmpty(status) && status.StartsWith("shell-process-query-rejected:", StringComparison.Ordinal))
                 return "Resident process query failed: " + status.Substring("shell-process-query-rejected:".Length).Trim() +
                     ". Module load was not attempted. See logs/combined.log";
@@ -1112,6 +1337,11 @@ namespace Orbis
             return WriteControl(id, paused ? "pause" : "resume");
         }
 
+        public static bool SetPaused(string id, bool paused, string expectedGeneration, Func<Action, bool> publishIfCurrent)
+        {
+            return WriteControl(id, paused ? "pause" : "resume", -1, expectedGeneration, true, publishIfCurrent);
+        }
+
         /// <summary>Durably publishes an app-registered BGFT task to the
         /// resident worker that is waiting in awaiting-bgft.</summary>
         public static bool AttachBgftTask(string id, int taskId, out string error)
@@ -1120,6 +1350,25 @@ namespace Orbis
             if (string.IsNullOrEmpty(id) || taskId < 0)
             {
                 error = "Resident BGFT task metadata is invalid";
+                return false;
+            }
+            string contentId, generation;
+            int subType;
+            if (!TryGetLegacyBgftIdentity(id, taskId, out contentId, out subType, out generation))
+            {
+                error = "Resident BGFT owner identity is unavailable or changed";
+                return false;
+            }
+            return AttachBgftTaskWithIdentity(id, taskId, contentId, subType, generation, out error);
+        }
+
+        static bool AttachBgftTaskWithIdentity(string id, int taskId, string contentId, int subType,
+            string generation, out string error)
+        {
+            error = null;
+            if (!PersistLegacyBgftIdentity(id, taskId, contentId, subType, generation))
+            {
+                error = "Resident BGFT owner identity could not be persisted";
                 return false;
             }
             try
@@ -1144,85 +1393,15 @@ namespace Orbis
         public static bool TryAttachPendingBgft(string id, out int taskId)
         {
             taskId = -1;
-            if (string.IsNullOrEmpty(id) || id.Length > 190 || OwnsBgftLifetime(id) ||
+            if (string.IsNullOrEmpty(id) || id.Length > 190 ||
                 Interlocked.CompareExchange(ref _bgftAttachInFlight, 1, 0) != 0) return false;
             try
             {
-                ResidentDownloadStatus status;
-                if (!TryGetStatus(id, out status) || status.State != "awaiting-bgft") return false;
-
-                int registered;
-                lock (Gate)
-                {
-                    if (_bgftAttachId == id && _bgftAttachTask >= 0) registered = _bgftAttachTask;
-                    else registered = AttachedBgftTask(id);
-                }
-                if (registered >= 0)
-                {
-                    string publishError;
-                    if (AttachBgftTask(id, registered, out publishError))
-                    {
-                        taskId = registered;
-                        return true;
-                    }
-                    // The task is live; keep the receipt and retry the write.
-                    lock (Gate) { _bgftAttachId = id; _bgftAttachTask = registered; _lastError = publishError; }
-                    return false;
-                }
-
-                string destination, titleId, contentId, jobError;
-                long total;
-                int subType;
-                if (!TryReadActiveJob(id, out destination, out titleId, out contentId,
-                    out total, out subType, out jobError))
-                { lock (Gate) _lastError = jobError; return false; }
-                long stagedSize;
-                try { stagedSize = File.Exists(destination) ? new FileInfo(destination).Length : -1; }
-                catch (Exception ex)
-                { lock (Gate) _lastError = "Resident staged package stat failed: " + ex.Message; return false; }
-                if (stagedSize != total) return false;
-
-                lock (Gate)
-                {
-                    if (DateTime.UtcNow < _nextBgftAttachAttemptUtc) return false;
-                    _nextBgftAttachAttemptUtc = DateTime.UtcNow.AddSeconds(5);
-                }
-
-                string url = "http://127.0.0.1:" + LoopbackPkgServer.LegacyResidentPort +
-                    "/pkg/" + Uri.EscapeDataString(id) + ".pkg";
-                string contentName = !string.IsNullOrEmpty(titleId)
-                    ? titleId + ".pkg" : Path.GetFileName(destination);
-                string packageType = null;
-                try { packageType = PkgIntegrity.PackageType(destination); } catch { }
-                int created;
-                string registerError;
-                bool started = PkgInstaller.TryStartLoopbackBgftDownload(url, titleId,
-                    contentId, contentName, subType, total, out created, out registerError, packageType);
-                if (!started && created < 0)
-                {
-                    lock (Gate) _nextBgftAttachAttemptUtc = DateTime.UtcNow.AddSeconds(5);
-                    WriteLastError("Resident BGFT attachment pending: " + registerError);
-                    return false;
-                }
-                if (!started)
-                    WriteLastError("Resident BGFT start unconfirmed: " + registerError +
-                        "; task and PKG retained for the resident worker");
-                lock (Gate)
-                {
-                    _bgftAttachId = id;
-                    _bgftAttachTask = created;
-                    _nextBgftAttachAttemptUtc = DateTime.MinValue;
-                }
-                string attachError;
-                if (!AttachBgftTask(id, created, out attachError))
-                {
-                    lock (Gate) _lastError = attachError;
-                    taskId = created;
-                    return false;
-                }
-                WriteLaunchLog("bgft attached id=" + id + " task=" + created);
-                taskId = created;
-                return true;
+                int attachedTask = -1;
+                bool attached = LegacyBgftAttach.ExecuteSerialized(() =>
+                    TryAttachPendingBgftSerialized(id, out attachedTask));
+                taskId = attachedTask;
+                return attached;
             }
             catch (Exception ex)
             {
@@ -1232,18 +1411,361 @@ namespace Orbis
             finally { Interlocked.Exchange(ref _bgftAttachInFlight, 0); }
         }
 
-        static int AttachedBgftTask(string id)
+        static bool TryAttachPendingBgftSerialized(string id, out int taskId)
+        {
+            taskId = -1;
+            if (OwnsBgftLifetime(id)) return false;
+            ResidentDownloadStatus status;
+            if (!TryGetStatus(id, out status) || status.State != "awaiting-bgft") return false;
+            string generation = status.Generation ?? "";
+            if (!IsLegacyBgftAttachCurrent(id, generation)) return false;
+
+            int staleTask = -1;
+            string staleId = null, staleGeneration = null;
+            lock (Gate)
+            {
+                if (_bgftAttachTask >= 0 &&
+                    (_bgftAttachId != id || !string.Equals(_bgftAttachGeneration ?? "", generation, StringComparison.Ordinal)))
+                {
+                    staleTask = _bgftAttachTask;
+                    staleId = _bgftAttachId;
+                    staleGeneration = _bgftAttachGeneration;
+                }
+            }
+            if (staleTask >= 0)
+            {
+                if (!CleanupLegacyBgftTask(staleId, staleTask))
+                {
+                    RetainLegacyBgftTask(staleId, staleGeneration, staleTask);
+                    return false;
+                }
+            }
+
+            string receiptOwner;
+            int receiptTask;
+            if (TryReadAttachedBgft(out receiptOwner, out receiptTask) &&
+                !LegacyBgftAttach.TryRetireForeignOwner(id, receiptOwner, receiptTask,
+                    (owner, task) => CleanupLegacyBgftTask(owner, task),
+                    (owner, task) => RetainLegacyBgftTask(owner, null, task)))
+            {
+                lock (Gate) _lastError = "A previous BGFT task still owns the attachment receipt";
+                return false;
+            }
+
+            int registered;
+            lock (Gate)
+            {
+                registered = _bgftAttachId == id && _bgftAttachTask >= 0 &&
+                    string.Equals(_bgftAttachGeneration ?? "", generation, StringComparison.Ordinal)
+                    ? _bgftAttachTask : AttachedBgftTask(id);
+            }
+            if (registered >= 0)
+            {
+                if (!IsLegacyBgftAttachCurrent(id, generation)) return false;
+                RememberLegacyBgftTask(id, generation, registered);
+                string publishError;
+                if (AttachBgftTask(id, registered, out publishError))
+                {
+                    taskId = registered;
+                    return true;
+                }
+                lock (Gate) _lastError = publishError;
+                taskId = registered;
+                return false;
+            }
+
+            string destination, titleId, contentId, jobError;
+            long total;
+            int subType;
+            if (!TryReadActiveJob(id, out destination, out titleId, out contentId,
+                out total, out subType, out jobError))
+            { lock (Gate) _lastError = jobError; return false; }
+            long stagedSize;
+            try { stagedSize = File.Exists(destination) ? new FileInfo(destination).Length : -1; }
+            catch (Exception ex)
+            { lock (Gate) _lastError = "Resident staged package stat failed: " + ex.Message; return false; }
+            if (stagedSize != total) return false;
+
+            lock (Gate)
+            {
+                if (DateTime.UtcNow < _nextBgftAttachAttemptUtc) return false;
+                _nextBgftAttachAttemptUtc = DateTime.UtcNow.AddSeconds(5);
+            }
+
+            string url = "http://127.0.0.1:" + LoopbackPkgServer.LegacyResidentPort +
+                "/pkg/" + Uri.EscapeDataString(id) + ".pkg";
+            string contentName = !string.IsNullOrEmpty(titleId)
+                ? titleId + ".pkg" : Path.GetFileName(destination);
+            string packageType = null;
+            try { packageType = PkgIntegrity.PackageType(destination); } catch { }
+            int created = -1;
+            string registerError = null;
+            bool started = false;
+            bool attached = LegacyBgftAttach.TryAttach(
+                () => IsLegacyBgftAttachCurrent(id, generation),
+                () =>
+                {
+                    started = PkgInstaller.TryStartLoopbackBgftDownload(url, titleId,
+                        contentId, contentName, subType, total, out created, out registerError, packageType);
+                    if (created >= 0 && !PersistLegacyBgftIdentity(id, created, contentId, subType, generation))
+                        WriteLastError("Resident BGFT owner binding could not be persisted after registration");
+                    if (!started && created < 0)
+                    {
+                        lock (Gate) _nextBgftAttachAttemptUtc = DateTime.UtcNow.AddSeconds(5);
+                        WriteLastError("Resident BGFT attachment pending: " + registerError);
+                        return -1;
+                    }
+                    RememberLegacyBgftTask(id, generation, created);
+                    if (!started)
+                        WriteLastError("Resident BGFT start unconfirmed: " + registerError +
+                            "; task and PKG retained for the resident worker");
+                    return created;
+                },
+                task =>
+                {
+                    RememberLegacyBgftTask(id, generation, task);
+                    string attachError;
+                    if (AttachBgftTaskWithIdentity(id, task, contentId, subType, generation, out attachError)) return true;
+                    lock (Gate) _lastError = attachError;
+                    return false;
+                },
+                task => CleanupLegacyBgftTask(id, task),
+                task => RetainLegacyBgftTask(id, generation, task, contentId, subType),
+                out taskId);
+            if (attached)
+            {
+                lock (Gate) _nextBgftAttachAttemptUtc = DateTime.MinValue;
+                WriteLaunchLog("bgft attached id=" + id + " task=" + taskId);
+            }
+            else if (created >= 0 && taskId < 0)
+            {
+                // A generation change won and the new task was retired successfully.
+                lock (Gate) _nextBgftAttachAttemptUtc = DateTime.UtcNow.AddSeconds(5);
+            }
+            return attached;
+        }
+
+        static bool IsLegacyBgftAttachCurrent(string id, string generation)
+        {
+            if (OwnsBgftLifetime(id) || HasPendingLegacyCancel(id, generation)) return false;
+            ResidentDownloadStatus status;
+            return TryGetStatus(id, out status) && status.State == "awaiting-bgft" &&
+                string.Equals(status.Generation ?? "", generation ?? "", StringComparison.Ordinal);
+        }
+
+        static bool HasPendingLegacyCancel(string id, string generation)
         {
             try
             {
-                string[] lines = File.ReadAllLines(BgftPath);
-                int taskId;
-                if (lines.Length == 3 && lines[0] == "1" && Decode(lines[1]) == id &&
-                    int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture,
-                        out taskId) && taskId >= 0) return taskId;
+                string[] lines = File.ReadAllLines(ControlPath);
+                if (lines.Length < 3 || Decode(lines[1]) != id ||
+                    (lines[2] != "cancel" && lines[2] != "release")) return false;
+                if (lines[0] == "1") return string.IsNullOrEmpty(generation) && lines.Length == 3;
+                return lines[0] == "2" && lines.Length == 4 && lines[3] == (generation ?? "");
+            }
+            catch { return false; }
+        }
+
+        static void RememberLegacyBgftTask(string id, string generation, int taskId)
+        {
+            lock (Gate)
+            {
+                _bgftAttachId = id;
+                _bgftAttachGeneration = generation ?? "";
+                _bgftAttachTask = taskId;
+            }
+        }
+
+        static void RetainLegacyBgftTask(string id, string generation, int taskId)
+        {
+            RememberLegacyBgftTask(id, generation, taskId);
+            string attachError;
+            if (!AttachBgftTask(id, taskId, out attachError))
+                lock (Gate) _lastError = attachError;
+            WriteLaunchLog("bgft attach retained id=" + id + " task=" + taskId);
+        }
+
+        static void RetainLegacyBgftTask(string id, string generation, int taskId, string contentId, int subType)
+        {
+            RememberLegacyBgftTask(id, generation, taskId);
+            string attachError;
+            if (!AttachBgftTaskWithIdentity(id, taskId, contentId, subType, generation, out attachError))
+                lock (Gate) _lastError = attachError;
+            WriteLaunchLog("bgft attach retained id=" + id + " task=" + taskId);
+        }
+
+        static bool CleanupLegacyBgftTask(string id, int taskId)
+        {
+            int activeTask;
+            string error;
+            string contentId;
+            int subType;
+            string generation;
+            if (!TryGetLegacyBgftIdentity(id, taskId, out contentId, out subType, out generation))
+            {
+                lock (Gate) _lastError = "BGFT task identity does not match its resident owner; task ownership is retained";
+                return false;
+            }
+            if (!PkgInstaller.CancelBackground(taskId, contentId, subType, out activeTask, out error))
+            {
+                lock (Gate) _lastError = error ?? "BGFT task cleanup is pending";
+                return false;
+            }
+            lock (Gate)
+            {
+                if (_bgftAttachId == id && _bgftAttachTask == taskId)
+                {
+                    _bgftAttachId = null;
+                    _bgftAttachGeneration = null;
+                    _bgftAttachTask = -1;
+                }
+            }
+            try
+            {
+                string receiptOwner; int receiptTask;
+                bool hasReceipt = TryReadAttachedBgft(out receiptOwner, out receiptTask);
+                if (hasReceipt && receiptOwner == id && receiptTask == taskId) File.Delete(BgftPath);
+                if (!File.Exists(BgftPath) || (hasReceipt && receiptOwner == id && receiptTask == taskId))
+                {
+                    string[] owner = File.ReadAllLines(BgftOwnerPath);
+                    int ownerTask;
+                    if (owner.Length == 6 && owner[0] == "1" && Decode(owner[1]) == id &&
+                        int.TryParse(owner[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out ownerTask) && ownerTask == taskId)
+                        File.Delete(BgftOwnerPath);
+                }
             }
             catch { }
-            return -1;
+            return true;
+        }
+
+        static bool PersistLegacyBgftIdentity(string id, int taskId, string contentId, int subType, string generation)
+        {
+            if (string.IsNullOrEmpty(id) || taskId < 0 || string.IsNullOrWhiteSpace(contentId) || contentId.Length != 36 ||
+                subType < 6 || subType > 8 || (!string.IsNullOrEmpty(generation) && !IsGeneration(generation))) return false;
+            string journalContent; int journalType;
+            if (!PkgInstaller.TryGetOwnedBackgroundIdentity(taskId, out journalContent, out journalType) ||
+                !string.Equals(contentId, journalContent, StringComparison.OrdinalIgnoreCase) || journalType != subType) return false;
+            if (File.Exists(BgftOwnerPath))
+            {
+                try
+                {
+                    string[] owner = File.ReadAllLines(BgftOwnerPath); int ownerTask, ownerType;
+                    if (owner.Length != 6 || owner[0] != "1" || Decode(owner[1]) != id ||
+                        !int.TryParse(owner[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out ownerTask) || ownerTask != taskId ||
+                        !int.TryParse(owner[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out ownerType) || ownerType != subType ||
+                        !string.Equals(Decode(owner[3]), contentId, StringComparison.OrdinalIgnoreCase) || Decode(owner[5]) != (generation ?? "")) return false;
+                    return true;
+                }
+                catch { return false; }
+            }
+            try
+            {
+                Directory.CreateDirectory(IpcRoot);
+                WriteAtomic(BgftOwnerPath, "1\n" + Encode(id) + "\n" + taskId.ToString(CultureInfo.InvariantCulture) + "\n" +
+                    Encode(contentId) + "\n" + subType.ToString(CultureInfo.InvariantCulture) + "\n" + Encode(generation));
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static bool TryGetLegacyBgftIdentity(string id, int taskId, out string contentId,
+            out int subType, out string generation)
+        {
+            contentId = null; subType = 0; generation = "";
+            if (string.IsNullOrEmpty(id) || taskId < 0) return false;
+            bool hasOwner = File.Exists(BgftOwnerPath);
+            if (hasOwner)
+            {
+                try
+                {
+                    string[] owner = File.ReadAllLines(BgftOwnerPath);
+                    int ownerTask;
+                    if (owner.Length != 6 || owner[0] != "1" || Decode(owner[1]) != id ||
+                        !int.TryParse(owner[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out ownerTask) || ownerTask != taskId ||
+                        !int.TryParse(owner[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out subType)) return false;
+                    contentId = Decode(owner[3]);
+                    generation = Decode(owner[5]);
+                    if (string.IsNullOrWhiteSpace(contentId) || contentId.Length != 36 || subType < 6 || subType > 8 ||
+                        (!string.IsNullOrEmpty(generation) && !IsGeneration(generation))) return false;
+                }
+                catch { return false; }
+            }
+            else
+            {
+                string receiptOwner; int receiptTask;
+                if (File.Exists(BgftPath) && (!TryReadAttachedBgft(out receiptOwner, out receiptTask) || receiptOwner != id || receiptTask != taskId))
+                    return false;
+                string destination, titleId, jobContent, jobError; long total; int jobType;
+                if (!TryReadActiveJob(id, out destination, out titleId, out jobContent, out total, out jobType, out jobError)) return false;
+                contentId = jobContent; subType = jobType;
+                generation = ActiveGeneration(id) ?? "";
+                ResidentDownloadStatus status;
+                if (TryGetStatus(id, out status) && !string.IsNullOrEmpty(status.Generation))
+                {
+                    if (!string.IsNullOrEmpty(generation) && generation != status.Generation) return false;
+                    generation = status.Generation;
+                }
+            }
+
+            string journalContent; int journalType;
+            if (!PkgInstaller.TryGetOwnedBackgroundIdentity(taskId, out journalContent, out journalType) ||
+                !string.Equals(contentId, journalContent, StringComparison.OrdinalIgnoreCase) || journalType != subType)
+                return false;
+
+            string activeGeneration = ActiveGeneration(id);
+            if (!string.IsNullOrEmpty(activeGeneration) &&
+                (string.IsNullOrEmpty(generation) || activeGeneration != generation)) return false;
+            ResidentDownloadStatus currentStatus;
+            if (TryGetStatus(id, out currentStatus) && !string.IsNullOrEmpty(currentStatus.Generation) &&
+                currentStatus.Generation != generation) return false;
+
+            if (!hasOwner)
+            {
+                if (!PersistLegacyBgftIdentity(id, taskId, contentId, subType, generation)) return false;
+            }
+            return true;
+        }
+
+        static int AttachedBgftTask(string id)
+        {
+            string owner;
+            int taskId;
+            return TryReadAttachedBgft(out owner, out taskId) && owner == id ? taskId : -1;
+        }
+
+        static bool TryReadAttachedBgft(out string id, out int taskId)
+        {
+            id = null;
+            taskId = -1;
+            if (!File.Exists(BgftPath)) return TryReadBgftOwner(out id, out taskId);
+            try
+            {
+                string[] lines = File.ReadAllLines(BgftPath);
+                if (lines.Length != 3 || lines[0] != "1" ||
+                    !int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture,
+                        out taskId) || taskId < 0) return false;
+                id = Decode(lines[1]);
+                return !string.IsNullOrEmpty(id);
+            }
+            catch { return false; }
+        }
+
+        static bool TryReadBgftOwner(out string id, out int taskId)
+        {
+            id = null; taskId = -1;
+            try
+            {
+                string[] owner = File.ReadAllLines(BgftOwnerPath);
+                int subType;
+                if (owner.Length != 6 || owner[0] != "1" ||
+                    !int.TryParse(owner[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out taskId) || taskId < 0 ||
+                    !int.TryParse(owner[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out subType) || subType < 6 || subType > 8) return false;
+                id = Decode(owner[1]);
+                string contentId = Decode(owner[3]), generation = Decode(owner[5]);
+                return !string.IsNullOrEmpty(id) && contentId.Length == 36 &&
+                    (string.IsNullOrEmpty(generation) || IsGeneration(generation));
+            }
+            catch { id = null; taskId = -1; return false; }
         }
 
         static bool TryReadActiveJob(string id, out string destination, out string titleId,
@@ -1300,10 +1822,10 @@ namespace Orbis
 
         public static void ResetQueueForFreshStart()
         {
+            string id = "";
             lock (Gate)
             {
                 Directory.CreateDirectory(IpcRoot);
-                string id = "";
                 ResidentDownloadStatus status;
                 if (TryReadStatus(out status)) id = status.Id;
                 if (File.Exists(JobPath))
@@ -1314,9 +1836,9 @@ namespace Orbis
                     if (!File.Exists(backup)) File.Copy(JobPath, backup);
                     File.Delete(JobPath);
                 }
-                // Release also cancels the worker, then clears its ownership after it stops.
-                if (!string.IsNullOrEmpty(id)) WriteControl(id, "release");
             }
+            // Release also cancels the worker, then clears its ownership after it stops.
+            if (!string.IsNullOrEmpty(id)) WriteControl(id, "release");
         }
 
         public static void MarkFailed(string id)
@@ -1331,9 +1853,54 @@ namespace Orbis
             return written;
         }
 
+        public static bool TryCancel(string id, int legacyTaskId, out string error)
+        {
+            bool written = WriteControl(id, "cancel", legacyTaskId);
+            error = written ? null : "Could not send cancellation to the resident: " + LastError;
+            return written;
+        }
+
+        public static bool TryCancel(string id, int legacyTaskId, string expectedGeneration,
+            Func<Action, bool> publishIfCurrent, out string error)
+        {
+            bool written = WriteControl(id, "cancel", legacyTaskId, expectedGeneration, true, publishIfCurrent);
+            error = written ? null : "Could not send cancellation to the resident: " + LastError;
+            return written;
+        }
+
+        public static bool TryCancelLegacyBgftTask(string id, int taskId, out string error)
+        { return TryCancelLegacyBgftTask(id, taskId, null, null, out error); }
+
+        public static bool TryCancelLegacyBgftTask(string id, int taskId, string expectedGeneration,
+            Func<bool> stillCurrent, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(id) || taskId < 0) return true;
+            string cleanupError = null;
+            bool cleaned = LegacyBgftAttach.ExecuteSerialized(() =>
+            {
+                if (stillCurrent != null && !stillCurrent()) return true;
+                if (OwnsBgftLifetime(id)) return true;
+                string activeGeneration = ActiveGeneration(id);
+                if (!string.Equals(activeGeneration ?? "", expectedGeneration ?? "", StringComparison.Ordinal)) return true;
+                if (CleanupLegacyBgftTask(id, taskId)) return true;
+                cleanupError = LastError;
+                RetainLegacyBgftTask(id, expectedGeneration, taskId);
+                return false;
+            });
+            if (!cleaned) error = string.IsNullOrEmpty(cleanupError)
+                ? "BGFT task cleanup is pending" : cleanupError;
+            return cleaned;
+        }
+
         public static void Release(string id)
         {
             WriteControl(id, "release");
+        }
+
+        public static void Release(string id, string expectedGeneration, Func<Action, bool> publishIfCurrent)
+        {
+            WriteControl(id, "release", -1, expectedGeneration, true, publishIfCurrent);
         }
 
         public static string GetError(string id)
@@ -1342,16 +1909,50 @@ namespace Orbis
             return TryGetStatus(id, out status) ? status.Error : LastError;
         }
 
-        static bool WriteControl(string id, string action)
+        static bool WriteControl(string id, string action, int fallbackTaskId = -1,
+            string expectedGeneration = null, bool bindGeneration = false, Func<Action, bool> publishIfCurrent = null)
         {
             if (string.IsNullOrEmpty(id)) return false;
+            return LegacyBgftAttach.ExecuteSerialized(() =>
+                WriteControlSerialized(id, action, fallbackTaskId, expectedGeneration, bindGeneration, publishIfCurrent));
+        }
+
+        static bool WriteControlSerialized(string id, string action, int fallbackTaskId,
+            string expectedGeneration, bool bindGeneration, Func<Action, bool> publishIfCurrent = null)
+        {
             try
             {
-                Directory.CreateDirectory(IpcRoot);
                 int slot = FindStagedSlot(id);
-                string generation = slot >= 0 ? StagedGeneration(slot) : ActiveGeneration(id);
-                WriteAtomic(slot >= 0 ? StagedPath(slot, "control") : ControlPath,
-                    CreateControlRecord(id, action, generation));
+                string currentGeneration = slot >= 0 ? StagedGeneration(slot) : ActiveGeneration(id);
+                string boundGeneration = string.IsNullOrEmpty(expectedGeneration) ? null : expectedGeneration;
+                if (bindGeneration && !string.Equals(currentGeneration ?? "", boundGeneration ?? "", StringComparison.Ordinal))
+                    return true;
+                string generation = bindGeneration ? boundGeneration : currentGeneration;
+                if (publishIfCurrent != null && !publishIfCurrent(null)) return true;
+                if ((action == "cancel" || action == "release") && !OwnsBgftLifetime(id))
+                {
+                    int legacyTask;
+                    string legacyGeneration;
+                    lock (Gate)
+                    {
+                        bool sameOwner = _bgftAttachId == id &&
+                            string.Equals(_bgftAttachGeneration ?? "", generation ?? "", StringComparison.Ordinal);
+                        legacyTask = sameOwner ? _bgftAttachTask : -1;
+                        legacyGeneration = sameOwner ? _bgftAttachGeneration : generation;
+                    }
+                    if (legacyTask < 0 && !bindGeneration) legacyTask = AttachedBgftTask(id);
+                    if (legacyTask < 0) legacyTask = fallbackTaskId;
+                    if (legacyTask >= 0 && !CleanupLegacyBgftTask(id, legacyTask))
+                        RetainLegacyBgftTask(id, legacyGeneration, legacyTask);
+                }
+                Action publish = () =>
+                {
+                    Directory.CreateDirectory(IpcRoot);
+                    WriteAtomic(slot >= 0 ? StagedPath(slot, "control") : ControlPath,
+                        CreateControlRecord(id, action, generation));
+                };
+                if (publishIfCurrent != null) publishIfCurrent(publish);
+                else publish();
                 return true;
             }
             catch (Exception ex)
@@ -1364,16 +1965,34 @@ namespace Orbis
         public static bool HasJob(string id)
         {
             if (HasStagedJob(id)) return true;
+            for (int slot = 0; slot < StagedSlotCount; slot++)
+            {
+                string path = StagedPath(slot, "job");
+                if (!File.Exists(path)) continue;
+                try
+                {
+                    string[] lines = File.ReadAllLines(path);
+                    // A damaged record still has a native owner until the worker
+                    // removes it. Only a valid record for another ID is excluded.
+                    if (!IsStagedRecord(lines)) return true;
+                }
+                catch { return true; }
+            }
+            if (!File.Exists(JobPath)) return false;
             try
             {
                 using (var reader = new StreamReader(JobPath))
                 {
                     string version = reader.ReadLine();
-                    return (version == "2" || version == "3" || version == "4" || version == "5" ||
-                        version == "8" || version == "9" || version == "11" || version == "12" || version == "14" || version == "15" || version == "17" || version == "19") && Decode(reader.ReadLine()) == id;
+                    bool known = version == "2" || version == "3" || version == "4" || version == "5" ||
+                        version == "8" || version == "9" || version == "11" || version == "12" ||
+                        version == "14" || version == "15" || version == "17" || version == "19";
+                    if (!known) return true;
+                    string owner = Decode(reader.ReadLine());
+                    return string.IsNullOrEmpty(owner) || owner == id;
                 }
             }
-            catch { return false; }
+            catch { return File.Exists(JobPath); }
         }
 
         internal static string ObservedWorkerVersion
@@ -1823,7 +2442,7 @@ namespace Orbis
             ResidentSfo.TrySetUtf8(daemonSfo, "TITLE", "Game Search Service", out sfoError);
             ResidentSfo.TrySetUtf8(daemonSfo, "CATEGORY", "gdd", out sfoError);
             ResidentSfo.TrySetUtf8(daemonSfo, "CONTENT_ID",
-                "IV0000-SRCHD0001_00-GAMESEARCHDAEMON", out sfoError);
+                "IV0000-SRCH00002_00-GAMESEARCHDAEMON", out sfoError);
         }
 
         static void StageDaemonPayload(string packageRoot)
@@ -1914,14 +2533,14 @@ namespace Orbis
 
         static bool TryRegisterDaemonTitle(string packageRoot, uint launchUser, ref int launchResult)
         {
-            string pkgSource = packageRoot + "/SRCHD0001.pkg";
+            string pkgSource = packageRoot + "/SRCH00002.pkg";
             if (!File.Exists(pkgSource))
             {
                 WriteLaunchLog("daemon pkg missing");
                 return false;
             }
-            string pkgDest = Path.Combine(IpcRoot, "SRCHD0001.pkg");
-            string userPkg = "/user/data/SSPI/resident/SRCHD0001.pkg";
+            string pkgDest = Path.Combine(IpcRoot, "SRCH00002.pkg");
+            string userPkg = "/user/data/SSPI/resident/SRCH00002.pkg";
             try
             {
                 NativeMkdir("/user");

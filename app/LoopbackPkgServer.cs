@@ -15,6 +15,20 @@ namespace Orbis
         // fetched from the process that did not own its route.
         public const int Port = 8743;
         public const int LegacyResidentPort = 8742;
+        // BGFT writes the installed copy to the disk this route reads from, so
+        // small alternating reads spend most of their time repositioning the
+        // head (background-worker logs: ~17 MB/s, 77% of it inside reads). Large
+        // complete bodies are read ahead on a helper thread in 8 MiB blocks while
+        // the previous block is on the socket. One pipeline at a time bounds the
+        // memory; other requests use the serial 1 MiB loop.
+        internal const int ReadAheadBlock = 8 * 1024 * 1024;
+        internal const long ReadAheadMinimum = 32L * 1024 * 1024;
+        const int SerialBlock = 1024 * 1024;
+        static int _readAheadBusy;
+        // The two blocks are reused by every pipeline instead of allocating 16 MiB per
+        // BGFT request. Only the thread that holds _readAheadBusy touches this field or the
+        // arrays, and it joins its reader thread before releasing _readAheadBusy.
+        static byte[][] _readAheadSlots;
 
         sealed class Entry
         {
@@ -25,6 +39,9 @@ namespace Orbis
             public volatile bool Complete;
             public volatile bool Failed;
             public volatile bool FullyServed;
+            // Set after the PS4 rejects a zero declaration; the reference JSON then
+            // declares the real byte length, matching the retried BGFT parameter.
+            public volatile bool DeclareTransferSize;
             public readonly List<long[]> Served = new List<long[]>();
         }
 
@@ -160,11 +177,35 @@ namespace Orbis
                 return _active != null && _active.QueueId == queueId && _active.FullyServed;
         }
 
-        public void Release(string queueId)
+        public bool DeclareTransferSize(string queueId)
         {
             lock (_gate)
+            {
+                if (_active == null || _active.QueueId != queueId || _active.Failed) return false;
+                _active.DeclareTransferSize = true;
+                return true;
+            }
+        }
+
+        public void Release(string queueId)
+        {
+            bool idle;
+            lock (_gate)
+            {
                 if (_active != null && _active.QueueId == queueId)
                     _active = null;
+                idle = _active == null;
+            }
+            if (idle) ReleaseReadAheadSlots();
+        }
+
+        // With no feeder registered the reused blocks are freed, unless a pipeline holds
+        // them right now; the next large request allocates a new pair.
+        internal static void ReleaseReadAheadSlots()
+        {
+            if (Interlocked.CompareExchange(ref _readAheadBusy, 1, 0) != 0) return;
+            _readAheadSlots = null;
+            Interlocked.Exchange(ref _readAheadBusy, 0);
         }
 
         bool TryStart(out string error)
@@ -227,6 +268,8 @@ namespace Orbis
                 {
                     client.ReceiveTimeout = 5000;
                     client.SendTimeout = 30000;
+                    // Optional: a larger send buffer only reduces send wakeups.
+                    try { client.SendBufferSize = SerialBlock; } catch { }
                     using (NetworkStream stream = client.GetStream()) Serve(stream);
                 }
                 catch (IOException) { }
@@ -316,19 +359,121 @@ namespace Orbis
             {
                 file.Position = start;
                 WriteHead(stream, partial ? 206 : 200, partial ? "Partial Content" : "OK", representation);
-                byte[] buffer = new byte[256 * 1024];
                 long remaining = end - start + 1;
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                long piped = CopyWithReadAhead(file, start, remaining, stream, () => !_stop && !entry.Failed);
+                if (piped >= 0)
+                {
+                    LogBody(entry, start, piped, remaining, watch, "read-ahead");
+                    if (piped != remaining) return;
+                    stream.Flush();
+                    RecordServed(entry, start, end);
+                    return;
+                }
+                byte[] buffer = new byte[SerialBlock];
+                long total = remaining;
                 while (remaining > 0)
                 {
                     int wanted = (int)Math.Min(buffer.Length, remaining);
                     int read = file.Read(buffer, 0, wanted);
-                    if (read <= 0) return;
+                    if (read <= 0) { LogBody(entry, start, total - remaining, total, watch, "serial"); return; }
                     stream.Write(buffer, 0, read);
                     remaining -= read;
                 }
                 stream.Flush();
+                LogBody(entry, start, total, total, watch, "serial");
                 RecordServed(entry, start, end);
             }
+        }
+
+        static void LogBody(Entry entry, long start, long sent, long requested, System.Diagnostics.Stopwatch watch, string mode)
+        {
+            // Large bodies only: one line per BGFT range with its throughput.
+            if (requested < ReadAheadMinimum) return;
+            long ms = Math.Max(1, watch.ElapsedMilliseconds);
+            SspiLog.Write("download", "event=loopback-body job=" + entry.QueueId + " start=" + start + " sent=" + sent +
+                " requested=" + requested + " elapsed_ms=" + ms + " mb_per_s=" +
+                (sent / 1048576.0 / (ms / 1000.0)).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " mode=" + mode);
+        }
+
+        /// <summary>
+        /// Sends count bytes from file (positioned at start) with a read-ahead
+        /// thread. Returns the bytes sent, or -1 when the pipeline is busy or
+        /// its memory is unavailable, so the caller uses the serial loop.
+        /// </summary>
+        internal static long CopyWithReadAhead(Stream file, long start, long count, Stream destination, Func<bool> keepGoing)
+        {
+            if (count < ReadAheadMinimum || Interlocked.CompareExchange(ref _readAheadBusy, 1, 0) != 0) return -1;
+            byte[][] slots = _readAheadSlots;
+            if (slots == null)
+            {
+                try { slots = new[] { new byte[ReadAheadBlock], new byte[ReadAheadBlock] }; }
+                catch (OutOfMemoryException) { Interlocked.Exchange(ref _readAheadBusy, 0); return -1; }
+                _readAheadSlots = slots;
+            }
+            var lengths = new int[2];
+            var ready = new bool[2];
+            var gate = new object();
+            bool stop = false, finished = false, failed = false;
+            var reader = new Thread(() =>
+            {
+                try
+                {
+                    long position = start, left = count;
+                    for (int n = 0; left > 0; n ^= 1)
+                    {
+                        lock (gate)
+                        {
+                            while (ready[n] && !stop) Monitor.Wait(gate);
+                            if (stop) break;
+                        }
+                        int wanted = (int)Math.Min(slots[n].Length, left), got = 0;
+                        file.Position = position;
+                        while (got < wanted)
+                        {
+                            int read = file.Read(slots[n], got, wanted - got);
+                            if (read <= 0) break;
+                            got += read;
+                        }
+                        lock (gate)
+                        {
+                            if (got != wanted) { failed = true; break; }
+                            lengths[n] = got;
+                            ready[n] = true;
+                            Monitor.PulseAll(gate);
+                        }
+                        position += got;
+                        left -= got;
+                    }
+                }
+                catch { lock (gate) failed = true; }
+                finally { lock (gate) { finished = true; Monitor.PulseAll(gate); } }
+            }) { IsBackground = true, Name = "PKG loopback read-ahead" };
+            try { reader.Start(); }
+            catch { Interlocked.Exchange(ref _readAheadBusy, 0); return -1; }
+            long sent = 0;
+            try
+            {
+                for (int n = 0; sent < count && keepGoing(); n ^= 1)
+                {
+                    lock (gate)
+                    {
+                        while (!ready[n] && !failed && !finished) Monitor.Wait(gate, 250);
+                        // A slot filled before a later read failed is still sent.
+                        if (!ready[n]) break;
+                    }
+                    destination.Write(slots[n], 0, lengths[n]);
+                    sent += lengths[n];
+                    lock (gate) { ready[n] = false; Monitor.PulseAll(gate); }
+                }
+            }
+            finally
+            {
+                lock (gate) { stop = true; Monitor.PulseAll(gate); }
+                reader.Join();
+                Interlocked.Exchange(ref _readAheadBusy, 0);
+            }
+            return sent;
         }
 
         static void RecordServed(Entry entry, long start, long end)
@@ -488,9 +633,13 @@ namespace Orbis
                 byte[] digest = new byte[32];
                 if (file.Read(digest, 0, digest.Length) != digest.Length) return false;
                 string hex = BitConverter.ToString(digest).Replace("-", "").ToLowerInvariant();
+                long declaredSize;
+                try { declaredSize = PkgIntegrity.BgftPackageSize(entry.FinalPath); }
+                catch { return false; }
+                if (entry.DeclareTransferSize) declaredSize = entry.Length;
                 // BGFT consumes the reference JSON even for a single local PKG,
                 // following flatz's Remote Package Installer reference format.
-                string json = "{\"originalFileSize\":" + entry.Length +
+                string json = "{\"originalFileSize\":" + declaredSize +
                     ",\"packageDigest\":\"" + hex + "\",\"numberOfSplitFiles\":1,\"pieces\":[{\"url\":\"" +
                     BuildUrl(entry.Route) + "\",\"fileOffset\":0,\"fileSize\":" + entry.Length +
                     ",\"hashValue\":\"0000000000000000000000000000000000000000\"}]}";

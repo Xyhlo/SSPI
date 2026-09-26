@@ -5,6 +5,7 @@
 #include "../../transfer/gs_transfer.h"
 #include "gs_storage_policy.h"
 #include <orbis/_types/user.h>
+#include <dirent.h>
 
 typedef struct {
     char id[192], url[8192], destination[1024], title[16], sha[65], content[49];
@@ -76,6 +77,33 @@ static int gs_file_stat(FILE *file, struct stat *value)
     int64_t end = sceKernelLseek(descriptor, 0, SEEK_END);
     if (at < 0 || end < 0 || sceKernelLseek(descriptor, at, SEEK_SET) < 0) return -1;
     memset(value, 0, sizeof(*value)); value->st_size = end; value->st_mode = S_IFREG; return 0;
+}
+
+/* The bundled libc lstat redirects to an ENOSYS fstatat stub. Probe through
+ * open with no-follow semantics; 1 means the requested kind, 0 absent, -1
+ * means an unexpected type or uncertain I/O and must retain ownership. */
+static int gs_nofollow_path(const char *path, int directory)
+{
+    int flags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | (directory ? O_DIRECTORY : 0);
+    int fd = open(path, flags);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    mode_t mode;
+#if defined(__FreeBSD__)
+    // The PS4 kernel stat layout has mode at byte 8; the bundled libc's
+    // lstat/fstatat path is ENOSYS. Do not reinterpret the full libc struct.
+    unsigned char info[256] __attribute__((aligned(8))) = {0};
+    uint16_t raw_mode = 0;
+    int rc = sceKernelFstat(fd, (OrbisKernelStat *)info);
+    if (!rc) memcpy(&raw_mode, info + 8, sizeof(raw_mode));
+    mode = raw_mode;
+#else
+    struct stat info;
+    int rc = fstat(fd, &info);
+    if (!rc) mode = info.st_mode;
+#endif
+    int closed = close(fd);
+    if (rc || closed) return -1;
+    return directory ? (S_ISDIR(mode) ? 1 : -1) : (S_ISREG(mode) ? 1 : -1);
 }
 
 static void gs_package_url(char *route, size_t size, const char *prefix)
@@ -867,11 +895,13 @@ static const char *gs_bgft_error(int code)
         case 0x80990015u: return "duplicate task";
         case 0x80990019u: return "task not found";
         case 0x8099002Cu: return "PS4 could not receive the package data (HTTP receive error)";
+        case 0x80990039u: return "not enough free space on the PS4 installation drive";
         case 0x80990086u: return "content already queued";
         case 0x80990088u: return "installed content conflict";
         case 0x80F00633u: return "NP environment rejected registration; a retry repeats the same system rejection";
+        case 0x80991401u: return "package source rejected authorization (HTTP 401)";
         case 0x80991404u: return "package source unavailable";
-        case 0x80020012u: return "cross-device path rejected";
+        case 0x80020012u: return "PS4 rejected a cross-device install; check Settings > Storage and the selected install drive, then cancel the matching failed PS4 download before retrying";
         default: return "system error";
     }
 }
@@ -1036,7 +1066,7 @@ static int gs_archive_cancel_before_start(const GsJob *job)
 {
     if (job->archive != 1) return 0;
     if (!gs_storage_matches(job->storage_root, job->storage_token)) return -1;
-    char directory[1100], path[1150], leaf[300]; struct stat st;
+    char directory[1100], path[1150], leaf[300];
     if (job->local_only || job->generation[0]) {
         int n = snprintf(directory, sizeof(directory), "%s/extract-%s", job->storage_root, job->id);
         if (n < 0 || n >= (int)sizeof(directory)) return -1;
@@ -1044,13 +1074,13 @@ static int gs_archive_cancel_before_start(const GsJob *job)
         snprintf(leaf, sizeof(leaf), "/archives/%s", job->id);
         if (gs_ipc_path(directory, sizeof(directory), leaf)) return -1;
     }
-    if (lstat(directory, &st)) return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(st.st_mode)) return -1;
+    int directory_kind = gs_nofollow_path(directory, 1);
+    if (directory_kind != 1) return directory_kind == 0 ? 0 : -1;
     /* No worker has restored child task IDs yet. Even a completion receipt
      * must retain ownership until the installer can verify it. */
     for (int ordinal = 1; ordinal <= 256; ordinal++) {
         snprintf(path, sizeof(path), "%s/install-%03d.txt", directory, ordinal);
-        if (!lstat(path, &st) || errno != ENOENT) return -1;
+        if (gs_nofollow_path(path, 0) != 0) return -1;
     }
     return 0;
 }
@@ -1072,9 +1102,24 @@ static void gs_worker_poll(void)
     if (gs_worker_created && !gs_worker_running) { scePthreadJoin(gs_worker, NULL); gs_worker_created = 0; }
     if (gs_release && !gs_worker_running && g_client_count == 0 && gs_archive_task < 0) {
         int installed = !strcmp(gs_state, "installed");
-        char job_path[128];
-        if (!gs_read_job(&candidate) && !strcmp(candidate.id, gs_job.id) &&
-            !gs_ipc_path(job_path, sizeof(job_path), "/job.txt")) unlink(job_path);
+        char job_path[1200];
+        if (gs_ipc_path(job_path, sizeof(job_path), "/job.txt")) return;
+        if (gs_read_job(&candidate)) {
+            // An unreadable durable record may still own this generation.
+            // Absence is the only safe case for clearing the in-memory owner.
+            if (gs_nofollow_path(job_path, 0) != 0) {
+                gs_log_write("resident", "job-release job=%s generation=%s state=retry unreadable-record errno=%d",
+                    gs_job.id, gs_job.generation, errno);
+                return;
+            }
+        } else if (!strcmp(candidate.id, gs_job.id) &&
+            !strcmp(candidate.generation, gs_job.generation)) {
+            if (unlink(job_path) && errno != ENOENT) {
+                gs_log_write("resident", "job-release job=%s generation=%s state=retry errno=%d",
+                    gs_job.id, gs_job.generation, errno);
+                return;
+            }
+        }
         memset(&gs_job, 0, sizeof(gs_job)); gs_stream_slot = -1; gs_validated = gs_served = gs_canceled = gs_paused = gs_release = 0;
         gs_done = 0; gs_current_task = -1; if (!installed) gs_write_status("idle", NULL);
         gs_archive_journal[0] = 0;

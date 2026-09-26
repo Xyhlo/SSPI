@@ -5064,6 +5064,8 @@ namespace Orbis
 
         static string KindShort(string kind)
         {
+            if (string.Equals(kind, "theme", StringComparison.OrdinalIgnoreCase)) return "THEME";
+            if (string.Equals(kind, "theme-license", StringComparison.OrdinalIgnoreCase)) return "LICENSE";
             if (string.Equals(kind, "update", StringComparison.OrdinalIgnoreCase)) return "UPD";
             if (string.Equals(kind, "backport", StringComparison.OrdinalIgnoreCase)) return "BP";
             if (string.Equals(kind, "dlc", StringComparison.OrdinalIgnoreCase)) return "DLC";
@@ -5074,6 +5076,8 @@ namespace Orbis
 
         static string PackageTitle(string kind)
         {
+            if (string.Equals(kind, "theme", StringComparison.OrdinalIgnoreCase)) return "System theme";
+            if (string.Equals(kind, "theme-license", StringComparison.OrdinalIgnoreCase)) return "Theme license";
             if (string.Equals(kind, "update", StringComparison.OrdinalIgnoreCase)) return "Game update";
             if (string.Equals(kind, "backport", StringComparison.OrdinalIgnoreCase)) return "Backport";
             if (string.Equals(kind, "dlc", StringComparison.OrdinalIgnoreCase)) return "Add-on content";

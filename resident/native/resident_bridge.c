@@ -114,12 +114,12 @@ __attribute__((visibility("default"))) int gs_resident_initialize(void)
 
 __attribute__((visibility("default"))) int gs_resident_launch(uint32_t user_id)
 {
-    return launch_title("SRCHD0001", user_id, LaunchApp_None);
+    return launch_title("SRCH00002", user_id, LaunchApp_None);
 }
 
 __attribute__((visibility("default"))) int gs_resident_launch_skip(uint32_t user_id)
 {
-    return launch_title("SRCHD0001", user_id, LaunchApp_SkipLaunch);
+    return launch_title("SRCH00002", user_id, LaunchApp_SkipLaunch);
 }
 
 __attribute__((visibility("default"))) int gs_resident_system_launch(uint32_t user_id)
@@ -138,7 +138,7 @@ __attribute__((visibility("default"))) int gs_resident_system_launch(uint32_t us
         lib = sceKernelLoadStartModule("libSceSystemService.sprx", 0, 0, 0, 0, 0);
     sceKernelDlsym(lib, "sceSystemServiceLaunchApp", (void**)&launch);
     if (!launch) return -2;
-    return launch("SRCHD0001", 0, &param);
+    return launch("SRCH00002", 0, &param);
 }
 
 __attribute__((visibility("default"))) int gs_resident_launch_title(const char* title_id, uint32_t user_id)
@@ -149,7 +149,7 @@ __attribute__((visibility("default"))) int gs_resident_launch_title(const char* 
 
 __attribute__((visibility("default"))) int gs_resident_get_app_id(void)
 {
-    return sceLncUtilGetAppId("SRCHD0001");
+    return sceLncUtilGetAppId("SRCH00002");
 }
 
 __attribute__((visibility("default"))) int gs_resident_get_app_id_of(const char* title_id)
@@ -160,7 +160,11 @@ __attribute__((visibility("default"))) int gs_resident_get_app_id_of(const char*
 
 __attribute__((visibility("default"))) int gs_resident_stop(void)
 {
-    int app_id = sceLncUtilGetAppId("SRCHD0001");
+    /* SRCHD0001 was the pre-5.11 daemon ID; stop it too if an old install launched it. */
+    int legacy = sceLncUtilGetAppId("SRCHD0001");
+    int app_id = sceLncUtilGetAppId("SRCH00002");
+    if (((uint32_t)legacy & 0xFF000000U) == 0x60000000U)
+        sceSystemServiceKillApp((uint32_t)legacy, -1, 0, 0);
     if (((uint32_t)app_id & 0xFF000000U) != 0x60000000U) return 0;
     return sceSystemServiceKillApp((uint32_t)app_id, -1, 0, 0);
 }

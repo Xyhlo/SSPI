@@ -7,7 +7,11 @@ static const char *gs_pkg_header_error(const unsigned char *h, int64_t size,
 {
     if (size < 0x1000 || (expected_size > 0 && size != expected_size)) return "PKG file size does not match the completed download";
     if (memcmp(h, "\x7f" "CNT", 4)) return "File is not a PS4 PKG";
-    if (gs_be64(h + 0x430) != (uint64_t)size) return "PKG declared size does not match the file";
+    int no_data = h[0x74] == 0 && h[0x75] == 0 && h[0x76] == 0 && h[0x77] == 0x1c &&
+        !gs_be64(h + 0x430) && !gs_be64(h + 0x410) && !gs_be64(h + 0x418) &&
+        gs_be64(h + 0x20) >= 0x1000 && gs_be64(h + 0x20) <= (uint64_t)size &&
+        gs_be64(h + 0x28) && gs_be64(h + 0x28) == (uint64_t)size - gs_be64(h + 0x20);
+    if (!no_data && gs_be64(h + 0x430) != (uint64_t)size) return "PKG declared size does not match the file";
     if (title && *title && (strlen(title) != 9 || memcmp(h + 0x47, title, 9))) return "PKG title ID does not match the selected title";
     if (content && *content && (strlen(content) > 48 || memcmp(h + 0x40, content, strlen(content)))) return "PKG content ID does not match the selected package";
     unsigned char digest[32]; SHA256_CTX sha;

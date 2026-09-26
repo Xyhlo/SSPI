@@ -61,6 +61,8 @@ namespace Orbis
                 DrawSettingsRow(r,sheet.x,sheet.y+228,sheet.w,92,1,"Stored files","Browse internal and connected USB files; remove unused files","Open");
                 TextFit(r,sheet.x,sheet.y+362,19,sheet.w,"Confirmed installs remove their staging PKG and transfer sidecars. Failed jobs keep their files.",Muted);
                 TextFit(r,sheet.x,sheet.y+405,18,sheet.w,"Use an exFAT USB drive for large packages. Keep it connected until installation finishes.",Dim);
+                TextFit(r,sheet.x,sheet.y+448,18,sheet.w,"PS4 Settings chooses where games install. SSPI's staging location only stores temporary files.",Dim);
+                TextFit(r,sheet.x,sheet.y+491,18,sheet.w,"A drive formatted as PS4 Extended Storage cannot also be used as an exFAT staging drive.",Dim);
             }
             else
             {

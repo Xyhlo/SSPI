@@ -18,6 +18,7 @@
 #include "../native/goldhen_process.h"
 #include "../native/worker_presence.h"
 #include "../native/filesystem_context.h"
+#include "crypto/sha256.h"
 
 #ifndef GS_APP_VERSION
 #define GS_APP_VERSION "5.11"
@@ -40,6 +41,18 @@
  * GS_HTTP_CLIENTS) cuts the switch rate; this is a bounded-change hypothesis,
  * not a measured speedup. */
 #define GS_LOOPBACK_BLOCK (1024 * 1024)
+/* Console logs of the serial loop above: ~17 MB/s overall across 228 large
+ * BGFT requests, 77% of the time inside pread, and reading never overlapped
+ * sending. Complete package bodies of GS_LOOPBACK_PIPE_MIN or more are
+ * therefore read ahead on a helper thread in 8 MiB blocks (2 MiB if memory is
+ * short) while the previous block is on the socket: the disk streams long
+ * sequential reads and the head switches to BGFT's writes far less often. One
+ * pipeline runs at a time, so the extra memory inside SceShellUI stays at
+ * 16 MiB; concurrent or streaming requests keep the serial loop. */
+#define GS_LOOPBACK_PIPE_BLOCK (8u * 1024 * 1024)
+#define GS_LOOPBACK_PIPE_SMALL_BLOCK (2u * 1024 * 1024)
+#define GS_LOOPBACK_PIPE_MIN (32LL * 1024 * 1024)
+#define GS_LOOPBACK_SNDBUF (1024 * 1024)
 /* A peer that stops reading must not pin one of the connection slots forever.
  * The budget is deliberately unchanged from the previous 90 s: BGFT may pause a
  * response body while it prepares or verifies on the same disk, and only a
@@ -408,16 +421,48 @@ static int has_pkg_magic(FILE *file)
     return magic[0] == 0x7f && magic[1] == 0x43 && magic[2] == 0x4e && magic[3] == 0x54;
 }
 
+static uint64_t bgft_header_u64(const unsigned char *p)
+{
+    uint64_t value = 0;
+    for (int i = 0; i < 8; i++) value = (value << 8) | p[i];
+    return value;
+}
+
+static int read_bgft_package_metadata(const char *source, int64_t length, uint64_t *declared_size, unsigned char *digest)
+{
+    unsigned char header[0x1000], hash[32]; SHA256_CTX sha;
+    FILE *file = fopen(source, "rb"); if (!file) return -1;
+    int valid = length >= (int64_t)sizeof(header) && fread(header, 1, sizeof(header), file) == sizeof(header);
+    fclose(file);
+    if (!valid || memcmp(header, "\x7f" "CNT", 4)) return -1;
+    uint64_t declared = bgft_header_u64(header + 0x430);
+    if (declared != (uint64_t)length) {
+        uint64_t body = bgft_header_u64(header + 0x20), body_size = bgft_header_u64(header + 0x28);
+        if (declared || memcmp(header + 0x74, "\0\0\0\x1c", 4) ||
+            bgft_header_u64(header + 0x410) || bgft_header_u64(header + 0x418) ||
+            body < 0x1000 || body > (uint64_t)length || !body_size || body_size != (uint64_t)length - body) return -1;
+    }
+    sha256_init(&sha); sha256_update(&sha, header, 0xfe0); sha256_final(&sha, hash);
+    if (memcmp(hash, header + 0xfe0, sizeof(hash))) return -1;
+    *declared_size = declared;
+    if (digest) memcpy(digest, header + 0xfe0, 32);
+    return 0;
+}
+
 static int serve_reference_json(int socket_id, const char *method, const char *source,
     const char *piece_route, int64_t length, const char *remote_url)
 {
     unsigned char digest[32]; char hex[65], headers[192], local_url[512];
     static const char digits[] = "0123456789abcdef";
-    FILE *file = fopen(source, "rb");
-    if (!file) return -1;
-    int valid = length >= 0x1000 && has_pkg_magic(file) && !fseek(file, 0xfe0, SEEK_SET) &&
-        fread(digest, 1, sizeof(digest), file) == sizeof(digest);
-    fclose(file); if (!valid) return -1;
+    uint64_t declared_size;
+    if (read_bgft_package_metadata(source, length, &declared_size, digest)) return -1;
+    // The installer writes this marker after BGFT rejects a zero declaration
+    // (0x80990004) and retries with the real length; declare the same value here.
+    if (!declared_size) {
+        char marker[1100];
+        int written = snprintf(marker, sizeof(marker), "%s.bgft-transfer-size", source);
+        if (written > 0 && written < (int)sizeof(marker) && !access(marker, F_OK)) declared_size = (uint64_t)length;
+    }
     for (int i = 0; i < 32; i++) { hex[i * 2] = digits[digest[i] >> 4]; hex[i * 2 + 1] = digits[digest[i] & 15]; }
     hex[64] = 0;
     snprintf(local_url, sizeof(local_url), "http://127.0.0.1:8742%s", piece_route);
@@ -436,7 +481,7 @@ static int serve_reference_json(int socket_id, const char *method, const char *s
     escaped[used] = 0;
     int size = snprintf(document, url_length * 2 + 512,
         "{\"originalFileSize\":%lld,\"packageDigest\":\"%s\",\"numberOfSplitFiles\":1,\"pieces\":[{\"url\":\"%s\",\"fileOffset\":0,\"fileSize\":%lld,\"hashValue\":\"0000000000000000000000000000000000000000\"}]}",
-        (long long)length, hex, escaped, (long long)length);
+        (long long)declared_size, hex, escaped, (long long)length);
     free(escaped);
     if (size < 0 || size >= (int)(url_length * 2 + 512)) { free(document); return -1; }
     snprintf(headers, sizeof(headers), "Content-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\n", size);
@@ -446,6 +491,110 @@ static int serve_reference_json(int socket_id, const char *method, const char *s
 }
 
 #include "gs_resident_worker.inc"
+
+typedef struct {
+    int fd, stop, failed, finished;
+    int ready[2];
+    int64_t offset, remaining;
+    size_t block, length[2];
+    unsigned char *slot[2];
+    uint64_t read_us;
+} GsReadAhead;
+static volatile int g_read_ahead_busy;
+
+/* Reader half: fills whichever slot the sender has released, in file order. */
+static void *gs_read_ahead_thread(void *argument)
+{
+    GsReadAhead *pipe = (GsReadAhead *)argument;
+    for (int n = 0; pipe->remaining > 0; n ^= 1) {
+        while (__atomic_load_n(&pipe->ready[n], __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&pipe->stop, __ATOMIC_ACQUIRE) && !g_stop)
+            sceKernelUsleep(1000);
+        if (__atomic_load_n(&pipe->stop, __ATOMIC_ACQUIRE) || g_stop) break;
+        size_t wanted = pipe->remaining < (int64_t)pipe->block ? (size_t)pipe->remaining : pipe->block, got = 0;
+        uint64_t before = sceKernelGetProcessTime();
+        while (got < wanted) {
+            ssize_t count = sceKernelPread(pipe->fd, pipe->slot[n] + got, wanted - got, (off_t)(pipe->offset + (int64_t)got));
+            int read_error = errno;
+            if (count < 0 && read_error == EINTR) continue;
+            if (count <= 0 || (size_t)count > wanted - got) {
+                gs_log_write("resident", "bgft-http-read offset=%lld wanted=%llu result=%lld errno=%d mode=read-ahead",
+                    (long long)(pipe->offset + (int64_t)got), (unsigned long long)(wanted - got), (long long)count, read_error);
+                break;
+            }
+            got += (size_t)count;
+        }
+        pipe->read_us += sceKernelGetProcessTime() - before;
+        if (got != wanted) { __atomic_store_n(&pipe->failed, 1, __ATOMIC_RELEASE); break; }
+        pipe->length[n] = got;
+        pipe->offset += (int64_t)got;
+        pipe->remaining -= (int64_t)got;
+        __atomic_store_n(&pipe->ready[n], 1, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&pipe->finished, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* Sender half. Returns the bytes sent, or -1 when the pipeline could not start
+ * (another body owns it, memory is short or no thread) so the caller serves the
+ * body with the serial loop instead. Stops on the same conditions as that loop. */
+static int64_t gs_send_read_ahead(int socket_id, int fd, int64_t offset, int64_t length, int job_route,
+    int64_t log_start, unsigned *block_used, uint64_t *read_us, uint64_t *send_us, uint64_t *wait_us)
+{
+    if (__sync_lock_test_and_set(&g_read_ahead_busy, 1)) return -1;
+    GsReadAhead pipe;
+    memset(&pipe, 0, sizeof(pipe));
+    pipe.fd = fd; pipe.offset = offset; pipe.remaining = length;
+    const size_t blocks[2] = { GS_LOOPBACK_PIPE_BLOCK, GS_LOOPBACK_PIPE_SMALL_BLOCK };
+    for (int i = 0; i < 2 && !pipe.block; i++) {
+        pipe.slot[0] = (unsigned char *)malloc(blocks[i]);
+        pipe.slot[1] = pipe.slot[0] ? (unsigned char *)malloc(blocks[i]) : NULL;
+        if (pipe.slot[1]) pipe.block = blocks[i];
+        else { free(pipe.slot[0]); pipe.slot[0] = NULL; }
+    }
+    OrbisPthread reader;
+    if (!pipe.block || scePthreadCreate(&reader, NULL, gs_read_ahead_thread, &pipe, "gs-http-read")) {
+        free(pipe.slot[0]); free(pipe.slot[1]);
+        __sync_lock_release(&g_read_ahead_busy);
+        return -1;
+    }
+    *block_used = (unsigned)pipe.block;
+    int64_t sent = 0;
+    uint64_t started = sceKernelGetProcessTime(), logged_at = started;
+    for (int n = 0; sent < length && !g_stop && (!job_route || (gs_validated && !gs_canceled && !gs_paused)); ) {
+        uint64_t now = sceKernelGetProcessTime();
+        if (job_route && now - logged_at >= 5000000) {
+            logged_at = now;
+            gs_log_write("resident", "bgft-http-body job=%s fd=%d start=%lld sent=%lld remaining=%lld block=%u elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=0 mode=read-ahead",
+                gs_job.id, socket_id, (long long)log_start, (long long)sent, (long long)(length - sent), (unsigned)pipe.block,
+                (unsigned long long)((now - started) / 1000), (unsigned long long)((*read_us + pipe.read_us) / 1000),
+                (unsigned long long)(*send_us / 1000), (unsigned long long)(*wait_us / 1000));
+        }
+        if (!__atomic_load_n(&pipe.ready[n], __ATOMIC_ACQUIRE)) {
+            /* Load finished before re-checking ready: a slot published just
+             * before the reader exits must still be sent. */
+            if (__atomic_load_n(&pipe.failed, __ATOMIC_ACQUIRE) ||
+                (__atomic_load_n(&pipe.finished, __ATOMIC_ACQUIRE) && !__atomic_load_n(&pipe.ready[n], __ATOMIC_ACQUIRE))) break;
+            uint64_t before = sceKernelGetProcessTime();
+            sceKernelUsleep(1000);
+            *wait_us += sceKernelGetProcessTime() - before;
+            continue;
+        }
+        uint64_t before = sceKernelGetProcessTime();
+        int result = send_until(socket_id, pipe.slot[n], pipe.length[n], job_route ? &gs_canceled : NULL);
+        *send_us += sceKernelGetProcessTime() - before;
+        if (result != 0) break;
+        sent += (int64_t)pipe.length[n];
+        __atomic_store_n(&pipe.ready[n], 0, __ATOMIC_RELEASE);
+        n ^= 1;
+    }
+    __atomic_store_n(&pipe.stop, 1, __ATOMIC_RELEASE);
+    scePthreadJoin(reader, NULL);
+    *read_us += pipe.read_us;
+    free(pipe.slot[0]); free(pipe.slot[1]);
+    __sync_lock_release(&g_read_ahead_busy);
+    return sent;
+}
 
 static void serve_client(int socket_id)
 {
@@ -603,16 +752,28 @@ static void serve_client(int socket_id)
         fclose(file);
         return;
     }
-    transfer_buffer = (unsigned char *)malloc(GS_LOOPBACK_BLOCK);
-    if (!transfer_buffer) { fclose(file); return; }
     uint64_t body_started = sceKernelGetProcessTime(), body_logged_at = body_started;
     uint64_t read_us = 0, send_us = 0, wait_us = 0, gate_us = 0;
+    unsigned block = GS_LOOPBACK_BLOCK;
+    const char *mode = "serial";
+    if (!(job_route && gs_stream_slot >= 0) && remaining >= GS_LOOPBACK_PIPE_MIN) {
+        int64_t piped = gs_send_read_ahead(socket_id, fileno(file), end + 1 - remaining, remaining, job_route,
+            start, &block, &read_us, &send_us, &wait_us);
+        if (piped >= 0) {
+            remaining -= piped;
+            mode = "read-ahead";
+            goto body_done;
+        }
+        block = GS_LOOPBACK_BLOCK;
+    }
+    transfer_buffer = (unsigned char *)malloc(GS_LOOPBACK_BLOCK);
+    if (!transfer_buffer) { fclose(file); return; }
     while (remaining > 0 && !g_stop && (!job_route || (gs_validated && !gs_canceled && (!gs_paused || gs_stream_slot >= 0))))
     {
         uint64_t now = sceKernelGetProcessTime();
         if (job_route && now - body_logged_at >= 5000000) {
             body_logged_at = now;
-            gs_log_write("resident", "bgft-http-body job=%s fd=%d start=%lld sent=%lld remaining=%lld block=%u elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
+            gs_log_write("resident", "bgft-http-body job=%s fd=%d start=%lld sent=%lld remaining=%lld block=%u elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu mode=serial",
                 gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining,
                 (unsigned)GS_LOOPBACK_BLOCK,
                 (unsigned long long)((now - body_started) / 1000), (unsigned long long)(read_us / 1000),
@@ -647,8 +808,9 @@ static void serve_client(int socket_id)
         remaining -= (int64_t)count;
     }
     free(transfer_buffer);
-    if (job_route) gs_log_write("resident", "bgft-http-end job=%s fd=%d start=%lld sent=%lld remaining=%lld block=%u canceled=%d paused=%d elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
-        gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining, (unsigned)GS_LOOPBACK_BLOCK, gs_canceled, gs_paused,
+body_done:
+    if (job_route) gs_log_write("resident", "bgft-http-end job=%s fd=%d start=%lld sent=%lld remaining=%lld block=%u mode=%s canceled=%d paused=%d elapsed_ms=%llu read_ms=%llu send_ms=%llu wait_ms=%llu gate_ms=%llu",
+        gs_job.id, socket_id, (long long)start, (long long)(end - start + 1 - remaining), (long long)remaining, block, mode, gs_canceled, gs_paused,
         (unsigned long long)((sceKernelGetProcessTime() - body_started) / 1000), (unsigned long long)(read_us / 1000),
         (unsigned long long)(send_us / 1000), (unsigned long long)(wait_us / 1000), (unsigned long long)(gate_us / 1000));
     if (job_route) gs_record_served(start, end + 1 - remaining);
@@ -681,6 +843,10 @@ static void *client_thread(void *argument)
         gs_log_write("resident", "bgft-http-send-timeout fd=%d errno=%d", socket_id, errno);
         goto done;
     }
+    // Optional: a larger loopback send buffer only reduces send() wakeups.
+    int send_buffer = GS_LOOPBACK_SNDBUF;
+    if (setsockopt(socket_id, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)))
+        gs_log_write("resident", "bgft-http-sndbuf fd=%d errno=%d requested=%d", socket_id, errno, send_buffer);
     serve_client(socket_id);
     // Advertised Connection: close is deliberate. Flush the response through
     // FIN, then drain the peer briefly so unread input does not cause a reset.
