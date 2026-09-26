@@ -121,9 +121,20 @@ static int gs_storage_matches(const char *root, const char *token)
 { return gs_storage_check(root, token) == 1; }
 
 /* Borrowed inputs are read-only files anywhere beneath one explicit USB mount.
- * Their staging marker identifies the drive; it does not confer file ownership. */
+ * Their staging marker identifies the drive; it does not confer file ownership.
+ * FTP uploads are flat files in the application's pkg-rars inbox on internal
+ * storage: they are borrowed the same way, stage in the internal downloads folder
+ * of the same namespace and return 0 (internal, no drive token). */
 static int gs_local_source_root(const char *path, char *root, size_t capacity)
 {
+    int user = path && !strncmp(path, "/user/data/SSPI/pkg-rars/", 25);
+    if (user || (path && !strncmp(path, "/data/SSPI/pkg-rars/", 20))) {
+        const char *leaf = path + (user ? 25 : 20); size_t length = strlen(leaf);
+        if (strlen(path) >= 1024 || strchr(path, '\\') || !length || length > 240 || strchr(leaf, '/') ||
+            !strcmp(leaf, ".") || !strcmp(leaf, "..")) return -1;
+        for (const char *p = leaf; *p; p++) if ((unsigned char)*p < 32 || *p == 127 || *p == ':') return -1;
+        return snprintf(root, capacity, "%s", user ? "/user/data/SSPI/downloads" : "/data/SSPI/downloads") >= (int)capacity ? -1 : 0;
+    }
     if (!path || strncmp(path, "/mnt/usb", 8) || path[8] < '0' || path[8] > '7' || path[9] != '/' ||
         !path[10] || strlen(path) >= 1024 || strchr(path, '\\')) return -1;
     const char *part = path + 10;
@@ -142,13 +153,20 @@ static int gs_local_source_root(const char *path, char *root, size_t capacity)
 static int gs_local_source_check(const char *path, const char *root, const char *token)
 {
     char expected[1024], parent_path[1024]; uint32_t mounted, device;
-    if (gs_local_source_root(path, expected, sizeof(expected)) != 1 || strcmp(expected, root) ||
-        !gs_storage_matches(root, token)) return 0;
+    int kind = gs_local_source_root(path, expected, sizeof(expected));
+    if (kind < 0 || strcmp(expected, root) || !gs_storage_matches(root, token)) return 0;
+    if (kind == 0) {
+        /* Inbox file: the unlinked pkg-rars folder and the file share a device. */
+        size_t n = (size_t)(strrchr(path, '/') - path);
+        memcpy(parent_path, path, n); parent_path[n] = 0;
+        if (!gs_storage_directory(parent_path, &mounted)) return 0;
+    } else {
     snprintf(parent_path, sizeof(parent_path), "%.9s", path);
     if (!gs_storage_directory(parent_path, &mounted)) return 0;
     for (const char *p = path + 10; *p; p++) if (*p == '/') {
         size_t n = (size_t)(p - path); memcpy(parent_path, path, n); parent_path[n] = 0;
         if (!gs_storage_directory(parent_path, &device) || device != mounted) return 0;
+    }
     }
 #if defined(__FreeBSD__)
     unsigned char info[256] = {0};

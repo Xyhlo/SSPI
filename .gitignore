@@ -80,6 +80,8 @@
 !/app/SearchWindow.Release.cs
 !/app/SearchWindow.cs
 !/app/SearchWindow.UsbInstall.cs
+!/app/SearchWindow.FtpInbox.cs
+!/app/FtpInbox.cs
 !/app/SequentialDownloadEngine.cs
 !/app/SourceHttps.cs
 !/app/String/CString.cs
@@ -256,6 +258,7 @@
 !/app/ArchivePasswordDefaults.cs
 !/app/SearchWindow.DownloadDrawer.cs
 !/resident/plugin/gs_stage_dependency.h
+!/resident/plugin/gs_ftp_inbox.inc
 
 # Concept/design artifacts for the Library redesign (kept local, ignored on purpose)
 /features/

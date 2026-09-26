@@ -34,8 +34,10 @@ static void gs_worker_background_priority(const char *phase)
  * Removable storage retains its mount and volume identity checks. */
 static int gs_resolve_job_storage(GsJob *job)
 {
+    /* Borrowed FTP inbox files live beside internal staging and move with it. */
+    int inbox = job->borrowed_source && !strncmp(job->destination, "/data/SSPI/pkg-rars/", 20);
     if (strcmp(g_ipc_root, "/user/data/SSPI/resident") ||
-        strncmp(job->destination, "/data/SSPI/downloads/", 21)) return 0;
+        (!inbox && strncmp(job->destination, "/data/SSPI/downloads/", 21))) return 0;
     char path[1024];
     int n = snprintf(path, sizeof(path), "/user%s", job->destination);
     if (n < 0 || n >= (int)sizeof(path)) return -1;
@@ -1087,10 +1089,12 @@ static int gs_archive_cancel_before_start(const GsJob *job)
 
 #include "gs_archive_job.inc"
 #include "gs_staged_transfer.inc"
+#include "gs_ftp_inbox.inc"
 
 static void gs_worker_poll(void)
 {
     GsJob candidate;
+    gs_inbox_poll(); // FTP uploads, also while SSPI is closed; throttled to one scan per 2 s.
     gs_control();
     if (gs_canceled && !gs_worker_running && gs_job.id[0]) {
         if ((!gs_worker_created && !gs_archive_journal[0] &&
