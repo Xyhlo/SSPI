@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -80,13 +81,29 @@ static int load_mono_runtime(const char* path)
         "libkernel", "libSceSsl", "libSceNet", "libSceSysmodule",
         "libSceRegMgr", "libSceLibcInternal"
     };
-    struct stat runtime;
-    if (!path || stat(path, &runtime) != 0 || !S_ISREG(runtime.st_mode) || runtime.st_size <= 0) {
+    // The SDK's libc stat layout differs from the PS4 kernel ABI.
+    // Read through the kernel descriptor API; st_size can otherwise be st_blocks.
+    int descriptor = path ? sceKernelOpen(path, O_RDONLY, 0) : -1;
+    if (descriptor < 0) {
         boot_stage("mono-runtime-file-unavailable", -1);
         return -1;
     }
-    gs_log_write("startup", "mono runtime bytes=%llu packaged_sdk=0x06720001",
-        (unsigned long long)runtime.st_size);
+    unsigned char signature[4] = {0};
+    uint32_t module_sdk = 0;
+    int64_t runtime_size = sceKernelLseek(descriptor, 0, SEEK_END);
+    int64_t signature_size = sceKernelPread(descriptor, signature, sizeof(signature), 0);
+    // The build lowers this module-parameter field (SELF offset 0x399fe0) so
+    // firmware older than the runtime's original 6.72 SDK accepts the module.
+    int64_t sdk_size = sceKernelPread(descriptor, &module_sdk, sizeof(module_sdk), 0x399FE0);
+    sceKernelClose(descriptor);
+    gs_log_write("startup", "mono runtime bytes=%llu module_sdk=0x%08x",
+        (unsigned long long)(runtime_size > 0 ? runtime_size : 0), sdk_size == (int64_t)sizeof(module_sdk) ? (unsigned)module_sdk : 0U);
+    // build-bootstrap.ps1 pins this exact runtime and its hook signature.
+    if (runtime_size != 3897544 || signature_size != sizeof(signature) ||
+        memcmp(signature, "\x4f\x15\x3d\x1d", sizeof(signature))) {
+        boot_stage("mono-runtime-damaged", -1);
+        return -1;
+    }
     for (size_t i = 0; i < sizeof(dependencies) / sizeof(dependencies[0]); i++) {
         int module = load_system_module(dependencies[i]);
         gs_log_write("startup", "mono dependency=%s code=0x%08x", dependencies[i], (unsigned)module);
@@ -474,7 +491,19 @@ int main()
     log_package_build();
     char pkgLib[0x100] = "\x0";
     sprintf(&pkgLib, "%s/sce_module/libmonosgen-2.0.prx", baseDir);
-	
+    // Firmware older than the runtime's 6.72 SDK rejects the original module
+    // (0x80020016 at module-mono). The package also carries a copy whose module
+    // parameter declares the 4.50 SDK; only those consoles load it, so every
+    // newer firmware keeps loading the original file unchanged.
+    if (versionResult == 0 && systemVersion.Version != 0 && systemVersion.Version < 0x06720000) {
+        char compatLib[0x100];
+        snprintf(compatLib, sizeof(compatLib), "%s/compat/libmonosgen-2.0.prx", baseDir);
+        int compat = file_exists(compatLib);
+        gs_log_write("startup", "mono runtime variant=%s firmware=0x%08x",
+            compat ? "sdk-4.50" : "original-compat-missing", (unsigned)systemVersion.Version);
+        if (compat) snprintf(pkgLib, sizeof(pkgLib), "%s", compatLib);
+    }
+
 	int libSceIpmi = load_system_module("libSceIpmi");
 	int libSceNet = load_system_module("libSceNet");
 	int libSceSystemService = load_system_module("libSceSystemService");

@@ -132,16 +132,24 @@ namespace Orbis
         private bool _pairSuccessConsumed;
         private int _pairConnectedRevision;
         private string _pairPersistentError = "";
+        // A session that ended (or never started) is announced, not pinned: the
+        // banner clears after PairNoticeMs while the pairing panel keeps the text.
+        // Errors the phone reports during a live session stay until it clears them.
+        private bool _pairErrorTransient;
+        private uint _pairErrorShownAt;
+        const uint PairNoticeMs = 8000;
         private enum PairUiStage { Idle, Waiting, Complete, Failed, TimedOut }
         private PairUiStage _pairUiStage;
         private string _pairUiDetail = "";
-        private enum UiOverlay { None, DownloadActions, ConfirmRemove, ConfirmCancel, Install, ConfirmClearToken, ConfirmClearHistory, QrPair, ConfirmSaveSettings }
+        private enum UiOverlay { None, DownloadActions, ConfirmRemove, ConfirmCancel, Install, ConfirmClearToken, ConfirmClearHistory, QrPair, ConfirmSaveSettings, SavingSettings }
         private UiOverlay _uiOverlay;
         private int _overlayFocus;
         private string _overlayDownloadId = "";
         private string _overlayTitle = "";
         private bool _appearanceDirty;
         private bool _settingsDirty;
+        private bool _settingsSaveBusy;
+        private Action _settingsSaveCompletion;
         private int _libraryScroll;
         private byte[] _wallpaperPixels;
         private int _wallpaperPw, _wallpaperPh;
@@ -231,12 +239,24 @@ namespace Orbis
         private SDL_Color Focused { get { return DarkSurfaces ? C(27, 27, 27) : C(43, 43, 43); } }
         private SDL_Color Border { get { return DarkSurfaces ? C(46, 46, 46) : C(53, 53, 53); } }
         // Single live V2 chrome accent. Semantic health/destructive colors are separate.
+        // Read many times per frame; resolving the preset list allocates, so the
+        // colour is recomputed only when the saved accent string changes.
+        string _accentSource;
+        bool _accentResolved;
+        SDL_Color _accentColor;
         private SDL_Color Accent
         {
             get
             {
-                ThemeColor color = ThemePalette.Accent(_cfg);
-                return C(color.R, color.G, color.B);
+                string source = _cfg.Accent;
+                if (!_accentResolved || !ReferenceEquals(source, _accentSource))
+                {
+                    ThemeColor color = ThemePalette.Accent(_cfg);
+                    _accentColor = C(color.R, color.G, color.B);
+                    _accentSource = source;
+                    _accentResolved = true;
+                }
+                return _accentColor;
             }
         }
         private SDL_Color FocusCyan { get { return Accent; } }
@@ -637,17 +657,27 @@ namespace Orbis
         int _pairRevision;
         readonly Queue<string> _pairToastNotices = new Queue<string>();
         volatile bool _pairSourcesChanged;
+        void ShowPairNotice(string message)
+        {
+            _pairPersistentError = _pairUiDetail = message;
+            _pairErrorTransient = true;
+            _pairErrorShownAt = UiTick();
+            Invalidated = true;
+        }
+
         void PollPairState()
         {
             var sourceCompletion = Interlocked.Exchange(ref _sourceBrowserComplete, null);
             if (sourceCompletion != null) sourceCompletion();
+            if (_pairErrorTransient && UiElapsed(_pairErrorShownAt) >= PairNoticeMs)
+            { _pairErrorTransient = false; _pairPersistentError = ""; Invalidated = true; }
             if (!_pairSessionActive) return;
             if (!_pair.Running || _pair.Expired)
             {
                 _pairSessionActive = false; _qr = null; _qrSize = 0;
                 _pairUiStage = _pair.Expired ? PairUiStage.TimedOut : PairUiStage.Failed;
-                _pairPersistentError = _pairUiDetail = "Phone session ended. Open a new QR code to reconnect.";
-                Invalidated = true; return;
+                ShowPairNotice("Phone session ended. Open a new QR code to reconnect.");
+                return;
             }
             if (_pairConnectedRevision != Volatile.Read(ref _pair.ConnectedRevision))
             {
@@ -658,7 +688,7 @@ namespace Orbis
                 User.NotifyToast("Phone connected · continue on your phone"); Invalidated = true;
             }
             if (_pairPersistentError != _pair.PhoneError)
-            { _pairPersistentError = _pair.PhoneError; Invalidated = true; }
+            { _pairPersistentError = _pair.PhoneError; _pairErrorTransient = false; Invalidated = true; }
             if (_pairSourcesChanged) { _pairSourcesChanged = false; SourcesChanged(); }
             if (_pairRevision != _pair.Revision)
             {
@@ -765,20 +795,20 @@ namespace Orbis
             if (_settingsFocus == 0) _cfg.BackgroundMusic = !_cfg.BackgroundMusic;
             else if (_settingsFocus == 1) _cfg.InterfaceSounds = !_cfg.InterfaceSounds;
             else _cfg.AudioVolume = Math.Max(0, Math.Min(100, volume + (button == DS4Button.SCE_PAD_BUTTON_LEFT ? -5 : 5)));
-            if (!_cfg.Save())
-            {
-                _cfg.BackgroundMusic = music; _cfg.InterfaceSounds = effects; _cfg.AudioVolume = volume;
-                User.NotifyToast("Could not save sound settings");
-            }
-            ApplyAudioSettings();
-            Invalidated = true;
+            RunSettingsSave(_cfg.Save, saved => {
+                if (!saved)
+                {
+                    _cfg.BackgroundMusic = music; _cfg.InterfaceSounds = effects; _cfg.AudioVolume = volume;
+                    User.NotifyToast("Could not save sound settings");
+                }
+                ApplyAudioSettings();
+            });
         }
 
         void DrawSettingsSound(IntPtr r, SDL_Rect sheet)
         {
             int x = sheet.x, y = sheet.y + 25, w = sheet.w;
-            TextPx(r, x, y, 27, "Sound", White);
-            TextPx(r, x, y + 43, 18, "Quiet ambience and gentle feedback. Changes save automatically.", Muted);
+            DrawSettingsPageHeader(r, x, y, w, "Sound", "Quiet ambience and gentle feedback. Changes save automatically.");
             DrawSettingsRow(r, x, y + 112, w, 83, 0, "Background music", "A soft, original ambient loop", _cfg.BackgroundMusic ? "ON" : "OFF");
             DrawSettingsRow(r, x, y + 221, w, 83, 1, "Interface sounds", "Navigation, queue and installation feedback", _cfg.InterfaceSounds ? "ON" : "OFF");
             DrawSettingsRow(r, x, y + 330, w, 83, 2, "Volume", "LEFT / RIGHT adjusts in 5% steps", _cfg.AudioVolume == 0 ? "Muted" : _cfg.AudioVolume + "%");
@@ -787,17 +817,22 @@ namespace Orbis
 
         public void HandleButton(DS4Button button)
         {
+            MarkUiProgress("input-wait");
             lock (_lock)
             {
+                MarkUiProgress("input");
                 bool sound = _launchFinished;
                 HandleButtonCore(button);
                 if (sound) PlayButtonSound(button);
             }
+            MarkUiProgress("input-done");
         }
 
         void HandleButtonCore(DS4Button button)
         {
+            if (_settingsSaveBusy) { Invalidated = true; return; }
             _lastInputAt = UiTick();
+            if (button == DS4Button.SCE_PAD_BUTTON_CROSS) MarkPress();
             if (!_launchFinished) { HandleStartupButton(button); Invalidated = true; return; }
             if (_libraryOpen && !_settingsOpen && _uiOverlay == UiOverlay.None)
             {
@@ -960,22 +995,61 @@ namespace Orbis
 
         void SaveSettingsAndClose()
         {
+            if (_settingsSaveBusy) return;
             _cfg.ProxyBaseUrl = (_proxyDraft ?? "").Trim();
             _cfg.DeepbridApiKey = (_deepbridDraft ?? "").Trim();
             _cfg.AllDebridApiKey = (_allDebridDraft ?? "").Trim();
             _cfg.TorBoxApiKey = (_torBoxDraft ?? "").Trim();
             _cfg.ValidateAppearance(true);
-            if (!_cfg.Save())
+            RunSettingsSave(_cfg.Save, saved => {
+                if (!saved)
+                {
+                    _settingsDirty = true;
+                    SetStatus("Settings could not be saved. Check free storage and retry.");
+                    return;
+                }
+                CaptureAppearanceDraft();
+                _settingsDirty = false;
+                CloseSettings();
+                User.NotifyToast("Settings saved");
+            });
+        }
+
+        void RunSettingsSave(Func<bool> save, Action<bool> completed)
+        {
+            if (_settingsSaveBusy) return;
+            _settingsSaveBusy = true;
+            _uiOverlay = UiOverlay.SavingSettings;
+            string previousStatus = _status;
+            SetStatus("Saving settings...");
+            Invalidated = true;
+            Action<bool> publish = saved => {
+                Volatile.Write(ref _settingsSaveCompletion, () => {
+                    _settingsSaveBusy = false;
+                    _uiOverlay = UiOverlay.None;
+                    if (_status == "Saving settings...") _status = previousStatus;
+                    completed(saved);
+                    Invalidated = true;
+                });
+            };
+            try
             {
-                _settingsDirty = true;
-                SetStatus("Settings could not be saved. Check free storage and retry.");
-                Invalidated = true;
-                return;
+                // Flush/rename and migration locks can wait on storage. Never hold
+                // the UI lock here; completion is applied by the next UI update.
+                new Thread(() => {
+                    bool saved = false;
+                    try { saved = save(); }
+                    catch { }
+                    finally { publish(saved); }
+                }) { IsBackground = true, Name = "Settings save" }.Start();
             }
-            CaptureAppearanceDraft();
-            _settingsDirty = false;
-            CloseSettings();
-            User.NotifyToast("Settings saved");
+            catch { publish(false); }
+        }
+
+        void PollSettingsSave()
+        {
+            Action completed = Interlocked.Exchange(ref _settingsSaveCompletion, null);
+            if (completed != null) lock (_lock) completed();
         }
 
         void MarkSettingsDirty()
@@ -993,7 +1067,7 @@ namespace Orbis
             _softKbForTorBox = false;
             _softKbForSourceUrl = false;
             SetStatus(_cfg.HasActiveUnlock
-                ? (UnlockProviders.DisplayName(_cfg.UnlockProviderId) + " ready | " + NetHttp.TransportLabel)
+                ? (UnlockProviders.DisplayName(_cfg.UnlockProviderId) + " ready")
                 : "Link Service not set");
         }
 
@@ -1037,14 +1111,13 @@ namespace Orbis
                     _pairSourcesChanged = true; return null;
                 };
                 _pairConnectedRevision = Volatile.Read(ref _pair.ConnectedRevision);
-                _pairPersistentError = "";
+                _pairPersistentError = ""; _pairErrorTransient = false;
                 _pair.Start(1440);
                 if (!_pair.Running)
                 {
                     _pairSessionActive = false;
                     _pairUiStage = PairUiStage.Failed;
-                    _pairPersistentError = _pairUiDetail = string.IsNullOrEmpty(_pair.Status)
-                        ? "Could not start pairing." : _pair.Status;
+                    ShowPairNotice(string.IsNullOrEmpty(_pair.Status) ? "Could not start pairing." : _pair.Status);
                     SetStatus("Pair server fail: " + _pairUiDetail);
                     SspiLog.Write("network", "pairing startup failed: " + _pairUiDetail);
                     _pairUrlShown = "";
@@ -1067,7 +1140,7 @@ namespace Orbis
                     " exception=" + ex.GetType().FullName + " hresult=0x" + ex.HResult.ToString("X8") + " " + ex);
                 _pairSessionActive = false;
                 _pairUiStage = PairUiStage.Failed;
-                _pairPersistentError = _pairUiDetail = "Could not start pairing: " + ex.Message;
+                ShowPairNotice("Could not start pairing: " + ex.Message);
                 SetStatus("Pair server fail: " + ex.Message);
                 User.NotifyToast("Pairing failed");
                 _pairUrlShown = "";
@@ -1124,14 +1197,15 @@ namespace Orbis
             if (b != DS4Button.SCE_PAD_BUTTON_CROSS && b != DS4Button.SCE_PAD_BUTTON_LEFT && b != DS4Button.SCE_PAD_BUTTON_RIGHT) return;
             if (_settingsFocus == 5) { _settingsPage = 2; _settingsFocus = 0; RefreshSourceUi(); return; }
             string id = ConnectionProviderIds[Math.Max(0, Math.Min(_settingsFocus, ConnectionProviderIds.Length - 1))];
-            string error;
-            if (_cfg.TryToggleDownloadService(id, out error)) SetStatus(id == UnlockProviders.NoneId ? "Direct links selected" :
-                UnlockProviders.DisplayName(id) + (UnlockProviders.IsEnabled(_cfg, id) ? " enabled for new downloads" : " disabled for new downloads"));
-            else {
-                if (!UnlockProviders.IsConfigured(_cfg, id)) { StartPairSession(); _uiOverlay = UiOverlay.QrPair; }
-                SetStatus(error);
-            }
-            Invalidated = true;
+            string error = null;
+            RunSettingsSave(() => _cfg.TryToggleDownloadService(id, out error), saved => {
+                if (saved) SetStatus(id == UnlockProviders.NoneId ? "Direct links selected" :
+                    UnlockProviders.DisplayName(id) + (UnlockProviders.IsEnabled(_cfg, id) ? " enabled for new downloads" : " disabled for new downloads"));
+                else {
+                    if (!UnlockProviders.IsConfigured(_cfg, id)) { StartPairSession(); _uiOverlay = UiOverlay.QrPair; }
+                    SetStatus(error ?? "Could not save the download service. Try again.");
+                }
+            });
         }
 
         void SourcesChanged()
@@ -1226,9 +1300,10 @@ namespace Orbis
             }
             else if (_settingsFocus == 1) _cfg.ReduceMotion = !_cfg.ReduceMotion;
             else { var preset = ThemePalette.Presets[_settingsFocus - 2]; _cfg.Accent = preset.Hex; _cfg.AccentName = preset.Name; }
-            if (_cfg.Save()) { CaptureAppearanceDraft(); SetStatus("Appearance saved"); }
-            else { _cfg.BackgroundMode = oldMode; _cfg.Accent = oldAccent; _cfg.AccentName = oldName; _cfg.BackgroundOverlay = oldOverlay; _cfg.ReduceMotion = oldMotion; User.NotifyToast("Could not save appearance"); }
-            Invalidated = true;
+            RunSettingsSave(_cfg.Save, saved => {
+                if (saved) { CaptureAppearanceDraft(); SetStatus("Appearance saved"); }
+                else { _cfg.BackgroundMode = oldMode; _cfg.Accent = oldAccent; _cfg.AccentName = oldName; _cfg.BackgroundOverlay = oldOverlay; _cfg.ReduceMotion = oldMotion; User.NotifyToast("Could not save appearance"); }
+            });
         }
 
         void OpenAppearanceText(bool accentHex)
@@ -1735,9 +1810,11 @@ namespace Orbis
                 _cfg.UnlockProviderId = UnlockProviders.DeepbridId;
                 _cfg.UseUnlockProvider = true;
                 _cfg.UseRealDebrid = false;
-                _cfg.Save();
                 _softKbForDeepbrid = false;
-                SetStatus(_cfg.HasDeepbrid ? "Deepbrid key saved" : "Deepbrid key empty");
+                RunSettingsSave(_cfg.Save, saved => {
+                    if (!saved) _settingsDirty = true;
+                    SetStatus(!saved ? "Could not save service key" : _cfg.HasDeepbrid ? "Deepbrid key saved" : "Deepbrid key empty");
+                });
                 return;
             }
             if (_softKbForAllDebrid)
@@ -1746,9 +1823,11 @@ namespace Orbis
                 _cfg.UnlockProviderId = UnlockProviders.AllDebridId;
                 _cfg.UseUnlockProvider = true;
                 _cfg.UseRealDebrid = false;
-                _cfg.Save();
                 _softKbForAllDebrid = false;
-                SetStatus(_cfg.HasAllDebrid ? "AllDebrid key saved" : "AllDebrid key empty");
+                RunSettingsSave(_cfg.Save, saved => {
+                    if (!saved) _settingsDirty = true;
+                    SetStatus(!saved ? "Could not save service key" : _cfg.HasAllDebrid ? "AllDebrid key saved" : "AllDebrid key empty");
+                });
                 return;
             }
             if (_softKbForTorBox)
@@ -1757,17 +1836,21 @@ namespace Orbis
                 _cfg.UnlockProviderId = UnlockProviders.TorBoxId;
                 _cfg.UseUnlockProvider = true;
                 _cfg.UseRealDebrid = false;
-                _cfg.Save();
                 _softKbForTorBox = false;
-                SetStatus(_cfg.HasTorBox ? "TorBox token saved" : "TorBox token empty");
+                RunSettingsSave(_cfg.Save, saved => {
+                    if (!saved) _settingsDirty = true;
+                    SetStatus(!saved ? "Could not save service token" : _cfg.HasTorBox ? "TorBox token saved" : "TorBox token empty");
+                });
                 return;
             }
             if (_softKbForProxy)
             {
                 _cfg.ProxyBaseUrl = (_proxyDraft ?? "").Trim();
-                bool saved = _cfg.Save();
                 _softKbForProxy = false;
-                SetStatus(saved ? "Proxy URL saved" : "Proxy URL save failed");
+                RunSettingsSave(_cfg.Save, saved => {
+                    if (!saved) _settingsDirty = true;
+                    SetStatus(saved ? "Proxy URL saved" : "Proxy URL save failed");
+                });
                 return;
             }
             _query = (_query ?? "").Trim();
@@ -1893,7 +1976,10 @@ namespace Orbis
                 if (_selected != null && _selected.Variants != null && _selected.Variants.Count > 1) {
                     var variants = _selected.Variants;
                     int index = variants.FindIndex(v => v.TitleId == _selected.TitleId && v.Region == _selected.Region && v.Source == _selected.Source && v.CatalogUrl == _selected.CatalogUrl);
-                    _selected = _selected.WithVariant(variants[(index + 1) % variants.Count]);
+                    // Prefer the region with the most complete package set when one is known.
+                    int target = PreferredRegionVariant();
+                    if (target < 0 || target >= variants.Count || target == index) target = (index + 1) % variants.Count;
+                    _selected = _selected.WithVariant(variants[target]);
                     ResetPackageFilters(); StartResolveJob();
                 }
                 return;
@@ -2020,6 +2106,7 @@ namespace Orbis
 
         void HandleUiOverlay(DS4Button b)
         {
+            if (_settingsSaveBusy) return;
             if (_uiOverlay == UiOverlay.QrPair)
             {
                 if (b == DS4Button.SCE_PAD_BUTTON_CIRCLE ||
@@ -2122,8 +2209,10 @@ namespace Orbis
                 else if (string.Equals(_cfg.UnlockProviderId, UnlockProviders.PremiumizeId, StringComparison.OrdinalIgnoreCase))
                     _cfg.PremiumizeApiKey = "";
                 else _cfg.RealDebridToken = "";
-                _cfg.Save(); _pairUiStage = PairUiStage.Idle; _pairUiDetail = "";
-                _uiOverlay = UiOverlay.None; User.NotifyToast("Token cleared");
+                RunSettingsSave(_cfg.Save, saved => {
+                    if (saved) { _pairUiStage = PairUiStage.Idle; _pairUiDetail = ""; User.NotifyToast("Token cleared"); }
+                    else { _settingsDirty = true; SetStatus("Could not save the token change. Retry saving settings."); }
+                });
             }
             else if (_uiOverlay == UiOverlay.ConfirmClearHistory)
             {
@@ -2144,6 +2233,16 @@ namespace Orbis
             Fill(r, 0, 0, W, H, new SDL_Color { r = 0, g = 0, b = 0, a = 155 });
             SoftRect(r, new SDL_Rect { x = panel.x - 5, y = panel.y + 8, w = panel.w + 10, h = panel.h + 6 }, new SDL_Color { r = 0, g = 0, b = 0, a = 110 });
             SoftRect(r, panel, Panel); StrokeRect(r, panel, C(77, 80, 82), 1);
+            if (_uiOverlay == UiOverlay.SavingSettings)
+            {
+                TextPx(r, panel.x + 36, panel.y + 30, 30, "Saving settings...", White);
+                TextFit(r, panel.x + 36, panel.y + 108, 21, panel.w - 72, "Waiting for storage to finish writing your changes.", Muted);
+                int trackWidth = panel.w - 72;
+                Fill(r, panel.x + 36, panel.y + 196, trackWidth, 4, Border);
+                int offset = _cfg.ReduceMotion ? 0 : (int)(UiTick() / 4 % (uint)(trackWidth - 80));
+                Fill(r, panel.x + 36 + offset, panel.y + 196, 80, 4, Accent);
+                return;
+            }
             DlItem item = OverlayDownload();
             string title = _uiOverlay == UiOverlay.Install ? "Install package?" :
                 (_uiOverlay == UiOverlay.DownloadActions ? (item == null ? "Package actions" : PackageTitle(item.Kind)) :
@@ -2172,7 +2271,7 @@ namespace Orbis
                 for (int i = 0; i < 2; i++) {
                     var choice = new SDL_Rect { x = panel.x + 28, y = panel.y + 150 + i * 78, w = panel.w - 56, h = 66 };
                     SoftRect(r, choice, _overlayFocus == i ? Focused : Row);
-                    if (_overlayFocus == i) StrokeRect(r, choice, Accent, 2);
+                    if (_overlayFocus == i) StrokeRect(r, Glide(GlideOverlay, choice), Accent, 2);
                     TextPx(r, choice.x + 24, choice.y + 19, 22, i == 0 ? "Save changes" : "Discard changes", White);
                     if (_overlayFocus == i) GamepadIcons.Draw(r, "cross", choice.x + choice.w - 56, choice.y + 16, 34);
                 }
@@ -3247,6 +3346,7 @@ namespace Orbis
             ObservePresentedFrame();
             PollResidentLaunchMaintenance();
             if (!_startupServicesReady) { Invalidated = true; return; }
+            PollSettingsSave();
             Program.RepeatNavigation();
             if (_launchFinished && !_audioStarted)
             {
@@ -3259,7 +3359,7 @@ namespace Orbis
             if (User.TryTakeStatus(out nextStatus))
                 SetStatus(nextStatus);
             // Pair completion/expiry is network-driven; never wait for another button press.
-            PollPairState();
+            if (!_settingsSaveBusy) PollPairState();
             RefreshLinkStatusLookup();
             if (UiElapsed(_downloadAudioAt) >= 1000) {
                 _downloadAudioAt = UiTick(); PollDownloadAudio(ReadDownloadSnapshot());
@@ -3331,6 +3431,8 @@ namespace Orbis
                 long elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - tick) / System.Diagnostics.Stopwatch.Frequency;
                 if (elapsed < 8 || Interlocked.Exchange(ref reportedTick, tick) == tick) return;
                 SspiLog.Write("startup", "event=ui-stall phase=" + _uiPhase + " seconds=" + elapsed +
+                    " tab=" + _tab + " screen=" + _screen + " overlay=" + _uiOverlay + " settings=" + (_settingsOpen ? 1 : 0) +
+                    " keyboard=" + (_softKbOpen ? 1 : 0) + " library=" + (_libraryOpen ? 1 : 0) +
                     " queue_action=" + Volatile.Read(ref _downloadActionBusy) + " build=" + BuildIdentity.Label);
             }, null, 10000, 5000);
         }
@@ -3359,19 +3461,32 @@ namespace Orbis
             UiFont.BindRenderer(r);
             GamepadIcons.Ensure(r);
             if (DrawLaunchBranding(r, FrameTime)) return;
-            if (DrawCachedScene(r)) { DrawHeader(r); DrawFooter(r); DrawToast(r); return; }
+            // Each step names itself so a stall report (event=ui-stall) points at
+            // the drawing step that stopped, not only at the start of the frame.
+            MarkUiProgress("draw-cached-scene");
+            if (DrawCachedScene(r)) { MarkUiProgress("draw-chrome"); DrawHeader(r); DrawFooter(r); DrawToast(r); return; }
             if (_libraryOpen && _libraryCaptureAttempted && !_settingsOpen)
-            { DrawLibraryOverlay(r); CacheScene(r); DrawHeader(r); DrawFooter(r); DrawToast(r); return; }
+            {
+                MarkUiProgress("draw-library"); DrawLibraryOverlay(r); CacheScene(r);
+                MarkUiProgress("draw-chrome"); DrawHeader(r); DrawFooter(r); DrawToast(r); return;
+            }
 
             UiBackgroundSurface surface = _settingsOpen
                 ? UiBackgroundSurface.Settings
                 : (_tab == TopTab.Search && _screen == BrowseScreen.Search
                     ? UiBackgroundSurface.SearchLanding : UiBackgroundSurface.Content);
-            DrawAppBackground(r, surface);
+            MarkUiProgress("draw-app-background");
+            // Every path below paints the opaque header and footer bands, and a
+            // keyboard modal repaints the whole band between them, so the
+            // background is drawn only where it can still be seen.
+            bool keyboardCovers = KeyboardCoversContent();
+            if (!keyboardCovers) DrawAppBackground(r, surface, HeaderBottom, FooterTop);
+            if (!_softKbOpen) ReleaseKeyboardLayer();
 
             if (_settingsOpen)
             {
                 // Exclusive full-screen settings — never draw Search/Downloads under it.
+                MarkUiProgress("draw-settings");
                 DrawSettingsOverlay(r);
                 DrawFooter(r);
                 if (_uiOverlay != UiOverlay.None) DrawUiOverlay(r);
@@ -3379,24 +3494,35 @@ namespace Orbis
                 return;
             }
 
+            MarkUiProgress("draw-header");
             DrawHeader(r);
-            if (_tab == TopTab.Downloads)
+            bool passwordModal = _softKbOpen && _archivePasswordId != null;
+            if (passwordModal)
+            {
+                // The archive password modal below repaints the whole content band.
+            }
+            else if (_tab == TopTab.Downloads)
             {
                 MarkUiProgress("draw-downloads");
                 DrawDownloads(r);
             }
             else if (_screen == BrowseScreen.Detail)
+            {
+                MarkUiProgress("draw-detail");
                 DrawDetail(r);
+            }
             else
             {
                 switch (_screen)
                 {
-                    case BrowseScreen.Search: DrawSearch(r); break;
-                    case BrowseScreen.Results: DrawResults(r); break;
+                    case BrowseScreen.Search: MarkUiProgress("draw-search"); DrawSearch(r); break;
+                    case BrowseScreen.Results: MarkUiProgress("draw-results"); DrawResults(r); break;
                 }
             }
 
-            if (_libraryOpen) DrawLibraryOverlay(r);
+            if (_libraryOpen && !passwordModal) { MarkUiProgress("draw-library"); DrawLibraryOverlay(r); }
+            FlushGlideRing(r);
+            MarkUiProgress("draw-scene-cache");
             CacheScene(r);
             // Busy state is footer text + skeleton/panel animation.
             MarkUiProgress("draw-footer");
@@ -3410,6 +3536,19 @@ namespace Orbis
         bool UsesImageBackground()
         {
             return false;
+        }
+
+        const int HeaderBottom = 106, FooterTop = 986;
+
+        // True when an on-screen keyboard modal repaints the whole content band,
+        // so neither the background nor the screen under it needs drawing.
+        bool KeyboardCoversContent()
+        {
+            if (!_softKbOpen) return false;
+            if (_settingsOpen)
+                return _settingsPage == 6 || _softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid ||
+                    _softKbForTorBox || _softKbForSourceUrl;
+            return _archivePasswordId != null || (_tab == TopTab.Search && _screen == BrowseScreen.Search);
         }
 
         static string ShowcaseWallpaperPath()
@@ -3432,9 +3571,10 @@ namespace Orbis
             return "";
         }
 
-        void DrawAppBackground(IntPtr r, UiBackgroundSurface surface)
+        void DrawAppBackground(IntPtr r, UiBackgroundSurface surface, int top = 0, int bottom = H)
         {
-            if (!DrawPattern(r)) Fill(r, 0, 0, W, H, Bg);
+            if (bottom <= top) return;
+            if (!DrawPattern(r, top, bottom)) Fill(r, 0, top, W, bottom - top, Bg);
         }
 
         void DrawContentShadow(IntPtr r)
@@ -3494,8 +3634,21 @@ namespace Orbis
 
         const int StatusRightInset = 48;
 
+        string _statusChipsText = "";
+        int _statusChipsWidth;
+        uint _statusChipsAt;
+
         void DrawHeaderStatusChips(IntPtr r)
         {
+            // Link and source counts change rarely; rebuilding the line every
+            // frame only produced garbage for the collector.
+            if (_statusChipsAt == 0 || UiElapsed(_statusChipsAt) >= 500) RefreshHeaderStatusChips();
+            TextPx(r, W - StatusRightInset - _statusChipsWidth, 44, 16, _statusChipsText, C(132, 132, 132));
+        }
+
+        void RefreshHeaderStatusChips()
+        {
+            _statusChipsAt = UiTick();
             int enabledSources = 0;
             for (int i = 0; i < _sourceUi.Count; i++)
                 if (_sourceUi[i] != null && _sourceUi[i].Enabled) enabledSources++;
@@ -3506,9 +3659,8 @@ namespace Orbis
                 (!_cfg.UseUnlockProvider || _cfg.UnlockProviderId == UnlockProviders.NoneId ? "Direct links" : linkSaved ? "Link service saved" : "No link service");
             string sources = enabledSources + (enabledSources == 1 ? " source" : " sources");
             string line = link + " · " + sources;
-            string fitted = UiFont.EllipsizePx(line, 16, 590);
-            int width = UiFont.MeasurePx(16, fitted);
-            TextPx(r, W - StatusRightInset - width, 44, 16, fitted, C(132, 132, 132));
+            _statusChipsText = UiFont.EllipsizePx(line, 16, 590);
+            _statusChipsWidth = UiFont.MeasurePx(16, _statusChipsText);
         }
 
         string EnabledSourceName()
@@ -3597,46 +3749,92 @@ namespace Orbis
             return "Search";
         }
 
-        void DrawToast(IntPtr r)
+        // Presentation of the current toast, computed once when its text changes.
+        const int ToastWidth = 400, ToastTextWidth = ToastWidth - 62, ToastFont = 17;
+        string _toastShapedFor, _toastLine1, _toastLine2, _toastIcon, _pairBannerFor, _pairBannerText;
+        SDL_Color _toastTone;
+        bool _toastTwoLines;
+
+        void ShapeToast()
         {
-            if (!string.IsNullOrEmpty(_pairPersistentError))
-            {
-                var errorBox = new SDL_Rect { x = 240, y = H - 246, w = 1440, h = 64 };
-                SoftRect(r, errorBox, C(49, 28, 36)); StrokeRect(r, errorBox, Danger, 1);
-                TextFit(r, errorBox.x + 20, errorBox.y + 18, 19, errorBox.w - 40, "Phone: " + _pairPersistentError, Danger);
-            }
-            if (!_toastActive || string.IsNullOrEmpty(_toastText)) return;
-            if (_settingsOpen && _sourceInstallStage != SourceInstallStage.Idle) return;
-            uint age = UiElapsed(_toastStartedAt), total = ToastEnterMs + ToastHoldMs + ToastExitMs;
-            if (age >= total) return;
+            if (ReferenceEquals(_toastShapedFor, _toastText)) return;
+            _toastShapedFor = _toastText;
             string message = _toastText == "DL fail" ? "Download failed. Open Files for details." : _toastText;
-            const int width = 400, textWidth = width - 62, font = 17;
-            bool twoLines = UiFont.MeasurePx(font, message) > textWidth;
-            int height = twoLines ? 68 : 46;
-            int y = H - 112 - height;
-            if (!_cfg.ReduceMotion && age < ToastEnterMs) { double t = age / (double)ToastEnterMs; y += (int)(6 * Math.Pow(1 - t, 3)); }
-            else if (!_cfg.ReduceMotion && age > ToastEnterMs + ToastHoldMs) { double t = (age - ToastEnterMs - ToastHoldMs) / (double)ToastExitMs; y += (int)(6 * t * t); }
+            _toastTwoLines = UiFont.MeasurePx(ToastFont, message) > ToastTextWidth;
+            int split = message.Length;
+            if (_toastTwoLines)
+            {
+                do { split = message.LastIndexOf(' ', Math.Max(0, split - 1)); }
+                while (split > 0 && UiFont.MeasurePx(ToastFont, message.Substring(0, split)) > ToastTextWidth);
+            }
+            if (split > 0 && split < message.Length) { _toastLine1 = message.Substring(0, split); _toastLine2 = message.Substring(split + 1); }
+            else { _toastLine1 = message; _toastLine2 = null; }
             string lower = _toastText.ToLowerInvariant();
             bool bad = lower.Contains("fail") || lower.Contains("error") || lower.Contains("corrupt") || lower.Contains("could not") || lower.Contains("not saved");
             bool restricted = lower.Contains("validation unavailable") || lower.Contains("plan restricts") || lower.Contains("plan status unverified");
             bool queued = lower.Contains("queued") || lower.Contains("added");
             bool good = queued || lower.Contains("complete") || lower.Contains("installed") || lower.Contains("saved") || lower.Contains("ready");
-            SDL_Color tone = bad ? Danger : restricted ? Warning : good ? Ok : White;
-            var box = new SDL_Rect { x = W - 72 - width, y = y, w = width, h = height };
-            SoftRect(r, box, C(32, 32, 32)); StrokeRect(r, box, C(70, 70, 70), 1);
-            DesignIcon(r, bad || restricted ? "error" : good ? "check" : "download", box.x + 16, box.y + (height - 20) / 2, 20, tone);
-            int split = message.Length;
-            if (twoLines)
+            _toastTone = bad ? Danger : restricted ? Warning : good ? Ok : White;
+            _toastIcon = bad || restricted ? "error" : good ? "check" : "download";
+        }
+
+        void DrawToast(IntPtr r)
+        {
+            if (!string.IsNullOrEmpty(_pairPersistentError))
             {
-                do { split = message.LastIndexOf(' ', Math.Max(0, split - 1)); }
-                while (split > 0 && UiFont.MeasurePx(font, message.Substring(0, split)) > textWidth);
+                if (!ReferenceEquals(_pairBannerFor, _pairPersistentError))
+                { _pairBannerFor = _pairPersistentError; _pairBannerText = "Phone: " + _pairPersistentError; }
+                var errorBox = new SDL_Rect { x = 240, y = H - 246, w = 1440, h = 64 };
+                // A notice rises in; a transient one also lowers away before it clears.
+                float bannerShown = 1f;
+                if (!_cfg.ReduceMotion && _pairErrorShownAt != 0)
+                {
+                    uint shownFor = UiElapsed(_pairErrorShownAt);
+                    if (shownFor < ToastEnterMs) bannerShown = EaseOut(shownFor / (float)ToastEnterMs);
+                    // Unsigned time: past PairNoticeMs the difference would wrap to a huge
+                    // value and draw the banner at full size until PollPairState clears it.
+                    else if (_pairErrorTransient && shownFor > PairNoticeMs - ToastExitMs)
+                        bannerShown = shownFor >= PairNoticeMs ? 0f : (PairNoticeMs - shownFor) / (float)ToastExitMs;
+                }
+                var bannerBox = WipeRect(errorBox, bannerShown);
+                if (bannerBox.h > 0)
+                {
+                    SoftRect(r, bannerBox, C(49, 28, 36)); StrokeRect(r, bannerBox, Danger, 1);
+                    if (errorBox.y + 18 >= bannerBox.y)
+                        TextFit(r, errorBox.x + 20, errorBox.y + 18, 19, errorBox.w - 40, _pairBannerText, Danger);
+                }
             }
-            if (split > 0 && split < message.Length)
+            if (!_toastActive || string.IsNullOrEmpty(_toastText)) return;
+            if (_settingsOpen && _sourceInstallStage != SourceInstallStage.Idle) return;
+            uint age = UiElapsed(_toastStartedAt), total = ToastEnterMs + ToastHoldMs + ToastExitMs;
+            if (age >= total) return;
+            ShapeToast();
+            int height = _toastTwoLines ? 68 : 46;
+            int y = H - 112 - height;
+            float shown = 1f;
+            if (!_cfg.ReduceMotion && age < ToastEnterMs)
             {
-                TextPx(r, box.x + 44, box.y + 8, font, message.Substring(0, split), White);
-                TextFit(r, box.x + 44, box.y + 32, font, textWidth, message.Substring(split + 1), White);
+                double t = age / (double)ToastEnterMs; y += (int)(6 * Math.Pow(1 - t, 3));
+                shown = EaseOut((float)t);
             }
-            else TextFit(r, box.x + 48, box.y + (height - 30) / 2, font, textWidth, message, White);
+            else if (!_cfg.ReduceMotion && age > ToastEnterMs + ToastHoldMs)
+            {
+                double t = (age - ToastEnterMs - ToastHoldMs) / (double)ToastExitMs; y += (int)(6 * t * t);
+                shown = 1f - (float)t;
+            }
+            var box = new SDL_Rect { x = W - 72 - ToastWidth, y = y, w = ToastWidth, h = height };
+            var open = WipeRect(box, shown);
+            if (open.h <= 0) return;
+            SoftRect(r, open, C(32, 32, 32)); StrokeRect(r, open, C(70, 70, 70), 1);
+            int iconY = box.y + (height - 20) / 2;
+            if (iconY >= open.y) DesignIcon(r, _toastIcon, box.x + 16, iconY, 20, _toastTone);
+            if (_toastLine2 != null)
+            {
+                if (box.y + 8 >= open.y) TextPx(r, box.x + 44, box.y + 8, ToastFont, _toastLine1, White);
+                if (box.y + 32 >= open.y) TextFit(r, box.x + 44, box.y + 32, ToastFont, ToastTextWidth, _toastLine2, White);
+            }
+            else if (box.y + (height - 30) / 2 >= open.y)
+                TextFit(r, box.x + 48, box.y + (height - 30) / 2, ToastFont, ToastTextWidth, _toastLine1, White);
         }
 
         void DrawFooterHints(IntPtr r, int y)
@@ -3801,18 +3999,22 @@ namespace Orbis
         void DrawSettingsOverlay(IntPtr r)
         {
             DrawHeader(r);
-            if (_settingsPage==6) { DrawMyFiles(r,new SDL_Rect{x=300,y=210,w=1320,h=714}); if(_softKbOpen)DrawSoftKeyboardModal(r,"Paste a download link",_directDraft,"R2 QUEUE"); return; }
-            string[] pages = { "General", "Connections", "Appearance", "Sound", "Storage" };
-            int[] ids = { 0, 1, 3, 5, 4 };
+            if (_settingsPage==6) { if(_softKbOpen)DrawSoftKeyboardModal(r,"Paste a download link",_directDraft,"R2 QUEUE"); else { DrawMyFiles(r,new SDL_Rect{x=300,y=210,w=1320,h=714}); FlushGlideRing(r); } return; }
+            if (KeyboardCoversContent())
+            {
+                // The modal repaints the whole content band; skip the page under it.
+                string covered = _softKbForSourceUrl ? _sourceUrlDraft : (_softKbForDeepbrid ? _deepbridDraft : (_softKbForAllDebrid ? _allDebridDraft : (_softKbForTorBox ? _torBoxDraft : _proxyDraft)));
+                DrawSoftKeyboardModal(r, _softKbForSourceUrl ? "Install package source" : "Connection settings", covered, "R2 SAVE");
+                return;
+            }
             var tabGroup = new SDL_Rect { x = (W - 1128) / 2, y = 140, w = 1128, h = 56 };
             SoftRect(r, tabGroup, C(29, 29, 29)); StrokeRect(r, tabGroup, Border, 1);
             GamepadIcons.Draw(r, "l1", tabGroup.x - 60, tabGroup.y + 10, 36);
             GamepadIcons.Draw(r, "r1", tabGroup.x + tabGroup.w + 24, tabGroup.y + 10, 36);
-            for (int i = 0; i < pages.Length; i++)
-            {
-                bool on = _settingsPage == ids[i] || ((_settingsPage == 2 || _settingsPage == 6) && i == 1);
-                FilterChip(r, tabGroup.x + 4 + i * 224, tabGroup.y + 4, 220, pages[i], on);
-            }
+            int activePage = -1;
+            for (int i = 0; i < SettingsPageIds.Length; i++)
+                if (_settingsPage == SettingsPageIds[i] || ((_settingsPage == 2 || _settingsPage == 6) && i == 1)) { activePage = i; break; }
+            DrawChipRow(r, tabGroup.x + 4, tabGroup.y + 4, 220, 4, SettingsPageNames, activePage, GlideChips);
             var sheet = new SDL_Rect { x = 210, y = 222, w = 1500, h = 714 };
             if (_settingsPage == 1) DrawSettingsUnlockPage(r, sheet);
             else if (_settingsPage == 2) DrawSettingsPackageSourcesPage(r, sheet);
@@ -3821,6 +4023,7 @@ namespace Orbis
             else if (_settingsPage == 6) DrawMyFiles(r, sheet);
             else if (_settingsPage == 5) DrawSettingsSound(r, sheet);
             else DrawSettingsGeneralPage(r, sheet);
+            FlushGlideRing(r);
             DrawSourceInstallNotification(r, sheet);
             if (_softKbOpen && (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox || _softKbForSourceUrl))
             {
@@ -3828,6 +4031,9 @@ namespace Orbis
                 DrawSoftKeyboardModal(r, _softKbForSourceUrl ? "Install package source" : "Connection settings", draft, "R2 SAVE");
             }
         }
+
+        static readonly string[] SettingsPageNames = { "General", "Connections", "Appearance", "Sound", "Storage" };
+        static readonly int[] SettingsPageIds = { 0, 1, 3, 5, 4 };
 
         static readonly string[] ConnectionProviderIds = { UnlockProviders.RealDebridId, UnlockProviders.TorBoxId,
             UnlockProviders.AllDebridId, UnlockProviders.PremiumizeId, UnlockProviders.NoneId };
@@ -3885,8 +4091,7 @@ namespace Orbis
         {
             if (_sourceBrowseMode != 0) { DrawSourceBrowser(r, sheet); return; }
             int x = sheet.x, w = sheet.w;
-            TextPx(r, x, sheet.y + 15, 28, "Package sources", White);
-            TextPx(r, x, sheet.y + 57, 18, "Choose which catalogs appear in search.", Muted);
+            DrawSettingsPageHeader(r, x, sheet.y + 15, w, "Package sources", "Choose which catalogs appear in search.");
             DrawSettingsRow(r, x, sheet.y + 105, w, 78, 0, "Install from USB", "Choose a connected drive and a .gssource file", "Open");
             DrawSettingsRow(r, x, sheet.y + 193, w, 78, 1, "Browse community sources", "Shared sources · names, tags and descriptions", "Browse");
             DrawSettingsRow(r, x, sheet.y + 281, w, 78, 2, "Add a source link", "Scan the QR code and send a source URL from your phone", "Connect");
@@ -3907,27 +4112,26 @@ namespace Orbis
         void DrawSettingsGeneralPage(IntPtr r, SDL_Rect sheet)
         {
             int x = sheet.x, w = sheet.w, y = sheet.y + 18;
-            TextPx(r, x, y, 27, "Downloads and compatibility", White);
-            TextFit(r, x, y + 43, 18, w, "PS4 " + _firmwareVersion + " · " + ResidentDownloadService.ModeStatus(_cfg.UseBgftDirect), Muted);
+            DrawSettingsPageHeader(r, x, y, w, "Downloads and compatibility", "PS4 " + _firmwareVersion + " · " + ResidentDownloadService.ModeStatus(_cfg.UseBgftDirect));
+            const int p = 77, h = 67;
             y += 84;
-            DrawSettingsRow(r, x, y, w, 67, 0, "Download mode", "Background waits for the resident; In-app requires SSPI to stay open", _cfg.UseBgftDirect ? "Background" : "In-app");
-            DrawSettingsRow(r, x, y + 77, w, 67, 1, "Background worker", ResidentDownloadService.ReadinessDetail, "RETRY");
-            DrawSettingsRow(r, x, y + 154, w, 67, 2, "Download statistics", "Size, speed and estimated time", DlStatsLabel(_cfg.DownloadStatsMode));
-            DrawSettingsRow(r, x, y + 231, w, 67, 3, "Stats for nerds", "Show a speed graph on the selected download", _cfg.NerdStats ? "ON" : "OFF");
-            DrawSettingsRow(r, x, y + 308, w, 67, 4, "Firmware and backport hints", "Show package requirements when available", _cfg.ShowFirmwareHints ? "ON" : "OFF");
-            DrawSettingsRow(r, x, y + 385, w, 67, 5, "Clear removable history", "Installed content and retry files stay protected", "CLEAR");
-            DrawSettingsRow(r, x, y + 462, w, 67, 6, "Retry source passwords", "Try up to four source passwords when an archive rejects its password", _cfg.RetrySourceArchivePasswords ? "ON" : "OFF");
+            DrawSettingsRow(r, x, y, w, h, 0, "Download mode", "Background waits for the resident; In-app requires SSPI to stay open", _cfg.UseBgftDirect ? "Background" : "In-app");
+            DrawSettingsRow(r, x, y + p, w, h, 1, "Background worker", ResidentDownloadService.ReadinessDetail, "RETRY");
+            DrawSettingsRow(r, x, y + p * 2, w, h, 2, "Download statistics", "Size, speed and estimated time", DlStatsLabel(_cfg.DownloadStatsMode));
+            DrawSettingsRow(r, x, y + p * 3, w, h, 3, "Stats for nerds", "Show a speed graph on the selected download", _cfg.NerdStats ? "ON" : "OFF");
+            DrawSettingsRow(r, x, y + p * 4, w, h, 4, "Firmware and backport hints", "Show package requirements when available", _cfg.ShowFirmwareHints ? "ON" : "OFF");
+            DrawSettingsRow(r, x, y + p * 5, w, h, 5, "Clear removable history", "Installed content and retry files stay protected", "CLEAR");
+            DrawSettingsRow(r, x, y + p * 6, w, h, 6, "Retry source passwords", "Try up to four source passwords when an archive rejects its password", _cfg.RetrySourceArchivePasswords ? "ON" : "OFF");
             DrawSettingsSave(r, sheet, 7);
         }
 
         void DrawSettingsAppearancePage(IntPtr r, SDL_Rect sheet)
         {
             int x = sheet.x, w = sheet.w, y = sheet.y + 18;
-            TextPx(r, x, y, 27, "Appearance", White);
-            TextPx(r, x, y + 45, 19, "Square: upload a pixel background from your phone. Changes save automatically.", Muted);
+            DrawSettingsPageHeader(r, x, y, w, "Appearance", "Square: upload a pixel background from your phone. Changes save automatically.");
             DrawSettingsRow(r, x, y + 100, w, 83, 0, "Background pattern", "LEFT / RIGHT to change", _cfg.BackgroundMode == AppSettings.BackgroundImage ? "Picture + " + BackdropPattern.Names[BackdropPattern.Index(_cfg.BackgroundOverlay)] : BackdropPattern.Names[BackdropPattern.Index(_cfg.BackgroundMode)]);
             DrawSettingsRow(r, x, y + 197, w, 83, 1, "Reduced motion", "Static focus and immediate transitions", _cfg.ReduceMotion ? "ON" : "OFF");
-            TextPx(r, x, y + 311, 22, "Accent", White);
+            DrawSettingsSection(r, x, y + 318, w, "ACCENT");
             int n = ThemePalette.Presets.Count, columns = 4, cw = (w - 42) / columns;
             for (int i = 0; i < n; i++)
             {
@@ -3945,19 +4149,50 @@ namespace Orbis
             var rect = new SDL_Rect { x = x, y = y, w = w, h = h };
             bool focused = index >= 0 && _settingsFocus == index;
             bool danger = string.Equals(value, "CLEAR", StringComparison.OrdinalIgnoreCase);
-            DesignCard(r, rect, focused);
+            DesignCard(r, rect, focused, GlideSettings);
+            // A short accent mark keeps the focused row readable from the sofa.
+            if (focused) Fill(r, x + 8, y + 16, 3, Math.Max(8, h - 32), Accent);
             bool toggle = value == "ON" || value == "OFF";
-            int valueWidth = toggle ? 90 : Math.Min(w / 3, UiFont.MeasurePx(19, value ?? "") + 65);
+            // Display-only casing: callers keep passing their existing value strings.
+            string label = value == "RETRY" ? "Retry" : value == "CLEAR" ? "Clear" : value ?? "";
+            // An empty value still reserves room: the Connections page draws its check box there.
+            int valueWidth = toggle ? 132 : Math.Min(w / 3, UiFont.MeasurePx(18, label) + 66);
             int available = Math.Max(30, w - 54 - valueWidth);
             int titlePx = h < 76 ? 21 : 23;
             TextFit(r, x + 22, y + (string.IsNullOrEmpty(body) ? (h - 30) / 2 : 11), titlePx, available, title, danger ? Danger : White);
             if (!string.IsNullOrEmpty(body)) TextFit(r, x + 22, y + h - 33, 17, available, body, Muted);
-            if (toggle) DrawSwitch(r, x + w - 76, y + (h - 28) / 2, value == "ON");
-            else
+            if (toggle)
             {
-                string shown = UiFont.EllipsizePx(value ?? "", 19, valueWidth - 34);
-                TextPx(r, x + w - 24 - UiFont.MeasurePx(19, shown), y + (h - 27) / 2, 19, shown, string.Equals(value, "Active", StringComparison.OrdinalIgnoreCase) ? Ok : focused ? White : Muted);
+                bool on = value == "ON";
+                string state = on ? "On" : "Off";
+                TextPx(r, x + w - 90 - UiFont.MeasurePx(17, state), y + (h - 24) / 2, 17, state, on ? (focused ? White : Muted) : Dim);
+                DrawSwitch(r, x + w - 76, y + (h - 28) / 2, on);
             }
+            else if (label.Length > 0)
+            {
+                // Right-aligned value chip; the card behind it stays opaque.
+                string shown = UiFont.EllipsizePx(label, 18, valueWidth - 34);
+                int chipW = UiFont.MeasurePx(18, shown) + 32, chipH = 36;
+                var chip = new SDL_Rect { x = x + w - 24 - chipW, y = y + (h - chipH) / 2, w = chipW, h = chipH };
+                SoftRect(r, chip, focused ? Raised : C(29, 29, 29));
+                SDL_Color ink = string.Equals(value, "Active", StringComparison.OrdinalIgnoreCase) ? Ok : danger ? Danger : focused ? White : Muted;
+                TextPx(r, chip.x + 16, chip.y + 7, 18, shown, ink);
+            }
+        }
+
+        // One header style for every settings page: title plus a one-line description.
+        void DrawSettingsPageHeader(IntPtr r, int x, int y, int w, string title, string description)
+        {
+            TextPx(r, x, y, 27, title, White);
+            if (!string.IsNullOrEmpty(description)) TextFit(r, x, y + 43, 18, w, description, Muted);
+        }
+
+        // Section label in the same small-caps language as the detail page.
+        void DrawSettingsSection(IntPtr r, int x, int y, int w, string label)
+        {
+            int width = UiFont.MeasurePx(14, label);
+            TextPx(r, x, y, 14, label, Dim);
+            Fill(r, x + width + 16, y + 9, Math.Max(0, w - width - 16), 1, Border);
         }
 
         void SoftKbAppend(char ch)
@@ -4197,35 +4432,118 @@ namespace Orbis
             DrawSoftKeyboard(r, 395);
         }
 
+        const int KbKeyH = 64, KbGap = 12, KbSpecialW = 244, KbSpecialH = 70, KbSpecialTop = 322;
+        // Cached resting keys: x/y/w/h of the layer and the state it was drawn for.
+        const int KbLayerX = 190, KbLayerW = W - 2 * KbLayerX, KbLayerMargin = 8, KbLayerH = KbSpecialTop + KbSpecialH + 2 * KbLayerMargin;
+        IntPtr _kbLayer;
+        int _kbLayerTop = int.MinValue;
+        bool _kbLayerLower, _kbLayerDark;
+        string _kbLayerAction;
+        static readonly string[] KbKeyLabels = BuildKeyLabels(false), KbKeyLabelsLower = BuildKeyLabels(true);
+
+        static string[] BuildKeyLabels(bool lower)
+        {
+            var labels = new List<string>();
+            foreach (string row in KbRows)
+                foreach (char key in row)
+                    labels.Add((lower && char.IsLetter(key) ? char.ToLowerInvariant(key) : key).ToString());
+            return labels.ToArray();
+        }
+
+        string KeyboardActionLabel()
+        {
+            return _archivePasswordId != null ? "Retry" : _settingsPage == 6 && _settingsOpen ? "Queue" :
+                (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? "Save" :
+                _softKbForSourceUrl ? "Install" : "Search";
+        }
+
+        SDL_Rect KeyboardKeyBox(int top, int row, int col)
+        {
+            if (row == 4)
+            {
+                int sx = (W - (5 * (KbSpecialW + KbGap) - KbGap)) / 2;
+                return new SDL_Rect { x = sx + col * (KbSpecialW + KbGap), y = top + KbSpecialTop, w = KbSpecialW, h = KbSpecialH };
+            }
+            int keyW = row == 3 ? 84 : 112, rowW = KbRows[row].Length * (keyW + KbGap) - KbGap, startX = (W - rowW) / 2;
+            return new SDL_Rect { x = startX + col * (keyW + KbGap), y = top + row * (KbKeyH + KbGap), w = keyW, h = KbKeyH };
+        }
+
+        void DrawKeyboardKey(IntPtr r, int top, int row, int col, bool on, bool pressed, int lift, string action)
+        {
+            var box = KeyboardKeyBox(top, row, col);
+            box.y -= lift;
+            bool primary = on || pressed || (row == 4 && col == 4);
+            SoftRect(r, box, primary ? PrimaryFill : Row);
+            string label;
+            if (row == 4)
+                label = col == 0 ? "Space" : col == 1 ? "Delete" : col == 2 ? "Clear" : col == 3 ? (_kbLower ? "ABC" : "abc") : action;
+            else
+            {
+                int index = col;
+                for (int k = 0; k < row; k++) index += KbRows[k].Length;
+                label = (_kbLower ? KbKeyLabelsLower : KbKeyLabels)[index];
+            }
+            TextCentered(r, box, row == 4 ? 22 : 29, label, primary ? PrimaryInk : White);
+        }
+
+        // The resting keys are one cached layer: a frame copies it and draws only
+        // the focused and pressed keys, instead of 50 rounded keys and labels.
         void DrawSoftKeyboard(IntPtr r, int top)
         {
-            const int keyH = 64, gap = 12;
-            for (int row = 0; row < 4; row++)
+            string action = KeyboardActionLabel();
+            bool cached = _kbLayer != IntPtr.Zero && _kbLayerTop == top && _kbLayerLower == _kbLower &&
+                _kbLayerDark == DarkSurfaces && ReferenceEquals(_kbLayerAction, action);
+            var layer = new SDL_Rect { x = KbLayerX, y = top - KbLayerMargin, w = KbLayerW, h = KbLayerH };
+            if (cached) SDL_RenderCopy(r, _kbLayer, IntPtr.Zero, ref layer);
+            else
             {
-                string keys = KbRows[row]; int keyW = row == 3 ? 84 : 112;
-                int rowW = keys.Length * (keyW + gap) - gap, startX = (W - rowW) / 2;
-                for (int col = 0; col < keys.Length; col++)
+                for (int row = 0; row < 5; row++)
+                    for (int col = 0, count = row == 4 ? 5 : KbRows[row].Length; col < count; col++)
+                        DrawKeyboardKey(r, top, row, col, false, false, 0, action);
+                CaptureKeyboardLayer(r, layer, top, action);
+            }
+            var ring = new SDL_Rect();
+            for (int row = 0; row < 5; row++)
+            {
+                for (int col = 0, count = row == 4 ? 5 : KbRows[row].Length; col < count; col++)
                 {
                     bool on = _kbSuggestionFocus < 0 && _kbRow == row && _kbCol == col;
-                    bool pressed = _kbPressedRow == row && _kbPressedCol == col && UiElapsed(_kbPressedAt) < 140;
+                    bool pressed = row < 4 && _kbPressedRow == row && _kbPressedCol == col && UiElapsed(_kbPressedAt) < 140;
+                    if (!on && !pressed) continue;
+                    // Clear the resting key, including its outline margin, then draw it live.
+                    var rest = KeyboardKeyBox(top, row, col);
+                    Fill(r, rest.x - 5, rest.y - 5, rest.w + 10, rest.h + 10, Bg);
                     int lift = _cfg.ReduceMotion ? 0 : pressed ? -2 : FocusLift(on);
-                    var box = new SDL_Rect { x = startX + col * (keyW + gap), y = top + row * (keyH + gap) - lift, w = keyW, h = keyH };
-                    SoftRect(r, box, on || pressed ? PrimaryFill : Row);
-                    if (on) StrokeRect(r, new SDL_Rect { x = box.x - 4, y = box.y - 4, w = box.w + 8, h = box.h + 8 }, White, 1);
-                    char ch = keys[col]; if (_kbLower && char.IsLetter(ch)) ch = char.ToLowerInvariant(ch);
-                    TextCentered(r, box, 29, ch.ToString(), on || pressed ? PrimaryInk : White);
+                    DrawKeyboardKey(r, top, row, col, on, pressed, lift, action);
+                    if (on) ring = new SDL_Rect { x = rest.x - 4, y = rest.y - lift - 4, w = rest.w + 8, h = rest.h + 8 };
                 }
             }
-            string[] special = { "Space", "Delete", "Clear", _kbLower ? "ABC" : "abc", _archivePasswordId != null ? "Retry" : _settingsPage==6 && _settingsOpen ? "Queue" : (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? "Save" : _softKbForSourceUrl ? "Install" : "Search" };
-            const int sw = 244; int sx = (W - (5 * (sw + gap) - gap)) / 2;
-            for (int i = 0; i < 5; i++)
+            // The focus ring glides from key to key across the cached layer.
+            if (ring.w > 0) StrokeRect(r, Glide(GlideKey, ring), White, 1);
+        }
+
+        void CaptureKeyboardLayer(IntPtr r, SDL_Rect layer, int top, string action)
+        {
+            ReleaseKeyboardLayer();
+            IntPtr texture = SDL_CreateTexture(r, SDL_PIXELFORMAT_BGR888, (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, layer.w, layer.h);
+            if (texture == IntPtr.Zero) return;
+            IntPtr pixels = System.Runtime.InteropServices.Marshal.AllocHGlobal(layer.w * layer.h * 4);
+            try
             {
-                bool on = _kbSuggestionFocus < 0 && _kbRow == 4 && _kbCol == i;
-                var box = new SDL_Rect { x = sx + i * (sw + gap), y = top + 322 - FocusLift(on), w = sw, h = 70 };
-                SoftRect(r, box, on || i == 4 ? PrimaryFill : Row);
-                if (on) StrokeRect(r, new SDL_Rect { x = box.x - 4, y = box.y - 4, w = box.w + 8, h = box.h + 8 }, White, 1);
-                TextCentered(r, box, 22, special[i], on || i == 4 ? PrimaryInk : White);
+                if (SDL_RenderReadPixels(r, ref layer, SDL_PIXELFORMAT_BGR888, pixels, layer.w * 4) != 0 ||
+                    SDL_UpdateTexture(texture, IntPtr.Zero, pixels, layer.w * 4) != 0)
+                { SDL_DestroyTexture(texture); return; }
             }
+            finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(pixels); }
+            SDL_SetTextureBlendMode(texture, SDL_BlendMode.SDL_BLENDMODE_NONE);
+            _kbLayer = texture; _kbLayerTop = top; _kbLayerLower = _kbLower; _kbLayerDark = DarkSurfaces; _kbLayerAction = action;
+        }
+
+        void ReleaseKeyboardLayer()
+        {
+            if (_kbLayer == IntPtr.Zero) return;
+            SDL_DestroyTexture(_kbLayer);
+            _kbLayer = IntPtr.Zero; _kbLayerTop = int.MinValue; _kbLayerAction = null;
         }
 
         void DrawResults(IntPtr r)

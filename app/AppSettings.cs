@@ -231,6 +231,37 @@ namespace Orbis
             catch { return "."; }
         }
 
+        /// <summary>
+        /// Launch-screen appearance, read before Load() so the first paint can match
+        /// the saved theme. One small read of the existing settings file only: it
+        /// never resolves or migrates storage, copies legacy settings, shows
+        /// notices or touches network state. Load() remains the source of truth.
+        /// </summary>
+        internal static bool ReadLaunchAppearance(out string accent, out string backgroundMode, out bool reduceMotion)
+        {
+            accent = ThemePalette.DefaultAccentHex;
+            backgroundMode = BackgroundSolid;
+            reduceMotion = false;
+            try
+            {
+                if (!_dataDirResolved || string.IsNullOrEmpty(_dataDir)) return false;
+                string path = Path.Combine(_dataDir, "settings.ini");
+                if (!File.Exists(path)) return false;
+                foreach (var raw in File.ReadAllLines(path))
+                {
+                    string line = (raw ?? "").Trim();
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0 || line[0] == '#' || line[0] == ';') continue;
+                    string key = line.Substring(0, eq).Trim(), value = line.Substring(eq + 1).Trim();
+                    if (Eq(key, "accent")) accent = value;
+                    else if (Eq(key, "bg_mode")) backgroundMode = value;
+                    else if (Eq(key, "reduce_motion")) reduceMotion = ReadToggle(value, reduceMotion);
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
         public void Load()
         {
             RetrySourceArchivePasswords = true;

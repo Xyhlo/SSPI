@@ -21,7 +21,7 @@ namespace Orbis
         byte[] _patternUploadPixels;
         bool _patternDisposed;
 
-        bool DrawPattern(IntPtr renderer)
+        bool DrawPattern(IntPtr renderer, int top = 0, int bottom = H)
         {
             if (_patternDisposed) return false;
             bool custom = _cfg.BackgroundMode == AppSettings.BackgroundImage && PixelBackground.IsOwnedPath(_cfg.BackgroundImagePath);
@@ -98,8 +98,8 @@ namespace Orbis
             // is prepared. Never publish partially uploaded rows.
             if (_patternTexture != IntPtr.Zero)
             {
-                var destination = new SDL_Rect { x = 0, y = 0, w = W, h = H };
-                SDL_RenderCopy(renderer, _patternTexture, IntPtr.Zero, ref destination);
+                var band = new SDL_Rect { x = 0, y = top, w = W, h = bottom - top };
+                SDL_RenderCopy(renderer, _patternTexture, ref band, ref band);
                 return true;
             }
             return false;

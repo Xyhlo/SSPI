@@ -10,6 +10,7 @@ namespace Orbis
     {
         bool _libraryOpen, _returnToLibrary, _libraryCaptureAttempted;
         int _expandedLibraryFocus;
+        uint _libraryOpenedAt, _libraryPageAt;
         IntPtr _libraryBackdrop;
         IntPtr _libraryBackdropUpload;
         byte[] _libraryBackdropPixels;
@@ -35,6 +36,7 @@ namespace Orbis
             CloseLibrary();
             _expandedLibraryFocus = Math.Max(0, Math.Min(_libraryGames.Count - 1, _searchLandingFocus - 1));
             _libraryOpen = true;
+            _libraryOpenedAt = UiTick(); _libraryPageAt = 0;
             _covers.BumpGeneration();
             Invalidated = true;
         }
@@ -56,7 +58,7 @@ namespace Orbis
                 button == DS4Button.SCE_PAD_BUTTON_L2 ? -10 : button == DS4Button.SCE_PAD_BUTTON_R2 ? 10 : 0;
             int oldPage = _expandedLibraryFocus / 10;
             _expandedLibraryFocus = LibraryMove(_expandedLibraryFocus, _libraryGames.Count, move);
-            if (oldPage != _expandedLibraryFocus / 10) _covers.BumpGeneration();
+            if (oldPage != _expandedLibraryFocus / 10) { _covers.BumpGeneration(); _libraryPageAt = UiTick(); }
             _searchLandingFocus = _expandedLibraryFocus + 1;
             if (button == DS4Button.SCE_PAD_BUTTON_CROSS && _libraryGames.Count > 0) {
                 _selected = _libraryGames[_expandedLibraryFocus];
@@ -171,6 +173,7 @@ namespace Orbis
                 return;
             }
             int first = _expandedLibraryFocus / 10 * 10;
+            var focusRing = new SDL_Rect(); bool focusNewer = false;
             for (int index = first; index < Math.Min(count, first + 10); index++) {
                 var game = _libraryGames[index]; int slot = index - first;
                 int x = 254 + (slot % 5) * 284, y = 247 + (slot / 5) * 295;
@@ -178,10 +181,14 @@ namespace Orbis
                 string state = LibraryUpdateStatus(game, out newer);
                 var art = new SDL_Rect { x = x + 41, y = y, w = 176, h = 222 };
                 DrawCase(r, game, art);
-                if (newer || focus) StrokeRect(r, new SDL_Rect { x = art.x - 6, y = y - 6, w = 188, h = 234 }, newer ? Warning : Accent, focus ? 2 : 1);
+                var ring = new SDL_Rect { x = art.x - 6, y = y - 6, w = 188, h = 234 };
+                if (newer && !focus) StrokeRect(r, ring, Warning, 1);
+                if (focus) focusRing = ring; focusNewer |= focus && newer;
                 TextFit(r, x + 7, y + 234, 19, 252, LibraryTitle(game), focus ? White : Muted);
                 TextFit(r, x + 7, y + 262, 15, 252, state, newer ? Warning : Muted);
             }
+            RevealVeil(r, new SDL_Rect { x = 250, y = 237, w = 1420, h = 600 }, C(29, 30, 32), _libraryPageAt, RevealMs);
+            if (focusRing.w > 0) StrokeRect(r, Glide(GlideLibrary, focusRing), focusNewer ? Warning : Accent, 2);
             Fill(r, 250, 846, 1420, 1, Border);
             var selected = _libraryGames[_expandedLibraryFocus];
             TextFit(r, 250, 864, 22, 1050, LibraryTitle(selected), White);
@@ -189,6 +196,7 @@ namespace Orbis
             GamepadIcons.Draw(r, "l2", 1460, 887, 28);
             TextPx(r, 1505, 890, 18, (first / 10 + 1) + " / " + ((count + 9) / 10), Muted);
             GamepadIcons.Draw(r, "r2", 1617, 887, 28);
+            RevealVeil(r, new SDL_Rect { x = 211, y = 145, w = 1498, h = 808 }, C(29, 30, 32), _libraryOpenedAt, RevealMs);
         }
 
         void DrawTouchpadAction(IntPtr r, int x, int y, string label)

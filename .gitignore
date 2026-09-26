@@ -80,6 +80,7 @@
 !/app/SearchWindow.Release.cs
 !/app/SearchWindow.cs
 !/app/SearchWindow.UsbInstall.cs
+!/app/SearchWindow.DetailRegions.cs
 !/app/SearchWindow.FtpInbox.cs
 !/app/FtpInbox.cs
 !/app/SequentialDownloadEngine.cs
@@ -262,6 +263,7 @@
 !/app/CustomCovers.cs
 !/app/PairServer.Library.cs
 !/app/SearchWindow.SceneCache.cs
+!/app/SearchWindow.Motion.cs
 !/resident/plugin/gs_stage_dependency.h
 !/resident/plugin/gs_ftp_inbox.inc
 

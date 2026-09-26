@@ -80,6 +80,38 @@ namespace Orbis
                 ? color : _presets[0].Color;
         }
 
+        /// <summary>Saved accent text resolved like <see cref="Accent"/>; invalid values use Charcoal.</summary>
+        public static ThemeColor ResolveAccent(string value)
+        {
+            ThemeColor color;
+            ThemeAccentPreset preset;
+            return TryResolveAccent(value, out color, out preset) ? color : _presets[0].Color;
+        }
+
+        /// <summary>
+        /// Opaque launch surface for the saved background family: plain charcoal,
+        /// the dark gradients' base, or the accent-tinted base shared by accent
+        /// patterns and pictures. Pictures are never decoded for this colour.
+        /// </summary>
+        public static ThemeColor LaunchSurface(string backgroundMode, ThemeColor accent)
+        {
+            var patternBase = new ThemeColor(11, 11, 12);
+            if (string.Equals(backgroundMode, AppSettings.BackgroundImage, StringComparison.OrdinalIgnoreCase))
+                return Mix(patternBase, accent, 0.05);
+            if (BackdropPattern.Index(backgroundMode) == 0) return new ThemeColor(20, 20, 20);
+            if (BackdropPattern.IsDarkGradient(backgroundMode)) return new ThemeColor(8, 8, 8);
+            return Mix(patternBase, accent, 0.05);
+        }
+
+        public static ThemeColor Mix(ThemeColor from, ThemeColor to, double amount)
+        {
+            amount = Math.Max(0, Math.Min(1, amount));
+            return new ThemeColor(
+                (byte)Math.Round(from.R + (to.R - from.R) * amount),
+                (byte)Math.Round(from.G + (to.G - from.G) * amount),
+                (byte)Math.Round(from.B + (to.B - from.B) * amount));
+        }
+
         public static bool TryResolveAccent(string value, out ThemeColor color,
             out ThemeAccentPreset preset)
         {

@@ -10,8 +10,16 @@ namespace Orbis
 {
     internal static class GamepadIcons
     {
-        static readonly Dictionary<string, IntPtr> Textures = new Dictionary<string, IntPtr>();
-        static readonly Dictionary<string, bool> UsesArtwork = new Dictionary<string, bool>();
+        // Icons are drawn every frame; a struct key avoids building "key:size" strings.
+        struct IconKey : IEquatable<IconKey>
+        {
+            public string Key; public int Size;
+            public bool Equals(IconKey other) { return Size == other.Size && string.Equals(Key, other.Key, StringComparison.Ordinal); }
+            public override bool Equals(object obj) { return obj is IconKey && Equals((IconKey)obj); }
+            public override int GetHashCode() { return (Key == null ? 0 : Key.GetHashCode()) * 31 + Size; }
+        }
+        static readonly Dictionary<IconKey, IntPtr> Textures = new Dictionary<IconKey, IntPtr>();
+        static readonly Dictionary<IconKey, bool> UsesArtwork = new Dictionary<IconKey, bool>();
         static IntPtr _renderer;
         public static string Diagnostics { get { return "P4Gamepad artwork with raster fallback"; } }
         public static bool AnyLoaded { get { return _renderer != IntPtr.Zero; } }
@@ -67,8 +75,10 @@ namespace Orbis
         public static bool Draw(IntPtr renderer, string key, int x, int y, int size)
         {
             if (renderer == IntPtr.Zero || string.IsNullOrEmpty(key)) return false;
-            Ensure(renderer); size = Math.Max(20, Math.Min(64, size)); key = key.ToLowerInvariant();
-            string cacheKey = key + ":" + size;
+            Ensure(renderer); size = Math.Max(20, Math.Min(64, size));
+            for (int i = 0; i < key.Length; i++)
+                if (char.IsUpper(key[i])) { key = key.ToLowerInvariant(); break; }
+            var cacheKey = new IconKey { Key = key, Size = size };
             IntPtr texture;
             bool artwork;
             if (!Textures.TryGetValue(cacheKey, out texture))

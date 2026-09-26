@@ -66,7 +66,8 @@ namespace Orbis
         }
         sealed class DrawerRow
         {
-            internal string Name, Detail, Size, ItemId;
+            // Key identifies the row's progress bar for smoothing; names repeat across rows.
+            internal string Name, Detail, Size, ItemId, Key;
             internal bool Error, Installed, Parked;
             internal long Done, Total;
             internal DlState State;
@@ -148,7 +149,7 @@ namespace Orbis
                     else if (item.State == DlState.Failed) detail = FriendlyTransferFailure(item.Error);
                     else if (!Extracting(item) && detail != state && !string.IsNullOrEmpty(detail)) detail = state + " · " + detail;
                     _drawerRows.Add(new DrawerRow { Name = PackageDisplayTitle(item.Kind, item.Label, group.Name, "", item.PackageVersion),
-                        Detail = string.IsNullOrEmpty(detail) ? state : detail,
+                        Detail = string.IsNullOrEmpty(detail) ? state : detail, Key = "package\n" + item.Id,
                         Size = DrawerPackageSize(item), ItemId = item.Id, Error = item.State == DlState.Failed,
                         Done = Math.Max(0, item.Done), Total = DownloadDisplayTotal(item), Installed = item.State == DlState.Installed,
                         State = item.State, Parked = item.ParkedForProvider });
@@ -166,18 +167,21 @@ namespace Orbis
                     long volumeTotal = Math.Max(0, volume.Size);
                     long volumeDone = downloaded ? volumeTotal : Math.Max(0, Math.Min(volumeTotal, selected.Done - offset));
                     _drawerRows.Add(new DrawerRow { Name = IncomingFileName(selected, volume.Name), Detail = "Incoming file · " + state,
+                        Key = "volume\n" + selected.Id + "\n" + _drawerRows.Count,
                         Size = volume.Size > 0 ? FileBytes(volume.Size) : "Size pending", ItemId = selected.Id,
                         Done = volumeDone, Total = volumeTotal, State = selected.State, Parked = selected.ParkedForProvider });
                     offset += volume.Size;
                 }
                 foreach (var output in outputs)
                     _drawerRows.Add(new DrawerRow { Name = output.Name, Detail = output.State, Size = FileBytes(output.Size),
+                        Key = "output\n" + selected.Id + "\n" + output.Name,
                         ItemId = selected.Id, Error = output.State.StartsWith("Failed", StringComparison.Ordinal),
                         Installed = output.State == "Installed",
                         Done = output.State == "Installed" ? Math.Max(0, output.Size) : 0,
                         Total = Math.Max(0, output.Size), State = selected.State, Parked = selected.ParkedForProvider });
                 if (_drawerRows.Count == 0)
                     _drawerRows.Add(new DrawerRow { Name = IncomingFileName(selected, System.IO.Path.GetFileName(selected.DestPath ?? "")),
+                        Key = "file\n" + selected.Id,
                         Detail = Extracting(selected) ? FormatDlLine(selected) : VisibleState(selected), Size = TransferSizeLine(selected),
                         ItemId = selected.Id, Done = Math.Max(0, selected.Done), Total = Math.Max(0, selected.Total),
                         State = selected.State, Parked = selected.ParkedForProvider });
@@ -260,7 +264,7 @@ namespace Orbis
                 var segment = new SDL_Rect { x = track.x + offset, y = track.y, w = width, h = track.h };
                 SoftRect(r, segment, total > 0 ? C(81, 83, 85) : C(65, 67, 69));
                 bool complete = entry.State == DlState.Completed || entry.State == DlState.Installed;
-                int fill = (int)Math.Round(width * DownloadDisplayProgress(complete, entry.Done, total));
+                int fill = (int)Math.Round(width * SmoothedProgress(entry.Id, DownloadDisplayProgress(complete, entry.Done, total)));
                 if (fill <= 0) continue;
                 segment.w = Math.Min(width, fill);
                 SoftRect(r, segment, entry.State == DlState.Failed ? Danger : White);
@@ -366,7 +370,7 @@ namespace Orbis
                 var bar = new SDL_Rect { x = barX, y = y + 28, w = barWidth, h = 7 };
                 SoftRect(r, bar, C(81, 83, 85));
                 bool complete = row.Installed || row.State == DlState.Completed || row.State == DlState.Installed;
-                int filled = (int)Math.Round(barWidth * DownloadDisplayProgress(complete, row.Done, row.Total));
+                int filled = (int)Math.Round(barWidth * SmoothedProgress(row.Key, DownloadDisplayProgress(complete, row.Done, row.Total)));
                 if (filled > 0) { bar.w = Math.Min(barWidth, filled); SoftRect(r, bar, row.Error ? Danger : White); }
                 string sizeText = row.Size ?? "";
                 string percent = DrawerPercentText(row);

@@ -102,6 +102,18 @@ namespace Orbis
             TextCentered(r, rect, 20, label, active ? White : Muted);
         }
 
+        // A row of chips whose active highlight glides between them: backgrounds
+        // first, then the moving highlight, then every label on top of it.
+        void DrawChipRow(IntPtr r, int x, int y, int w, int gap, string[] labels, int active, int glideSlot)
+        {
+            for (int i = 0; i < labels.Length; i++)
+                SoftRect(r, new SDL_Rect { x = x + i * (w + gap), y = y, w = w, h = 48 }, C(29, 29, 29));
+            if (active >= 0 && active < labels.Length)
+                SoftRect(r, Glide(glideSlot, new SDL_Rect { x = x + active * (w + gap), y = y, w = w, h = 48 }), Raised);
+            for (int i = 0; i < labels.Length; i++)
+                TextCentered(r, new SDL_Rect { x = x + i * (w + gap), y = y, w = w, h = 48 }, 20, labels[i], i == active ? White : Muted);
+        }
+
         void TreeBranch(IntPtr r, int stemX, int top, int mid, int bottom, int endX, bool last)
         {
             Fill(r, stemX, top, 2, Math.Max(1, (last ? mid : bottom) - top), Muted);
@@ -326,7 +338,7 @@ namespace Orbis
                     int x = shelfX + i * (posterW + gap);
                     var art = new SDL_Rect { x = x, y = 388 - FocusLift(focused), w = posterW, h = 284 };
                     DrawCase(r, hit, art);
-                    if (focused) StrokeRect(r, new SDL_Rect { x = x - 6, y = art.y - 6, w = posterW + 12, h = art.h + 12 }, Accent, 2);
+                    if (focused) StrokeRect(r, Glide(GlidePoster, new SDL_Rect { x = x - 6, y = art.y - 6, w = posterW + 12, h = art.h + 12 }), Accent, 2);
                     TextFit(r, x, 693, 22, posterW, LibraryTitle(hit), White);
                     TextFit(r, x, 731, 17, posterW, LibraryInstalledVersion(hit), Muted);
                     bool newer; string updateStatus = LibraryUpdateStatus(hit, out newer);
@@ -364,7 +376,7 @@ namespace Orbis
             int chipW = 138, chipGap = 8;
             int chipsTotal = RegionFilters.Length * chipW + (RegionFilters.Length - 1) * chipGap;
             int chipStart = ContentX + (ContentWidth - chipsTotal) / 2;
-            for (int i = 0; i < RegionFilters.Length; i++) FilterChip(r, chipStart + i * (chipW + chipGap), 218, chipW, RegionFilters[i], _regionFilter == i);
+            DrawChipRow(r, chipStart, 218, chipW, chipGap, RegionFilters, _regionFilter, GlideChips);
             if (list.Count == 0)
             {
                 // Single empty state: heading + guidance are always distinct.
@@ -383,7 +395,7 @@ namespace Orbis
             for (int i = 0; i < visible && _listScroll + i < list.Count; i++)
             {
                 int index = _listScroll + i, y = top + i * rowH; var hit = list[index]; bool on = index == _focus;
-                DesignCard(r, new SDL_Rect { x = ContentX, y = y, w = ContentWidth, h = 114 }, on);
+                DesignCard(r, new SDL_Rect { x = ContentX, y = y, w = ContentWidth, h = 114 }, on, GlideList);
                 DrawCase(r, hit, new SDL_Rect { x = ContentX + 22, y = y + 9 - FocusLift(on), w = 74, h = 94 });
                 TextFit(r, ContentX + 122, y + 18, 27, ContentWidth - 440, hit.Name, White);
                 TextFit(r, ContentX + 122, y + 65, 19, ContentWidth - 440, hit.TitleId ?? "", Muted);
@@ -391,6 +403,7 @@ namespace Orbis
                 DrawPillRight(r, ContentX + ContentWidth - 66, y + 41, hit.Region ?? "?", Muted);
                 DesignIcon(r, "chevron", ContentX + ContentWidth - 43, y + 46, 21, on ? White : Dim);
             }
+            FlushGlideRing(r);
             DrawScrollBar(r, new SDL_Rect { x = ContentX + ContentWidth + 16, y = top, w = 4, h = 618 }, list.Count, visible, _listScroll);
         }
 
@@ -454,7 +467,11 @@ namespace Orbis
                 string label = PackageFilters[i] + "  " + _detailTypeCounts[i];
                 TextCentered(r, new SDL_Rect { x = x, y = 276, w = w, h = 44 }, 20, label,
                     _packageFilter == i ? White : _detailTypeCounts[i] > 0 ? Muted : Dim);
-                if (_packageFilter == i) Fill(r, x + 22, 329, w - 44, 2, Accent);
+            }
+            {
+                int w = rightW / PackageFilters.Length, x = rightX + _packageFilter * w;
+                var line = Glide(GlideTabs, new SDL_Rect { x = x + 22, y = 329, w = w - 44, h = 2 });
+                Fill(r, line.x, line.y, line.w, line.h, Accent);
             }
             Fill(r, rightX, 332, rightW, 1, Border);
             GamepadIcons.Draw(r, "l2", rightX, 350, 26);
@@ -471,6 +488,9 @@ namespace Orbis
             if (ShowsProviderStatus)
                 TextCentered(r, new SDL_Rect { x = rightX + (rightW - 300) / 2, y = 350, w = 300, h = 28 }, 16,
                     UnlockProviders.EnabledSummary(_cfg), Muted);
+            RefreshDetailRegionModel(installed);
+            bool notice = HasRegionNotice;
+            if (notice) DrawRegionNotice(r, rightX, 394, rightW);
 
             if (_detailRows.Count == 0)
             {
@@ -485,7 +505,8 @@ namespace Orbis
             }
 
             RefreshQueueModel();
-            const int top = 401, rowH = 98, visible = 5;
+            const int rowH = 98;
+            int top = notice ? 462 : 401, visible = notice ? 4 : 5;
             int focused = Math.Max(0, Math.Min(_detailFocus, _detailRows.Count - 1));
             EnsureVisible(ref _detailScroll, focused, _detailRows.Count, visible);
             DrawSelectedPackageInfo(r, leftX, _linkPresentation[_detailRows[focused]]);
@@ -502,7 +523,7 @@ namespace Orbis
                     Fill(r, rightX + 14, y + 44, 12, 1, Border);
                 }
                 var rect = new SDL_Rect { x = x, y = y, w = width, h = 88 };
-                if (on) DesignCard(r, rect, true);
+                if (on) DesignCard(r, rect, true, GlideList);
                 else Fill(r, x + 20, y + 87, width - 40, 1, Border);
                 if (ShowsProviderStatus)
                 {
@@ -512,20 +533,39 @@ namespace Orbis
                         Fill(r, x + 8, y + 22, 7, 44, C((byte)(tone.r / 5), (byte)(tone.g / 5), (byte)(tone.b / 5)));
                     Fill(r, x + 10, y + 24, 3, 40, tone);
                 }
+                else if (!child) Fill(r, x + 10, y + 24, 3, 40, PackageTint(meta.Kind));
                 bool queued = PackageGroupQueued(index, _queueSnapshot);
                 bool blocked = meta.Candidate != null && !string.IsNullOrEmpty(meta.Candidate.ResolutionError);
                 string title = child ? meta.Hoster : PackageRowTitle(meta);
-                TextFit(r, x + 24, y + 15, 24, width - (child ? 80 : 276), title, White);
+                TextFit(r, x + 24, y + 15, 24, width - (child ? 80 : 300), title, White);
                 string sub = child ? "Alternate mirror" : meta.MirrorCount + (meta.MirrorCount == 1 ? " mirror" : " mirrors");
                 if (queued) sub += "  ·  In queue";
                 else if (blocked) sub += "  ·  Requires another mirror";
                 else if (meta.Candidate != null && meta.Candidate.ExpectedByteSize.GetValueOrDefault() > 0)
                     sub += "  ·  " + DownloadManager.Human(meta.Candidate.ExpectedByteSize.Value);
-                TextFit(r, x + 24, y + 52, 17, width - 86, sub, blocked ? Warning : queued ? Ok : Muted);
-                if (!child) TextFit(r, x + width - 226, y + 22, 17, 176, meta.Hoster, on ? Muted : Dim);
+                int subX = x + 24;
+                if (!child)
+                {
+                    // Group caption in the package tint keeps base / update / DLC rows distinct.
+                    string caption = PackageGroupCaption(meta.Kind);
+                    TextPx(r, subX, y + 55, 14, caption, PackageTint(meta.Kind));
+                    subX += UiFont.MeasurePx(14, caption) + 14;
+                }
+                TextFit(r, subX, y + 52, 17, x + width - (child ? 62 : 300) - subX, sub, blocked ? Warning : queued ? Ok : Muted);
+                if (!child)
+                {
+                    SDL_Color statusTone;
+                    string status = PackageStatusText(index, out statusTone);
+                    if (queued) { status = "In queue"; statusTone = Ok; }
+                    if (!string.IsNullOrEmpty(status)) DrawPillRight(r, x + width - 50, y + 12, status, statusTone);
+                    string host = meta.Hoster ?? "";
+                    int hostW = Math.Min(200, UiFont.MeasurePx(16, host));
+                    TextFit(r, x + width - 50 - hostW, y + 55, 16, 200, host, on ? Muted : Dim);
+                }
                 DesignIcon(r, "chevron", x + width - 32, y + 35, 17, on ? White : Dim);
             }
-            DrawScrollBar(r, new SDL_Rect { x = rightX + rightW + 13, y = top, w = 4, h = 480 }, _detailRows.Count, visible, _detailScroll);
+            FlushGlideRing(r);
+            DrawScrollBar(r, new SDL_Rect { x = rightX + rightW + 13, y = top, w = 4, h = visible * rowH - 10 }, _detailRows.Count, visible, _detailScroll);
             Fill(r, rightX, 910, rightW, 1, Border);
             if (ShowsProviderStatus)
                 DrawSelectedLinkGuidance(r, rightX + 70, 914, rightW - 140, _linkPresentation[_detailRows[focused]].Candidate);
