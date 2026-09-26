@@ -14,6 +14,7 @@ namespace Orbis
         public byte[] Data;
         public long Total;
         public string EffectiveUrl;
+        public string ContentDisposition;
     }
 
     /// <summary>
@@ -157,20 +158,23 @@ namespace Orbis
         }
 
         public static string GetStringDirect(string url, int timeoutMs = 45000, string referer = null,
-            string bearer = null, string userAgent = null, int maxBytes = DefaultResponseBytes)
+            string bearer = null, string userAgent = null, int maxBytes = DefaultResponseBytes, Func<bool> cancel = null,
+            Func<Uri, bool> allowOrigin = null)
         {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             ProviderCooldown.Check(url);
-            try { return GetStringInternal(url, timeoutMs, referer, bearer, allowProxy: false, userAgent: userAgent, maxBytes: maxBytes); }
+            try { return GetStringInternal(url, timeoutMs, referer, bearer, allowProxy: false, userAgent: userAgent, maxBytes: maxBytes, cancel: cancel, allowOrigin: allowOrigin); }
             catch (Exception ex) { ProviderCooldown.NoteException(url, ex); throw; }
         }
 
         public static string GetString(string url, int timeoutMs = 45000, string referer = null,
-            string bearer = null, string userAgent = null)
+            string bearer = null, string userAgent = null, Func<bool> cancel = null, Func<Uri, bool> allowOrigin = null)
         {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             ProviderCooldown.Check(url);
             try
             {
-                return GetStringInternal(url, timeoutMs, referer, bearer, allowProxy: true, userAgent: userAgent);
+                return GetStringInternal(url, timeoutMs, referer, bearer, allowProxy: true, userAgent: userAgent, cancel: cancel, allowOrigin: allowOrigin);
             }
             catch (Exception ex)
             {
@@ -180,20 +184,24 @@ namespace Orbis
         }
 
         static string GetStringInternal(string url, int timeoutMs, string referer, string bearer,
-            bool allowProxy, string userAgent, int maxBytes = DefaultResponseBytes)
+            bool allowProxy, string userAgent, int maxBytes = DefaultResponseBytes, Func<bool> cancel = null,
+            Func<Uri, bool> allowOrigin = null)
         {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             if (string.IsNullOrEmpty(url)) throw new Exception("Empty URL");
             if (maxBytes <= 0) throw new ArgumentOutOfRangeException("maxBytes");
             bool https = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
-            bool proxyOk = allowProxy && UseProxy;
+            // Source permissions must be enforced locally at every redirect; an
+            // upstream proxy can follow redirects that this client cannot inspect.
+            bool proxyOk = allowProxy && UseProxy && allowOrigin == null;
 
             // Emergency proxy: rewrite https → http://PC/p/... then managed plain HTTP
             if (https && proxyOk)
-                return ManagedGet(ResolveUrl(url), timeoutMs, referer, bearer, addProxyKey: true, userAgent: userAgent, maxBytes: maxBytes);
+                return ManagedGet(ResolveUrl(url), timeoutMs, referer, bearer, addProxyKey: true, userAgent: userAgent, maxBytes: maxBytes, cancel: cancel);
 
             // Plain HTTP always managed
             if (!https)
-                return ManagedGet(url, timeoutMs, referer, bearer, addProxyKey: false, userAgent: userAgent, maxBytes: maxBytes);
+                return ManagedGet(url, timeoutMs, referer, bearer, addProxyKey: false, userAgent: userAgent, maxBytes: maxBytes, cancel: cancel, allowOrigin: allowOrigin);
 
             // HTTPS without proxy: native only — never MonoBTLS
             NativeHttp.EnsureInit();
@@ -202,17 +210,19 @@ namespace Orbis
 
             try
             {
-                return NativeHttp.GetString(url, timeoutMs, referer, bearer, maxBytes, userAgent);
+                return NativeHttp.GetString(url, timeoutMs, referer, bearer, maxBytes, userAgent, cancel, allowOrigin);
             }
             catch (Exception nex)
             {
+                if (nex is OperationCanceledException) throw;
                 throw new Exception("Native HTTPS: " + nex.Message, nex);
             }
         }
 
         public static string PostForm(string url, string formBody, int timeoutMs = 45000,
-            string referer = null, string bearer = null, string contentType = null)
+            string referer = null, string bearer = null, string contentType = null, Func<bool> cancel = null)
         {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             ProviderCooldown.Check(url);
             try
             {
@@ -220,10 +230,10 @@ namespace Orbis
                 bool https = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
 
                 if (https && UseProxy)
-                    return ManagedPost(ResolveUrl(url), formBody, timeoutMs, referer, bearer, contentType, true);
+                    return ManagedPost(ResolveUrl(url), formBody, timeoutMs, referer, bearer, contentType, true, cancel);
 
                 if (!https)
-                    return ManagedPost(url, formBody, timeoutMs, referer, bearer, contentType, false);
+                    return ManagedPost(url, formBody, timeoutMs, referer, bearer, contentType, false, cancel);
 
                 NativeHttp.EnsureInit();
                 if (!NativeHttp.Available)
@@ -231,10 +241,11 @@ namespace Orbis
 
                 try
                 {
-                    return NativeHttp.PostForm(url, formBody, timeoutMs, referer, bearer);
+                    return NativeHttp.PostForm(url, formBody, timeoutMs, referer, bearer, cancel);
                 }
                 catch (Exception nex)
                 {
+                    if (nex is OperationCanceledException) throw;
                     throw new Exception("Native HTTPS POST: " + nex.Message, nex);
                 }
             }
@@ -556,45 +567,90 @@ namespace Orbis
     }
 
         static string ManagedGet(string finalUrl, int timeoutMs, string referer, string bearer, bool addProxyKey,
-            string userAgent = null, int maxBytes = DefaultResponseBytes)
+            string userAgent = null, int maxBytes = DefaultResponseBytes, Func<bool> cancel = null,
+            Func<Uri, bool> allowOrigin = null)
         {
-            var req = (HttpWebRequest)WebRequest.Create(finalUrl);
+            Uri initial = new Uri(finalUrl, UriKind.Absolute), current = initial;
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            for (int hop = 0; hop <= 8; hop++)
+            {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            int remaining = timeoutMs;
+            if (allowOrigin != null)
+            {
+                if (current.UserInfo.Length != 0 || (current.Scheme != "http" && current.Scheme != "https") || !allowOrigin(current))
+                    throw new IOException("Source request origin is not permitted");
+                if (timeoutMs > 0)
+                {
+                    remaining = timeoutMs - (int)Math.Min(int.MaxValue, elapsed.ElapsedMilliseconds);
+                    if (remaining <= 0) throw new TimeoutException("Source request timed out");
+                }
+            }
+            string requestBearer = current.Scheme == initial.Scheme && current.IdnHost == initial.IdnHost && current.Port == initial.Port ? bearer : null;
+            if (allowOrigin != null && current.Scheme == "https")
+                return NativeHttp.GetString(current.AbsoluteUri, remaining, referer, requestBearer, maxBytes, userAgent, cancel, allowOrigin, 8 - hop);
+            var req = (HttpWebRequest)WebRequest.Create(current.AbsoluteUri);
             req.Method = "GET";
             req.UserAgent = string.IsNullOrEmpty(userAgent) ? UserAgent : userAgent;
-            req.Timeout = timeoutMs;
-            req.ReadWriteTimeout = timeoutMs;
-            req.AllowAutoRedirect = !addProxyKey;
+            req.Timeout = remaining;
+            req.ReadWriteTimeout = remaining;
+            req.AllowAutoRedirect = !addProxyKey && allowOrigin == null;
             req.KeepAlive = false;
             if (!string.IsNullOrEmpty(referer)) req.Referer = referer;
             req.Accept = "text/html,application/json,*/*";
             req.Headers["Accept-Language"] = "en-US,en;q=0.8";
-            if (!string.IsNullOrEmpty(bearer))
-                req.Headers["Authorization"] = "Bearer " + bearer;
+            if (!string.IsNullOrEmpty(requestBearer))
+                req.Headers["Authorization"] = "Bearer " + requestBearer;
             if (addProxyKey)
                 req.Headers["X-GS-Proxy-Key"] = ProxyKey ?? "";
 
-            HttpWebResponse getResp;
-            try { getResp = RejectProxyRedirect((HttpWebResponse)req.GetResponse(), addProxyKey); }
-            catch (WebException webEx) { throw CooldownOrRethrow(finalUrl, webEx); }
-            using (var resp = getResp)
-            using (var stream = resp.GetResponseStream())
-            using (var body = new MemoryStream())
+            using (var cancellation = new TransferCancellation(cancel, () => req.Abort()))
             {
-                if (resp.ContentLength > maxBytes) throw new IOException("HTTP response exceeds byte limit");
-                var input = stream ?? Stream.Null;
-                var block = new byte[8192]; int count;
-                while ((count = input.Read(block, 0, block.Length)) > 0) {
-                    if (body.Length + count > maxBytes) throw new IOException("HTTP response exceeds byte limit");
-                    body.Write(block, 0, count);
+                HttpWebResponse getResp;
+                try { getResp = RejectProxyRedirect((HttpWebResponse)req.GetResponse(), addProxyKey); }
+                catch (WebException webEx)
+                {
+                    if (cancel != null && cancel()) throw new OperationCanceledException();
+                    throw CooldownOrRethrow(finalUrl, webEx);
                 }
-                body.Position = 0;
-                using (var reader = new StreamReader(body, Encoding.UTF8)) return reader.ReadToEnd();
+                using (var resp = getResp)
+                {
+                int status = (int)resp.StatusCode;
+                if (allowOrigin != null && (status == 301 || status == 302 || status == 303 || status == 307 || status == 308))
+                {
+                    if (hop == 8) throw new IOException("Too many source redirects");
+                    string location = resp.Headers["Location"];
+                    Uri next;
+                    if (string.IsNullOrEmpty(location) || !Uri.TryCreate(current, location, out next))
+                        throw new IOException("Invalid source redirect");
+                    current = next;
+                    continue;
+                }
+                using (var stream = resp.GetResponseStream())
+                using (var body = new MemoryStream())
+                {
+                    if (resp.ContentLength > maxBytes) throw new IOException("HTTP response exceeds byte limit");
+                    var input = stream ?? Stream.Null;
+                    var block = new byte[8192]; int count;
+                    while ((count = input.Read(block, 0, block.Length)) > 0) {
+                        if (cancel != null && cancel()) throw new OperationCanceledException();
+                        if (body.Length + count > maxBytes) throw new IOException("HTTP response exceeds byte limit");
+                        body.Write(block, 0, count);
+                    }
+                    if (cancel != null && cancel()) throw new OperationCanceledException();
+                    body.Position = 0;
+                    using (var reader = new StreamReader(body, Encoding.UTF8)) return reader.ReadToEnd();
+                }
+                }
             }
+            }
+            throw new IOException("Too many source redirects");
         }
 
         static string ManagedPost(string finalUrl, string formBody, int timeoutMs, string referer,
-            string bearer, string contentType, bool addProxyKey)
+            string bearer, string contentType, bool addProxyKey, Func<bool> cancel = null)
         {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             byte[] data = Encoding.UTF8.GetBytes(formBody ?? "");
             var req = (HttpWebRequest)WebRequest.Create(finalUrl);
             req.Method = "POST";
@@ -612,23 +668,40 @@ namespace Orbis
                 req.Headers["X-GS-Proxy-Key"] = ProxyKey ?? "";
             req.Accept = "application/json,*/*";
 
-            using (var rs = req.GetRequestStream())
-                rs.Write(data, 0, data.Length);
-
             HttpWebResponse postResp;
-            try { postResp = RejectProxyRedirect((HttpWebResponse)req.GetResponse(), addProxyKey); }
-            catch (WebException webEx) { throw CooldownOrRethrow(finalUrl, webEx); }
-            using (var resp = postResp)
-            using (var stream = resp.GetResponseStream())
-            using (var reader = new StreamReader(stream ?? Stream.Null, Encoding.UTF8))
+            using (var cancellation = new TransferCancellation(cancel, () => req.Abort()))
+            {
+                try
                 {
-                    var text = new StringBuilder(); var block = new char[8192]; int count;
-                    while ((count = reader.Read(block, 0, block.Length)) > 0) {
-                        if (text.Length + count > 2 * 1024 * 1024) throw new IOException("HTTP response exceeds 2 MiB");
-                        text.Append(block, 0, count);
+                    using (var rs = req.GetRequestStream()) rs.Write(data, 0, data.Length);
+                    try { postResp = RejectProxyRedirect((HttpWebResponse)req.GetResponse(), addProxyKey); }
+                    catch (WebException webEx)
+                    {
+                        if (cancel != null && cancel()) throw new OperationCanceledException();
+                        throw CooldownOrRethrow(finalUrl, webEx);
                     }
-                    return text.ToString();
+
+                    using (var resp = postResp)
+                    using (var stream = resp.GetResponseStream())
+                    using (var reader = new StreamReader(stream ?? Stream.Null, Encoding.UTF8))
+                    {
+                        var text = new StringBuilder(); var block = new char[8192]; int count;
+                        while ((count = reader.Read(block, 0, block.Length)) > 0) {
+                            if (text.Length + count > 2 * 1024 * 1024) throw new IOException("HTTP response exceeds 2 MiB");
+                            text.Append(block, 0, count);
+                        }
+                        // EOF proves the create response is complete. Stop the abort
+                        // watcher before returning it so the provider can persist IDs.
+                        cancellation.Dispose();
+                        return text.ToString();
+                    }
                 }
+                catch (WebException)
+                {
+                    if (cancel != null && cancel()) throw new OperationCanceledException();
+                    throw;
+                }
+            }
         }
 
         static HttpWebResponse RejectProxyRedirect(HttpWebResponse response, bool authenticatedProxy)
@@ -698,7 +771,8 @@ namespace Orbis
                 {
                     Data = output.ToArray(),
                     Total = total,
-                    EffectiveUrl = resp.ResponseUri != null ? resp.ResponseUri.AbsoluteUri : url
+                    EffectiveUrl = resp.ResponseUri != null ? resp.ResponseUri.AbsoluteUri : url,
+                    ContentDisposition = resp.Headers["Content-Disposition"]
                 };
             }
         }

@@ -52,6 +52,12 @@ int gs_store_size(int fd,int64_t *size)
 #ifndef _WIN32
 _Static_assert(sizeof(off_t)>=8,"Large package offsets require 64-bit off_t");
 #endif
+typedef struct {
+    uint32_t magic, version, chunk_size, count;
+    uint64_t total;
+    unsigned char identity[32], expected[32];
+    uint32_t single, crc;
+} GsMapHeaderV3;
 #ifdef _WIN32
 static volatile int host_io_gate;
 static int host_alive(long pid) {HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,(DWORD)pid);if(process){DWORD status=STILL_ACTIVE;int alive=!GetExitCodeProcess(process,&status)||status==STILL_ACTIVE;CloseHandle(process);return alive;}return GetLastError()!=ERROR_INVALID_PARAMETER;}
@@ -181,7 +187,7 @@ int gs_store_checkpoint(GsJobState *j)
     int rc=gs_store_snapshot(j,j->header,j->chunks);
     if(!rc){j->dirty=0;j->checkpoint_at=gs_clock();}return rc;
 }
-int gs_store_open(GsJobState *j,const unsigned char identity[32])
+int gs_store_open(GsJobState *j,const unsigned char identity[32],const unsigned char source_identity[32],const char *etag)
 {
     j->storage_error[0]=j->storage_stage[0]=0;j->storage_errno=0;
     if(acquire(j))return -1;
@@ -197,10 +203,14 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32])
 #endif
     int part_existed=access(j->part,F_OK)==0;
     j->fd=open(j->part,flags,0600);if(j->fd<0)return storage_failure(j,"package open",errno);
-    j->header.magic=0x33585347;j->header.version=3;j->header.chunk_size=GS_XFER_CHUNK;
+    j->header.magic=0x33585347;j->header.version=4;j->header.chunk_size=GS_XFER_CHUNK;
     j->header.total=(uint64_t)j->status.total;
     j->header.count=(uint32_t)((j->header.total+GS_XFER_CHUNK-1)/GS_XFER_CHUNK);
-    j->header.single=(uint32_t)j->single;memcpy(j->header.identity,identity,32);
+    // Mode 2 requires a payload audit even when every chunk is durable.
+    j->header.single=j->pkg_integrity?2U:(uint32_t)j->single;memcpy(j->header.identity,identity,32);
+    memcpy(j->header.source_identity,source_identity,32);
+    if(etag&&gs_http_strong_etag(etag))snprintf(j->header.etag,sizeof(j->header.etag),"%s",etag);
+    snprintf(j->etag,sizeof(j->etag),"%s",j->header.etag);
     if(j->expected[0] && gs_unhex(j->expected,j->header.expected))return storage_failure(j,"checksum validation",EINVAL);
     if(!j->header.count || j->header.count>65536)return storage_failure(j,"package size validation",EFBIG);
     j->checkpoint_chunks=calloc(j->header.count,sizeof(GsChunk));
@@ -208,23 +218,58 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32])
     j->retry_at=calloc(j->header.count,sizeof(uint64_t));j->accepted=calloc(j->header.count,sizeof(uint64_t));
     if(!j->chunks||!j->checkpoint_chunks||!j->claims||!j->attempts||!j->retry_at||!j->accepted)return storage_failure(j,"resume-map allocation",ENOMEM);
     int map_present=access(j->map,F_OK)==0;
-    FILE *f=fopen(j->map,"rb");int valid=0;
+    FILE *f=fopen(j->map,"rb");int valid=0,same_package=0;
     if(map_present&&!f)return storage_failure(j,"resume-map open",errno?errno:EACCES);
     if(f) {
-        GsMapHeader old;
-        if(fread(&old,1,sizeof(old),f)==sizeof(old) && old.magic==j->header.magic && old.version==3 && old.count==j->header.count &&
-           old.total==j->header.total && old.chunk_size==GS_XFER_CHUNK && old.single==j->header.single &&
-           !memcmp(old.identity,identity,32)&&!memcmp(old.expected,j->header.expected,32) &&
-           fread(j->chunks,sizeof(GsChunk),old.count,f)==old.count && fgetc(f)==EOF) {
-            uint32_t crc=old.crc;old.crc=0;valid=crc==gs_crc(j->chunks,old.count*sizeof(GsChunk),gs_crc(&old,sizeof(old),0));
-        }fclose(f);
+        uint32_t prefix[4]={0};
+        if(fread(prefix,sizeof(prefix),1,f)==1 && !fseek(f,0,SEEK_SET)) {
+            if(prefix[1]==3) {
+                GsMapHeaderV3 old;
+                if(fread(&old,1,sizeof(old),f)==sizeof(old)) {
+                    same_package=old.magic==j->header.magic&&old.version==3&&old.count==j->header.count&&
+                        old.total==j->header.total&&old.chunk_size==GS_XFER_CHUNK&&
+                        !memcmp(old.identity,identity,32)&&!memcmp(old.expected,j->header.expected,32);
+                    if(same_package && fread(j->chunks,sizeof(GsChunk),old.count,f)==old.count && fgetc(f)==EOF) {
+                        uint32_t crc=old.crc;old.crc=0;
+                        valid=crc==gs_crc(j->chunks,old.count*sizeof(GsChunk),gs_crc(&old,sizeof(old),0));
+                    }
+                    // Version 3 has no representation validator. Reuse it only
+                    // when a trusted full-file digest will authenticate the mix.
+                    valid=valid&&j->expected[0]&&old.single==j->header.single;
+                }
+            } else if(prefix[1]==4) {
+                GsMapHeader old;
+                if(fread(&old,1,sizeof(old),f)==sizeof(old)) {
+                    same_package=old.magic==j->header.magic&&old.version==4&&old.count==j->header.count&&
+                        old.total==j->header.total&&old.chunk_size==GS_XFER_CHUNK&&
+                        !memcmp(old.identity,identity,32)&&!memcmp(old.expected,j->header.expected,32);
+                    if(same_package && fread(j->chunks,sizeof(GsChunk),old.count,f)==old.count && fgetc(f)==EOF) {
+                        uint32_t crc=old.crc;old.crc=0;
+                        valid=crc==gs_crc(j->chunks,old.count*sizeof(GsChunk),gs_crc(&old,sizeof(old),0));
+                    }
+                    int old_etag_valid=!old.etag[0]||
+                        (memchr(old.etag,0,sizeof(old.etag))&&gs_http_strong_etag(old.etag));
+                    int representation_same=old_etag_valid&&
+                        !memcmp(old.source_identity,j->header.source_identity,32)&&
+                        !strcmp(old.etag,j->header.etag)&&old.single==j->header.single;
+                    // A renewed link to the same package (a dead CDN node replaced by a
+                    // fresh one) keeps its verified chunks when the package's own digests
+                    // can audit every payload byte: switch to that audit before publication.
+                    if(valid&&!representation_same&&!j->expected[0]&&j->pkg_capable) {
+                        j->pkg_integrity=1;j->header.single=2U;representation_same=1;
+                    }
+                    valid=valid&&(representation_same||j->expected[0]);
+                }
+            }
+        }
+        fclose(f);
     }
     int64_t file_size=0;if(gs_store_size(j->fd,&file_size))return storage_failure(j,"package size query",errno);
-    // Never resize or replace retained data when its durable map describes a
-    // different source, size, checksum, or range capability. The operator can
-    // move/remove the pair explicitly; automatic recovery must stay lossless.
-    if(map_present&&!valid)return storage_failure(j,"resume identity",EINVAL);
-    if(valid&&file_size!=j->status.total)return storage_failure(j,"resume size",EINVAL);
+    // A different package identity or publisher digest remains an operator
+    // error. Matching packages with stale/missing representation proof are
+    // safely restarted by committing an empty map before any network writes.
+    if(map_present&&!same_package)return storage_failure(j,"resume identity",EINVAL);
+    if(map_present&&file_size!=j->status.total)return storage_failure(j,"resume size",EINVAL);
     if(!map_present&&part_existed&&file_size>0)return storage_failure(j,"unmapped retained package",EINVAL);
     if(!valid || j->single)memset(j->chunks,0,j->header.count*sizeof(GsChunk));
     if(ftruncate(j->fd,j->status.total))return storage_failure(j,"package resize",errno);
@@ -254,11 +299,34 @@ void gs_store_close(GsJobState *j)
 int64_t sspi_xfer_durable(const char *destination)
 {
     char path[1100];snprintf(path,sizeof(path),"%s.map",destination);FILE *f=fopen(path,"rb");if(!f)return 0;
-    GsMapHeader h;int64_t done=0;
-    if(fread(&h,1,sizeof(h),f)!=sizeof(h)||h.magic!=0x33585347||h.version!=3||h.chunk_size!=GS_XFER_CHUNK||!h.count||h.count>65536||h.total>1099511627776ULL||h.count!=(h.total+GS_XFER_CHUNK-1)/GS_XFER_CHUNK){fclose(f);return 0;}
-    GsChunk *chunks=calloc(h.count,sizeof(GsChunk));if(!chunks){fclose(f);return 0;}
-    uint32_t crc=h.crc;h.crc=0;
-    if(fread(chunks,sizeof(GsChunk),h.count,f)==h.count && fgetc(f)==EOF && crc==gs_crc(chunks,h.count*sizeof(GsChunk),gs_crc(&h,sizeof(h),0)))
-        for(uint32_t i=0;i<h.count;i++)if(chunks[i].done){uint64_t n=h.total-(uint64_t)i*GS_XFER_CHUNK;done+=(int64_t)(n>GS_XFER_CHUNK?GS_XFER_CHUNK:n);}
-    free(chunks);fclose(f);return done;
+    uint32_t prefix[4]={0};int64_t done=0;
+    if(fread(prefix,sizeof(prefix),1,f)!=1||fseek(f,0,SEEK_SET)){fclose(f);return 0;}
+    if(prefix[1]==4) {
+        GsMapHeader h;
+        if(fread(&h,1,sizeof(h),f)!=sizeof(h)||h.magic!=0x33585347||h.version!=4||h.chunk_size!=GS_XFER_CHUNK||!h.count||h.count>65536||h.total>1099511627776ULL||h.count!=(h.total+GS_XFER_CHUNK-1)/GS_XFER_CHUNK){fclose(f);return 0;}
+        GsChunk *chunks=calloc(h.count,sizeof(GsChunk));if(!chunks){fclose(f);return 0;}
+        uint32_t crc=h.crc;h.crc=0;
+        if(fread(chunks,sizeof(GsChunk),h.count,f)==h.count && fgetc(f)==EOF && crc==gs_crc(chunks,h.count*sizeof(GsChunk),gs_crc(&h,sizeof(h),0)))
+            for(uint32_t i=0;i<h.count;i++)if(chunks[i].done){uint64_t n=h.total-(uint64_t)i*GS_XFER_CHUNK;done+=(int64_t)(n>GS_XFER_CHUNK?GS_XFER_CHUNK:n);}
+        // Resident recovery treats a full durable count as ready for structural
+        // validation and rename. Force integrity-mode maps through the engine's
+        // mandatory payload audit before that shortcut can expose a package.
+        if(h.single==2U && done==(int64_t)h.total && done>0)done--;
+        free(chunks);
+    } else if(prefix[1]==3) {
+        GsMapHeaderV3 h;
+        if(fread(&h,1,sizeof(h),f)!=sizeof(h)||h.magic!=0x33585347||h.version!=3||h.chunk_size!=GS_XFER_CHUNK||!h.count||h.count>65536||h.total>1099511627776ULL||h.count!=(h.total+GS_XFER_CHUNK-1)/GS_XFER_CHUNK){fclose(f);return 0;}
+        unsigned char expected=0;for(unsigned i=0;i<sizeof(h.expected);i++)expected|=h.expected[i];
+        // A v3 receipt has no source validator. Its completed-byte count is
+        // trustworthy only when finalization will authenticate the full file
+        // against the stored publisher digest.
+        if(expected) {
+            GsChunk *chunks=calloc(h.count,sizeof(GsChunk));if(!chunks){fclose(f);return 0;}
+            uint32_t crc=h.crc;h.crc=0;
+            if(fread(chunks,sizeof(GsChunk),h.count,f)==h.count && fgetc(f)==EOF && crc==gs_crc(chunks,h.count*sizeof(GsChunk),gs_crc(&h,sizeof(h),0)))
+                for(uint32_t i=0;i<h.count;i++)if(chunks[i].done){uint64_t n=h.total-(uint64_t)i*GS_XFER_CHUNK;done+=(int64_t)(n>GS_XFER_CHUNK?GS_XFER_CHUNK:n);}
+            free(chunks);
+        }
+    }
+    fclose(f);return done;
 }

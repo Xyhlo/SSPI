@@ -11,8 +11,11 @@ namespace Orbis
     internal static class DownloadTransferSettings
     {
         public const int MinRangeCount = 1;
-        public const int MaxRangeCount = 5;
-        public const int DefaultRangeCount = 5;
+        // Per-provider connection ceiling. Providers with a documented lower
+        // allowance (AllDebrid, Premiumize, Real-Debrid's per-link chunks)
+        // remember that lower limit for their links.
+        public const int MaxRangeCount = 25;
+        public const int DefaultRangeCount = 25;
 
         public static int ClampRangeCount(int value)
         {
@@ -217,7 +220,7 @@ namespace Orbis
     // every single stream and range shares this budget; provider limits remain per URL.
     internal static class TransferLaneBudget
     {
-        internal const int Maximum = 5;
+        internal const int Maximum = DownloadTransferSettings.MaxRangeCount;
         static readonly object Gate = new object();
         static readonly List<Job> Jobs = new List<Job>();
         [ThreadStatic] static Job current;

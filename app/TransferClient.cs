@@ -1,13 +1,24 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace Orbis
 {
+    // The download server stopped accepting connections while no bytes arrived.
+    // A fresh link from the same provider may reach a healthy node; retained
+    // chunks resume on it (see DownloadLinkRecovery).
+    internal sealed class DownloadLinkUnreachableException : IOException
+    {
+        internal DownloadLinkUnreachableException(string message) : base(message) { }
+    }
+
     internal static class TransferClient
     {
         internal const int ApiLevel = 3;
+        // No byte for this long while failures continue marks a dead download link.
+        internal const long UnreachablePackageMs = 75000, UnreachableArchiveMs = 180000;
         static readonly object Gate = new object();
         static bool ready;
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
@@ -64,17 +75,30 @@ namespace Orbis
                 string path = destination + ".map";
                 if (!File.Exists(path)) return 0;
                 long length = new FileInfo(path).Length;
-                if (length < 96 || length > 96 + 65536 * 40) return 0;
+                if (length < 96 || length > 640 + 65536 * 40) return 0;
                 byte[] bytes = File.ReadAllBytes(path);
+                uint version = BitConverter.ToUInt32(bytes, 4);
+                int headerSize = version == 3 ? 96 : version == 4 ? 640 : 0;
+                if (headerSize == 0 || bytes.Length < headerSize) return 0;
                 uint count = BitConverter.ToUInt32(bytes, 12);
                 ulong total = BitConverter.ToUInt64(bytes, 16);
                 const ulong chunk = 16777216;
-                if (BitConverter.ToUInt32(bytes, 0) != 0x33585347 || BitConverter.ToUInt32(bytes, 4) != 3 ||
+                uint mode = BitConverter.ToUInt32(bytes, headerSize - 8);
+                if (BitConverter.ToUInt32(bytes, 0) != 0x33585347 || mode > 2 ||
                     BitConverter.ToUInt32(bytes, 8) != chunk || count == 0 || count > 65536 ||
                     total == 0 || total > 1099511627776UL || count != (total + chunk - 1) / chunk ||
-                    bytes.Length != 96 + count * 40) return 0;
-                uint expected = BitConverter.ToUInt32(bytes, 92);
-                Array.Clear(bytes, 92, 4);
+                    bytes.Length != headerSize + count * 40) return 0;
+                bool digest = false, sourceIdentity = false;
+                for (int i = 56; i < 88; i++) digest |= bytes[i] != 0;
+                if (version == 3 && !digest) return 0;
+                if (version == 4)
+                {
+                    for (int i = 88; i < 120; i++) sourceIdentity |= bytes[i] != 0;
+                    if (!digest && !sourceIdentity) return 0;
+                }
+                int crcOffset = headerSize - 4;
+                uint expected = BitConverter.ToUInt32(bytes, crcOffset);
+                Array.Clear(bytes, crcOffset, 4);
                 uint crc = 0xffffffff;
                 foreach (byte value in bytes)
                 {
@@ -84,8 +108,9 @@ namespace Orbis
                 if (~crc != expected) return 0;
                 ulong done = 0;
                 for (uint i = 0; i < count; i++)
-                    if (bytes[96 + i * 40] != 0) done += Math.Min(chunk, total - i * chunk);
-                return (long)done;
+                    if (bytes[headerSize + i * 40] != 0) done += Math.Min(chunk, total - i * chunk);
+                // Mode 2 must run the native package payload audit before publication.
+                return mode == 2 && done == total ? (long)done - 1 : (long)done;
             }
             catch { return 0; }
         }
@@ -97,6 +122,14 @@ namespace Orbis
             int handle = start(url, bearer ?? "", destination, title ?? "", content ?? "", sha ?? "",
                 DownloadTransferSettings.ConnectionsFor(url, lanes));
             if (handle < 0) throw new IOException("Native transfer could not start: " + handle);
+            // A server that stops accepting connections leaves the native engine
+            // retrying forever. When no byte has arrived for this long while new
+            // failures keep arriving, stop so the caller can request a fresh link;
+            // retained chunks resume on it. Archives lack package digests to keep
+            // their chunks across a new link, so they wait longer first.
+            long unreachableMs = string.IsNullOrEmpty(content) ? UnreachableArchiveMs : UnreachablePackageMs;
+            var watchdog = new DeadLinkWatchdog(unreachableMs);
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 for (;;)
@@ -104,10 +137,16 @@ namespace Orbis
                     Status state;
                     if (poll(handle, out state) != 0) throw new IOException("Native transfer status unavailable");
                     if (canceled != null && canceled()) { pause(handle); throw new OperationCanceledException(); }
+                    if (watchdog.Unreachable(state.State, state.NetworkBytes, state.Done, state.Total, state.Retries,
+                            clock.ElapsedMilliseconds))
+                        throw new DownloadLinkUnreachableException(
+                            "Download server stopped accepting connections; requesting a fresh link");
                     if (telemetry != null) telemetry(state.Done, state.Total, state.NetworkBytes);
                     else if (progress != null) progress(state.Done, state.Total);
                     if (state.State == 4 && phase != null) phase(state.Error);
-                    else if ((state.State == 1 || state.State == 2) && activity != null && !string.IsNullOrEmpty(state.Error))
+                    else if (activity != null && state.State == 1)
+                        activity(string.IsNullOrEmpty(state.Error) ? "Connecting to download server…" : state.Error);
+                    else if (activity != null && state.State == 2 && !string.IsNullOrEmpty(state.Error))
                         activity(state.Error);
                     if (state.State == 5)
                     {
@@ -139,6 +178,7 @@ namespace Orbis
                 }
             }
         }
+
         internal static bool HasCompletedJournal(string destination)
         {
             try { return File.Exists(destination + ".part") && new FileInfo(destination + ".part").Length >= 4096 &&
@@ -149,11 +189,21 @@ namespace Orbis
         internal static bool TryPublishCompleted(string destination, string title, string kind, string content,
             string sha, long expectedSize, Func<bool> cancel, Action<string> phase)
         {
+            return TryPublishCompletedBound(destination, title, kind, content, sha, expectedSize,
+                cancel, phase, null);
+        }
+
+        internal static bool TryPublishCompletedBound(string destination, string title, string kind, string content,
+            string sha, long expectedSize, Func<bool> cancel, Action<string> phase, string source)
+        {
             string part = destination + ".part", map = destination + ".map";
             if (File.Exists(destination) || !File.Exists(part) || !File.Exists(map)) return false;
             long size = new FileInfo(part).Length;
             if (size < 4096 || DurableBytes(destination) != size) return false;
             byte[] journal = File.ReadAllBytes(map);
+            uint version = BitConverter.ToUInt32(journal, 4);
+            int headerSize = version == 3 ? 96 : version == 4 ? 640 : 0;
+            if (headerSize == 0 || journal.Length < headerSize) return false;
             if (journal.Length < 96 || BitConverter.ToUInt64(journal, 16) != (ulong)size) return false;
             bool journalHasSha = false;
             for (int i = 56; i < 88; i++) journalHasSha |= journal[i] != 0;
@@ -163,6 +213,15 @@ namespace Orbis
                 if (!string.IsNullOrEmpty(sha) && !string.Equals(savedSha, sha, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("Completed file retained: expected SHA-256 identity changed");
                 sha = savedSha;
+            }
+            if (version == 4 && string.IsNullOrEmpty(sha))
+            {
+                if (string.IsNullOrEmpty(source)) return false;
+                byte[] identity;
+                using (var hash = PkgIntegrity.CreateSha256())
+                    identity = hash.ComputeHash(Encoding.UTF8.GetBytes(source + "\0" + source));
+                for (int i = 0; i < identity.Length; i++)
+                    if (identity[i] != journal[88 + i]) return false;
             }
             if (cancel != null && cancel()) throw new OperationCanceledException();
             if (phase != null) phase("Recovering completed file locally...");
@@ -194,14 +253,70 @@ namespace Orbis
                 string error;
                 if(!PkgIntegrity.VerifyFile(part,sha,phase,cancel,out error))throw new IOException("Completed file retained: " + error);
             }
+            else VerifyJournalChunks(part, journal, headerSize, cancel);
             if (cancel != null && cancel()) throw new OperationCanceledException();
             File.Move(part,destination);
             if(!string.IsNullOrEmpty(sha))PkgIntegrity.RememberVerifiedSha256(destination,sha);
             try { File.Delete(map); } catch { }
             return true;
         }
+
+        static void VerifyJournalChunks(string part, byte[] journal, int headerSize, Func<bool> cancel)
+        {
+            const int chunkSize = 16777216;
+            uint count = BitConverter.ToUInt32(journal, 12);
+            long total = (long)BitConverter.ToUInt64(journal, 16);
+            byte[] buffer = new byte[1024 * 1024];
+            using (var input = File.OpenRead(part))
+                for (uint i = 0; i < count; i++)
+                {
+                    if (cancel != null && cancel()) throw new OperationCanceledException();
+                    long remaining = Math.Min(chunkSize, total - (long)i * chunkSize);
+                    using (var hash = PkgIntegrity.CreateSha256())
+                    {
+                        while (remaining > 0)
+                        {
+                            if (cancel != null && cancel()) throw new OperationCanceledException();
+                            int wanted = (int)Math.Min(buffer.Length, remaining);
+                            int read = input.Read(buffer, 0, wanted);
+                            if (read <= 0) throw new IOException("Completed file retained: chunk is truncated");
+                            hash.TransformBlock(buffer, 0, read, buffer, 0);
+                            remaining -= read;
+                        }
+                        hash.TransformFinalBlock(new byte[0], 0, 0);
+                        int digestOffset = headerSize + (int)i * 40 + 8;
+                        for (int b = 0; b < 32; b++)
+                            if (hash.Hash[b] != journal[digestOffset + b])
+                                throw new IOException("Completed file retained: journal chunk digest mismatch");
+                    }
+                }
+        }
+
         [DllImport("libkernel", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceKernelDlsym(int module, string name, out IntPtr symbol);
+    }
+    // Dead-link decision for TransferClient.Download, one call per native poll.
+    // A state other than preparing (1) or downloading (2), new network bytes or
+    // local progress restarts the quiet interval: on resume the engine re-hashes
+    // retained chunks (Done rises) without network bytes. A complete map under
+    // its local audit (Done >= Total) is never a dead link. Otherwise the link is
+    // unreachable once nothing changes for limitMs while failures keep rising.
+    internal sealed class DeadLinkWatchdog
+    {
+        readonly long limitMs;
+        long network = -1, done = -1, since;
+        int retries;
+        internal DeadLinkWatchdog(long limitMs) { this.limitMs = limitMs; }
+        internal bool Unreachable(int state, long networkBytes, long doneBytes, long total, int retryCount, long nowMs)
+        {
+            if ((state != 1 && state != 2) || networkBytes != network || doneBytes != done)
+            {
+                network = networkBytes; done = doneBytes; retries = retryCount; since = nowMs;
+                return false;
+            }
+            if (total > 0 && doneBytes >= total) return false;
+            return retryCount > retries && nowMs - since >= limitMs;
+        }
     }
     // Allocated only for an active native transfer. No timer, task, file I/O or
     // per-sample allocation: 33 samples cover eight seconds at four updates/s.
