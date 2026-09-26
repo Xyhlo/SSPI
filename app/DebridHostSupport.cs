@@ -300,11 +300,13 @@ namespace Orbis
             if (!UnlockProviders.IsSupported(provider) ||
                 (canceled != null && canceled())) return null;
             string key = CredentialScope(provider, token);
+            Cached previous;
             lock (Cache)
             {
-                Cached cached;
-                if (Cache.TryGetValue(key, out cached) && cached.Until > DateTime.UtcNow) return cached.Hosts;
-                if (!refresh) return null;
+                if (Cache.TryGetValue(key, out previous) && previous.Until > DateTime.UtcNow) return previous.Hosts;
+                // An expired list is still the provider's last answer. Host support
+                // changes rarely; hiding every mirror until a refresh succeeds does not.
+                if (!refresh) return previous != null ? previous.Hosts : null;
             }
             if (string.IsNullOrWhiteSpace(token) || timeoutMs < 500) return null;
             var elapsed = Stopwatch.StartNew();
@@ -330,10 +332,19 @@ namespace Orbis
             int aliasTimeout = timeoutMs - (int)elapsed.ElapsedMilliseconds;
             if (provider == UnlockProviders.RealDebridId && hosts != null && aliasTimeout >= 500 && (canceled == null || !canceled()))
                 try { AddRealDebridAliases(hosts, NetHttp.GetStringDirect("https://api.real-debrid.com/rest/1.0/hosts/regex", aliasTimeout)); } catch { }
-            if (canceled != null && canceled()) return null;
+            if (canceled != null && canceled()) return previous != null ? previous.Hosts : null;
             lock (Cache)
             {
                 if (Cache.Count > 16) Cache.Clear();
+                // A failed refresh (busy network during a download, rate limit or a
+                // provider outage) keeps the last successful list and retries soon.
+                // Replacing it with nothing marked every mirror unsupported until
+                // SSPI was restarted.
+                if (hosts == null && previous != null && previous.Hosts != null)
+                {
+                    Cache[key] = new Cached { Hosts = previous.Hosts, Until = DateTime.UtcNow.AddSeconds(30) };
+                    return previous.Hosts;
+                }
                 Cache[key] = new Cached { Hosts = hosts, Until = DateTime.UtcNow.AddSeconds(hosts == null ? 30 : 180) };
             }
             return hosts;
@@ -393,6 +404,10 @@ namespace Orbis
             if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https")) return false;
             if (direct) return true;
             if (cfg == null || !cfg.UseUnlockProvider) return FreeHosterClient.IsSupportedHoster(uri);
+            // A host counts as supported only on a service's actual list. Load keeps
+            // the last good list through a failed refresh, so a brief outage during
+            // a session does not hide mirrors; with no list at all, support is not
+            // advertised and the view asks the user to check Connections.
             foreach (string provider in UnlockProviders.EnabledIds(cfg))
             {
                 var hosts = Load(cfg, provider, false);
