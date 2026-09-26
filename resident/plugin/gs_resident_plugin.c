@@ -221,7 +221,7 @@ static void write_heartbeat(void)
             "capattempts=%d capnet=0x%08X captransfer=0x%08X capbgft=0x%08X ",
             g_capability_attempts, (unsigned)g_capability_network_rc,
             (unsigned)g_capability_transfer_rc, (unsigned)g_capability_bgft_rc);
-    snprintf(body, sizeof(body), "%s\n%lld\nhost=shell pid=%d listener=%d download=%d transfer=%d bgft=%d %sv=2 api=3 engine=sceHttp-chunks build=%s epoch=%llu staged=10 usb=1 archives=1 zip=1 sevenzip=1 fscontext=1 hostcontext=preserved usbcontext=0 revision=1 migration=%d\n",
+    snprintf(body, sizeof(body), "%s\n%lld\nhost=shell pid=%d listener=%d download=%d transfer=%d bgft=%d %sv=2 api=3 engine=sceHttp-chunks build=%s epoch=%llu staged=10 usb=1 archives=1 zip=1 sevenzip=1 fscontext=1 hostcontext=preserved usbcontext=0 ftpinbox=1 revision=1 migration=%d\n",
         GS_WORKER_VERSION, (long long)dotnet_ticks_now,
         getpid(), g_listener >= 0 ? 1 : 0, g_transfer_ready, g_transfer_ready, g_bgft_ready,
         capability, GS_BUILD_ID, (unsigned long long)g_epoch,

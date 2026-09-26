@@ -157,6 +157,8 @@
     <Compile Include="CloudCatalog.cs" />
     <Compile Include="SearchWindow.MyFiles.cs" />
     <Compile Include="SearchWindow.UsbInstall.cs" />
+    <Compile Include="SearchWindow.FtpInbox.cs" />
+    <Compile Include="FtpInbox.cs" />
     <Compile Include="LocalInstallSource.cs" />
     <Compile Include="SearchWindow.Patterns.cs" />
     <Compile Include="BackdropPattern.cs" />

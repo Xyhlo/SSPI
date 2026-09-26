@@ -842,15 +842,17 @@ namespace Orbis
                     if (!LocalInstallSource.TryNormalizePath(path, out canonical)) throw new IOException("USB paths cannot contain parent links, colons, or names longer than 240 UTF-8 bytes");
                     if (!seen.Add(canonical)) continue;
                     LocalInstallSource source = LocalInstallSource.Read(canonical, true);
+                    bool ftp = LocalInstallSource.IsInboxPath(canonical);
                     pending.Add(new DlItem {
                         Id = "usb_" + Guid.NewGuid().ToString("N"), TitleId = source.TitleId,
                         Name = source.Name, ImageUrl = source.ImagePath, Kind = source.Kind,
-                        Label = "USB · " + Path.GetFileName(canonical), DestPath = canonical,
+                        Label = (ftp ? "FTP · " : "USB · ") + Path.GetFileName(canonical), DestPath = canonical,
                         HosterUrl = "local:" + source.Fingerprint, SourceId = "local-usb", AccessType = "Local",
                         CandidateId = source.Fingerprint, LocalSource = true, LocalSourceFingerprint = source.Fingerprint,
                         ExpectedContentId = source.ContentId, ExpectedByteSize = source.Size,
                         PackageVersion = source.Version, Total = source.Size, Done = source.Size,
-                        State = DlState.Queued, StatusText = "Queued for USB installation; source file retained"
+                        State = DlState.Queued, StatusText = ftp ? "Queued for installation; FTP file retained" :
+                            "Queued for USB installation; source file retained"
                     });
                 }
                 catch (Exception ex)
@@ -2135,7 +2137,8 @@ namespace Orbis
             {
                 string source;
                 if (!LocalInstallSource.TryNormalizePath(item.DestPath, out source)) return null;
-                root = AppSettings.StagingRoot(source.Substring(0, 9));
+                // FTP inbox sources extract into internal staging, not a USB drive.
+                root = LocalInstallSource.StagingRootFor(source);
             }
             else root = Path.GetDirectoryName(NormalizePath(item.DestPath));
             foreach (string candidate in StorageRoots())
@@ -4868,7 +4871,20 @@ namespace Orbis
             LocalInstallSource source = LocalInstallSource.Read(job.DestPath, false);
             if (source.Fingerprint != job.LocalSourceFingerprint || source.Size != job.ExpectedByteSize)
                 throw new IOException("USB file changed since it was queued; remove this row and select the file again");
-            if (!BackgroundSelected)
+            if (LocalInstallSource.IsInboxPath(job.DestPath))
+            {
+                // FTP uploads can also be opened with the PS4 package installer. Check
+                // the live install state right before registering, never an older row.
+                bool installed;
+                string conflict = LocalInstallConflict(source, out installed);
+                if (installed) { MarkAlreadyInstalled(job.Id, conflict, attempt); return; }
+                if (conflict != null) { SetFailureIfCurrent(job, attempt, conflict); return; }
+            }
+            // Only a worker that advertises the FTP inbox admits inbox files as borrowed
+            // sources; with an older worker or another data folder SSPI installs them.
+            bool residentSource = !LocalInstallSource.IsInboxPath(job.DestPath) ||
+                (LocalInstallSource.ResidentCanBorrow(job.DestPath) && ResidentDownloadService.WatchesFtpInbox);
+            if (!BackgroundSelected || !residentSource)
             {
                 lock (_lock) { job.ForceLocalInstall = true; job.StatusText = "Preparing USB installation in SSPI"; }
                 if (source.ExpectedKind == 0)
@@ -4895,6 +4911,26 @@ namespace Orbis
             }
             HandoffStagedPackage(job, attempt, "", source.TitleId, source.Kind, source.ContentId,
                 source.Size, source.ExpectedKind == 0, false, true);
+        }
+
+        // Fresh install state for a local PKG: a live PS4 task that SSPI does not own
+        // (for example the PS4 package installer) or an identical installed container.
+        // Patches share the base content ID, so a live base task also blocks a patch.
+        internal static string LocalInstallConflict(LocalInstallSource source, out bool installed)
+        {
+            installed = false;
+            if (source == null || source.ExpectedKind < 6 || source.ExpectedKind > 8 || string.IsNullOrEmpty(source.ContentId)) return null;
+            int task;
+            // The task state cannot show every finished task (TryFindActiveForeignTask), so
+            // the message says how to clear one that has finished or stopped.
+            if (PkgInstaller.TryFindActiveForeignTask(source.ContentId, source.ExpectedKind, out task) ||
+                (source.ExpectedKind == 8 && PkgInstaller.TryFindActiveForeignTask(source.ContentId, 6, out task)))
+                return "PS4 is already installing this package; no second install was started. File kept. " +
+                    "If it is not installing, open PS4 Notifications > Downloads, clear the finished or stopped entry for this title, then retry";
+            installed = source.ExpectedKind == 6 ? PkgInstaller.IsBasePackageInstalled(source.Path, source.TitleId) :
+                source.ExpectedKind == 8 ? PkgInstaller.IsPatchPackageInstalled(source.Path, source.TitleId) :
+                PkgInstaller.IsAddonInstalled(source.Path, false);
+            return installed ? "Already installed; file kept" : null;
         }
 
         void HandoffRetainedMetadata(DlItem job, int attempt)
@@ -9234,8 +9270,14 @@ namespace Orbis
                     {
                         DlState previous;
                         if (!Enum.TryParse(st, true, out previous)) previous = DlState.Paused;
-                        it.State = previous == DlState.Canceled || previous == DlState.Paused || previous == DlState.Failed ? previous : DlState.Queued;
-                        it.StatusText = "Reconnect the USB drive containing " + Path.GetFileName(it.DestPath);
+                        // A confirmed install stays installed when its source is gone; turning it
+                        // back into a queued row would reinstall it when the same file returns.
+                        bool installed = previous == DlState.Installed && it.InstallConfirmed;
+                        it.State = installed || previous == DlState.Canceled || previous == DlState.Paused || previous == DlState.Failed ? previous : DlState.Queued;
+                        if (installed) { it.Background = false; it.BgftTaskId = -1; }
+                        it.StatusText = installed ? "Installed; source file no longer present" :
+                            LocalInstallSource.IsInboxPath(it.DestPath) ? "Waiting for FTP file " + Path.GetFileName(it.DestPath) :
+                            "Reconnect the USB drive containing " + Path.GetFileName(it.DestPath);
                         _items.Add(it); continue;
                     }
                     if (File.Exists(it.DestPath))

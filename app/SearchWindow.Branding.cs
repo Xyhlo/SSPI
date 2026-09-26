@@ -101,6 +101,7 @@ namespace Orbis
                 _startupStatus = "3 / 3  Restoring your download queue";
                 Program.StartupStage("download-manager");
                 _dlMgr = new DownloadManager(_cfg);
+                StartFtpInbox();
                 RefreshLandingModel(); StartLibraryUpdateScan();
                 _freeStorageLabel = ReadFreeStorageLabel();
                 _startupServicesReady = true;

@@ -722,9 +722,11 @@ namespace Orbis
             if (!string.IsNullOrEmpty(generation) && !IsGeneration(generation))
             { error = "Resident staged generation is invalid"; return false; }
             Uri address; string storageRoot = null, canonical;
-            bool sourceValid = localSource ? LocalInstallSource.TryNormalizePath(destination, out canonical)
+            bool sourceValid = localSource ? LocalInstallSource.TryNormalizePath(destination, out canonical) &&
+                    LocalInstallSource.ResidentCanBorrow(destination)
                 : TryStagingRoot(destination, out storageRoot);
-            if (localSource && sourceValid) storageRoot = destination.Substring(0, 9) + "/SSPI/staging";
+            // USB sources stage on their drive; FTP inbox files stage internally (no drive token).
+            if (localSource && sourceValid) storageRoot = LocalInstallSource.StagingRootFor(destination);
             if (string.IsNullOrWhiteSpace(id) || id.Length > 190 ||
                 !System.Text.RegularExpressions.Regex.IsMatch(id, "^[A-Za-z0-9_-]+$") ||
                 (!localSource && (!Uri.TryCreate(url, UriKind.Absolute, out address) ||
@@ -795,8 +797,6 @@ namespace Orbis
                     }
                     string storageToken = StorageToken(storageRoot);
                     if (string.IsNullOrEmpty(generation)) generation = Guid.NewGuid().ToString("N");
-                    File.Delete(StagedPath(slot, "status"));
-                    File.Delete(StagedPath(slot, "control"));
                     // A retry with the same job ID must earn a new installation receipt.
                     File.Delete(Path.Combine(IpcRoot, "installed-" + id + ".txt"));
                     string record = localSource
@@ -812,11 +812,46 @@ namespace Orbis
                         if (record.StartsWith("10\n", StringComparison.Ordinal)) record = "13" + record.Substring(2) + Encode(password) + "\n";
                         record = AppendPasswordFallbacks(record, passwordFallbacks);
                     }
-                    WriteAtomic(StagedPath(slot, "job"), record);
-                    return true; // Durable publication transfers ownership; do not fall back after this point.
+                    // The resident FTP inbox publishes its own transfer-N.job records (O_EXCL).
+                    // A replacing write here could discard one it created after the free-slot
+                    // check above, and that upload would never run: publish exclusively and
+                    // move to the next free slot when this one was taken meanwhile.
+                    for (; slot < StagedSlotCount; slot++)
+                    {
+                        string jobPath = StagedPath(slot, "job");
+                        if (File.Exists(jobPath)) continue;
+                        File.Delete(StagedPath(slot, "status"));
+                        File.Delete(StagedPath(slot, "control"));
+                        if (!TryCreateExclusive(jobPath, record)) continue;
+                        MirrorSharedWrite(jobPath, record);
+                        return true; // Durable publication transfers ownership; do not fall back after this point.
+                    }
+                    busy = true; error = "The resident transfer queue is full"; return false;
                 }
                 catch (Exception ex) { error = "Resident staged handoff failed: " + ex.Message; return false; }
             }
+        }
+
+        // Creates path only when it does not exist, like the resident's O_EXCL records: one
+        // write, flushed to disk before the handle closes. A reader that finds the file still
+        // empty parses no record and retries. Returns false when another writer created the
+        // file first; a failed write removes the file this call created.
+        static bool TryCreateExclusive(string path, string body)
+        {
+            byte[] bytes = new UTF8Encoding(false).GetBytes(body ?? "");
+            FileStream file;
+            try { file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None); }
+            catch (IOException) when (File.Exists(path)) { return false; }
+            try
+            {
+                using (file) { file.Write(bytes, 0, bytes.Length); file.Flush(true); }
+            }
+            catch
+            {
+                try { File.Delete(path); } catch { }
+                throw;
+            }
+            return true;
         }
 
         static bool IsLocalStagedInstall()
@@ -2037,6 +2072,18 @@ namespace Orbis
             return TryReadHeartbeat(out heartbeat) && heartbeat.Ready && heartbeat.Current;
         }
 
+        // A ready worker that advertises ftpinbox=1 watches <data>/pkg-rars itself.
+        // The app then leaves claiming and installing FTP uploads to it.
+        internal static bool WatchesFtpInbox
+        {
+            get
+            {
+                if (!AppSettings.DataDirWritable || AppSettings.DataMigrationPending) return false;
+                WorkerHeartbeat heartbeat;
+                return TryReadHeartbeat(out heartbeat) && heartbeat.Ready && heartbeat.Current && heartbeat.FtpInbox;
+            }
+        }
+
         static long _readinessRefreshAt;
         static string _readinessDetail = "Checking resident worker";
         internal static string ReadinessDetail
@@ -2123,7 +2170,7 @@ namespace Orbis
         {
             public string Version, Build, Epoch, NotReadyReason;
             public int ProcessId;
-            public bool Current, Ready, SevenZip, UsbFilesystemContext;
+            public bool Current, Ready, SevenZip, UsbFilesystemContext, FtpInbox;
         }
 
         internal static WorkerHeartbeat ParseHeartbeat(string[] lines, long nowTicks, string expectedBuild)
@@ -2151,6 +2198,7 @@ namespace Orbis
             return new WorkerHeartbeat { Version = lines[0], Build = value("build"), Epoch = value("epoch"), ProcessId = pid,
                 SevenZip = value("sevenzip") == "1",
                 UsbFilesystemContext = value("usbcontext") == "1",
+                FtpInbox = value("ftpinbox") == "1",
                 NotReadyReason = value("migration") == "1" ? "Resident loaded; SSPI data migration is holding the background queue" :
                     value("storage") == "0" ? "Resident loaded; SceShellUI cannot access /data/SSPI. Background jobs are waiting for shared storage access" :
                     value("listener") != "1" ? "Resident loaded; local listener is not ready" :

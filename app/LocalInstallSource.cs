@@ -14,6 +14,35 @@ namespace Orbis
         internal long Size;
         internal int ExpectedKind;
 
+        // FTP clients drop files into this internal folder. It is handled like a
+        // read-only USB source, so queued files are never moved or deleted.
+        internal static string InboxRoot
+        { get { return AppSettings.DataDir.Replace('\\', '/').TrimEnd('/') + "/pkg-rars"; } }
+
+        internal static bool IsInboxPath(string value)
+        {
+            string root;
+            try { root = InboxRoot; } catch { return false; }
+            return !string.IsNullOrEmpty(value) && value.Length > root.Length + 1 && value.StartsWith(root + "/", StringComparison.Ordinal);
+        }
+
+        // Staging folder for a canonical local source: USB files stage on their own
+        // drive (/mnt/usbN/SSPI/staging); FTP inbox files stage in internal storage.
+        internal static string StagingRootFor(string canonical)
+        {
+            if (IsInboxPath(canonical)) return AppSettings.StagingRoot("ps4").Replace('\\', '/');
+            return AppSettings.StagingRoot(canonical.Substring(0, 9)).Replace('\\', '/');
+        }
+
+        // The resident worker admits flat inbox files only under its fixed data
+        // roots; other application data folders keep in-app installation.
+        internal static bool ResidentCanBorrow(string canonical)
+        {
+            if (!IsInboxPath(canonical)) return true;
+            string root = InboxRoot, leaf = canonical.Substring(root.Length + 1);
+            return (root == "/data/SSPI/pkg-rars" || root == "/user/data/SSPI/pkg-rars") && leaf.IndexOf('/') < 0;
+        }
+
         static readonly Regex NameTitleId = new Regex(@"(?<![A-Za-z0-9])CUSA[-_ ]?(\d{5})(?!\d)", RegexOptions.IgnoreCase);
 
         // Archives are not opened before extraction, so their title comes from the
@@ -66,9 +95,10 @@ namespace Orbis
         internal static bool TryNormalizePath(string value, out string canonical)
         {
             canonical = null;
+            bool inbox = IsInboxPath(value);
             if (string.IsNullOrEmpty(value) || value.Length >= 1024 || value.IndexOf('\\') >= 0 || value.IndexOf(':') >= 0 ||
-                !value.StartsWith("/mnt/usb", StringComparison.Ordinal) || value.Length < 11 ||
-                value[8] < '0' || value[8] > '7' || value[9] != '/') return false;
+                (!inbox && (!value.StartsWith("/mnt/usb", StringComparison.Ordinal) || value.Length < 11 ||
+                value[8] < '0' || value[8] > '7' || value[9] != '/'))) return false;
             foreach (char c in value) if (char.IsControl(c)) return false;
             if (Encoding.UTF8.GetByteCount(value) >= 1024) return false;
             string[] parts = value.Split('/');
@@ -82,9 +112,10 @@ namespace Orbis
         {
             string canonical;
             if (!TryNormalizePath(path, out canonical)) throw new IOException("Choose a USB file with no linked or parent paths, colons, or folder names longer than 240 UTF-8 bytes");
-            string current = canonical.Substring(0, 9);
+            bool inbox = IsInboxPath(canonical);
+            string current = inbox ? InboxRoot : canonical.Substring(0, 9);
             string detail;
-            if (!UsbVolumeLabel.IsConnected(current, out detail)) { SspiLog.Write("download", "usb-storage " + detail); throw new IOException(detail); }
+            if (!inbox && !UsbVolumeLabel.IsConnected(current, out detail)) { SspiLog.Write("download", "usb-storage " + detail); throw new IOException(detail); }
             for (;;)
             {
                 FileAttributes attributes = File.GetAttributes(current);

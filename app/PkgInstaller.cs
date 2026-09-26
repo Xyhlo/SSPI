@@ -777,6 +777,43 @@ namespace Orbis
             return false;
         }
 
+        internal static bool IsPatchPackageInstalled(string source, string titleId)
+        {
+            if (!System.Text.RegularExpressions.Regex.IsMatch(titleId ?? "", "^[A-Z]{4}[0-9]{5}$")) return false;
+            foreach (string root in new[] { "/user/patch/", "/mnt/ext0/user/patch/" })
+                if (PkgInstallPolicy.MatchesInstalledContainer(source, root + titleId + "/patch.pkg")) return true;
+            return false;
+        }
+
+        /// <summary>True when a live BGFT task that SSPI does not own (for example one
+        /// started by the PS4 package installer) exists for this content. Tasks in SSPI's
+        /// ownership journal keep their existing recovery; failed or finished tasks and
+        /// lookup failures do not block.</summary>
+        internal static bool TryFindActiveForeignTask(string contentId, int subType, out int taskId)
+        {
+            taskId = -1;
+            string initError;
+            if (string.IsNullOrEmpty(contentId) || subType <= 0 || !EnsureBgftReady(out initError)) return false;
+            try
+            {
+                int found;
+                if (sceBgftServiceDownloadFindTaskByContentId(contentId, subType, out found) != 0 || found < 0) return false;
+                if (IsOwnedBackgroundTask(found, contentId, subType)) return false;
+                BgftTaskProgress state;
+                if (sceBgftServiceDownloadGetProgress(found, out state) == 0)
+                {
+                    if (state.ErrorResult != 0) return false;
+                    ulong total = state.LengthTotal != 0 ? state.LengthTotal : state.Length;
+                    ulong done = state.TransferredTotal != 0 ? state.TransferredTotal : state.Transferred;
+                    if (total > 0 && done >= total && state.PreparingPercent >= 100 && state.LocalCopyPercent >= 100) return false;
+                }
+                LogInstall("foreign BGFT task task=" + found + " content=" + contentId + " subtype=" + subType);
+                taskId = found;
+                return true;
+            }
+            catch { return false; }
+        }
+
         internal static bool IsBasePackageInstalled(string source, string titleId)
         {
             if (!System.Text.RegularExpressions.Regex.IsMatch(titleId ?? "", "^[A-Z]{4}[0-9]{5}$")) return false;
