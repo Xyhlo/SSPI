@@ -27,7 +27,10 @@ namespace Orbis
             if (string.IsNullOrWhiteSpace(token)) throw new IOException("Connect this service in Connections first");
             lock (Gate)
             {
-                if (NextRequest > DateTime.UtcNow) System.Threading.Thread.Sleep((int)Math.Min(1000, (NextRequest-DateTime.UtcNow).TotalMilliseconds));
+                // Read the clock once: a second read after a GC pause could yield -1
+                // (Sleep forever while holding Gate) or less (ArgumentOutOfRangeException).
+                double waitMs = (NextRequest - DateTime.UtcNow).TotalMilliseconds;
+                if (waitMs > 0) System.Threading.Thread.Sleep((int)Math.Min(1000, waitMs));
                 NextRequest = DateTime.UtcNow.AddMilliseconds(750);
                 string json;
                 try { json = form == null
@@ -226,7 +229,7 @@ namespace Orbis
             string url=response as string ?? Text(response as Dictionary<string,object>,"data");
             if(!ValidLink(url))throw new IOException("Cloud file is not ready to download; retry after it finishes preparing");
             if(cancel!=null&&cancel())throw new OperationCanceledException();
-            DownloadTransferSettings.RememberProviderLimit(url,4);return url;
+            DownloadTransferSettings.RememberProviderLimit(url,DownloadTransferSettings.MaxRangeCount);return url;
         }
         internal static string OwningProvider(string locator)
         {

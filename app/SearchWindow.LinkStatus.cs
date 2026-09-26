@@ -12,6 +12,7 @@ namespace Orbis
         string _linkStatusProvider, _linkStatusRdKey, _linkStatusTbKey, _linkStatusAdKey, _linkStatusPmKey;
         uint _linkStatusStartedAt;
         int _supportRowsRevision = int.MinValue;
+        DebridMultiProviderStatusLookup _supportRowsLookup;
         readonly Dictionary<PackageCandidate, bool> _supportedPackages = new Dictionary<PackageCandidate, bool>();
         IList<PackageCandidate> _supportedCandidates;
 
@@ -24,14 +25,23 @@ namespace Orbis
             if (candidate == null) return false;
             bool supported;
             if (!_supportedPackages.TryGetValue(candidate, out supported))
-                _supportedPackages[candidate] = supported = DebridHostSupport.IsSupported(_cfg, candidate);
+            {
+                // Row visibility and its badge must use one completed support
+                // snapshot. The short-lived transport cache can expire during browsing.
+                var status = _linkStatusLookup == null ? null : _linkStatusLookup.Get(candidate);
+                supported = status != null && status.HostState == DebridHostState.Supported;
+                if (status == null || (candidate.AccessType == PackageAccessType.Direct && string.IsNullOrEmpty(candidate.ArchiveVolumes)) || !ShowsProviderStatus)
+                    supported = DebridHostSupport.IsSupported(_cfg, candidate);
+                _supportedPackages[candidate] = supported;
+            }
             return supported;
         }
 
         void RefreshSupportedRows()
         {
             int revision = _linkStatusLookup == null ? -1 : _linkStatusLookup.Revision;
-            if (_supportRowsRevision == revision) return;
+            if (_supportRowsLookup == _linkStatusLookup && _supportRowsRevision == revision) return;
+            _supportRowsLookup = _linkStatusLookup;
             _supportRowsRevision = revision;
             _supportedPackages.Clear();
             RebuildDetailRows();
@@ -64,7 +74,8 @@ namespace Orbis
                     _linkStatusProvider == string.Join(",", UnlockProviders.EnabledIds(_cfg)) &&
                     _linkStatusRdKey == _cfg.RealDebridToken && _linkStatusTbKey == _cfg.TorBoxApiKey &&
                     _linkStatusAdKey == _cfg.AllDebridApiKey && _linkStatusPmKey == _cfg.PremiumizeApiKey &&
-                    (UiElapsed(_linkStatusStartedAt) < 120000 || _tab != TopTab.Search || _settingsOpen))
+                    (UiElapsed(_linkStatusStartedAt) < (_detailTypeCounts[0] == 0 ? 30000U : 120000U) ||
+                     (_linkStatusLookup != null && _linkStatusLookup.IsChecking) || _tab != TopTab.Search || _settingsOpen))
                 { RefreshSupportedRows(); return; }
 
                 StopLinkStatusLookup();

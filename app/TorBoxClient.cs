@@ -12,12 +12,25 @@ namespace Orbis
     internal static class TorBoxClient
     {
         const string Api = "https://api.torbox.app/v1/api";
-        sealed class Pending { public string Id, FileId; public DateTime Until; }
+        sealed class Pending { public string Id, FileId, FileName; public DateTime AttemptUtc; }
         static readonly Dictionary<string, Pending> PendingDownloads = new Dictionary<string, Pending>();
         static readonly object CreationGate = new object();
         static readonly Stopwatch CreationClock = Stopwatch.StartNew();
-        static long NextCreation, CreationBlockedUntil;
-        static DebridResolutionError CreationRejection;
+        static long NextCreation;
+
+        // Local-only seams used by the source-linked host regression harness.
+        internal static string ApiRootForTests;
+        internal static string DataRootForTests;
+        internal static TimeSpan ReconciliationGrace = TimeSpan.FromMinutes(2);
+        static string ApiRoot { get { return string.IsNullOrEmpty(ApiRootForTests) ? Api : ApiRootForTests.TrimEnd('/'); } }
+        static string DataRoot { get { return string.IsNullOrEmpty(DataRootForTests) ? AppSettings.DataDir : DataRootForTests; } }
+
+        internal static void ResetForTests()
+        {
+            lock (PendingDownloads) PendingDownloads.Clear();
+            NextCreation = 0;
+            CreationClock.Restart();
+        }
 
         /// <summary>Outcome of a single provider list poll for a prepared download.</summary>
         internal enum PreparedPollKind { Ready, Preparing, Rejected, Terminal, Transient }
@@ -31,12 +44,14 @@ namespace Orbis
         {
             internal PreparedPollKind Kind;
             internal string FileId = "";
+            internal string FileName = "";
             internal string StatusText = "";
             internal string Metric = "";
             internal string ProviderState = "";
             internal string Error = "";
             internal string RawJson = "";
             internal bool Visible;
+            internal bool NeedsAction;
             internal Exception Transport;
             internal string FailedUrl;
             internal int PartNumber, PartCount, RetryAfterSeconds;
@@ -55,8 +70,6 @@ namespace Orbis
             if (string.IsNullOrEmpty(hostUrl))
                 throw new Exception("Empty host URL");
 
-            string json = null;
-            string key = PendingKey(token, hostUrl);
             Pending pending = GetOrCreatePending(token, hostUrl, progress, cancel);
 
             string fileId = pending.FileId;
@@ -76,12 +89,14 @@ namespace Orbis
                     if (progress != null)
                         progress("TorBox preparing this file · list request retry " + transient + "/" + TransientListAttempts +
                             " · " + (int)elapsed.Elapsed.TotalSeconds + "s");
-                    Wait(PollDelayMs(poll), cancel);
+                    Wait(PollDelayWithRetryAfter(PollDelayMs(poll), outcome.RetryAfterSeconds), cancel);
                     continue;
                 }
                 transient = 0;
                 if (outcome.Kind == PreparedPollKind.Rejected)
-                    throw DebridResolutionError.FromResponse("TorBox", hostUrl, outcome.RawJson);
+                    throw outcome.NeedsAction
+                        ? DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "WEB_DOWNLOAD_RECONCILIATION_REQUIRED", outcome.Error)
+                        : DebridResolutionError.FromResponse("TorBox", hostUrl, outcome.RawJson);
                 if (outcome.Kind == PreparedPollKind.Terminal) throw PreparationFailure(hostUrl, outcome);
                 if (outcome.Visible) listed++;
                 fileId = outcome.Kind == PreparedPollKind.Ready ? outcome.FileId : null;
@@ -109,38 +124,7 @@ namespace Orbis
                 throw new Exception("TorBox is still preparing this file after " + (int)elapsed.Elapsed.TotalSeconds +
                     "s (" + detail + "). The prepared download was kept; retry from Downloads shortly.");
             }
-            if (cancel != null && cancel()) throw new OperationCanceledException();
-            string url = Api + "/webdl/requestdl?token=" + Uri.EscapeDataString(token.Trim()) +
-                "&web_id=" + Uri.EscapeDataString(pending.Id) + "&file_id=" + Uri.EscapeDataString(fileId) + "&zip_link=false";
-            try
-            {
-                json = NetHttp.GetString(url, 20000);
-            }
-            catch (Exception ex)
-            {
-                // Transport failure (timeout/5xx/429): keep the prepared IDs.
-                throw DebridResolutionError.FromTransport("TorBox", hostUrl, ex);
-            }
-
-            string raw = (json ?? "").Trim().Trim('"');
-            if (cancel != null && cancel()) throw new OperationCanceledException();
-            if (IsHttp(raw))
-            {
-                DownloadTransferSettings.RememberProviderLimit(raw.Trim(), 4);
-                return raw.Trim();
-            }
-            var linkResponse = Response(json);
-            if (!Flag(linkResponse, "success"))
-            {
-                // Invalid/expired tokens do not invalidate the prepared download.
-                if (MissingJob(Text(linkResponse, "error"))) ForgetPending(key);
-                throw DebridResolutionError.FromResponse("TorBox", hostUrl, json);
-            }
-            string download = Text(linkResponse, "data");
-            if (!IsHttp(download)) throw new Exception("TorBox returned no download URL");
-            if (cancel != null && cancel()) throw new OperationCanceledException();
-            DownloadTransferSettings.RememberProviderLimit(download.Trim(), 4);
-            return download.Trim();
+            return RefreshPrepared(token, hostUrl, cancel);
         }
 
         internal static int PollDelayMs(int poll) { return poll == 0 ? 1000 : poll == 1 ? 2000 : 5000; }
@@ -192,6 +176,85 @@ namespace Orbis
             }
             return false;
         }
+        static List<Dictionary<string, object>> MatchingCreateAttempts(object data, string sourceUrl, DateTime attemptUtc)
+        {
+            var matches = new List<Dictionary<string, object>>();
+            var single = data as Dictionary<string, object>;
+            if (single != null) AddCreateMatch(single, sourceUrl, attemptUtc, matches);
+            var items = data as List<object>;
+            if (items != null)
+                foreach (object value in items)
+                {
+                    var job = value as Dictionary<string, object>;
+                    if (job != null) AddCreateMatch(job, sourceUrl, attemptUtc, matches);
+                }
+            return matches;
+        }
+
+        static void AddCreateMatch(Dictionary<string, object> job, string sourceUrl, DateTime attemptUtc,
+            List<Dictionary<string, object>> matches)
+        {
+            string id = First(job, "id", "webdownload_id", "webdownloadId");
+            if (!ValidId(id) || !SourceMatches(job, sourceUrl)) return;
+            DateTime? created = CreateTime(job);
+            if (!created.HasValue) return;
+            // Provider timestamps may have whole-second precision. If evidence does
+            // not fall near the persisted request attempt, leave the intent unresolved.
+            if (created.Value < attemptUtc.AddSeconds(-5) || created.Value > attemptUtc.AddMinutes(5)) return;
+            matches.Add(job);
+        }
+
+        static bool SourceMatches(Dictionary<string, object> job, string sourceUrl)
+        {
+            string[] names = { "link", "url", "source", "source_url", "sourceUrl", "src_url", "web_url", "webUrl",
+                "webdownload_url", "webdownload_link", "download_link", "input_link", "original_link", "originalLink" };
+            foreach (string name in names)
+            {
+                string value = Text(job, name);
+                if (string.Equals(value, sourceUrl, StringComparison.Ordinal)) return true;
+            }
+            return false;
+        }
+
+        static DateTime? CreateTime(Dictionary<string, object> job)
+        {
+            string[] names = { "created_at", "createdAt", "created", "created_on", "createdOn", "timestamp" };
+            foreach (string name in names)
+            {
+                object value = Value(job, name);
+                if (value == null) continue;
+                double numeric;
+                if ((value is long || value is int || value is double) &&
+                    double.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out numeric))
+                {
+                    try
+                    {
+                        if (numeric > 100000000000.0) numeric /= 1000.0;
+                        if (numeric < 0 || numeric > 4102444800.0) continue;
+                        return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(numeric);
+                    }
+                    catch (ArgumentOutOfRangeException) { continue; }
+                }
+                string text = Convert.ToString(value, CultureInfo.InvariantCulture);
+                long unix;
+                if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out unix))
+                {
+                    try
+                    {
+                        double seconds = unix > 100000000000L ? unix / 1000.0 : unix;
+                        if (seconds < 0 || seconds > 4102444800.0) continue;
+                        return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(seconds);
+                    }
+                    catch (ArgumentOutOfRangeException) { continue; }
+                }
+                DateTimeOffset parsed;
+                if (DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out parsed))
+                    return parsed.UtcDateTime;
+            }
+            return null;
+        }
         static string ReadyFile(Dictionary<string, object> job)
         {
             var files = Value(job, "files") as List<object>;
@@ -201,6 +264,12 @@ namespace Orbis
             string id = Text(Object(files[0]), "id");
             if (!ValidId(id)) throw new IOException("TorBox returned an invalid file ID");
             return id;
+        }
+        static string ReadyFileName(Dictionary<string, object> job)
+        {
+            if (string.IsNullOrEmpty(ReadyFile(job))) return "";
+            var files = Value(job, "files") as List<object>;
+            return files == null || files.Count == 0 ? "" : Text(Object(files[0]), "name") ?? "";
         }
         static bool MissingJob(string code)
         { return code == "ITEM_NOT_FOUND" || code == "DOWNLOAD_NOT_FOUND" || code == "WEB_DOWNLOAD_NOT_FOUND"; }
@@ -238,20 +307,61 @@ namespace Orbis
             return string.Join(" · ", parts.ToArray());
         }
 
-        static string PendingKey(string token, string hostUrl)
+        static string HashKey(string value)
         {
             using (var sha = SHA256.Create())
-                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(token.Trim() + "\n" + hostUrl)));
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(value ?? "")));
         }
+        static string PendingKey(string token, string hostUrl) { return HashKey(token.Trim() + "\n" + hostUrl); }
+        static string AccountKey(string token) { return HashKey(token.Trim()); }
 
         static Pending LookupPending(string key)
         {
             Pending pending;
             lock (PendingDownloads) { PendingDownloads.TryGetValue(key, out pending); }
-            if (pending != null && pending.Until < DateTime.UtcNow) pending = null;
             if (pending == null) pending = LoadPending(key);
             return pending;
         }
+
+        static Pending ReloadPending(string key)
+        {
+            lock (PendingDownloads) PendingDownloads.Remove(key);
+            return LoadPending(key);
+        }
+
+        static void CachePending(string key, Pending pending)
+        {
+            lock (PendingDownloads) PendingDownloads[key] = pending;
+        }
+
+        static string HashFilePart(string key) { return key.Replace("-", ""); }
+
+        static FileStream AcquireFileLock(string path, Func<bool> cancel)
+        {
+            string directory = Path.GetDirectoryName(path);
+            Directory.CreateDirectory(directory);
+            var waited = Stopwatch.StartNew();
+            while (true)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+                catch (IOException)
+                {
+                    if (waited.Elapsed > TimeSpan.FromSeconds(30))
+                        throw new IOException("TorBox persistence lock could not be acquired.");
+                    Wait(100, cancel);
+                }
+            }
+        }
+
+        static string SourceLockPath(string key)
+        { return Path.Combine(DataRoot, "torbox-pending", HashFilePart(key) + ".lock"); }
+
+        static string AdmissionPath(string accountKey)
+        { return Path.Combine(DataRoot, "torbox-admissions", HashFilePart(accountKey) + ".txt"); }
+
+        static string AdmissionLockPath(string accountKey)
+        { return Path.Combine(DataRoot, "torbox-admissions", HashFilePart(accountKey) + ".lock"); }
 
         /// <summary>The durable prepared record exists for this account and link.</summary>
         internal static bool HasPreparedDownload(string token, string hostUrl)
@@ -284,38 +394,108 @@ namespace Orbis
                 return result;
             }
             if (cancel != null && cancel()) throw new OperationCanceledException();
+
+            bool reconciling = string.IsNullOrEmpty(pending.Id);
+            string url = ApiRoot + "/webdl/mylist?" + (reconciling ? "" : "id=" + Uri.EscapeDataString(pending.Id) + "&") + "bypass_cache=true";
             string list;
-            try { list = NetHttp.GetString(Api + "/webdl/mylist?id=" + Uri.EscapeDataString(pending.Id) + "&bypass_cache=true", 15000, null, token.Trim()); }
+            try { list = NetHttp.GetString(url, 15000, null, token.Trim(), cancel: cancel); }
             catch (Exception ex)
             {
-                result.Kind = PreparedPollKind.Transient;
+                if (ex is OperationCanceledException) throw;
+                var transport = DebridResolutionError.FromTransport("TorBox", hostUrl, ex) as DebridResolutionError;
                 result.Transport = ex;
-                result.Error = ex.Message;
+                result.RetryAfterSeconds = transport == null ? 0 : transport.RetryAfterSeconds;
+                result.Error = transport == null ? ex.Message : transport.Message;
+                bool hasProviderResponse = transport != null &&
+                    (transport.HttpStatusCode != 0 || !string.IsNullOrEmpty(transport.ProviderCode));
+                if (hasProviderResponse && !transport.IsTransient && !transport.IsRateLimited)
+                {
+                    result.Kind = PreparedPollKind.Rejected;
+                    result.NeedsAction = transport.NeedsAction;
+                }
+                else result.Kind = PreparedPollKind.Transient;
                 return result;
             }
             result.RawJson = list;
             var response = Response(list);
             if (!Flag(response, "success"))
             {
-                if (MissingJob(Text(response, "error"))) ForgetPending(key);
+                var failure = DebridResolutionError.FromResponse("TorBox", hostUrl, list);
+                result.Error = failure.Message;
+                result.RetryAfterSeconds = failure.RetryAfterSeconds;
+                if (failure.IsTransient || failure.IsRateLimited)
+                {
+                    result.Kind = PreparedPollKind.Transient;
+                    result.Transport = failure;
+                    return result;
+                }
+                if (!reconciling && MissingJob(Text(response, "error"))) ForgetPending(key);
+                result.NeedsAction = failure.NeedsAction;
                 result.Kind = PreparedPollKind.Rejected;
-                result.Error = Text(response, "error") ?? "the provider rejected the list request";
                 return result;
             }
+
+            object data = Value(response, "data");
             Dictionary<string, object> job;
-            bool visible = TryFindJob(Value(response, "data"), pending.Id, out job);
+            bool visible;
+            if (reconciling)
+            {
+                var matches = MatchingCreateAttempts(data, hostUrl, pending.AttemptUtc);
+                if (matches.Count > 1)
+                {
+                    result.Kind = PreparedPollKind.Rejected;
+                    result.NeedsAction = true;
+                    result.Error = "TorBox returned multiple matching downloads after an uncertain create. Check the TorBox account before retrying.";
+                    return result;
+                }
+                if (matches.Count == 1)
+                {
+                    job = matches[0];
+                    string id = First(job, "id", "webdownload_id", "webdownloadId");
+                    if (!ValidId(id))
+                    {
+                        result.Kind = PreparedPollKind.Rejected;
+                        result.NeedsAction = true;
+                        result.Error = "TorBox found the matching download but returned no usable receipt. Check the TorBox account before retrying.";
+                        return result;
+                    }
+                    string fileId = ReadyFile(job) ?? "";
+                    pending = new Pending { Id = id, FileId = fileId,
+                        FileName = string.IsNullOrEmpty(fileId) ? "" : ReadyFileName(job), AttemptUtc = pending.AttemptUtc };
+                    SavePending(key, pending);
+                    visible = true;
+                }
+                else
+                {
+                    result.StatusText = "TorBox checking an uncertain create";
+                    if (DateTime.UtcNow - pending.AttemptUtc >= ReconciliationGrace)
+                    {
+                        result.Kind = PreparedPollKind.Rejected;
+                        result.NeedsAction = true;
+                        result.Error = "TorBox could not confirm whether this download was created. Automatic resubmission was stopped to avoid a duplicate. Check the TorBox account before retrying.";
+                    }
+                    else result.Kind = PreparedPollKind.Preparing;
+                    return result;
+                }
+            }
+            else visible = TryFindJob(data, pending.Id, out job);
+
             result.Visible = visible;
             if (visible)
             {
-                // Readiness is checked before the state wording, matching the
-                // original resolve loop: a listed file id wins over any state text.
                 string fileId = ReadyFile(job);
                 if (!string.IsNullOrEmpty(fileId))
                 {
-                    pending.FileId = fileId;
-                    SavePending(key, pending);
+                    string fileName = ReadyFileName(job);
+                    if (string.IsNullOrEmpty(fileName) && pending.FileId == fileId) fileName = pending.FileName ?? "";
+                    if (pending.FileId != fileId || !string.Equals(pending.FileName ?? "", fileName, StringComparison.Ordinal))
+                    {
+                        pending = new Pending { Id = pending.Id, FileId = fileId, FileName = fileName, AttemptUtc = pending.AttemptUtc };
+                        SavePending(key, pending);
+                    }
                     result.Kind = PreparedPollKind.Ready;
                     result.FileId = fileId;
+                    result.FileName = fileName;
                     result.Metric = MetricText(job);
                     result.StatusText = PreparationProgress(result.Metric, TimeSpan.Zero);
                     return result;
@@ -332,10 +512,7 @@ namespace Orbis
                     return result;
                 }
             }
-            else
-            {
-                result.StatusText = "TorBox preparing";
-            }
+            else result.StatusText = "TorBox preparing";
             result.Kind = PreparedPollKind.Preparing;
             return result;
         }
@@ -343,56 +520,216 @@ namespace Orbis
         /// <summary>
         /// Queue preflight before the blocking resolve. Guarantees a prepared
         /// download exists (creating at most one cloud job on first sight),
-        /// performs at most one list poll, and returns Ready when the provider
+        /// performs a bounded set of list polls for a cache hit, and returns Ready when the provider
         /// already published a file. A Ready result here lets the normal resolve
         /// skip its loop entirely, so no second provider job is ever created.
         /// </summary>
-        internal static PreparedPollResult TryParkOrPrepare(string token, string hostUrl, Func<bool> cancel, Action<string> progress = null)
+        internal static PreparedPollResult TryParkOrPrepare(string token, string hostUrl, Func<bool> cancel, Action<string> progress = null,
+            bool cached = false)
         {
             if (string.IsNullOrWhiteSpace(token) || string.IsNullOrEmpty(hostUrl))
                 return new PreparedPollResult { Kind = PreparedPollKind.Rejected, Error = "TorBox token missing" };
             Pending pending = GetOrCreatePending(token, hostUrl, progress, cancel);
             if (!string.IsNullOrEmpty(pending.FileId))
-                return new PreparedPollResult { Kind = PreparedPollKind.Ready, FileId = pending.FileId };
-            return PollPrepared(token, hostUrl, cancel);
+                return new PreparedPollResult { Kind = PreparedPollKind.Ready, FileId = pending.FileId,
+                    FileName = pending.FileName ?? "" };
+            var poll = PollPrepared(token, hostUrl, cancel);
+            // Cache availability is a hint, not a ready receipt. Briefly check for
+            // the published file before yielding to the normal preparation cadence.
+            for (int n = 0; cached && n < CachedReadyPolls && poll.Kind == PreparedPollKind.Preparing; n++)
+            {
+                if (progress != null) progress("Cached at TorBox · starting");
+                Wait(CachedReadyPollMs, cancel);
+                poll = PollPrepared(token, hostUrl, cancel);
+            }
+            return poll;
+        }
+
+        internal const int CachedReadyPolls = 6;
+        internal const int CachedReadyPollMs = 750;
+
+        /// <summary>
+        /// Web-download cache lookup. TorBox identifies a link by the MD5 of the
+        /// exact URL. Returns the subset of <paramref name="urls"/> that TorBox
+        /// already holds; any failure returns an empty set so the normal
+        /// preparation path is unchanged. This call never creates a cloud job.
+        /// </summary>
+        internal static HashSet<string> CachedLinks(string token, IList<string> urls, Func<bool> cancel, int timeoutMs = 8000)
+        {
+            var cached = new HashSet<string>(StringComparer.Ordinal);
+            if (string.IsNullOrWhiteSpace(token) || urls == null || urls.Count == 0) return cached;
+            var byHash = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string url in urls)
+                if (IsHttp(url) && byHash.Count < 32) byHash[LinkHash(url)] = url;
+            if (byHash.Count == 0) return cached;
+            try
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                string json = NetHttp.GetString(ApiRoot + "/webdl/checkcached?hash=" +
+                    string.Join(",", new List<string>(byHash.Keys).ToArray()) + "&format=object",
+                    timeoutMs, null, token.Trim(), cancel: cancel);
+                var response = Response(json);
+                if (!Flag(response, "success")) return cached;
+                var data = Value(response, "data") as Dictionary<string, object>;
+                if (data != null)
+                    foreach (var pair in data)
+                    {
+                        string url;
+                        if ((pair.Value is Dictionary<string, object> || Equals(pair.Value, true)) &&
+                            byHash.TryGetValue(pair.Key, out url)) cached.Add(url);
+                    }
+                var list = Value(response, "data") as List<object>;
+                if (list != null)
+                    foreach (object item in list)
+                    {
+                        var row = item as Dictionary<string, object>;
+                        string hash = row == null ? null : Text(row, "hash"), url;
+                        if (hash != null && byHash.TryGetValue(hash, out url)) cached.Add(url);
+                    }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // A cache lookup is an optimisation; it must never block preparation.
+                SspiLog.Write("download", "event=torbox-cache-check-failed exception=" + ex.GetType().Name);
+                cached.Clear();
+            }
+            return cached;
+        }
+
+        internal static string LinkHash(string url)
+        {
+            using (var md5 = MD5.Create())
+            {
+                byte[] digest = md5.ComputeHash(Encoding.UTF8.GetBytes(url ?? ""));
+                var text = new StringBuilder(32);
+                foreach (byte b in digest) text.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+                return text.ToString();
+            }
         }
 
         static Pending GetOrCreatePending(string token, string hostUrl, Action<string> progress, Func<bool> cancel)
         {
             string key = PendingKey(token, hostUrl);
-            while (!Monitor.TryEnter(CreationGate, 100))
-                if (cancel != null && cancel()) throw new OperationCanceledException();
-            try
+            using (AcquireFileLock(SourceLockPath(key), cancel))
             {
                 if (cancel != null && cancel()) throw new OperationCanceledException();
-                Pending pending = LookupPending(key);
+                Pending pending = ReloadPending(key);
                 if (pending != null) return pending;
-                if (CreationClock.ElapsedMilliseconds < CreationBlockedUntil) throw CreationRejection;
-                int delay = (int)Math.Max(0, NextCreation - CreationClock.ElapsedMilliseconds);
-                if (delay > 0) Wait(delay, cancel);
-                if (progress != null) progress("Sending file to TorBox");
-                string json;
-                try { json = CreateWebDownload(token.Trim(), hostUrl, progress, cancel); }
-                catch (DebridResolutionError ex) {
-                    if (ex.IsRateLimited) {
-                        CreationRejection = ex;
-                        CreationBlockedUntil = CreationClock.ElapsedMilliseconds + Math.Max(15L, ex.RetryAfterSeconds) * 1000;
+                while (!Monitor.TryEnter(CreationGate, 100))
+                    if (cancel != null && cancel()) throw new OperationCanceledException();
+                try
+                {
+                    int delay = (int)Math.Max(0, NextCreation - CreationClock.ElapsedMilliseconds);
+                    if (delay > 0) Wait(delay, cancel);
+                    TakeCreateAdmission(token, hostUrl, cancel);
+                    pending = new Pending { Id = "", FileId = "", AttemptUtc = DateTime.UtcNow };
+                    SavePending(key, pending);
+                    if (progress != null) progress("Sending file to TorBox");
+
+                    string json;
+                    try { json = CreateWebDownload(token.Trim(), hostUrl, cancel); }
+                    catch (OperationCanceledException) { throw; }
+                    catch (DebridResolutionError ex)
+                    {
+                        // These explicit HTTP responses prove the provider refused
+                        // the create, so only their intent is safe to clear.
+                        if (ex.HttpStatusCode == 401 || ex.HttpStatusCode == 403 || ex.HttpStatusCode == 429 ||
+                            ex.ProviderCode == "DOWNLOAD_SERVER_ERROR")
+                            ForgetPending(key);
+                        throw;
                     }
-                    throw;
+                    finally { NextCreation = CreationClock.ElapsedMilliseconds + 1000; }
+
+                    Dictionary<string, object> envelope;
+                    try { envelope = Response(json); }
+                    catch
+                    {
+                        throw DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "CREATE_RECEIPT_UNREADABLE",
+                            "TorBox accepted a create request but its receipt could not be read. Reconciliation is required before retrying.");
+                    }
+                    if (!Flag(envelope, "success"))
+                    {
+                        object successValue = Value(envelope, "success");
+                        string rejectionCode = Text(envelope, "error");
+                        if (!(successValue is bool) || (bool)successValue || string.IsNullOrWhiteSpace(rejectionCode))
+                        {
+                            throw DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "CREATE_RECEIPT_UNREADABLE",
+                                "TorBox returned an unclear create response. Reconciliation is required before retrying.");
+                        }
+                        DebridResolutionError rejection = DebridResolutionError.FromResponse("TorBox", hostUrl, json);
+                        ForgetPending(key);
+                        throw rejection;
+                    }
+
+                    Dictionary<string, object> created;
+                    try { created = Object(Value(envelope, "data")); }
+                    catch
+                    {
+                        throw DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "CREATE_RECEIPT_UNREADABLE",
+                            "TorBox accepted a create request but returned no usable receipt. Reconciliation is required before retrying.");
+                    }
+                    string id = First(created, "webdownload_id", "webdownloadId", "id");
+                    if (!ValidId(id))
+                    {
+                        throw DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "CREATE_RECEIPT_UNREADABLE",
+                            "TorBox accepted a create request but returned no usable receipt. Reconciliation is required before retrying.");
+                    }
+
+                    pending = new Pending { Id = id, FileId = "", AttemptUtc = pending.AttemptUtc };
+                    SavePending(key, pending);
+                    string createdFile = ReadyFile(created);
+                    if (!string.IsNullOrEmpty(createdFile))
+                    {
+                        pending = new Pending { Id = id, FileId = createdFile, FileName = ReadyFileName(created), AttemptUtc = pending.AttemptUtc };
+                        SavePending(key, pending);
+                    }
+                    if (cancel != null && cancel()) throw new OperationCanceledException();
+                    if (progress != null) progress("File accepted by TorBox");
+                    return pending;
                 }
-                finally { NextCreation = CreationClock.ElapsedMilliseconds + 1000; }
-                var created = Object(Value(Response(json), "data"));
-                string id = First(created, "webdownload_id", "webdownloadId", "id");
-                if (!ValidId(id)) throw new IOException("TorBox returned an invalid web download ID");
-                pending = new Pending { Id = id, FileId = "", Until = DateTime.UtcNow.AddHours(6) };
-                SavePending(key, pending);
-                lock (PendingDownloads) { if (PendingDownloads.Count >= 256) PendingDownloads.Clear(); PendingDownloads[key] = pending; }
-                pending.FileId = ReadyFile(created);
-                SavePending(key, pending);
-                if (progress != null) progress("File accepted by TorBox");
-                return pending;
+                finally { Monitor.Exit(CreationGate); }
             }
-            finally { Monitor.Exit(CreationGate); }
+        }
+
+        /// <summary>Request a fresh signed link for an already prepared TorBox task.</summary>
+        internal static string RefreshPrepared(string token, string sourceUrl, Func<bool> cancel)
+        {
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrEmpty(sourceUrl))
+                throw new Exception("TorBox token or source URL is missing");
+            string key = PendingKey(token, sourceUrl);
+            Pending pending = LookupPending(key);
+            if (pending == null || string.IsNullOrEmpty(pending.Id) || string.IsNullOrEmpty(pending.FileId))
+                throw DebridResolutionError.AmbiguousCreate("TorBox", sourceUrl, "PREPARED_RECEIPT_MISSING",
+                    "TorBox has no confirmed prepared-download receipt to refresh. Automatic creation was stopped to avoid a duplicate; reconcile the existing task before retrying.");
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            string url = ApiRoot + "/webdl/requestdl?token=" + Uri.EscapeDataString(token.Trim()) +
+                "&web_id=" + Uri.EscapeDataString(pending.Id) + "&file_id=" + Uri.EscapeDataString(pending.FileId) + "&zip_link=false";
+            string json;
+            try { json = NetHttp.GetString(url, 20000, cancel: cancel); }
+            catch (Exception ex)
+            {
+                if (ex is OperationCanceledException) throw;
+                throw DebridResolutionError.FromTransport("TorBox", sourceUrl, ex);
+            }
+            string raw = (json ?? "").Trim().Trim('"');
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            if (IsHttp(raw))
+            {
+                DownloadTransferSettings.RememberProviderLimit(raw, DownloadTransferSettings.MaxRangeCount);
+                return raw;
+            }
+            var response = Response(json);
+            if (!Flag(response, "success"))
+            {
+                if (MissingJob(Text(response, "error"))) ForgetPending(key);
+                throw DebridResolutionError.FromResponse("TorBox", sourceUrl, json);
+            }
+            string download = Text(response, "data");
+            if (!IsHttp(download)) throw new IOException("TorBox returned no download URL");
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            DownloadTransferSettings.RememberProviderLimit(download.Trim(), DownloadTransferSettings.MaxRangeCount);
+            return download.Trim();
         }
 
         // Submit every advertised archive part without waiting for an earlier part
@@ -473,34 +810,33 @@ namespace Orbis
         }
         internal static DebridResolutionError PreparationFailure(string hostUrl, PreparedPollResult outcome)
         {
+            if (outcome.NeedsAction)
+            {
+                var action = DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "WEB_DOWNLOAD_RECONCILIATION_REQUIRED", outcome.Error);
+                return outcome.PartCount > 0 ? action.ForArchivePart(outcome.PartNumber, outcome.PartCount) : action;
+            }
             var failure = DebridResolutionError.FromResponse("TorBox", hostUrl,
                 outcome.Kind == PreparedPollKind.Terminal ? "{\"error\":\"DOWNLOAD_FAILED\"}" : outcome.RawJson);
             return outcome.PartCount > 0 ? failure.ForArchivePart(outcome.PartNumber, outcome.PartCount) : failure;
         }
 
-        static string CreateWebDownload(string token, string hostUrl, Action<string> progress, Func<bool> cancel)
+        static string CreateWebDownload(string token, string hostUrl, Func<bool> cancel)
         {
-            for (int attempt = 0; ; attempt++)
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            try
             {
-                if (cancel != null && cancel()) throw new OperationCanceledException();
-                try
-                {
-                    string json;
-                    try { json = NetHttp.PostForm(Api + "/webdl/createwebdownload",
-                        "link=" + Uri.EscapeDataString(hostUrl) + "&as_queued=false", 30000, null, token); }
-                    catch (Exception ex) { throw DebridResolutionError.FromTransport("TorBox", hostUrl, ex); }
-                    if (!Flag(Response(json), "success")) throw DebridResolutionError.FromResponse("TorBox", hostUrl, json);
-                    return json;
-                }
-                catch (DebridResolutionError ex)
-                {
-                    // AUTH_ERROR explicitly means the server failed to verify the key;
-                    // unlike a transport timeout, it confirms no download was created.
-                    if (attempt != 0 || ex.ProviderCode != "AUTH_ERROR") throw;
-                    if (progress != null) progress("TorBox token verification unavailable · retrying once");
-                    Wait(1500, cancel);
-                }
+                return NetHttp.PostForm(ApiRoot + "/webdl/createwebdownload",
+                    "link=" + Uri.EscapeDataString(hostUrl) + "&as_queued=false", 30000, null, token, cancel: cancel);
             }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { throw DebridResolutionError.FromTransport("TorBox", hostUrl, ex); }
+        }
+
+        static int PollDelayWithRetryAfter(int normalDelayMs, int retryAfterSeconds)
+        {
+            if (retryAfterSeconds <= 0) return normalDelayMs;
+            long requested = (long)retryAfterSeconds * 1000;
+            return (int)Math.Min(int.MaxValue, Math.Max((long)normalDelayMs, requested));
         }
         static void Wait(int milliseconds, Func<bool> cancel)
         {
@@ -515,35 +851,131 @@ namespace Orbis
             long value;
             return !string.IsNullOrEmpty(id) && long.TryParse(id, NumberStyles.None, CultureInfo.InvariantCulture, out value) && value >= 0;
         }
+
+        static void TakeCreateAdmission(string token, string sourceUrl, Func<bool> cancel)
+        {
+            string account = AccountKey(token), path = AdmissionPath(AccountKey(token));
+            using (AcquireFileLock(AdmissionLockPath(account), cancel))
+            {
+                string[] lines = ReadLinesIfPresent(path, 8192);
+                var attempts = new List<long>();
+                if (lines != null)
+                {
+                    if (lines.Length == 0 || lines[0] != "TORBOX-ADMISSIONS-1")
+                        throw new IOException("TorBox create-admission history is unreadable; new creates are blocked to avoid exceeding the provider limit.");
+                    for (int i = 1; i < lines.Length; i++)
+                    {
+                        long ticks;
+                        if (!long.TryParse(lines[i], NumberStyles.None, CultureInfo.InvariantCulture, out ticks) ||
+                            ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
+                            throw new IOException("TorBox create-admission history is unreadable; new creates are blocked to avoid exceeding the provider limit.");
+                        attempts.Add(ticks);
+                    }
+                }
+                long now = DateTime.UtcNow.Ticks;
+                long cutoff = now - TimeSpan.FromHours(1).Ticks;
+                attempts.RemoveAll(ticks => ticks < cutoff);
+                if (attempts.Count >= 60)
+                {
+                    attempts.Sort();
+                    int retry = (int)Math.Max(1, Math.Ceiling(TimeSpan.FromHours(1).TotalSeconds -
+                        TimeSpan.FromTicks(Math.Max(0, now - attempts[0])).TotalSeconds));
+                    var limited = (DebridResolutionError)DebridResolutionError.FromResponse("TorBox", sourceUrl,
+                        "{\"error\":\"RATE_LIMITED\"}");
+                    limited.IsRateLimited = true;
+                    limited.IsTransient = true;
+                    limited.RetryAfterSeconds = retry;
+                    limited.HttpStatusCode = 429;
+                    throw limited;
+                }
+                attempts.Add(now);
+                var text = new StringBuilder("TORBOX-ADMISSIONS-1\n");
+                foreach (long ticks in attempts) text.Append(ticks.ToString(CultureInfo.InvariantCulture)).Append('\n');
+                AtomicFile.WriteText(path, text.ToString());
+            }
+        }
+
+        static string[] ReadLinesIfPresent(string path, int maximumBytes)
+        {
+            string contents;
+            try { contents = File.ReadAllText(path); }
+            catch (FileNotFoundException) { return null; }
+            catch (DirectoryNotFoundException) { return null; }
+            if (Encoding.UTF8.GetByteCount(contents) > maximumBytes)
+                throw new IOException("TorBox persistence record is too large to read safely.");
+            string[] lines = contents.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            int count = lines.Length;
+            while (count > 0 && lines[count - 1].Length == 0) count--;
+            if (count != lines.Length) Array.Resize(ref lines, count);
+            return lines;
+        }
+
         static string PendingPath(string key)
-        { return Path.Combine(AppSettings.DataDir, "torbox-pending", key.Replace("-", "") + ".txt"); }
+        { return Path.Combine(DataRoot, "torbox-pending", HashFilePart(key) + ".txt"); }
         static Pending LoadPending(string key)
         {
-            try {
-                string path = PendingPath(key);
-                if (!File.Exists(path) || new FileInfo(path).Length > 1024) return null;
-                string[] lines = File.ReadAllLines(path); long ticks;
-                if (lines.Length != 3 || !ValidId(lines[0]) || (lines[1] != "" && !ValidId(lines[1])) ||
-                    !long.TryParse(lines[2], out ticks) || ticks <= DateTime.UtcNow.Ticks || ticks > DateTime.UtcNow.AddHours(6).Ticks) return null;
-                var pending = new Pending { Id = lines[0], FileId = lines[1], Until = new DateTime(ticks, DateTimeKind.Utc) };
-                lock (PendingDownloads) { if (PendingDownloads.Count >= 256) PendingDownloads.Clear(); PendingDownloads[key] = pending; }
-                return pending;
-            } catch { return null; }
+            string path = PendingPath(key);
+            string[] lines = ReadLinesIfPresent(path, 4096);
+            if (lines == null) return null;
+            Pending pending;
+            long ticks;
+            if (lines.Length == 5 && lines[0] == "TORBOX-PENDING-3" &&
+                (lines[1] == "" || ValidId(lines[1])) && (lines[2] == "" || ValidId(lines[2])) &&
+                long.TryParse(lines[4], NumberStyles.None, CultureInfo.InvariantCulture, out ticks) &&
+                ticks >= DateTime.MinValue.Ticks && ticks <= DateTime.MaxValue.Ticks)
+            {
+                pending = new Pending { Id = lines[1], FileId = lines[2], FileName = DecodePendingFileName(lines[3]),
+                    AttemptUtc = new DateTime(ticks, DateTimeKind.Utc) };
+            }
+            else if (lines.Length == 4 && lines[0] == "TORBOX-PENDING-2" &&
+                (lines[1] == "" || ValidId(lines[1])) && (lines[2] == "" || ValidId(lines[2])) &&
+                long.TryParse(lines[3], NumberStyles.None, CultureInfo.InvariantCulture, out ticks) &&
+                ticks >= DateTime.MinValue.Ticks && ticks <= DateTime.MaxValue.Ticks)
+            {
+                pending = new Pending { Id = lines[1], FileId = lines[2], AttemptUtc = new DateTime(ticks, DateTimeKind.Utc) };
+            }
+            else if (lines.Length == 3 && ValidId(lines[0]) && (lines[1] == "" || ValidId(lines[1])) &&
+                long.TryParse(lines[2], NumberStyles.None, CultureInfo.InvariantCulture, out ticks) &&
+                ticks >= DateTime.MinValue.Ticks && ticks <= DateTime.MaxValue.Ticks)
+            {
+                // Preserve legacy acknowledged receipts even after their old six-hour
+                // cache expiry: forgetting one could cause a duplicate web download.
+                pending = new Pending { Id = lines[0], FileId = lines[1], AttemptUtc = DateTime.UtcNow };
+                SavePending(key, pending);
+            }
+            else throw new IOException("TorBox prepared-download record is unreadable; automatic resubmission was blocked.");
+            CachePending(key, pending);
+            return pending;
         }
         static void SavePending(string key, Pending pending)
         {
-            try {
-                string path = PendingPath(key), dir = Path.GetDirectoryName(path);
-                Directory.CreateDirectory(dir);
-                AtomicFile.WriteText(path, pending.Id + "\n" + (pending.FileId ?? "") + "\n" + pending.Until.Ticks.ToString(CultureInfo.InvariantCulture));
-                var files = new DirectoryInfo(dir).GetFiles("*.txt");
-                if (files.Length > 256) { Array.Sort(files, (a,b) => a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc)); for (int i=0; i<files.Length-256; i++) files[i].Delete(); }
-            } catch { } // An unavailable cache must not stop link resolution.
+            string path = PendingPath(key), dir = Path.GetDirectoryName(path);
+            Directory.CreateDirectory(dir);
+            AtomicFile.WriteText(path, "TORBOX-PENDING-3\n" + (pending.Id ?? "") + "\n" +
+                (pending.FileId ?? "") + "\n" + EncodePendingFileName(pending.FileName) + "\n" +
+                pending.AttemptUtc.Ticks.ToString(CultureInfo.InvariantCulture));
+            CachePending(key, pending);
+        }
+        static string EncodePendingFileName(string fileName)
+        {
+            if (string.IsNullOrEmpty(fileName)) return "";
+            byte[] bytes = Encoding.UTF8.GetBytes(fileName);
+            return bytes.Length > 1024 ? "" : Convert.ToBase64String(bytes);
+        }
+        static string DecodePendingFileName(string encoded)
+        {
+            if (string.IsNullOrEmpty(encoded)) return "";
+            try
+            {
+                byte[] bytes = Convert.FromBase64String(encoded);
+                return bytes.Length > 1024 ? "" : Encoding.UTF8.GetString(bytes);
+            }
+            catch { return ""; }
         }
         static void ForgetPending(string key)
         {
+            File.Delete(PendingPath(key));
             lock (PendingDownloads) PendingDownloads.Remove(key);
-            try { File.Delete(PendingPath(key)); } catch { }
         }
 
         public static string ProbeUser(string token)

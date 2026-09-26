@@ -8,13 +8,16 @@ namespace Orbis
     internal static class RealDebridClient
     {
         const string Api = "https://api.real-debrid.com/rest/1.0";
+        internal static Action<int, Func<bool>> WaitImpl;
+        internal const int TransientCreateRetries = 3;
 
-        public static string Unrestrict(string token, string hostUrl)
+        public static string Unrestrict(string token, string hostUrl, Func<bool> cancel = null, bool queueRetry = false)
         {
-            return Unrestrict(token, hostUrl, AppSettings.RdLocationAuto);
+            return Unrestrict(token, hostUrl, AppSettings.RdLocationAuto, cancel, queueRetry);
         }
 
-        public static string Unrestrict(string token, string hostUrl, string preferredLocation)
+        public static string Unrestrict(string token, string hostUrl, string preferredLocation,
+            Func<bool> cancel = null, bool queueRetry = false)
         {
             if (string.IsNullOrEmpty(token))
                 throw new Exception("Real-Debrid token missing (Options > Settings)");
@@ -22,26 +25,41 @@ namespace Orbis
                 throw new Exception("Empty host URL");
 
             string body = "link=" + Uri.EscapeDataString(hostUrl);
-            string json;
-            try
+            for (int attempt = 0; ; attempt++)
             {
-                json = NetHttp.PostForm(Api + "/unrestrict/link", body, 60000, null, token.Trim());
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                string json;
+                try { json = NetHttp.PostForm(Api + "/unrestrict/link", body, 60000, null, token.Trim(), null, cancel); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { throw DebridResolutionError.FromTransport("Real-Debrid", hostUrl, ex); }
+
+                string err = JsonLite.GetString(json, "error");
+                if (!string.IsNullOrEmpty(err))
+                {
+                    DebridResolutionError rejection = DebridResolutionError.FromResponse("Real-Debrid", hostUrl, json);
+                    if (!rejection.IsTransient || queueRetry || attempt >= TransientCreateRetries) throw rejection;
+                    int delay = rejection.RetryAfterSeconds > 0 ? rejection.RetryAfterSeconds : Math.Min(8, 1 << attempt);
+                    Wait(Math.Min(24 * 60 * 60, delay) * 1000, cancel);
+                    continue;
+                }
+
+                var downloads = DownloadCandidates(json);
+                if (downloads.Count == 0)
+                    throw new Exception("RD returned no download URL");
+                string selected = SelectByLocation(downloads, preferredLocation);
+                DownloadTransferSettings.RememberProviderLimit(selected, ConnectionLimit(json, selected));
+                return selected;
             }
-            catch (Exception ex)
+        }
+
+        static void Wait(int milliseconds, Func<bool> cancel)
+        {
+            if (WaitImpl != null) { WaitImpl(milliseconds, cancel); return; }
+            for (int remaining = milliseconds; remaining > 0; remaining -= Math.Min(100, remaining))
             {
-                throw DebridResolutionError.FromTransport("Real-Debrid", hostUrl, ex);
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                System.Threading.Thread.Sleep(Math.Min(100, remaining));
             }
-
-            string err = JsonLite.GetString(json, "error");
-            if (!string.IsNullOrEmpty(err))
-                throw DebridResolutionError.FromResponse("Real-Debrid", hostUrl, json);
-
-            var downloads = DownloadCandidates(json);
-            if (downloads.Count == 0)
-                throw new Exception("RD returned no download URL");
-            string selected = SelectByLocation(downloads, preferredLocation);
-            DownloadTransferSettings.RememberProviderLimit(selected, ConnectionLimit(json, selected));
-            return selected;
         }
 
         internal static int ConnectionLimit(string json, string selected)
@@ -222,22 +240,36 @@ namespace Orbis
 
         public static string ProbeUser(string token)
         {
+            if (string.IsNullOrWhiteSpace(token)) return "REJECTED: Real-Debrid token missing; reconnect in Connections";
             try
             {
                 string json = NetHttp.GetString(Api + "/user", 6000, null, token.Trim());
                 string err = JsonLite.GetString(json, "error");
                 if (!string.IsNullOrEmpty(err))
-                    return "ERROR: " + err;
+                    return ProbeFailure(DebridResolutionError.FromResponse("Real-Debrid", Api + "/user", json));
                 string user = JsonLite.GetString(json, "username") ?? "?";
                 string prem = JsonLite.GetString(json, "type") ?? "?";
                 string exp = JsonLite.GetString(json, "expiration") ?? "";
-                if (prem != "free" && prem != "premium") return "ERROR: Real-Debrid returned no recognized account tier";
+                if (prem != "free" && prem != "premium") return "RETRY: Real-Debrid returned no recognized account tier";
                 return (string.Equals(prem, "free", StringComparison.OrdinalIgnoreCase) ? "FREE: " : "OK ") + "@" + user + " (" + prem + ") " + exp;
             }
             catch (Exception ex)
             {
-                return "ERROR: " + ex.Message;
+                return ProbeFailure(DebridResolutionError.FromTransport("Real-Debrid", Api + "/user", ex));
             }
+        }
+
+        internal static string ProbeFailure(Exception error)
+        {
+            var rejection = error as DebridResolutionError;
+            if (rejection == null) return "RETRY: Real-Debrid account verification is unavailable; saved token kept";
+            if (rejection.ProviderCode == "8" || rejection.ProviderCode == "12" || rejection.ProviderCode == "13")
+                return "REJECTED: Real-Debrid rejected the saved token; reconnect in Connections (code " + rejection.ProviderCode + ")";
+            if (rejection.IsRateLimited)
+                return "RATE_LIMITED: Real-Debrid is busy; wait before retrying";
+            if (rejection.NeedsAction)
+                return "LIMITED: Real-Debrid account needs attention; check the connected account";
+            return "RETRY: Real-Debrid account verification is unavailable; saved token kept";
         }
     }
 }

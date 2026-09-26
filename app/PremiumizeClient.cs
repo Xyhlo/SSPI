@@ -1,7 +1,7 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading;
 
 namespace Orbis
 {
@@ -16,13 +16,13 @@ namespace Orbis
             if (cancel != null && cancel()) throw new OperationCanceledException();
             if (progress != null) progress("Premiumize is resolving the file");
             string json;
-            try { json = NetHttp.PostForm(Api + "/transfer/directdl", "src=" + Uri.EscapeDataString(hostUrl), 60000, null, apiKey.Trim()); }
+            try { json = NetHttp.PostForm(Api + "/transfer/directdl", "src=" + Uri.EscapeDataString(hostUrl), 60000, null, apiKey.Trim(), null, cancel); }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex) { throw DebridResolutionError.FromTransport("Premiumize", hostUrl, ex); }
-            if (cancel != null && cancel()) throw new OperationCanceledException();
             var root = AllDebridClient.Parse(json);
             if (AllDebridClient.Text(root, "status") != "success") throw DebridResolutionError.FromResponse("Premiumize", hostUrl, json);
             object content;
-            var files = root.TryGetValue("content", out content) ? content as IList : null;
+            var files = root.TryGetValue("content", out content) ? content as System.Collections.IList : null;
             // Each source candidate names one file/volume. Never substitute an arbitrary folder member.
             if (files == null || files.Count != 1)
                 throw new Exception("Premiumize returned multiple files or no file. Choose an individual file mirror.");

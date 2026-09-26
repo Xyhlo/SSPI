@@ -14,7 +14,10 @@ namespace Orbis
         internal readonly bool CanTryProvider;
         readonly string Detail;
         internal bool IsRateLimited;
+        internal bool IsTransient;
+        internal bool NeedsAction;
         internal int RetryAfterSeconds;
+        internal int HttpStatusCode;
 
         DebridResolutionError(string provider, string host, string message, bool canTryMirror, string code = "", bool canTryProvider = false)
             : base(provider + ": " + message + " (" + host + ")")
@@ -23,7 +26,13 @@ namespace Orbis
         internal DebridResolutionError ForArchivePart(int part, int count)
         {
             return new DebridResolutionError(Provider, Host, "Archive part " + part + "/" + count + ": " + Detail,
-                CanTryMirror, ProviderCode, CanTryProvider) { IsRateLimited = IsRateLimited, RetryAfterSeconds = RetryAfterSeconds };
+                CanTryMirror, ProviderCode, CanTryProvider) { IsRateLimited = IsRateLimited, IsTransient = IsTransient,
+                    NeedsAction = NeedsAction, RetryAfterSeconds = RetryAfterSeconds, HttpStatusCode = HttpStatusCode };
+        }
+
+        internal static DebridResolutionError AmbiguousCreate(string provider, string url, string code, string message)
+        {
+            return new DebridResolutionError(provider, HostName(url), message, false, code, false) { NeedsAction = true };
         }
 
         internal static string HostName(string url)
@@ -37,7 +46,7 @@ namespace Orbis
             return new DebridResolutionError(provider, HostName(url), unknown ?
                 "Host support could not be checked. Retry shortly or check Connections." :
                 "This host is not currently supported or its allowance is exhausted. Choose another supported mirror.",
-                !unknown, unknown ? "SUPPORT_UNAVAILABLE" : "HOST_UNAVAILABLE", true);
+                !unknown, unknown ? "SUPPORT_UNAVAILABLE" : "HOST_UNAVAILABLE", true) { IsTransient = unknown };
         }
 
         internal static DebridResolutionError FromResponse(string provider, string url, string json)
@@ -49,7 +58,12 @@ namespace Orbis
             bool alternate = false;
             if (provider == "Real-Debrid")
             {
-                if (number == 16 || code == "hoster_unsupported")
+                if (number == -1 || number == 6 || number == 25)
+                {
+                    message = "Real-Debrid could not prepare this link temporarily. Retry shortly.";
+                    message += " Code " + number + ".";
+                }
+                else if (number == 16 || code == "hoster_unsupported")
                 { message = "This host is unsupported. Choose another mirror."; alternate = true; }
                 else if (number == 17 || number == 19 || number == 24)
                 { message = "This file or host is unavailable. Choose another mirror."; alternate = true; }
@@ -94,7 +108,9 @@ namespace Orbis
             {
                 if (code == "service_unsupported")
                 { message = "This host is unsupported. Choose another mirror."; alternate = true; }
-                else if (code == "service_down" || code == "not_found")
+                else if (code == "service_down")
+                    message = "Premiumize could not reach this service. Retry shortly.";
+                else if (code == "not_found")
                 { message = "This file or host is unavailable. Choose another mirror or retry later."; alternate = true; }
                 else if (code == "authentication_failed")
                     message = "Your API key was missing or rejected. Reconnect in Connections.";
@@ -106,15 +122,19 @@ namespace Orbis
                     message = "Too many requests. Wait before retrying.";
                 else if (code == "link_generation_failed" || code == "transient_error" || code == "unknown_error")
                     message = "The provider could not prepare the link right now. Retry shortly.";
+                else if (code == "semi_permanent_error")
+                    message = "Premiumize deferred this request. Check the provider's service or account limits before retrying.";
                 else if (code == "invalid_request")
                     message = "The provider rejected this source URL. Choose an individual file mirror.";
             }
             else if (code == "UNSUPPORTED_SITE")
             { message = "This host is unsupported. Choose another mirror."; alternate = true; }
-            else if (code == "DOWNLOAD_FAILED" || code == "DOWNLOAD_SERVER_ERROR")
-            { message = "TorBox host download failed. Try another provider or mirror."; alternate = true; }
+            else if (code == "DOWNLOAD_FAILED")
+            { message = "The host download failed (DOWNLOAD_FAILED). Try another provider or mirror."; alternate = true; }
+            else if (code == "DOWNLOAD_SERVER_ERROR")
+                message = "TorBox's download server reported DOWNLOAD_SERVER_ERROR. Wait before retrying.";
             else if (code == "AUTH_ERROR")
-                message = "Token verification is temporarily unavailable at TorBox. Your saved key was kept; retry shortly.";
+                message = "Token verification is temporarily unavailable at TorBox (AUTH_ERROR). Your saved key was kept; retry shortly.";
             else if (code == "BAD_TOKEN" || code == "INVALID_TOKEN")
                 message = "Your API key was rejected. Reconnect in Connections.";
             else if (code == "NO_AUTH")
@@ -131,12 +151,47 @@ namespace Orbis
             { message = "TorBox reports this file is offline. Choose another mirror."; alternate = true; }
             else if (code == "RATE_LIMITED" || code == "TOO_MANY_REQUESTS")
                 message = "Too many requests. Wait before retrying.";
+            else if (provider == "TorBox" && (code == "DATABASE_ERROR" || code == "UNKNOWN_ERROR" ||
+                code == "NO_SERVERS_AVAILABLE_ERROR" || code == "REDIRECT_ERROR"))
+                message = "TorBox could not prepare the link right now (" + code + "). Retrying shortly.";
             // Never include the raw provider body: it can echo a signed URL or token.
-            return new DebridResolutionError(provider, HostName(url), message, alternate, code,
-                !string.IsNullOrEmpty(code) || number != 0) {
-                IsRateLimited = (provider == "Real-Debrid" && (number == 5 || number == 34)) ||
-                    code == "rate_limit_reached" || code == "RATE_LIMITED" || code == "TOO_MANY_REQUESTS" ||
-                    code == "API_RATE_LIMIT" || code == "MAINTENANCE"
+            string providerCode = provider == "Real-Debrid" && number != 0
+                ? number.ToString(System.Globalization.CultureInfo.InvariantCulture) : code;
+            bool rateLimited = (provider == "Real-Debrid" && (number == 5 || number == 34)) ||
+                code == "rate_limit_reached" || code == "RATE_LIMITED" || code == "TOO_MANY_REQUESTS" ||
+                code == "API_RATE_LIMIT" || code == "MAINTENANCE" ||
+                provider == "AllDebrid" && (code == "LINK_HOST_LIMIT_REACHED" || code == "LINK_TOO_MANY_DOWNLOADS" || code == "LINK_HOST_FULL") ||
+                provider == "TorBox" && (code == "ACTIVE_LIMIT" || code == "COOLDOWN_LIMIT");
+            bool transient = provider == "Real-Debrid" && (number == -1 || number == 6 || number == 25) ||
+                provider == "AllDebrid" && code == "MAINTENANCE" ||
+                provider == "Premiumize" && (code == "service_down" || code == "link_generation_failed" ||
+                    code == "transient_error" || code == "unknown_error" || code == "rate_limit_reached") ||
+                // TorBox's own server-side failures clear on a later request; they
+                // are not a verdict on the link or the account.
+                provider == "TorBox" && (code == "AUTH_ERROR" || code == "DOWNLOAD_SERVER_ERROR" ||
+                    code == "DATABASE_ERROR" || code == "UNKNOWN_ERROR" ||
+                    code == "NO_SERVERS_AVAILABLE_ERROR" || code == "REDIRECT_ERROR");
+            bool needsAction = provider == "Premiumize" &&
+                    (code == "semi_permanent_error" || code == "authentication_failed" || code == "permission_denied" ||
+                        code == "service_limit_reached" || code == "account_limit_reached") ||
+                provider == "Real-Debrid" &&
+                    (number == 8 || number == 9 || number == 12 || number == 13 || number == 14 || number == 15 ||
+                        number == 18 || number == 20 || number == 21 || number == 22 || number == 23 || number == 36) ||
+                provider == "AllDebrid" &&
+                    (code == "AUTH_BAD_APIKEY" || code == "AUTH_MISSING_APIKEY" || code == "AUTH_BLOCKED" ||
+                        code == "AUTH_USER_BANNED" || code == "ACCOUNT_INVALID" || code == "MUST_BE_PREMIUM" ||
+                        code == "FREE_TRIAL_LIMIT_REACHED" || code == "NO_SERVER") ||
+                provider == "TorBox" &&
+                    (code == "BAD_TOKEN" || code == "INVALID_TOKEN" || code == "NO_AUTH" ||
+                        code == "PLAN_RESTRICTED_FEATURE" || code == "PLAN_RESTRICTED" || code == "NO_PREMIUM" ||
+                        code == "MONTHLY_LIMIT");
+            bool canTryProvider = alternate || (transient && !(provider == "TorBox" && code == "DOWNLOAD_SERVER_ERROR")) ||
+                rateLimited || needsAction;
+            return new DebridResolutionError(provider, HostName(url), message, alternate, providerCode,
+                canTryProvider) {
+                IsRateLimited = rateLimited,
+                IsTransient = transient || rateLimited,
+                NeedsAction = needsAction
             };
         }
 
@@ -190,6 +245,9 @@ namespace Orbis
                 var rejection = FromResponse(provider, url, body);
                 rejection.IsRateLimited |= httpStatus == 429 || httpStatus == 503;
                 rejection.RetryAfterSeconds = retryAfter;
+                rejection.HttpStatusCode = httpStatus;
+                rejection.IsTransient |= httpStatus == 408 || httpStatus == 425 || httpStatus == 429 ||
+                    httpStatus == 500 || httpStatus == 502 || httpStatus == 503 || httpStatus == 504;
                 return rejection;
             }
             string diagnostic = web != null ? " " + web.Status + "." : "";
@@ -224,8 +282,11 @@ namespace Orbis
                 (tls ? "The secure connection to the provider failed." : "The service request failed.") +
                 diagnostic + " Check the connection and retry.", false, "", rejectedHandshake) {
                 RetryAfterSeconds = retryAfter,
+                HttpStatusCode = httpStatus,
                 IsRateLimited = httpStatus == 429 || httpStatus == 503 ||
-                    diagnostic.IndexOf("HTTP 429", StringComparison.Ordinal) >= 0 || diagnostic.IndexOf("HTTP 503", StringComparison.Ordinal) >= 0
+                    diagnostic.IndexOf("HTTP 429", StringComparison.Ordinal) >= 0 || diagnostic.IndexOf("HTTP 503", StringComparison.Ordinal) >= 0,
+                IsTransient = httpStatus == 408 || httpStatus == 425 || httpStatus == 429 || httpStatus == 500 ||
+                    httpStatus == 502 || httpStatus == 503 || httpStatus == 504
             };
         }
     }
