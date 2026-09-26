@@ -1846,6 +1846,14 @@ namespace Orbis
             WriteControl(id, "cancel");
         }
 
+        /// <summary>MarkFailed for a caller that could not send it at once: the cancel is
+        /// written only while publishIfCurrent confirms (under the caller's own lock) that
+        /// the queue row still wants it, so a later release or resume is never replaced.</summary>
+        public static bool MarkFailedIfCurrent(string id, Func<Action, bool> publishIfCurrent)
+        {
+            return WriteControl(id, "cancel", -1, null, false, publishIfCurrent);
+        }
+
         public static bool TryCancel(string id, out string error)
         {
             bool written = WriteControl(id, "cancel");

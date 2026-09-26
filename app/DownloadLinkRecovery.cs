@@ -7,13 +7,21 @@ namespace Orbis
     internal static class DownloadLinkRecovery
     {
         internal const int MaximumRenewals = 3;
+        // A dead link that cannot be renewed (a direct link, or a link service that
+        // is unreachable because the console is offline) keeps its link and waits.
+        internal const int MaximumStallWaits = 30;
+        const int StallWaitMs = 30000;
         static readonly Regex HttpFailure = new Regex(
             @"\bHTTP(?:/\d(?:\.\d)?)?(?:\s+(?:status(?:\s+code)?\s*[:=]?\s*|error\s*[:=]?\s*)?|[:=]\s*)[\[(]?\s*(401|403|410)\b|\bremote server returned an error:\s*\((401|403|410)\)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        static readonly Regex BgftAuthorizationFailure = new Regex(
+            @"\bAPI=sceBgftServiceDownloadGetProgress\s+rc=0x00000000\s+error=0x80991401\b",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
         internal static bool IsExpired(string message)
         {
-            return !string.IsNullOrEmpty(message) && HttpFailure.IsMatch(message);
+            return !string.IsNullOrEmpty(message) &&
+                (HttpFailure.IsMatch(message) || BgftAuthorizationFailure.IsMatch(message));
         }
 
         internal static bool IsExpired(Exception error)
@@ -35,7 +43,7 @@ namespace Orbis
         {
             if (transfer == null || durableBytes == null) throw new ArgumentNullException();
             string url = initialUrl;
-            int renewals = 0;
+            int renewals = 0, stalls = 0;
             long episodeBytes = -1;
             for (;;)
             {
@@ -51,14 +59,31 @@ namespace Orbis
                 catch (Exception error)
                 {
                     CheckCanceled(canceled);
-                    if (!IsExpired(error) || renew == null || canRenew == null || !canRenew()) throw;
+                    bool unreachable = error is DownloadLinkUnreachableException;
+                    if (!unreachable && !IsExpired(error)) throw;
+                    bool renewable = renew != null && canRenew != null && canRenew();
                     long now = Math.Max(0, durableBytes());
-                    if (episodeBytes < 0 || now > episodeBytes) { episodeBytes = now; renewals = 0; }
-                    if (renewals >= MaximumRenewals) throw;
+                    if (episodeBytes < 0 || now > episodeBytes) { episodeBytes = now; renewals = 0; stalls = 0; }
+                    if (unreachable && !renewable)
+                    {
+                        if (++stalls > MaximumStallWaits) throw;
+                        (wait ?? Wait)(StallWaitMs, canceled);
+                        continue;
+                    }
+                    if (!renewable || renewals >= MaximumRenewals) throw;
                     if (renewing != null) renewing(renewals + 1);
                     if (renewals > 0) (wait ?? Wait)(1000 << (renewals - 1), canceled);
                     CheckCanceled(canceled);
-                    string fresh = renew();
+                    string fresh;
+                    try { fresh = renew(); }
+                    catch (Exception renewFailure) when (unreachable && !(renewFailure is OperationCanceledException))
+                    {
+                        // The link service is unreachable too (usually the console is
+                        // offline): keep the current link and wait for the network.
+                        if (++stalls > MaximumStallWaits) throw;
+                        (wait ?? Wait)(StallWaitMs, canceled);
+                        continue;
+                    }
                     CheckCanceled(canceled);
                     if (string.IsNullOrWhiteSpace(fresh))
                         throw new InvalidOperationException("Link service returned an empty download link");

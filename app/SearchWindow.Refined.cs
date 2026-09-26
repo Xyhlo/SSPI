@@ -271,14 +271,8 @@ namespace Orbis
                         TextPx(renderer, counterX, metricsY + 2, 19, counter, Muted);
                         if (_cfg.DownloadStatsMode != 1)
                         {
-                            string rate = item.State == DlState.Failed ? "Files kept for retry" : TransferRateLine(item);
+                            string rate = item.State == DlState.Failed ? "Files kept for retry" : TransferRateLine(item, _cfg.DownloadStatsMode);
                             if (item.ParkedForProvider) rate = "Preparing in TorBox";
-                            if (item.State == DlState.Downloading || Extracting(item))
-                            {
-                                string speed = item.BytesPerSec > 0 ? (item.BytesPerSec / 1000000.0).ToString("0.00") + " MB/s" : "Measuring speed…";
-                                string eta = item.EtaSeconds > 0 ? "ETA " + item.EtaSeconds / 60 + ":" + (item.EtaSeconds % 60).ToString("00") : "ETA —";
-                                rate = _cfg.DownloadStatsMode == 2 ? speed : _cfg.DownloadStatsMode == 3 ? eta : speed + "  ·  " + eta;
-                            }
                             int rateRight = counterX - 32;
                             int rateWidth = Math.Max(0, rateRight - (tx + 478));
                             int rateX = Math.Max(tx + 478, rateRight - UiFont.MeasurePx(21, rate));

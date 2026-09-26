@@ -74,13 +74,7 @@ namespace Orbis
         readonly List<DrawerRow> _drawerRows = new List<DrawerRow>();
         static string IncomingFileName(DlItem item, string name)
         {
-            string format = item.ContainerFormat ?? "";
-            if (string.IsNullOrEmpty(name)) name = (item.TitleId ?? "download") + ".bin";
-            string extension = System.IO.Path.GetExtension(name).ToLowerInvariant();
-            if (format == "rar" && (extension == ".rar" || (extension.Length == 4 && extension[1] == 'r' && char.IsDigit(extension[2]) && char.IsDigit(extension[3])))) return name;
-            if (format == "rar" || format == "zip" || format == "7z" || format == "pkg")
-                return System.IO.Path.ChangeExtension(name, "." + format);
-            return name;
+            return DownloadManager.IncomingContainerFileName(item, name);
         }
         void OpenDownloadDrawer(DownloadGroup group)
         {

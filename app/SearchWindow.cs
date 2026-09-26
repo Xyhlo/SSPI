@@ -795,6 +795,12 @@ namespace Orbis
                 Invalidated = true;
                 return;
             }
+            if (_softKbOpen)
+            {
+                HandleSoftKeyboard(button);
+                Invalidated = true;
+                return;
+            }
             if (button == DS4Button.SCE_PAD_BUTTON_OPTIONS)
             {
                 if (_settingsOpen) TryCloseSettings();
@@ -822,13 +828,6 @@ namespace Orbis
                     return;
                 }
                 HandleSettings(button);
-                Invalidated = true;
-                return;
-            }
-
-            if (_softKbOpen)
-            {
-                HandleSoftKeyboard(button);
                 Invalidated = true;
                 return;
             }
@@ -2669,16 +2668,22 @@ namespace Orbis
 
         void QueueRecommendedResolved(GameHit game, bool notify)
         {
-            int queued = QueueRecommendedCandidates(game, _linkCandidates);
-            if (queued <= 0)
+            // Enqueue can check a completed package already on disk (a whole-file SHA-256),
+            // so it runs on the queue action thread, never on the UI thread.
+            var candidates = new List<PackageCandidate>(_linkCandidates);
+            RunDownloadAction(() =>
             {
-                SetStatus("No recommended package is available");
-                if (notify) User.NotifyToast("No recommended packages");
-                return;
-            }
-            string suffix = RecommendedToastSuffix(queued);
-            SetStatus("Recommended queued · R1 Downloads");
-            if (notify) User.NotifyToast((game == null ? "Title" : game.Name) + " · " + suffix + " queued");
+                int queued = QueueRecommendedCandidates(game, candidates);
+                if (queued <= 0)
+                {
+                    SetStatus("No recommended package is available");
+                    if (notify) User.NotifyToast("No recommended packages");
+                    return;
+                }
+                string suffix = RecommendedToastSuffix(queued);
+                SetStatus("Recommended queued · R1 Downloads");
+                if (notify) User.NotifyToast((game == null ? "Title" : game.Name) + " · " + suffix + " queued");
+            });
         }
 
         int QueueRecommendedCandidates(GameHit game, IList<PackageCandidate> candidates)
@@ -2984,6 +2989,21 @@ namespace Orbis
         void PrepareInstall(DlItem item, bool uninstallFirst)
         {
             if (item == null || string.IsNullOrEmpty(item.DestPath)) return;
+            PkgContentKind requestedContentKind = PkgValidator.RequestedKind(item.Kind);
+            if (requestedContentKind == PkgContentKind.SystemTheme ||
+                requestedContentKind == PkgContentKind.SystemThemeLicense)
+            {
+                if (uninstallFirst)
+                {
+                    SetStatus(_cfg.UseBgftDirect
+                        ? "Force reinstall requires In-app mode in General settings"
+                        : "Force reinstall is only available for base games");
+                    return;
+                }
+                _dlMgr.QueueLocalInstall(item.Id);
+                SetStatus("Queued for verified theme installation · R1 Downloads");
+                return;
+            }
             if (_cfg.UseBgftDirect)
             {
                 if (uninstallFirst) { SetStatus("Force reinstall requires In-app mode in General settings"); return; }
@@ -3002,8 +3022,8 @@ namespace Orbis
                 SetStatus(missing + " — remove row or re-download");
                 return;
             }
-            if (PkgValidator.RequestedKind(item.Kind) == PkgContentKind.Patch)
-            { _dlMgr.QueueLocalInstall(item.Id); SetStatus("Verifying update before BGFT installation"); return; }
+            if (!uninstallFirst && PkgInstaller.UseLoopbackInstall(requestedContentKind, item.DestPath))
+            { _dlMgr.QueueLocalInstall(item.Id); SetStatus("Queued for verified package installation"); return; }
             string exp = item.TitleId;
             if (_dlMgr.HasPendingInstall(exp))
             {
@@ -3042,8 +3062,20 @@ namespace Orbis
                         packageKind = PkgContentKind.Unknown;
                     var outcome = PkgInstaller.InstallLocal(path, exp, requestedKind,
                         out tid, out err, out taskId, uninstallFirst);
+                    if (outcome != InstallOutcome.Started && taskId >= 0)
+                    {
+                        _dlMgr.TrackLocalInstallTask(id, installAttempt, taskId);
+                        _dlMgr.MarkInstallAccepted(id, "PS4 registration is unconfirmed; task and PKG retained: " + Clip(err, 110),
+                            taskId, installAttempt);
+                        SetStatus("PS4 registration is unconfirmed; task and PKG retained");
+                        return;
+                    }
                     switch (outcome)
                     {
+                        case InstallOutcome.QueueRequired:
+                            if (_dlMgr.QueuePreparedLocalInstall(id, installAttempt))
+                                SetStatus("Queued for verified package installation");
+                            break;
                         case InstallOutcome.Started:
                             if (taskId < 0)
                             {
