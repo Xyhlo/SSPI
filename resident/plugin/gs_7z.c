@@ -33,6 +33,7 @@ static int64_t gs_storage_available_bytes(const char *path) { (void)path; return
 
 #define SEVEN_MEMORY_LIMIT (128U * 1024U * 1024U)
 #define SEVEN_EXPANDED_LIMIT (512ULL * 1024ULL * 1024ULL * 1024ULL)
+#define SEVEN_PREFLIGHT_READ_LIMIT (64LL * 1024 * 1024)
 typedef union { size_t size; long double alignment; } SevenAllocation;
 static size_t memory_used, memory_peak;
 static int memory_exhausted;
@@ -98,7 +99,7 @@ size_t gs_7z_memory_peak(void) { return memory_peak; }
 
 typedef struct {
     FILE *input;
-    int64_t size, processed;
+    int64_t size, processed, read_bytes, read_limit;
     int canceled;
     GsArchiveProgress progress;
     unsigned char buffer[128 * 1024];
@@ -112,9 +113,20 @@ static la_ssize_t seven_read(struct archive *archive, void *opaque, const void *
 {
     SevenInput *input = opaque; (void)archive;
     if (seven_canceled(input)) return -1;
+    if (input->read_limit && input->read_bytes >= input->read_limit) return -1;
     *buffer = input->buffer;
     size_t count = fread(input->buffer, 1, sizeof(input->buffer), input->input);
+    input->read_bytes += (int64_t)count;
     return ferror(input->input) ? -1 : (la_ssize_t)count;
+}
+/* The first failed output write, flush, close or rename decides the result: the
+ * file-size limit (EFBIG; FAT32 stops at 4 GiB) is 3019, a full drive 3007 and
+ * any other write error 3011. None of them means the archive is invalid. */
+static int seven_write_failure(int *write_error, int error)
+{
+    if (!*write_error) *write_error = error ? error : EIO;
+    int cause = gs_archive_write_cause(*write_error);
+    return cause == GS_ARCHIVE_WRITE_TOO_LARGE ? -3019 : cause == GS_ARCHIVE_WRITE_NO_SPACE ? -3007 : -3011;
 }
 static la_int64_t seven_seek(struct archive *archive, void *opaque, la_int64_t offset, int whence)
 {
@@ -136,6 +148,69 @@ static int seven_name(const char *name)
         part = p + 1;
     }
 }
+/* A metadata pass sums every declared PKG size, so an archive whose packages
+ * do not all fit is refused before its first PKG is written. Listing does not
+ * decode entry data: libarchive's 7z reader only records skipped bytes until
+ * data is read, so the pass reads the archive header whatever the expanded
+ * size. A symbolic-link entry makes the reader decode data; the pass stops
+ * after 64 MiB of input and the per-package check still applies. */
+static int seven_preflight_pkg_space(const char *first, const char *destination,
+    GsArchiveProgress progress)
+{
+    SevenInput input = {0};
+    struct archive *archive = NULL;
+    int fd = -1, result = 0, complete = 0;
+    uint64_t packages = 0;
+    fd = open(first, O_RDONLY | O_NOFOLLOW | SEVEN_BINARY);
+    if (fd < 0) goto done;
+    input.input = fdopen(fd, "rb");
+    if (!input.input) { close(fd); fd = -1; goto done; }
+    fd = -1;
+    input.progress = progress;
+    input.read_limit = SEVEN_PREFLIGHT_READ_LIMIT;
+    if (seven_seek_file(input.input, 0, SEEK_END) ||
+        (input.size = seven_tell_file(input.input)) < 32 ||
+        seven_seek_file(input.input, 0, SEEK_SET)) goto done;
+    archive = archive_read_new();
+    if (!archive || archive_read_support_filter_none(archive) != ARCHIVE_OK ||
+        archive_read_support_format_7zip(archive) != ARCHIVE_OK ||
+        archive_read_set_seek_callback(archive, seven_seek) != ARCHIVE_OK ||
+        archive_read_open2(archive, &input, NULL, seven_read, NULL, NULL) != ARCHIVE_OK)
+        goto done;
+    for (;;) {
+        if (seven_canceled(&input)) { result = -3008; goto done; }
+        struct archive_entry *entry = NULL;
+        int status = archive_read_next_header(archive, &entry);
+        if (status == ARCHIVE_EOF) { complete = 1; break; }
+        if (status != ARCHIVE_OK || archive_entry_is_encrypted(entry) ||
+            archive_read_has_encrypted_entries(archive) > 0 ||
+            !archive_entry_size_is_set(entry) || archive_entry_size(entry) < 0)
+            goto done;
+        uint64_t size = (uint64_t)archive_entry_size(entry);
+        const char *name = archive_entry_pathname_utf8(entry);
+        if (!name) name = archive_entry_pathname(entry);
+        size_t length = name ? strlen(name) : 0;
+        if (archive_entry_filetype(entry) == AE_IFREG && length >= 4 &&
+            name[length - 4] == '.' &&
+            (name[length - 3] == 'p' || name[length - 3] == 'P') &&
+            (name[length - 2] == 'k' || name[length - 2] == 'K') &&
+            (name[length - 1] == 'g' || name[length - 1] == 'G')) {
+            if (size > UINT64_MAX - packages) goto done;
+            packages += size;
+        }
+        if (archive_read_data_skip(archive) != ARCHIVE_OK) goto done;
+    }
+    if (complete) {
+        int64_t available = gs_storage_available_bytes(destination);
+        result = available < 0 || packages > UINT64_MAX - 64ULL * 1024 * 1024 ||
+            (uint64_t)available < packages + 64ULL * 1024 * 1024 ? -3007 : 1;
+    }
+done:
+    if (archive) archive_read_free(archive);
+    if (input.input) fclose(input.input);
+    if (fd >= 0) close(fd);
+    return result;
+}
 static void seven_error(int code, const char *detail)
 {
     const char *message = detail;
@@ -146,7 +221,12 @@ static void seven_error(int code, const char *detail)
             case 3007: message = "Not enough free space for the extracted package; original retained"; break;
             case 3008: message = "7z extraction canceled; original retained"; break;
             case 3009: message = "7z output already exists or cannot be created; original retained"; break;
+            case 3011: message = "7z output could not be written to the staging drive; original retained. Check free space and that the drive is connected, then retry"; break;
+            case 3019: message = "7z output is larger than the staging drive can store in one file (FAT32 limit: 4 GiB); original retained. Use an exFAT-formatted drive and retry"; break;
             case 3012: message = "7z archive contains no PKG files"; break;
+            case 3016: message = "7z archive holds an extracted game folder (eboot.bin/sce_sys), not an installable PKG; choose another mirror"; break;
+            case 3017: message = "7z archive holds another archive instead of a PKG; extract it on a computer or choose another mirror"; break;
+            case 3018: message = "7z archive holds split PKG pieces that must be joined first; choose another mirror"; break;
             default: message = "7z extraction failed; archive or compression method is invalid or unsupported"; break;
         }
     }
@@ -164,10 +244,14 @@ static int seven_extract(const char *first, const char *destination,
         return -3001;
     }
     memory_used = memory_peak = 0; memory_exhausted = 0; last_error[0] = 0;
-    int result = -3002, count = 0, entries = 0, owned = 0, reserved = 0;
+    int result = -3002, count = 0, entries = 0, owned = 0, reserved = 0, write_error = 0;
     char partial[1100] = {0}; FILE *output = NULL;
     SevenInput *input = NULL; unsigned char *buffer = NULL;
-    struct archive *archive = NULL; char **seen = NULL; uint64_t expanded = 0;
+    struct archive *archive = NULL; char **seen = NULL; uint64_t expanded = 0; unsigned content_hints = 0;
+    if (destination) {
+        int preflight = seven_preflight_pkg_space(first, destination, progress);
+        if (preflight < 0) { result = preflight; goto done; }
+    }
     input = gs_7z_calloc(1, sizeof(*input)); buffer = gs_7z_malloc(128 * 1024);
     if (!input || !buffer) { result = -3006; goto done; }
     input->progress = progress;
@@ -186,7 +270,7 @@ static int seven_extract(const char *first, const char *destination,
         struct archive_entry *entry = NULL;
         if (seven_canceled(input)) { result = -3008; goto done; }
         int status = archive_read_next_header(archive, &entry);
-        if (status == ARCHIVE_EOF) { result = count ? count : -3012; break; }
+        if (status == ARCHIVE_EOF) { result = count ? count : -(3012 + gs_archive_no_pkg_offset(content_hints)); break; }
         if (status != ARCHIVE_OK) { result = -3010; goto done; }
         if (archive_entry_is_encrypted(entry) || archive_read_has_encrypted_entries(archive) > 0) { result = -3005; goto done; }
         const char *name = archive_entry_pathname_utf8(entry);
@@ -202,6 +286,7 @@ static int seven_extract(const char *first, const char *destination,
         for (int i = 0; i < entries; i++) if (!strcmp(seen[i], key)) { gs_7z_free(key); result = -3004; goto done; }
         seen[entries++] = key;
         size_t length = strlen(key); int package = type == AE_IFREG && length >= 4 && !strcmp(key + length - 4, ".pkg");
+        if (type == AE_IFREG) content_hints |= gs_archive_entry_hint(key, length);
         if (package) {
             if (count >= capacity || count >= 256 || expected < 4) { result = -3004; goto done; }
             if (!destination) {
@@ -237,14 +322,19 @@ static int seven_extract(const char *first, const char *destination,
                 size_t n = sizeof(magic) - (size_t)written; if (n > (size_t)bytes) n = (size_t)bytes;
                 memcpy(magic + written, buffer, n);
             }
-            if (output && fwrite(buffer, 1, (size_t)bytes, output) != (size_t)bytes) { result = -3011; goto done; }
+            if (output) {
+                errno = 0;
+                if (fwrite(buffer, 1, (size_t)bytes, output) != (size_t)bytes) { result = seven_write_failure(&write_error, errno); goto done; }
+            }
             written += (uint64_t)bytes; input->processed += bytes;
         }
         if (written != expected || (package && memcmp(magic, "\x7f" "CNT", 4))) { result = -3010; goto done; }
         if (output) {
-            if (fflush(output) || fsync(fileno(output))) { result = -3011; goto done; }
-            int closed = fclose(output); output = NULL;
-            if (closed) { result = -3011; goto done; }
+            errno = 0;
+            if (fflush(output) || fsync(fileno(output))) { result = seven_write_failure(&write_error, errno); goto done; }
+            errno = 0;
+            int closed = fclose(output), close_error = errno; output = NULL;
+            if (closed) { result = seven_write_failure(&write_error, close_error); goto done; }
             fd = open(packages[count].path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | SEVEN_BINARY, 0600);
             if (fd < 0) { result = -3009; goto done; }
             close(fd); reserved = 1;
@@ -252,7 +342,8 @@ static int seven_extract(const char *first, const char *destination,
             /* Windows rename does not replace even our exclusive placeholder. */
             unlink(packages[count].path);
 #endif
-            if (rename(partial, packages[count].path)) { result = -3011; goto done; }
+            errno = 0;
+            if (rename(partial, packages[count].path)) { result = seven_write_failure(&write_error, errno); goto done; }
             reserved = 0; owned = 0; partial[0] = 0; packages[count++].size = (int64_t)written;
         }
     }

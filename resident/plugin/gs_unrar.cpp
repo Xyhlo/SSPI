@@ -7,9 +7,12 @@
 #include <wchar.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include "../native/storage_space.h"
+#include <new>
 #include <set>
 #include <string>
 #include "../../SDK/vendor/unrar/dll.hpp"
@@ -19,9 +22,34 @@
 #endif
 
 static const uint64_t maximum_expanded_bytes = 512ULL * 1024 * 1024 * 1024;
+static uint64_t rar_now_us(void)
+{
+#ifdef GS_RAR_PS4
+    return sceKernelGetProcessTime();
+#else
+    clock_t ticks = clock();
+    return ticks < 0 ? 0 : (uint64_t)ticks * 1000000ULL / CLOCKS_PER_SEC;
+#endif
+}
+
+static uint32_t rar_elapsed_ms(uint64_t elapsed_us)
+{
+    uint64_t elapsed_ms = elapsed_us / 1000;
+    return elapsed_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_ms;
+}
+
 // UnRAR's CRC lookup tables are populated by a C++ module constructor.
 extern unsigned int CRC32(unsigned int, const void *, size_t);
 static int extraction_busy;
+// OpenOrbis libc's lstat64 delegates to an unimplemented fstatat64 on PS4.
+// Check for absence through the same open path used for staging, without
+// following links. Any error except ENOENT must fail closed before rename.
+static bool rar_output_absent(const char *path)
+{
+    int descriptor = ::open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK, 0);
+    if (descriptor >= 0) { close(descriptor); return false; }
+    return errno == ENOENT;
+}
 struct ExtractionLease {
     bool held;
     ExtractionLease() : held(__sync_lock_test_and_set(&extraction_busy, 1) == 0) {}
@@ -72,11 +100,33 @@ struct Extraction {
     GsArchiveDiagnostic diagnostic;
     uint64_t opening_since;
     bool opening, open_timed_out;
-    uint64_t total;
+    uint64_t total, package_total;
     int volume_index;
+    unsigned named_packages;
+    bool sniff, sniff_decided, sniff_found;
+    unsigned char signature[4];
+    unsigned signature_bytes;
+    int sniff_error;
+    const char *sniff_destination, *sniff_output;
+    const char *sniff_package_path;
+    uint64_t sniff_size;
+    bool *sniff_output_owned;
+    uint64_t process_us, output_write_us, output_sync_us;
+    unsigned content_hints;
+    int write_error;
 };
 
 static Extraction *active_extraction;
+
+// An output write, flush or close failed. Keep the first errno and report the
+// file-size limit (EFBIG; FAT32 stops at 4 GiB) as 1009, anything else as a
+// write error (19), instead of the decoder's generic ERAR_UNKNOWN. Inside the
+// data callback the code goes to sniff_error, which overrides RARProcessFile's result.
+static int rar_write_failure(Extraction *ctx, int error)
+{
+    if (!ctx->write_error) ctx->write_error = error ? error : EIO;
+    return gs_archive_write_cause(ctx->write_error) == GS_ARCHIVE_WRITE_TOO_LARGE ? 1009 : ERAR_EWRITE;
+}
 
 extern "C" int gs_rar_input_allowed(const char *path)
 {
@@ -86,12 +136,35 @@ extern "C" int gs_rar_input_allowed(const char *path)
     return 0;
 }
 
+// Opening and the header scan read every volume, so the budget grows with the
+// set: 30 s plus 2 s per volume.
+static uint64_t rar_open_budget_us(int volume_count)
+{
+    return 30000000ULL + 2000000ULL * static_cast<uint64_t>(volume_count > 0 ? volume_count : 0);
+}
+
+// The job's progress callback blocks while the job is paused. Time spent in it
+// does not count against the opening budget.
+static bool rar_progress_stopped(Extraction *ctx)
+{
+    if (!ctx->progress) return false;
+#ifdef GS_RAR_PS4
+    uint64_t before = sceKernelGetProcessTime();
+#endif
+    bool stopped = ctx->progress(ctx->processed, ctx->total) != 0;
+#ifdef GS_RAR_PS4
+    uint64_t after = sceKernelGetProcessTime();
+    if (ctx->opening && after > before) ctx->opening_since += after - before;
+#endif
+    return stopped;
+}
+
 extern "C" int gs_rar_io_poll(const char *stage)
 {
     Extraction *ctx = active_extraction;
     if (!ctx) return -1;
 #ifdef GS_RAR_PS4
-    if (ctx->opening && sceKernelGetProcessTime() - ctx->opening_since > 30000000) {
+    if (ctx->opening && sceKernelGetProcessTime() - ctx->opening_since > rar_open_budget_us(ctx->volume_count)) {
         ctx->open_timed_out = true;
         return -1;
     }
@@ -99,7 +172,7 @@ extern "C" int gs_rar_io_poll(const char *stage)
     if (!strcmp(stage, "file-open-before") || !strcmp(stage, "file-open-after") ||
         (ctx->opening && !strncmp(stage, "unicode-", 8)))
         rar_checkpoint(ctx->diagnostic, stage, 0, 0);
-    return ctx->progress && ctx->progress(ctx->processed, ctx->total) ? -1 : 0;
+    return rar_progress_stopped(ctx) ? -1 : 0;
 }
 
 struct ActiveExtraction {
@@ -164,7 +237,7 @@ static bool encode_utf8(const wchar_t *input, char *output, size_t capacity)
 static int callback(UINT message, LPARAM opaque, LPARAM p1, LPARAM p2)
 {
     Extraction *ctx = reinterpret_cast<Extraction *>(opaque);
-    if (ctx->progress && ctx->progress(ctx->processed, ctx->total)) return -1;
+    if (rar_progress_stopped(ctx)) return -1;
     if (message == UCM_NEEDPASSWORD || message == UCM_NEEDPASSWORDW) {
         if (!p1 || p2 <= 0 || !ctx->password || !*ctx->password || ++ctx->password_requests > 4) return -1;
         size_t length = message == UCM_NEEDPASSWORDW ? wcslen(ctx->wide_password) : strlen(ctx->password);
@@ -202,10 +275,51 @@ static int callback(UINT message, LPARAM opaque, LPARAM p1, LPARAM p2)
     if (message == UCM_PROCESSDATA) {
         if (p2 < 0 || static_cast<uint64_t>(p2) > maximum_expanded_bytes - ctx->processed) return -1;
         ctx->processed += p2;
+        const unsigned char *data = reinterpret_cast<const unsigned char *>(p1);
+        size_t length = static_cast<size_t>(p2);
+        if (ctx->sniff && !ctx->sniff_decided) {
+            size_t prefix = 4 - ctx->signature_bytes;
+            if (prefix > length) prefix = length;
+            if (prefix) memcpy(ctx->signature + ctx->signature_bytes, data, prefix);
+            ctx->signature_bytes += static_cast<unsigned>(prefix);
+            data += prefix;
+            length -= prefix;
+            if (ctx->signature_bytes < 4) return 1;
+            ctx->sniff_decided = true;
+            if (memcmp(ctx->signature, "\x7f\x43\x4e\x54", 4)) return 1;
+            ctx->sniff_found = true;
+            if (!ctx->sniff_package_path) { ctx->sniff_error = ERAR_BAD_DATA; return -1; }
+            int64_t available = gs_storage_available_bytes(ctx->sniff_destination);
+            if (available < 0 || static_cast<uint64_t>(available) < ctx->sniff_size + 64 * 1024 * 1024)
+            { ctx->sniff_error = ERAR_EWRITE; return -1; }
+            if (!rar_output_absent(ctx->sniff_package_path))
+            { ctx->sniff_error = ERAR_ECREATE; return -1; }
+            int descriptor = ::open(ctx->sniff_output, O_WRONLY | O_CREAT | O_EXCL, 0600);
+            if (descriptor < 0) { ctx->sniff_error = ERAR_ECREATE; return -1; }
+            *ctx->sniff_output_owned = true;
+            ctx->output = fdopen(descriptor, "wb");
+            if (!ctx->output) { close(descriptor); ctx->sniff_error = ERAR_ECREATE; return -1; }
+            setvbuf(ctx->output, NULL, _IOFBF, 1024 * 1024);
+            ctx->written = 0;
+            ctx->expected = ctx->sniff_size;
+            uint64_t write_started = rar_now_us();
+            errno = 0;
+            if (fwrite(ctx->signature, 1, 4, ctx->output) != 4)
+            { ctx->sniff_error = rar_write_failure(ctx, errno); return -1; }
+            uint64_t write_finished = rar_now_us();
+            if (write_finished >= write_started) ctx->output_write_us += write_finished - write_started;
+            ctx->written = 4;
+        }
         if (ctx->output) {
-            if (static_cast<uint64_t>(p2) > ctx->expected - ctx->written ||
-                fwrite(reinterpret_cast<void *>(p1), 1, p2, ctx->output) != static_cast<size_t>(p2)) return -1;
-            ctx->written += p2;
+            if (length > ctx->expected - ctx->written) return -1;
+            uint64_t write_started = rar_now_us();
+            errno = 0;
+            size_t written = fwrite(data, 1, length, ctx->output);
+            int write_errno = errno;
+            uint64_t write_finished = rar_now_us();
+            if (write_finished >= write_started) ctx->output_write_us += write_finished - write_started;
+            if (written != length) { ctx->sniff_error = rar_write_failure(ctx, write_errno); return -1; }
+            ctx->written += length;
         }
     }
     return 1;
@@ -224,8 +338,23 @@ static bool pkg_name(const Character *name, size_t capacity)
         (name[length - 1] == 'g' || name[length - 1] == 'G');
 }
 
+// Entry names can be wide or locale-narrow. Classification only needs ASCII
+// suffixes, so other characters become '?'.
+template <typename Character>
+static unsigned entry_hint(const Character *name, size_t capacity)
+{
+    char narrow[1025]; size_t length = 0;
+    while (length < capacity && length < sizeof(narrow) - 1 && name[length]) {
+        unsigned value = static_cast<unsigned>(name[length]);
+        narrow[length++] = value < 128 ? static_cast<char>(value) : '?';
+    }
+    narrow[length] = 0;
+    return gs_archive_entry_hint(narrow, length);
+}
+
 static int measure_archive(RAROpenArchiveDataEx open, Extraction &ctx)
 {
+    uint64_t started = rar_now_us();
     open.OpenMode = RAR_OM_LIST;
     HANDLE archive = RAROpenArchiveEx(&open);
     int rc = open.OpenResult ? static_cast<int>(open.OpenResult) : archive ? 0 : ERAR_BAD_ARCHIVE;
@@ -234,32 +363,52 @@ static int measure_archive(RAROpenArchiveDataEx open, Extraction &ctx)
      * BrokenHeader before it examines FailedHeaderDecryption. Record the open
      * result so a console log can tell them apart without guessing. */
     if (open.OpenResult) rar_checkpoint(ctx.diagnostic, "open-failed", 0, static_cast<int>(open.OpenResult));
-    uint64_t total = 0;
+    uint64_t total = 0, package_total = 0;
     unsigned entries = 0, packages = 0;
-    while (archive && !rc) {
-        RARHeaderDataEx header = {};
-        ctx.password_requests = 0;
-        if (gs_rar_io_poll("scan")) { rc = ctx.open_timed_out ? 1001 : ERAR_UNKNOWN; break; }
-        rc = RARReadHeaderEx(archive, &header);
-        if (rc == ERAR_END_ARCHIVE) { rc = 0; break; }
-        if (rc) break;
-        uint64_t size = (uint64_t(header.UnpSizeHigh) << 32) | header.UnpSize;
-        if (++entries > 4096 || size > maximum_expanded_bytes - total || header.DictSize > 256 * 1024)
-        { rc = ERAR_LARGE_DICT; break; }
-        if (!(header.Flags & RHDF_DIRECTORY)) {
-            total += size;
-            if (header.FileNameW[0] ? pkg_name(header.FileNameW, sizeof(header.FileNameW) / sizeof(wchar_t))
-                : pkg_name(header.FileName, sizeof(header.FileName))) packages++;
+    // RARReadHeaderEx catches only RAR_EXIT (RAROpenArchiveEx and RARProcessFile
+    // also catch std::bad_alloc). Contain any other exception here: close the
+    // archive and return an error instead of unwinding into the C caller, which
+    // would reach std::terminate inside the shell process.
+    try {
+        while (archive && !rc) {
+            RARHeaderDataEx header = {};
+            ctx.password_requests = 0;
+            if (gs_rar_io_poll("scan")) { rc = ctx.open_timed_out ? 1001 : ERAR_UNKNOWN; break; }
+            rc = RARReadHeaderEx(archive, &header);
+            if (rc == ERAR_END_ARCHIVE) { rc = 0; break; }
+            if (rc) break;
+            uint64_t size = (uint64_t(header.UnpSizeHigh) << 32) | header.UnpSize;
+            if (++entries > 4096 || size > maximum_expanded_bytes - total || header.DictSize > 256 * 1024)
+            { rc = ERAR_LARGE_DICT; break; }
+            if (!(header.Flags & RHDF_DIRECTORY)) {
+                total += size;
+                ctx.content_hints |= header.FileNameW[0] ? entry_hint(header.FileNameW, sizeof(header.FileNameW) / sizeof(wchar_t))
+                    : entry_hint(header.FileName, sizeof(header.FileName));
+                int is_package = header.FileNameW[0] ? pkg_name(header.FileNameW, sizeof(header.FileNameW) / sizeof(wchar_t))
+                    : pkg_name(header.FileName, sizeof(header.FileName));
+                if (is_package) {
+                    if (size > maximum_expanded_bytes - package_total) { rc = ERAR_LARGE_DICT; break; }
+                    package_total += size; packages++;
+                }
+            }
+            rc = RARProcessFile(archive, RAR_SKIP, NULL, NULL);
         }
-        rc = RARProcessFile(archive, RAR_SKIP, NULL, NULL);
+    } catch (const std::bad_alloc &) {
+        rc = ERAR_NO_MEMORY; rar_checkpoint(ctx.diagnostic, "exception", entries, rc);
+    } catch (...) {
+        rc = ERAR_UNKNOWN; rar_checkpoint(ctx.diagnostic, "exception", entries, rc);
     }
     if (archive) RARCloseArchive(archive);
-    if (!rc) ctx.total = total;
+    if (!rc) { ctx.total = total; ctx.package_total = package_total; ctx.named_packages = packages; }
     /* entry 0 with a failure means no file header was ever listed, so the
      * archive could not be opened or its first header block is broken. A
      * successful scan keeps entry 0 so the bounded entry trace is unaffected. */
     rar_checkpoint(ctx.diagnostic, "scan-complete", rc ? entries : 0, rc);
     if (ctx.diagnostic) ctx.diagnostic("scan-pkg-count", packages, rc, 0, 0, total);
+    if (ctx.diagnostic) {
+        uint64_t finished = rar_now_us();
+        ctx.diagnostic("scan-timing", entries, rc, 0, 0, finished >= started ? finished - started : 0);
+    }
     return rc;
 }
 
@@ -293,7 +442,7 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
     }
     rar_checkpoint(diagnostic, "runtime-ready", 0, 0);
     if (capacity > 256) capacity = 256;
-    Extraction ctx = { names, paths, volume_count, NULL, 0, 0, 0, progress, password ? password : "", {}, 0, diagnostic, 0, true, false };
+    Extraction ctx = { names, paths, volume_count, NULL, 0, 0, 0, progress, password ? password : "", {}, 0, diagnostic, 0, true, false, 0, 0, 0 };
     ActiveExtraction active(&ctx);
 #ifdef GS_RAR_PS4
     ctx.opening_since = sceKernelGetProcessTime();
@@ -307,6 +456,11 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
     open.Callback = callback; open.UserData = reinterpret_cast<LPARAM>(&ctx);
     int measured = measure_archive(open, ctx);
     if (measured) return -measured;
+    if (ctx.package_total) {
+        int64_t available = gs_storage_available_bytes(destination);
+        if (available < 0 || static_cast<uint64_t>(available) < ctx.package_total + 64 * 1024 * 1024)
+            return -ERAR_EWRITE;
+    }
     ctx.volume_index = 0;
     ctx.password_requests = 0;
     if (progress && progress(0, ctx.total)) return -ERAR_UNKNOWN;
@@ -376,17 +530,38 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
                 rc = ERAR_BAD_DATA; rar_checkpoint(diagnostic, "entry-duplicate-rejected", entries, rc, &header); break;
             }
             bool selected = !(header.Flags & RHDF_DIRECTORY) && key.size() >= 4 && key.compare(key.size() - 4, 4, L".pkg") == 0;
+            // If the listing had no .pkg names, inspect decoded entry signatures.
+            // Some sources store a PKG under an opaque filename. Nested paths are
+            // already accepted by the suffix check above; only the filename is new.
+            // Split PKG pieces (name.pkg.001, ...) are not packages on their own:
+            // the first piece carries the PKG signature, so never sniff them.
+            bool sniff = !selected && !ctx.named_packages && !(header.Flags & RHDF_DIRECTORY) && size >= 4 &&
+                !(ctx.content_hints & GS_ARCHIVE_HINT_SPLIT_PKG);
+            ctx.sniff = sniff;
+            ctx.sniff_decided = ctx.sniff_found = false;
+            ctx.signature_bytes = 0;
+            ctx.sniff_error = 0;
+            if (selected || sniff) {
+                if (selected && count >= capacity) { rc = ERAR_BAD_DATA; break; }
+                if (count < capacity) {
+                    int path_length = snprintf(packages[count].path, sizeof(packages[count].path), "%s/pkg-%03d.pkg", destination, count + 1);
+                    if (path_length < 0 || static_cast<size_t>(path_length) >= sizeof(packages[count].path)) { rc = ERAR_ECREATE; break; }
+                    snprintf(output, sizeof(output), "%s.part", packages[count].path);
+                }
+                if (sniff) {
+                    ctx.sniff_destination = destination;
+                    ctx.sniff_output = count < capacity ? output : NULL;
+                    ctx.sniff_package_path = count < capacity ? packages[count].path : NULL;
+                    ctx.sniff_size = size;
+                    ctx.sniff_output_owned = &output_owned;
+                }
+            }
             if (selected) {
-                if (count >= capacity) { rc = ERAR_BAD_DATA; break; }
                 int64_t available = gs_storage_available_bytes(destination);
                 if (available < 0 || static_cast<uint64_t>(available) < size + 64 * 1024 * 1024)
                 { rc = ERAR_EWRITE; break; }
-                int path_length = snprintf(packages[count].path, sizeof(packages[count].path), "%s/pkg-%03d.pkg", destination, count + 1);
-                if (path_length < 0 || static_cast<size_t>(path_length) >= sizeof(packages[count].path)) { rc = ERAR_ECREATE; break; }
                 packages[count].size = size;
-                snprintf(output, sizeof(output), "%s.part", packages[count].path);
-                struct stat existing;
-                if (!lstat(packages[count].path, &existing)) { rc = ERAR_ECREATE; break; }
+                if (!rar_output_absent(packages[count].path)) { rc = ERAR_ECREATE; break; }
                 int descriptor = ::open(output, O_WRONLY | O_CREAT | O_EXCL, 0600);
                 if (descriptor < 0) { rc = ERAR_ECREATE; break; }
                 output_owned = true;
@@ -401,20 +576,41 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
             // Non-PKG entries are consumed to preserve solid dictionaries without writing junk.
             ctx.password_requests = 0;
             rar_checkpoint(diagnostic, "process-before", entries, 0, &header);
+            uint64_t process_started = rar_now_us();
             rc = RARProcessFile(archive, RAR_TEST, NULL, NULL);
+            uint64_t process_finished = rar_now_us();
+            if (process_finished >= process_started) ctx.process_us += process_finished - process_started;
             rar_checkpoint(diagnostic, "process-after", entries, rc, &header);
+            if (ctx.sniff_error) rc = ctx.sniff_error;
+            if (sniff && ctx.signature_bytes == 4) {
+                const char *signature = ctx.sniff_found ? "entry-signature-pkg" :
+                    !memcmp(ctx.signature, "PK\x03\x04", 4) ? "entry-signature-zip" :
+                    !memcmp(ctx.signature, "Rar!", 4) ? "entry-signature-rar" :
+                    !memcmp(ctx.signature, "\x37\x7a\xbc\xaf", 4) ? "entry-signature-7z" :
+                    "entry-signature-other";
+                rar_checkpoint(diagnostic, signature, entries, 0, &header);
+                if (!memcmp(ctx.signature, "PK\x03\x04", 4) || !memcmp(ctx.signature, "Rar!", 4) ||
+                    !memcmp(ctx.signature, "\x37\x7a\xbc\xaf", 4)) ctx.content_hints |= GS_ARCHIVE_HINT_NESTED;
+            }
+            if (ctx.sniff_found && !rc) packages[count].size = size;
             if (ctx.output) {
-                if (fflush(ctx.output) || fsync(fileno(ctx.output))) rc = ERAR_EWRITE;
-                if (fclose(ctx.output)) rc = ERAR_EWRITE;
+                uint64_t sync_started = rar_now_us();
+                errno = 0;
+                if (fflush(ctx.output) || fsync(fileno(ctx.output))) rc = rar_write_failure(&ctx, errno);
+                errno = 0;
+                if (fclose(ctx.output)) rc = rar_write_failure(&ctx, errno);
+                uint64_t sync_finished = rar_now_us();
+                if (sync_finished >= sync_started) ctx.output_sync_us += sync_finished - sync_started;
                 ctx.output = NULL;
+                // The errno is the console evidence for a FAT32 limit (27, EFBIG) or a full drive (28).
+                if (ctx.write_error) rar_checkpoint(diagnostic, "write-failed", entries, ctx.write_error, &header);
                 if (!rc && ctx.written != ctx.expected) rc = ERAR_BAD_DATA;
                 if (!rc) {
                     unsigned char magic[4]; FILE *check = fopen(output, "rb");
                     if (!check || fread(magic, 1, 4, check) != 4 || memcmp(magic, "\x7f\x43\x4e\x54", 4)) rc = ERAR_BAD_DATA;
                     if (check) fclose(check);
                 }
-                struct stat existing;
-                if (!rc && (!lstat(packages[count].path, &existing) || rename(output, packages[count].path))) rc = ERAR_EWRITE;
+                if (!rc && (!rar_output_absent(packages[count].path) || rename(output, packages[count].path))) rc = ERAR_EWRITE;
                 if (!rc) { count++; output[0] = 0; output_owned = false; }
             }
             if (rc) break;
@@ -424,19 +620,29 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
     rar_checkpoint(diagnostic, "close-before", 0, 0);
     int close_result = RARCloseArchive(archive);
     rar_checkpoint(diagnostic, "close-after", 0, close_result);
-    if (!rc && count == 0) rc = 1002;
+    // No PKG: name the likely cause (extracted game folder, split PKG pieces or
+    // a nested archive) as 1006/1008/1007 instead of the generic 1002.
+    if (!rc && count == 0) rc = 1002 + gs_archive_no_pkg_offset(ctx.content_hints);
     if (rc) {
+        if (diagnostic) diagnostic("extract-timing", count, -rc, rar_elapsed_ms(ctx.output_write_us),
+            rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
         if (output_owned) unlink(output);
         for (int i = 0; i < count; i++) unlink(packages[i].path);
         return -rc;
     }
     if (ctx.processed != ctx.total) {
+        if (diagnostic) diagnostic("extract-timing", count, -ERAR_BAD_DATA, rar_elapsed_ms(ctx.output_write_us),
+            rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
         for (int i = 0; i < count; i++) unlink(packages[i].path);
         return -ERAR_BAD_DATA;
     }
     if (progress && progress(ctx.processed, ctx.total)) {
+        if (diagnostic) diagnostic("extract-timing", count, -ERAR_UNKNOWN, rar_elapsed_ms(ctx.output_write_us),
+            rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
         for (int i = 0; i < count; i++) unlink(packages[i].path);
         return -ERAR_UNKNOWN;
     }
+    if (diagnostic) diagnostic("extract-timing", count, rc, rar_elapsed_ms(ctx.output_write_us),
+        rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
     return count;
 }

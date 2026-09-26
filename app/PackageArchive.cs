@@ -126,7 +126,7 @@ namespace Orbis
                     if (!File.Exists(path)) throw new InvalidDataException("Missing archive volume " + (i + 1));
                     Marshal.WriteIntPtr(nativePaths, i * IntPtr.Size, ArchiveUtf8(path, allocations));
                     Marshal.WriteIntPtr(nativeNames, i * IntPtr.Size,
-                        ArchiveUtf8(volumeNames == null ? Path.GetFileName(path) : volumeNames[i], allocations));
+                        ArchiveUtf8(ArchiveVolumeSet.DecoderName(volumeNames == null ? Path.GetFileName(path) : volumeNames[i]), allocations));
                 }
                 const int stride = 1032;
                 IntPtr packages = Marshal.AllocHGlobal(MaximumPackageEntries * stride); allocations.Add(packages);
@@ -145,16 +145,26 @@ namespace Orbis
                         case 22: case 24: detail = "RAR password rejected; check the password supplied by the source"; break;
                         case 15: case 18: detail = "RAR volume could not be read; check that every volume finished downloading"; break;
                         case 11: case 25: detail = "RAR dictionary or expanded size exceeds the supported memory limit"; break;
-                        case 16: case 19: detail = "RAR output could not be written; check storage space and the staging drive"; break;
+                        // Same causes and wording as the background worker (gs_archive_job.inc).
+                        case 16: case 19: detail = "RAR output could not be created or written on the staging drive; check free space and that the drive is connected, then retry"; break;
+                        case 1009: detail = "RAR output is larger than the staging drive can store in one file (FAT32 limit: 4 GiB); use an exFAT-formatted drive and retry"; break;
                         // UnRAR reports a broken or undecodable header block, and a wrong RAR4
                         // header-decryption key, as ERAR_BAD_DATA (see dll.cpp:241, which tests
                         // BrokenHeader before FailedHeaderDecryption, and arcread.cpp:538, which
                         // sets BrokenHeader on a header CRC failure). The text names both
                         // possibilities; which one applies is decided by phase evidence, never by
                         // this wording.
-                        case 12: detail = "RAR header or data integrity check failed; the archive content is damaged or truncated, or its encrypted headers could not be unlocked"; break;
+                        case 12: detail = headerPhaseResult != 0 && !payloadStarted
+                            // Failed before any entry was decoded: encrypted headers with a
+                            // missing or wrong password look like this. Naming the password
+                            // lets the Downloads drawer offer "Enter archive password".
+                            ? "RAR headers could not be read: the archive password is missing or incorrect, or the first volume is damaged"
+                            : "RAR header or data integrity check failed; the archive content is damaged or truncated"; break;
                         case 1001: detail = "RAR header scan timed out"; break;
                         case 1002: detail = "RAR was read successfully but contains no PKG files; check that the source supplied a PS4 package archive"; break;
+                        case 1006: detail = "RAR holds an extracted game folder (eboot.bin/sce_sys), not an installable PKG. SSPI installs PKG files only; choose another mirror"; break;
+                        case 1007: detail = "RAR holds another archive instead of a PKG. Extract it on a computer or choose another mirror"; break;
+                        case 1008: detail = "RAR holds split PKG pieces that must be joined first; choose another mirror"; break;
                         case 1003: detail = "Another RAR extraction is still running; retry after it finishes"; break;
                         case 1005: detail = "RAR decoder initialization failed; restart SSPI after installing the updated package"; break;
                         default: detail = "RAR decoder could not read this archive"; break;
@@ -290,10 +300,128 @@ namespace Orbis
             throw new InvalidDataException("Not a PKG or archive");
         }
 
+        // Mirrors gs_archive_entry_hint in the native readers: name the likely
+        // reason an archive held no PKG instead of a generic failure, in the
+        // background worker's words (gs_archive_job.inc).
+        internal static string NoPackageMessage(string format, IEnumerable<string> entryNames)
+        {
+            bool dump = false, split = false, nested = false;
+            foreach (string raw in entryNames)
+            {
+                string name = (raw ?? "").Replace('\\', '/').ToLowerInvariant();
+                string leaf = name.Substring(name.LastIndexOf('/') + 1);
+                if (leaf == "eboot.bin" || name.EndsWith("sce_sys/param.sfo", StringComparison.Ordinal)) dump = true;
+                else if (IsSplitPackagePiece(leaf)) split = true;
+                else foreach (string suffix in new[] { ".rar", ".zip", ".7z", ".r00", ".z01", ".001" })
+                    if (name.EndsWith(suffix, StringComparison.Ordinal)) { nested = true; break; }
+            }
+            if (dump) return format + " holds an extracted game folder (eboot.bin/sce_sys), not an installable PKG. SSPI installs PKG files only; choose another mirror. Archive retained.";
+            if (split) return format + " holds split PKG pieces that must be joined first; choose another mirror. Archive retained.";
+            if (nested) return format + " holds another archive instead of a PKG. Extract it on a computer or choose another mirror. Archive retained.";
+            return format == "ZIP" ? ZipFailureMessage(2012) : "Archive contains no PKG files";
+        }
+
+        /// <summary>A split PKG piece ends in ".pkg." plus 1 to 6 digits (game.pkg.001), as in
+        /// gs_unrar.h. Sidecars such as game.pkg.md5 and archives such as game.pkg.rar are not.</summary>
+        internal static bool IsSplitPackagePiece(string leaf)
+        {
+            int dot = leaf.LastIndexOf('.');
+            int digits = dot < 0 ? 0 : leaf.Length - dot - 1;
+            if (dot < 4 || digits < 1 || digits > 6 || string.CompareOrdinal(leaf, dot - 4, ".pkg", 0, 4) != 0) return false;
+            for (int i = dot + 1; i < leaf.Length; i++) if (leaf[i] < '0' || leaf[i] > '9') return false;
+            return true;
+        }
+
+        /// <summary>The background worker's ZIP messages (gs_archive_job.inc) for the same
+        /// native codes, so In-app and background extraction name a cause in the same words.</summary>
+        internal static string ZipFailureMessage(int code)
+        {
+            string number = code.ToString(CultureInfo.InvariantCulture);
+            switch (code)
+            {
+                case 2001: return "Split ZIP sets are not supported; select one complete ZIP file. Archive retained.";
+                case 2003: case 2010: return "ZIP is incomplete or damaged (" + number + "); archive retained. Retry the download or choose another mirror.";
+                case 2005: return "ZIP uses encryption or a compression method SSPI cannot read; archive retained. Choose another mirror.";
+                case 2007: return "Not enough free space for the extracted package; archive retained. Free space on the staging drive and retry.";
+                case 2011: return "ZIP output could not be written to the staging drive; archive retained. Check free space and that the drive is connected, then retry.";
+                case 2012: return "ZIP was read successfully but contains no PKG files; archive retained. Check that the source supplied a PS4 package archive.";
+                case 2019: return "ZIP output is larger than the staging drive can store in one file (FAT32 limit: 4 GiB); archive retained. Use an exFAT-formatted drive and retry.";
+                default: return "ZIP extraction failed (" + number + "); check missing volumes, storage or archive integrity";
+            }
+        }
+
+        // Reader failures that are not cancellation or an input read error: the ZIP itself
+        // could not be parsed or decoded.
+        static bool IsZipReaderFailure(Exception error)
+        {
+            return !(error is OperationCanceledException) &&
+                !(error is IOException && !(error is EndOfStreamException));
+        }
+
+        static Exception ZipReaderFailure(Exception error, int damagedCode)
+        {
+            if (error is NotSupportedException || error is System.Security.Cryptography.CryptographicException)
+                return new InvalidDataException(ZipFailureMessage(2005), error);
+            return new InvalidDataException(ZipFailureMessage(damagedCode) + " (" + error.Message + ")", error);
+        }
+
+        static T OpenZip<T>(Func<T> open)
+        {
+            try { return open(); }
+            catch (Exception error) when (IsZipReaderFailure(error)) { throw ZipReaderFailure(error, 2003); }
+        }
+
+        // Directory reads can fail while enumerating; report them as a damaged ZIP (2003).
+        static IEnumerable<T> ZipDirectory<T>(IEnumerable<T> entries)
+        {
+            IEnumerator<T> cursor;
+            try { cursor = entries.GetEnumerator(); }
+            catch (Exception error) when (IsZipReaderFailure(error)) { throw ZipReaderFailure(error, 2003); }
+            using (cursor)
+                for (;;)
+                {
+                    bool more;
+                    try { more = cursor.MoveNext(); }
+                    catch (Exception error) when (IsZipReaderFailure(error)) { throw ZipReaderFailure(error, 2003); }
+                    if (!more) yield break;
+                    yield return cursor.Current;
+                }
+        }
+
+        static void RequireZipSpace(string destination, long required)
+        {
+            try { ArchiveStorage.RequireFreeSpace(destination, required); }
+            catch (IOException error) when (error.Message.StartsWith("Extraction needs ", StringComparison.Ordinal))
+            { throw new IOException(ZipFailureMessage(2007) + " (" + error.Message + ")", error); }
+        }
+
+        /// <summary>A failed output write is a storage failure, never a damaged archive: a full
+        /// drive (Win32 39 or 112) is 2007; a write that fails as the file passes 4 GiB - 1 byte,
+        /// the most FAT32 can store, is 2019 (the margin covers data the stream buffered before
+        /// this write); any other write error is 2011.</summary>
+        internal static IOException ZipWriteFailure(IOException error, long offset, long count)
+        {
+            const long buffered = 1024 * 1024;
+            int code = error.HResult & 0xFFFF;
+            if ((error.HResult & unchecked((int)0xFFFF0000)) == unchecked((int)0x80070000) && (code == 39 || code == 112))
+                return new IOException(ZipFailureMessage(2007), error);
+            if (offset - buffered <= uint.MaxValue && offset + count > uint.MaxValue)
+                return new IOException(ZipFailureMessage(2019), error);
+            return new IOException(ZipFailureMessage(2011) + " (" + error.Message + ")", error);
+        }
+
+        static void RequireZipPkgMagic(string path, string entryName)
+        {
+            try { RequirePkgMagic(path, entryName); }
+            catch (InvalidDataException error)
+            { throw new InvalidDataException(ZipFailureMessage(2010) + " (" + entryName + " is not a PKG)", error); }
+        }
+
         static List<PackageArchiveEntry> ReadZip(string archivePath, string destination,
             Func<bool> cancel = null, Action<long, long> progress = null)
         {
             var result = new List<PackageArchiveEntry>();
+            var entryNames = new List<string>();
             var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var created = new List<string>();
             long expanded = 0, total = 0, writtenTotal = 0;
@@ -301,20 +429,21 @@ namespace Orbis
             try
             {
                 using (var input = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                using (var archive = SharpCompress.Archives.Zip.ZipArchive.OpenArchive(input))
+                using (var archive = OpenZip(() => SharpCompress.Archives.Zip.ZipArchive.OpenArchive(input)))
                 {
                     int preflightEntries = 0;
-                    foreach (var item in archive.Entries)
+                    foreach (var item in ZipDirectory(archive.Entries))
                     {
                         CheckCancel(cancel);
                         if (++preflightEntries > MaximumArchiveEntries)
                             throw new InvalidDataException("Archive contains too many entries");
+                        if (!item.IsDirectory) entryNames.Add(item.Key ?? "");
                         if (!item.IsDirectory && (item.Key ?? "").EndsWith(".pkg", StringComparison.OrdinalIgnoreCase))
                             AddExpanded(ref total, item.Size);
                     }
-                    if (destination != null) ArchiveStorage.RequireFreeSpace(destination, checked(total + 64L * 1024 * 1024));
+                    if (destination != null) RequireZipSpace(destination, checked(total + 64L * 1024 * 1024));
                     if (progress != null) progress(0, total);
-                    foreach (var item in archive.Entries)
+                    foreach (var item in ZipDirectory(archive.Entries))
                     {
                         CheckCancel(cancel);
                         if (++archiveEntries > MaximumArchiveEntries)
@@ -322,7 +451,7 @@ namespace Orbis
                         string name = ValidateEntryName(item.Key);
                         if (item.IsDirectory || name.EndsWith("/", StringComparison.Ordinal) ||
                             !name.EndsWith(".pkg", StringComparison.OrdinalIgnoreCase)) continue;
-                        if (item.IsEncrypted) throw new InvalidDataException("Encrypted ZIP packages are not supported; choose another mirror");
+                        if (item.IsEncrypted) throw new InvalidDataException(ZipFailureMessage(2005));
                         if (!names.Add(name))
                             throw new InvalidDataException("Duplicate PKG archive entry: " + name);
                         if (result.Count >= MaximumPackageEntries)
@@ -336,35 +465,44 @@ namespace Orbis
                         };
                         if (destination != null)
                         {
-                            ArchiveStorage.RequireFreeSpace(destination, checked(item.Size + 64L * 1024 * 1024));
+                            RequireZipSpace(destination, checked(item.Size + 64L * 1024 * 1024));
                             string output = OutputPath(destination, result.Count + 1);
                             string partial = output + ".part";
                             created.Add(partial);
                             long written = 0;
                             uint crc = 0xFFFFFFFF;
-                            using (Stream source = item.OpenEntryStream())
+                            Stream source;
+                            try { source = item.OpenEntryStream(); }
+                            catch (Exception error) when (IsZipReaderFailure(error)) { throw ZipReaderFailure(error, 2010); }
+                            using (source)
                             using (var target = new FileStream(partial, FileMode.CreateNew,
                                 FileAccess.Write, FileShare.None))
                             {
                                 byte[] buffer = new byte[128 * 1024];
-                                int count;
-                                while ((count = source.Read(buffer, 0, buffer.Length)) > 0)
+                                for (;;)
                                 {
+                                    int count;
+                                    try { count = source.Read(buffer, 0, buffer.Length); }
+                                    catch (Exception error) when (IsZipReaderFailure(error)) { throw ZipReaderFailure(error, 2010); }
+                                    if (count <= 0) break;
                                     CheckCancel(cancel);
                                     if (count > item.Size - written)
-                                        throw new InvalidDataException("ZIP entry exceeds its declared size: " + name);
-                                    target.Write(buffer, 0, count);
+                                        throw new InvalidDataException(ZipFailureMessage(2010) + " (" + name + " exceeds its declared size)");
+                                    try { target.Write(buffer, 0, count); }
+                                    catch (IOException error) { throw ZipWriteFailure(error, written, count); }
                                     crc = UpdateCrc(crc, buffer, 0, count);
                                     written += count;
                                     writtenTotal += count;
                                     if (progress != null) progress(writtenTotal, total);
                                 }
+                                try { target.Flush(); }
+                                catch (IOException error) { throw ZipWriteFailure(error, written, 0); }
                             }
                             if (written != item.Size)
-                                throw new InvalidDataException("ZIP entry is truncated: " + name);
+                                throw new InvalidDataException(ZipFailureMessage(2010) + " (" + name + " is truncated)");
                             if (~crc != unchecked((uint)item.Crc))
-                                throw new InvalidDataException("ZIP entry CRC mismatch: " + name);
-                            RequirePkgMagic(partial, name);
+                                throw new InvalidDataException(ZipFailureMessage(2010) + " (CRC mismatch in " + name + ")");
+                            RequireZipPkgMagic(partial, name);
                             File.Move(partial, output);
                             created.Remove(partial);
                             created.Add(output);
@@ -373,7 +511,7 @@ namespace Orbis
                         result.Add(entry);
                     }
                 }
-                if (result.Count == 0) throw new InvalidDataException("Archive contains no PKG files");
+                if (result.Count == 0) throw new InvalidDataException(NoPackageMessage("ZIP", entryNames));
                 return result;
             }
             catch
@@ -432,6 +570,7 @@ namespace Orbis
             }
             if (paths.Count == 1 && kind == PackageObjectKind.Zip)
                 return ReadZip(paths[0], Path.GetFullPath(destination), cancel, progress);
+            if (kind == PackageObjectKind.Zip) throw new InvalidDataException(ZipFailureMessage(2001));
             throw new InvalidDataException("Not a supported archive");
         }
 

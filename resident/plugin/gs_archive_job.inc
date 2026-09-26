@@ -30,10 +30,12 @@ static const char *gs_volume_record(FILE *file, GsVolume *volume)
     return NULL;
 }
 
+/* 0: volumes read; -1: invalid or unreadable; -2: the borrowed set has more
+ * than GS_MAX_VOLUMES volumes (the caller reports it instead of truncating). */
 static int gs_read_volumes(void)
 {
     if (gs_job.local_only) {
-        gs_volumes = (GsVolume *)calloc(gs_job.borrowed_source ? GS_MAX_VOLUMES : 1, sizeof(GsVolume));
+        gs_volumes = (GsVolume *)calloc(1, sizeof(GsVolume));
         if (!gs_volumes) return -1;
         const char *name = strrchr(gs_job.destination, '/'); name = name ? name + 1 : gs_job.destination;
         snprintf(gs_volumes[0].name, sizeof(gs_volumes[0].name), "%s", name);
@@ -53,21 +55,36 @@ static int gs_read_volumes(void)
                         prefix = i; digits = (int)(end - (stem + i)); break;
                     }
                 }
-                for (int i = 1; i < GS_MAX_VOLUMES; i++) {
-                    GsVolume *v = &gs_volumes[i];
-                    if (prefix >= 0) snprintf(v->name, sizeof(v->name), "%.*s%0*d%s", prefix, stem, digits, i + 1, stem + n - 4);
-                    else {
-                        int letter = 'r' + (i - 1) / 100;
-                        if (letter > 'z') break;
-                        snprintf(v->name, sizeof(v->name), "%.*s.%c%02d", (int)n - 4, stem, letter, (i - 1) % 100);
+                /* Old-style continuations follow the case of the first volume's
+                 * extension (GAME.RAR + GAME.R00). Internal storage is case-sensitive,
+                 * so the other case is tried too. Probing one name past the limit
+                 * turns a longer set into an explicit failure, not a truncated one. */
+                int upper = stem[n - 3] == 'R';
+                for (int i = 1; i <= GS_MAX_VOLUMES; i++) {
+                    GsVolume next = {0};
+                    FILE *part = NULL;
+                    for (int attempt = 0; attempt < (prefix >= 0 ? 1 : 2) && !part; attempt++) {
+                        if (prefix >= 0) snprintf(next.name, sizeof(next.name), "%.*s%0*d%s", prefix, stem, digits, i + 1, stem + n - 4);
+                        else {
+                            int letter = 'r' + (i - 1) / 100;
+                            if (letter > 'z') break;
+                            if (attempt ? !upper : upper) letter -= 'a' - 'A';
+                            snprintf(next.name, sizeof(next.name), "%.*s.%c%02d", (int)n - 4, stem, letter, (i - 1) % 100);
+                        }
+                        if (snprintf(next.path, sizeof(next.path), "%s%s", parent, next.name) >= (int)sizeof(next.path)) return -1;
+                        part = fopen(next.path, "rb");
+                        if (!part && errno != ENOENT) return -1;
                     }
-                    if (snprintf(v->path, sizeof(v->path), "%s%s", parent, v->name) >= (int)sizeof(v->path)) return -1;
-                    FILE *part = fopen(v->path, "rb");
-                    if (!part) { if (errno == ENOENT) break; return -1; }
+                    if (!part) break;
+                    if (i == GS_MAX_VOLUMES) { fclose(part); return -2; }
                     struct stat st; int valid = !gs_file_stat(part, &st) && st.st_size >= 8;
                     fclose(part);
-                    if (!valid || !gs_local_source_check(v->path, gs_job.storage_root, gs_job.storage_token)) return -1;
-                    v->size = st.st_size; gs_volume_count++;
+                    if (!valid || !gs_local_source_check(next.path, gs_job.storage_root, gs_job.storage_token)) return -1;
+                    next.size = st.st_size;
+                    GsVolume *grown = (GsVolume *)realloc(gs_volumes, (size_t)(gs_volume_count + 1) * sizeof(GsVolume));
+                    if (!grown) return -1;
+                    gs_volumes = grown;
+                    gs_volumes[gs_volume_count++] = next;
                 }
             }
         }
@@ -125,9 +142,34 @@ static int gs_archive_progress(int64_t done, int64_t total)
     return 0;
 }
 
+static int gs_rar_header_bad_data, gs_rar_process_started;
+static void gs_reset_rar_retry_evidence(void) { gs_rar_header_bad_data = gs_rar_process_started = 0; }
+static int gs_retry_rar_password(int result, const char *password)
+{
+    if (g_stop || gs_canceled || gs_done > 0) return 0;
+    return result == -22 || result == -24 || (result == -12 && password && password[0] &&
+        gs_rar_header_bad_data && !gs_rar_process_started);
+}
+
 static void gs_archive_diagnostic(const char *stage, unsigned entry, int result,
     uint32_t dictionary_kib, uint32_t method, uint64_t unpacked_bytes)
 {
+    if (!strcmp(stage, "process-before")) gs_rar_process_started = 1;
+    if (result == 12 && (!strcmp(stage, "open-after") || !strcmp(stage, "open-failed") || !strcmp(stage, "header-after")))
+        gs_rar_header_bad_data = 1;
+    if (!strcmp(stage, "scan-timing")) {
+        gs_log_write("resident", "archive-rar job=%s stage=%s entries=%u result=%d elapsed_ms=%llu",
+            gs_job.id, stage, entry, result, (unsigned long long)(unpacked_bytes / 1000));
+        return;
+    }
+    if (!strcmp(stage, "extract-timing")) {
+        uint64_t process_ms = unpacked_bytes / 1000;
+        uint64_t decode_ms = process_ms > dictionary_kib ? process_ms - dictionary_kib : 0;
+        gs_log_write("resident", "archive-rar job=%s stage=%s files=%u result=%d write_ms=%u sync_ms=%u process_ms=%llu decode_estimate_ms=%llu",
+            gs_job.id, stage, entry, result, dictionary_kib, method,
+            (unsigned long long)process_ms, (unsigned long long)decode_ms);
+        return;
+    }
     gs_log_write("resident", "archive-rar job=%s stage=%s entry=%u result=%d dictionary_kib=%u method=%u unpacked_bytes=%llu",
         gs_job.id, stage, entry, result, dictionary_kib, method, (unsigned long long)unpacked_bytes);
 }
@@ -1172,35 +1214,47 @@ static int gs_retire_parked_package(const char *job_id, const char *content, int
     return write_atomic(path, record);
 }
 
-static int gs_verify_volume(GsVolume *volume);
+static int gs_verify_volume(GsVolume *volume, int receipt_matches);
 
 static int gs_archive_download_volume(GsVolume *volume)
 {
-    struct stat st; char partial[1050];
+    struct stat st; char partial[1050], destination[1100], original[1024];
     snprintf(gs_job.url, sizeof(gs_job.url), "%s", volume->url);
     snprintf(gs_job.sha, sizeof(gs_job.sha), "%s", volume->sha);
     gs_job.total = volume->size;
+    snprintf(partial, sizeof(partial), "%s.resident.part", volume->path);
+    snprintf(destination, sizeof(destination), "%s.resident", volume->path);
     FILE *existing = fopen(volume->path, "rb");
     int present = existing && !gs_file_stat(existing, &st) && st.st_size == volume->size;
     if (existing) fclose(existing);
-    if (present) return 0;
+    if (present) {
+        int receipt = !gs_job.borrowed_source && volume->sha[0] &&
+            sspi_xfer_receipt_matches(volume->path, destination, volume->size, "", "", volume->sha) == 1;
+        return gs_verify_volume(volume, receipt);
+    }
     if (gs_job.local_only) return -1;
-    snprintf(partial, sizeof(partial), "%s.resident.part", volume->path);
-    char destination[1100], original[1024];
-    snprintf(destination, sizeof(destination), "%s.resident", volume->path);
     if (sspi_xfer_durable(destination) == volume->size) {
         snprintf(original, sizeof(original), "%s", volume->path);
         snprintf(volume->path, sizeof(volume->path), "%s", partial);
-        int valid = !gs_verify_volume(volume);
+        int receipt = volume->sha[0] &&
+            sspi_xfer_receipt_matches(partial, destination, volume->size, "", "", volume->sha) == 1;
+        int valid = !gs_verify_volume(volume, receipt);
         snprintf(volume->path, sizeof(volume->path), "%s", original);
         if (valid) return !gs_storage_matches(gs_job.storage_root, gs_job.storage_token) || rename(partial, original) ? -1 : 0;
     }
     if (gs_network_init()) return -1;
-    if (gs_download_stream(partial) || rename(partial, volume->path)) return -1;
+    if (gs_download_stream(partial)) return -1;
+    snprintf(original, sizeof(original), "%s", volume->path);
+    snprintf(volume->path, sizeof(volume->path), "%s", partial);
+    int receipt = volume->sha[0] &&
+        sspi_xfer_receipt_matches(partial, destination, volume->size, "", "", volume->sha) == 1;
+    int valid = !gs_verify_volume(volume, receipt);
+    snprintf(volume->path, sizeof(volume->path), "%s", original);
+    if (!valid || !gs_storage_matches(gs_job.storage_root, gs_job.storage_token) || rename(partial, original)) return -1;
     return 0;
 }
 
-static int gs_verify_volume(GsVolume *volume)
+static int gs_verify_volume(GsVolume *volume, int receipt_matches)
 {
     FILE *file = fopen(volume->path, "rb"); unsigned char signature[8], hash[32], buffer[128 * 1024];
     SHA256_CTX sha; char hex[65]; size_t count, i; struct stat st;
@@ -1209,13 +1263,13 @@ static int gs_verify_volume(GsVolume *volume)
         ((memcmp(signature, "Rar!\x1a\x07", 6) || (signature[6] != 0 && (signature[6] != 1 || signature[7] != 0))) &&
          memcmp(signature, "PK\x03\x04", 4) && memcmp(signature, "PK\x05\x06", 4) &&
          memcmp(signature, "7z\xbc\xaf\x27\x1c", 6) && memcmp(signature, "\x7f" "CNT", 4))) { fclose(file); return -1; }
-    if (volume->sha[0]) {
+    if (volume->sha[0] && !receipt_matches) {
         rewind(file); sha256_init(&sha);
         while ((count = fread(buffer, 1, sizeof(buffer), file)) > 0) {
             if (g_stop || gs_canceled) { fclose(file); return -1; }
             sha256_update(&sha, buffer, count);
         }
-        if (ferror(file)) { fclose(file); return -1; }
+        if (ferror(file) || g_stop || gs_canceled) { fclose(file); return -1; }
         sha256_final(&sha, hash);
         for (i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", hash[i]);
         if (strcasecmp(hex, volume->sha)) { fclose(file); return -1; }
@@ -1446,10 +1500,21 @@ static int gs_run_archive(void)
     count = gs_read_packages(directory, packages);
     if (count == 0) { gs_write_status("failed", "Archive package journal is invalid"); goto done; }
     if (count > 0) goto validate_packages;
-    if (gs_read_volumes()) { gs_write_status("failed", "Archive job metadata is invalid"); goto done; }
+    int volumes_read = gs_read_volumes();
+    if (volumes_read == -2) {
+        gs_write_status("failed", "ARCHIVE_FAILED: This RAR set has more than 512 volumes; SSPI supports up to 512. Re-pack it with larger volumes. Input retained.");
+        goto done;
+    }
+    if (volumes_read) { gs_write_status("failed", "Archive job metadata is invalid"); goto done; }
     for (int i = 0; i < gs_volume_count; i++) {
-        if (gs_archive_download_volume(&gs_volumes[i]) || gs_verify_volume(&gs_volumes[i])) {
-            gs_write_status("failed", "RAR volume download, size or checksum failed; input retained"); goto done;
+        gs_transfer_error[0] = 0;
+        if (gs_archive_download_volume(&gs_volumes[i])) {
+            // Pause, cancel or shutdown is not a download failure; done: publishes it.
+            if (gs_canceled || g_stop) goto done;
+            char failure[256];
+            if (gs_transfer_error[0]) snprintf(failure, sizeof(failure), "Archive part %d of %d download failed: %s. Input retained.", i + 1, gs_volume_count, gs_transfer_error);
+            else snprintf(failure, sizeof(failure), "Archive part %d of %d failed its download, size or checksum check; input retained", i + 1, gs_volume_count);
+            gs_write_status("failed", failure); goto done;
         }
         /* The volume callback maps original names directly; exFAT needs no hard links. */
         if (i == 0) snprintf(first, sizeof(first), "%s", gs_volumes[i].path);
@@ -1487,10 +1552,12 @@ static int gs_run_archive(void)
     gs_log_write("resident", "archive-dispatch job=%s stage=extract-before format=%s signature_bytes=%u signature=%02x%02x%02x%02x%02x%02x volumes=%d password_set=%d",
         gs_job.id, format, (unsigned)signature_bytes, signature[0], signature[1], signature[2], signature[3], signature[4], signature[5], gs_volume_count, gs_job.password[0] != 0);
     char seven_error[256] = {0};
+    gs_reset_rar_retry_evidence();
+    const char *attempt_password = gs_job.password;
     count = seven ? (gs_volume_count == 1 ? gs_7z_extract_local_ex(first, directory, packages, 256, gs_archive_progress, seven_error, sizeof(seven_error)) : -3001)
                 : zip ? gs_extract_zip(first, directory, names, paths, gs_volume_count, packages, 256, gs_archive_progress)
                 : gs_extract_rar_password_diagnostic(first, directory, names, paths, gs_volume_count, packages, 256, gs_archive_progress, gs_job.password, gs_archive_diagnostic);
-    for (int i = 0; rar && (count == -24 || count == -22) && i < gs_job.password_fallback_count; i++) {
+    for (int i = 0; rar && gs_retry_rar_password(count, attempt_password) && i < gs_job.password_fallback_count; i++) {
         if (gs_archive_progress(0, 0)) break;
         const char *password = gs_job.password_fallbacks[i];
         int duplicate = !strcmp(password, gs_job.password);
@@ -1498,6 +1565,7 @@ static int gs_run_archive(void)
         if (duplicate) continue;
         gs_log_write("resident", "archive-password-retry job=%s attempt=%d limit=%d", gs_job.id, i + 2, gs_job.password_fallback_count + 1);
         gs_write_status("extracting", "Extracting: trying another source password");
+        gs_reset_rar_retry_evidence(); attempt_password = password;
         count = gs_extract_rar_password_diagnostic(first, directory, names, paths, gs_volume_count, packages, 256, gs_archive_progress, password, gs_archive_diagnostic);
     }
     gs_log_write("resident", "archive-dispatch job=%s stage=extract-after format=%s result=%d", gs_job.id, format, count);
@@ -1506,12 +1574,30 @@ static int gs_run_archive(void)
         if (gs_canceled || g_stop) { gs_write_status("canceled", "Archive extraction canceled; input retained"); goto done; }
         if (seven) snprintf(error, sizeof(error), "%s", seven_error[0] ? seven_error : "Split 7z archives are not supported; original retained");
         else if (!zip && count == -1001) snprintf(error, sizeof(error), "RAR header reading timed out; input retained. Remove the queue entry or retry after checking the archive.");
-        else if (!zip && count == -1002) snprintf(error, sizeof(error), "RAR was read successfully but contains no PKG files; archive retained. Check that the source supplied a PS4 package archive.");
+        else if (!zip && count == -1002) snprintf(error, sizeof(error), "RAR scan found no PKG filename or package signature; archive retained. Check that the source supplied a PS4 package archive.");
+        else if (count == -1006 || count == -2016) snprintf(error, sizeof(error), "%s holds an extracted game folder (eboot.bin/sce_sys), not an installable PKG. SSPI installs PKG files only; choose another mirror. Archive retained.", zip ? "ZIP" : "RAR");
+        else if (count == -1007 || count == -2017) snprintf(error, sizeof(error), "%s holds another archive instead of a PKG. Extract it on a computer or choose another mirror. Archive retained.", zip ? "ZIP" : "RAR");
+        else if (count == -1008 || count == -2018) snprintf(error, sizeof(error), "%s holds split PKG pieces that must be joined first; choose another mirror. Archive retained.", zip ? "ZIP" : "RAR");
+        else if (zip && count == -2012) snprintf(error, sizeof(error), "ZIP was read successfully but contains no PKG files; archive retained. Check that the source supplied a PS4 package archive.");
+        else if (zip && count == -2001) snprintf(error, sizeof(error), "Split ZIP sets are not supported; select one complete ZIP file. Archive retained.");
+        else if (zip && count == -2005) snprintf(error, sizeof(error), "ZIP uses encryption or a compression method SSPI cannot read; archive retained. Choose another mirror.");
+        else if (zip && count == -2007) snprintf(error, sizeof(error), "Not enough free space for the extracted package; archive retained. Free space on the staging drive and retry.");
+        else if (zip && (count == -2003 || count == -2010)) snprintf(error, sizeof(error), "ZIP is incomplete or damaged (%d); archive retained. Retry the download or choose another mirror.", -count);
+        // Write failures are storage problems, not archive damage: EFBIG (1009/2019)
+        // is the drive's file-size limit, which FAT32 sets at 4 GiB.
+        else if (count == -1009 || count == -2019) snprintf(error, sizeof(error), "%s output is larger than the staging drive can store in one file (FAT32 limit: 4 GiB); archive retained. Use an exFAT-formatted drive and retry.", zip ? "ZIP" : "RAR");
+        else if (zip && count == -2011) snprintf(error, sizeof(error), "ZIP output could not be written to the staging drive; archive retained. Check free space and that the drive is connected, then retry.");
+        else if (!zip && (count == -16 || count == -19)) snprintf(error, sizeof(error), "RAR output could not be created or written on the staging drive; archive retained. Check free space and that the drive is connected, then retry.");
         else if (!zip && count == -1003) snprintf(error, sizeof(error), "Another RAR extraction is still running; input retained. Retry after it finishes.");
         else if (!zip && count == -1005) snprintf(error, sizeof(error), "RAR decoder initialization failed; archive retained. Restart the console after updating SSPI and its background worker.");
         else if (!zip && count == -24) snprintf(error, sizeof(error), "RAR password is incorrect; archive retained. Update its password and retry.");
         else if (!zip && count == -22) snprintf(error, sizeof(error), "RAR password is required; archive retained. Enter its password and retry.");
         else if (!zip && count == -15) snprintf(error, sizeof(error), "RAR input could not be opened; archive retained. Check that its storage and all supplied volumes are accessible.");
+        // A header block that fails before any entry is decoded is how UnRAR
+        // reports encrypted headers opened with a missing or wrong password.
+        // Name the password so the drawer offers "Enter archive password".
+        else if (!zip && count == -12 && gs_rar_header_bad_data && !gs_rar_process_started)
+            snprintf(error, sizeof(error), "RAR headers could not be read: the archive password is missing or incorrect, or the first volume is damaged. Enter its password and retry; archive retained.");
         else snprintf(error, sizeof(error), "%s extraction failed (%d); check missing volumes, storage or archive integrity", zip ? "ZIP" : "RAR", -count);
         snprintf(detail, sizeof(detail), "ARCHIVE_FAILED: %s", error);
         gs_write_status("failed", detail); goto done;

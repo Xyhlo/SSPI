@@ -16,6 +16,54 @@ namespace Orbis
         string[] _removeGroupIds;
         uint _drawerRowsAt;
         bool _drawerRowsDirty;
+        string _archivePasswordId;
+        string _archivePasswordDraft = "";
+
+        internal static bool NeedsArchivePassword(DlItem item)
+        {
+            if (item == null || item.State != DlState.Failed) return false;
+            string message = (item.Error ?? "") + " " + (item.StatusText ?? "");
+            return message.IndexOf("password", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                (message.IndexOf("archive", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 message.IndexOf("RAR", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 item.ContainerFormat == "rar" || item.ContainerFormat == "7z" || item.ContainerFormat == "zip");
+        }
+
+        void OpenArchivePassword(DlItem item)
+        {
+            _uiOverlay = UiOverlay.None;
+            if (!_imeDisabled)
+            {
+                string value, error;
+                if (NativeImeDialog.Show("", "Archive password", "Retry extraction using the retained files", 256, false, out value, out error))
+                { RetryArchivePassword(item.Id, value); return; }
+                if (string.IsNullOrEmpty(error)) return; // Closing the system keyboard is not a failure.
+                _imeDisabled = true;
+            }
+            _archivePasswordId = item.Id;
+            _archivePasswordDraft = "";
+            _softKbForProxy = _softKbForDeepbrid = _softKbForAllDebrid = _softKbForTorBox = _softKbForSourceUrl = false;
+            _kbSuggestionFocus = -1; _kbSuggestionCount = 0;
+            _kbRow = _kbCol = 0; _softKbOpen = true;
+            SetStatus("Enter the archive password, then press R2 to retry extraction");
+        }
+
+        void RetryArchivePassword(string id, string password)
+        {
+            RunDownloadAction(() => {
+                string error;
+                bool accepted = _dlMgr.SetArchivePasswordAndRetry(id, password, out error);
+                User.NotifyToast(accepted ? "Extraction retry queued; downloaded files kept" : error);
+            });
+        }
+
+        string DrawerActionLabel()
+        {
+            var group = DrawerGroup();
+            if (group == null || _drawerFocus < 0 || _drawerFocus >= _drawerRows.Count) return "Package action";
+            var item = group.Items.Find(x => x.Id == _drawerRows[_drawerFocus].ItemId);
+            return NeedsArchivePassword(item) ? "Enter password" : "Package action";
+        }
         sealed class DrawerRow
         {
             internal string Name, Detail, Size, ItemId;

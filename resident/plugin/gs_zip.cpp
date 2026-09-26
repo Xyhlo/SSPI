@@ -34,7 +34,17 @@ struct ZipContext {
     uint64_t size, written, expected, completed, total;
     size_t allocated;
     GsArchiveProgress progress;
+    int write_error;
 };
+// A failed output write, flush or close is a storage failure, not a damaged
+// archive: 2019 for the file-size limit (EFBIG; FAT32 stops at 4 GiB), 2007 for
+// a full drive and 2011 for any other write error. The first errno is kept.
+static int zip_write_failure(ZipContext &ctx, int error)
+{
+    if (!ctx.write_error) ctx.write_error = error ? error : EIO;
+    int cause = gs_archive_write_cause(ctx.write_error);
+    return cause == GS_ARCHIVE_WRITE_TOO_LARGE ? 2019 : cause == GS_ARCHIVE_WRITE_NO_SPACE ? 2007 : 2011;
+}
 union ZipAllocation { size_t size; unsigned char alignment[16]; };
 
 static void *zip_allocate(void *opaque, size_t items, size_t size)
@@ -97,7 +107,9 @@ static size_t zip_write(void *opaque, mz_uint64 offset, const void *buffer, size
     ZipContext *ctx = static_cast<ZipContext *>(opaque);
     if (offset != ctx->written || bytes > ctx->expected - ctx->written ||
         (ctx->progress && ctx->progress(ctx->completed + ctx->written, ctx->total))) return 0;
+    errno = 0;
     size_t count = fwrite(buffer, 1, bytes, ctx->output);
+    if (count != bytes) zip_write_failure(*ctx, errno);
     ctx->written += count; return count;
 }
 static bool zip_name(const char *name, size_t length)
@@ -139,6 +151,8 @@ extern "C" int gs_extract_zip(const char *first, const char *destination,
         fclose(ctx.input); return -2003;
     }
     int count = 0, result = -2004;
+    uint64_t package_total = 0;
+    unsigned content_hints = 0;
     char partial[1100] = {}; bool partial_owned = false;
     try {
         mz_uint entries = mz_zip_reader_get_num_files(&archive);
@@ -163,6 +177,15 @@ extern "C" int gs_extract_zip(const char *first, const char *destination,
                 else if (key[k] >= 'A' && key[k] <= 'Z') key[k] += 'a' - 'A';
             }
             if (!seen.insert(key).second) throw 2004;
+            if (!stat.m_is_directory) content_hints |= gs_archive_entry_hint(key.c_str(), key.size());
+            if (!stat.m_is_directory && zip_is_package(key)) {
+                if (stat.m_uncomp_size > zip_max_expanded - package_total) throw 2006;
+                package_total += stat.m_uncomp_size;
+            }
+        }
+        if (package_total) {
+            int64_t available = gs_storage_available_bytes(destination);
+            if (available < 0 || (uint64_t)available < package_total + 64 * 1024 * 1024) throw 2007;
         }
         for (mz_uint i = 0; i < entries; ++i) {
             mz_zip_archive_file_stat stat; char name[1025];
@@ -186,10 +209,13 @@ extern "C" int gs_extract_zip(const char *first, const char *destination,
             if (!ctx.output) { close(fd); throw 2009; }
             setvbuf(ctx.output, NULL, _IOFBF, 1024 * 1024);
             ctx.written = 0; ctx.expected = stat.m_uncomp_size;
-            if (!mz_zip_reader_extract_to_callback(&archive, i, zip_write, &ctx, 0) || ctx.written != ctx.expected) throw 2010;
-            if (fflush(ctx.output) || fsync(fileno(ctx.output))) throw 2011;
-            int closed = fclose(ctx.output); ctx.output = NULL;
-            if (closed) throw 2011;
+            if (!mz_zip_reader_extract_to_callback(&archive, i, zip_write, &ctx, 0) || ctx.written != ctx.expected)
+                throw ctx.write_error ? zip_write_failure(ctx, ctx.write_error) : 2010;
+            errno = 0;
+            if (fflush(ctx.output) || fsync(fileno(ctx.output))) throw zip_write_failure(ctx, errno);
+            errno = 0;
+            int closed = fclose(ctx.output), close_error = errno; ctx.output = NULL;
+            if (closed) throw zip_write_failure(ctx, close_error);
             unsigned char magic[4]; FILE *check = fopen(partial, "rb");
             bool valid = check && fread(magic, 1, 4, check) == 4 && !memcmp(magic, "\x7f" "CNT", 4);
             if (check) fclose(check);
@@ -199,7 +225,8 @@ extern "C" int gs_extract_zip(const char *first, const char *destination,
             packages[count].size = (int64_t)ctx.written; ++count;
             ctx.completed += ctx.written;
         }
-        result = count ? count : -2012;
+        // No PKG: 2016 extracted game folder, 2018 split PKG pieces, 2017 nested archive.
+        result = count ? count : -(2012 + gs_archive_no_pkg_offset(content_hints));
     } catch (int error) { result = -error; }
       catch (...) { result = -2013; }
     if (ctx.output) fclose(ctx.output);

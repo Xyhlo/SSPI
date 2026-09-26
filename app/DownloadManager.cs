@@ -998,6 +998,39 @@ namespace Orbis
             }
         }
 
+        public bool SetArchivePasswordAndRetry(string id, string password, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(password))
+            { error = "Enter the archive password"; return false; }
+            if (!ResidentDownloadService.ValidArchivePassword(password))
+            { error = "Archive password exceeds 256 UTF-8 bytes or is invalid"; return false; }
+            lock (_lock)
+            {
+                var item = Find(id);
+                if (item == null) { error = "Download not found"; return false; }
+                if (item.State != DlState.Failed || item.ResidentRemovePending ||
+                    item.ResidentRetryPending || item.CancelRequested)
+                { error = "Wait for the archive to stop before entering its password"; return false; }
+                string format = item.ContainerFormat ?? "";
+                string failure = item.Error ?? "";
+                bool rar = string.Equals(format, "rar", StringComparison.OrdinalIgnoreCase) ||
+                    !string.IsNullOrEmpty(item.ArchiveVolumes) ||
+                    ((format.Length == 0 || format == "archive") &&
+                        (failure.IndexOf("RAR", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         failure.IndexOf("archive password", StringComparison.OrdinalIgnoreCase) >= 0));
+                if (!rar) { error = "This download is not a failed RAR archive"; return false; }
+                // Commit the explicit password before any worker receives a retry. Source
+                // defaults only fill empty passwords, so retained parts use this value.
+                string previous = item.ArchivePassword;
+                item.ArchivePassword = password;
+                if (!SaveManifest())
+                { item.ArchivePassword = previous; error = "Could not save the archive password"; return false; }
+                TogglePause(id);
+                return true;
+            }
+        }
+
         public void TogglePause(string id)
         {
             lock (_lock)

@@ -1538,7 +1538,7 @@ namespace Orbis
             {
                 case DS4Button.SCE_PAD_BUTTON_UP:
                     if (_settingsPage!=6 && !_softKbForProxy && !_softKbForDeepbrid && !_softKbForAllDebrid &&
-                        !_softKbForTorBox && !_softKbForSourceUrl &&
+                        !_softKbForTorBox && !_softKbForSourceUrl && _archivePasswordId == null &&
                         _kbRow == 0 && _kbSuggestionCount > 0)
                     {
                         _kbSuggestionFocus = _kbSuggestionFocus < 0 ? 0 :
@@ -1595,6 +1595,7 @@ namespace Orbis
                     SoftKbSubmit(); break;
                 case DS4Button.SCE_PAD_BUTTON_CIRCLE:
                     _softKbOpen = false;
+                    _archivePasswordId = null; _archivePasswordDraft = "";
                     _kbSuggestionFocus = -1;
                     SetStatus("Keyboard closed");
                     break;
@@ -1629,6 +1630,7 @@ namespace Orbis
         void SoftKbBackspace()
         {
             _typingPulseAt = UiTick();
+            if (_archivePasswordId != null) { if (_archivePasswordDraft.Length > 0) _archivePasswordDraft = _archivePasswordDraft.Substring(0, _archivePasswordDraft.Length - 1); return; }
             if (_settingsPage==6 && _settingsOpen) { if(_directDraft.Length>0)_directDraft=_directDraft.Substring(0,_directDraft.Length-1); return; }
             if (_softKbForSourceUrl)
             {
@@ -1665,6 +1667,12 @@ namespace Orbis
         void SoftKbSubmit()
         {
             _softKbOpen = false;
+            if (_archivePasswordId != null)
+            {
+                string id = _archivePasswordId, password = _archivePasswordDraft;
+                _archivePasswordId = null; _archivePasswordDraft = "";
+                RetryArchivePassword(id, password); return;
+            }
             if(_settingsPage==6 && _settingsOpen){try{QueuePersonalLink("My package",_directDraft.Trim(),false);}catch(Exception ex){_cloudMessage=ex.Message;}return;}
             if (_softKbForSourceUrl)
             {
@@ -1736,6 +1744,7 @@ namespace Orbis
                 case 1: SoftKbBackspace(); break;
                 case 2:
                     _typingPulseAt = UiTick();
+                    if (_archivePasswordId != null) { _archivePasswordDraft = ""; break; }
                     if(_settingsPage==6 && _settingsOpen) _directDraft="";
                     else if (_softKbForSourceUrl) _sourceUrlDraft = "";
                     else if (_softKbForDeepbrid) _deepbridDraft = "";
@@ -2093,7 +2102,7 @@ namespace Orbis
             Fill(r, panel.x + 36, panel.y + 78, panel.w - 72, 1, Border);
             if (_uiOverlay == UiOverlay.DownloadActions)
             {
-                string primary = item != null && item.State == DlState.Paused ? "Resume" :
+                string primary = NeedsArchivePassword(item) ? "Enter archive password" : item != null && item.State == DlState.Paused ? "Resume" :
                     (item != null && (item.State == DlState.Failed || item.State == DlState.Canceled) ? "Retry" : "Pause");
                 string[] actions = { primary, "Move up", "Remove", "Cancel" };
                 for (int i = 0; i < actions.Length; i++) {
@@ -2149,6 +2158,7 @@ namespace Orbis
 
         void ActOnDownload(DlItem item)
         {
+            if (NeedsArchivePassword(item)) { OpenArchivePassword(item); return; }
             if (item.State == DlState.Installed)
             {
                 SetStatus("Already installed — SQUARE remove row, then queue again to re-download");
@@ -3304,6 +3314,8 @@ namespace Orbis
             MarkUiProgress("draw-footer");
             DrawFooter(r);
             if (_uiOverlay != UiOverlay.None) DrawUiOverlay(r);
+            if (_softKbOpen && _archivePasswordId != null)
+                DrawSoftKeyboardModal(r, "Archive password", new string('\u2022', _archivePasswordDraft.Length), "R2 RETRY EXTRACTION");
             DrawToast(r);
         }
 
@@ -3543,15 +3555,14 @@ namespace Orbis
                 add("square", "Del");
                 add("triangle", "Space");
                 add("l2", "Caps");
-                add("r2", _softKbForSourceUrl ? "Install" :
+                add("r2", _archivePasswordId != null ? "Retry" : _softKbForSourceUrl ? "Install" :
                     (_softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox ||
                     _softKbForProxy ? "Save" : "Search"));
                 add("circle", "Close");
             }
             else if (!_settingsOpen && _tab == TopTab.Downloads && _downloadFilesTitle != null)
             {
-                add("cross", "Package action");
-                add("triangle", "Download next");
+                add("cross", DrawerActionLabel());
                 add("square", "Remove package");
                 add("l2", "Close drawer");
             }
@@ -3858,6 +3869,7 @@ namespace Orbis
         void SoftKbAppend(char ch)
         {
             _typingPulseAt = UiTick();
+            if (_archivePasswordId != null) { if (System.Text.Encoding.UTF8.GetByteCount(_archivePasswordDraft + ch) <= 256) _archivePasswordDraft += ch; return; }
             if(_settingsPage==6 && _settingsOpen){if(_directDraft.Length<8192)_directDraft+=ch;return;}
             int maxLen = _softKbForSourceUrl ? 256 :
                 ((_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? 96 : MaxQuery);
@@ -4110,7 +4122,7 @@ namespace Orbis
                     TextCentered(r, box, 29, ch.ToString(), on || pressed ? PrimaryInk : White);
                 }
             }
-            string[] special = { "Space", "Delete", "Clear", _kbLower ? "ABC" : "abc", _settingsPage==6 && _settingsOpen ? "Queue" : (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? "Save" : _softKbForSourceUrl ? "Install" : "Search" };
+            string[] special = { "Space", "Delete", "Clear", _kbLower ? "ABC" : "abc", _archivePasswordId != null ? "Retry" : _settingsPage==6 && _settingsOpen ? "Queue" : (_softKbForProxy || _softKbForDeepbrid || _softKbForAllDebrid || _softKbForTorBox) ? "Save" : _softKbForSourceUrl ? "Install" : "Search" };
             const int sw = 244; int sx = (W - (5 * (sw + gap) - gap)) / 2;
             for (int i = 0; i < 5; i++)
             {
