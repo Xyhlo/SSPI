@@ -321,8 +321,9 @@ namespace Orbis
             var item = group.Items.Find(x => x.Id == _fileDetailId);
             if (item != null) RefreshFileOutputs(item);
             var box = new SDL_Rect { x = ContentX, y = top, w = ContentWidth, h = DownloadDrawerContentHeight(group) };
-            SoftRect(r, box, Panel);
-            Fill(r, box.x, box.y, box.w, 12, Panel);
+            var glass = Panel; glass.a = 145;
+            SoftRect(r, box, glass);
+            Fill(r, box.x, box.y, box.w, 12, glass);
             Fill(r, box.x + 24, box.y, box.w - 48, 1, Border);
             int x = box.x + 24;
             for (int i = 0; i < DrawerTabs.Length; i++)

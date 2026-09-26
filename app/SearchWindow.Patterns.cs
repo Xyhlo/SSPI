@@ -24,7 +24,11 @@ namespace Orbis
         bool DrawPattern(IntPtr renderer)
         {
             if (_patternDisposed) return false;
-            int mode = BackdropPattern.Index(_cfg.BackgroundMode);
+            bool custom = _cfg.BackgroundMode == AppSettings.BackgroundImage && PixelBackground.IsOwnedPath(_cfg.BackgroundImagePath);
+            string customPath = custom ? _cfg.BackgroundImagePath : "";
+            string overlay = _cfg.BackgroundOverlay;
+            int imageOpacity = _cfg.BackgroundImageOpacity, effectOpacity = _cfg.BackgroundEffectOpacity;
+            int mode = custom ? BackdropPattern.Modes.Length : BackdropPattern.Index(_cfg.BackgroundMode);
             if (mode == 0)
             {
                 if (_patternTexture != IntPtr.Zero) { SDL_DestroyTexture(_patternTexture); _patternTexture = IntPtr.Zero; }
@@ -35,10 +39,11 @@ namespace Orbis
             }
             var color = Accent;
             int rgb = color.r << 16 | color.g << 8 | color.b;
-            if (_patternMode != mode || _patternColor != rgb)
+            string desiredKey = mode + ":" + rgb + ":" + customPath + ":" + overlay + ":" + imageOpacity + ":" + effectOpacity;
+            if (_patternMode != mode || _patternColor != rgb || _patternDesiredKey != desiredKey)
             {
                 _patternMode = mode; _patternColor = rgb;
-                lock (_patternLock) _patternDesiredKey = mode + ":" + rgb;
+                lock (_patternLock) _patternDesiredKey = desiredKey;
             }
             string key = _patternDesiredKey;
             if (_patternUploadKey != key) AbortPatternUpload();
@@ -64,12 +69,15 @@ namespace Orbis
                         byte[] pixels = null;
                         try
                         {
+                            if (custom) pixels = PixelBackground.Render(customPath, W, H, color.r, color.g, color.b, overlay, imageOpacity, effectOpacity);
+                            else {
                             byte[] small = BackdropPattern.Render(mode, color.r, color.g, color.b);
                             using (var image = Image.LoadPixelData<Rgba32>(CoverImageDecoder.CreateConfiguration(),
                                 small, BackdropPattern.Width, BackdropPattern.Height))
                             {
                                 image.Mutate(x => x.Resize(W, H));
                                 pixels = new byte[W * H * 4]; image.CopyPixelDataTo(pixels);
+                            }
                             }
                         }
                         catch { }
@@ -145,6 +153,8 @@ namespace Orbis
 
         void ReleasePattern()
         {
+            ReleaseSceneCache();
+            CloseLibrary();
             lock (_patternLock) { _patternDisposed = true; _patternPixels = null; _patternDesiredKey = ""; }
             AbortPatternUpload();
             if (_patternTexture != IntPtr.Zero) SDL_DestroyTexture(_patternTexture);

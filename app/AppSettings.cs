@@ -107,6 +107,9 @@ namespace Orbis
         public string AccentName = ThemePalette.DefaultAccentName;
         public string BackgroundMode = BackgroundSolid;
         public string BackgroundImagePath = "";
+        public string BackgroundOverlay = "solid";
+        public int BackgroundImageOpacity = 35;
+        public int BackgroundEffectOpacity = 35;
         public string BackgroundQuality = BgQualityPerformance;
         public bool CoverCloud = false;
         public string CoverCloudDensity = CloudDensityNormal;
@@ -312,6 +315,9 @@ namespace Orbis
                     else if (Eq(key, "accent_name")) AccentName = val;
                     else if (Eq(key, "bg_mode")) BackgroundMode = val;
                     else if (Eq(key, "bg_image")) BackgroundImagePath = val;
+                    else if (Eq(key, "bg_overlay")) BackgroundOverlay = val;
+                    else if (Eq(key, "bg_image_opacity")) { int n; if (int.TryParse(val, out n)) BackgroundImageOpacity = n; }
+                    else if (Eq(key, "bg_effect_opacity")) { int n; if (int.TryParse(val, out n)) BackgroundEffectOpacity = n; }
                     else if (Eq(key, "bg_quality")) BackgroundQuality = val;
                     else if (Eq(key, "cloud")) CoverCloud = ReadToggle(val, CoverCloud);
                     else if (Eq(key, "cloud_density")) CoverCloudDensity = val;
@@ -383,6 +389,9 @@ namespace Orbis
                 sb.AppendLine("accent_name=" + AccentName);
                 sb.AppendLine("bg_mode=" + BackgroundMode);
                 sb.AppendLine("bg_image=" + (BackgroundImagePath ?? ""));
+                sb.AppendLine("bg_overlay=" + BackgroundOverlay);
+                sb.AppendLine("bg_image_opacity=" + BackgroundImageOpacity);
+                sb.AppendLine("bg_effect_opacity=" + BackgroundEffectOpacity);
                 sb.AppendLine("bg_quality=" + (BackgroundQuality ?? BgQualityPerformance));
                 sb.AppendLine("staging_location=" + StagingLocation);
                 sb.AppendLine("cloud=" + (CoverCloud ? "on" : "off"));
@@ -534,7 +543,12 @@ namespace Orbis
         public void ValidateAppearance(bool notify)
         {
             SettingsNotice = "";
-            BackgroundMode = BackdropPattern.Modes[BackdropPattern.Index(BackgroundMode)]; BackgroundImagePath = ""; CoverCloud = false;
+            if (BackgroundMode != BackgroundImage || !PixelBackground.IsOwnedPath(BackgroundImagePath))
+                BackgroundMode = BackdropPattern.Modes[BackdropPattern.Index(BackgroundMode)];
+            CoverCloud = false;
+            BackgroundOverlay = BackdropPattern.Modes[BackdropPattern.Index(BackgroundOverlay)];
+            BackgroundImageOpacity = Math.Max(0, Math.Min(100, BackgroundImageOpacity));
+            BackgroundEffectOpacity = Math.Max(0, Math.Min(100, BackgroundEffectOpacity));
             BackgroundQuality = BgQualityPerformance; UiStyle = StyleFlat;
             SearchRecents = true; SearchContinue = true; EtaFormat = EtaShort;
 

@@ -130,6 +130,8 @@ namespace Orbis
         private string _pairUrlShown = "";
         private bool _pairSessionActive;
         private bool _pairSuccessConsumed;
+        private int _pairConnectedRevision;
+        private string _pairPersistentError = "";
         private enum PairUiStage { Idle, Waiting, Complete, Failed, TimedOut }
         private PairUiStage _pairUiStage;
         private string _pairUiDetail = "";
@@ -427,6 +429,7 @@ namespace Orbis
 
         void RefreshLandingModel()
         {
+            _landingRevision++;
             _landingContinue.Clear();
             _landingPebble = null;
             List<DlItem> items = ReadDownloadSnapshot();
@@ -471,6 +474,7 @@ namespace Orbis
                 });
             }
             RebuildLibraryGames(items);
+            _pair.LibraryGames = _libraryGames.ToArray();
             for (int i = 0; i < _libraryGames.Count && _cloudPool.Count < 18; i++)
             {
                 GameHit hit = _libraryGames[i];
@@ -638,6 +642,23 @@ namespace Orbis
             var sourceCompletion = Interlocked.Exchange(ref _sourceBrowserComplete, null);
             if (sourceCompletion != null) sourceCompletion();
             if (!_pairSessionActive) return;
+            if (!_pair.Running || _pair.Expired)
+            {
+                _pairSessionActive = false; _qr = null; _qrSize = 0;
+                _pairUiStage = _pair.Expired ? PairUiStage.TimedOut : PairUiStage.Failed;
+                _pairPersistentError = _pairUiDetail = "Phone session ended. Open a new QR code to reconnect.";
+                Invalidated = true; return;
+            }
+            if (_pairConnectedRevision != Volatile.Read(ref _pair.ConnectedRevision))
+            {
+                _pairConnectedRevision = Volatile.Read(ref _pair.ConnectedRevision);
+                _pairSuccessConsumed = true; _pairUiStage = PairUiStage.Complete;
+                _pairUiDetail = "Phone connected"; _qr = null; _qrSize = 0;
+                if (_uiOverlay == UiOverlay.QrPair) _uiOverlay = UiOverlay.None;
+                User.NotifyToast("Phone connected · continue on your phone"); Invalidated = true;
+            }
+            if (_pairPersistentError != _pair.PhoneError)
+            { _pairPersistentError = _pair.PhoneError; Invalidated = true; }
             if (_pairSourcesChanged) { _pairSourcesChanged = false; SourcesChanged(); }
             if (_pairRevision != _pair.Revision)
             {
@@ -652,8 +673,8 @@ namespace Orbis
             while (_pair.TryTakeServiceNotice(out serviceNotice))
             {
                 if (serviceNotice.Saved) _pairToastNotices.Clear();
-                if (serviceNotice.Saved && _uiOverlay == UiOverlay.QrPair && !_pairDownloadMode)
-                { _uiOverlay = UiOverlay.None; _pairUiStage = PairUiStage.Complete; }
+                if (serviceNotice.Saved)
+                { if (_uiOverlay == UiOverlay.QrPair) _uiOverlay = UiOverlay.None; _pairUiStage = PairUiStage.Complete; _qr = null; _qrSize = 0; }
                 SetStatus(serviceNotice.Message);
                 if (_pairToastNotices.Count >= 12) _pairToastNotices.Dequeue();
                 _pairToastNotices.Enqueue(serviceNotice.Message);
@@ -778,6 +799,17 @@ namespace Orbis
         {
             _lastInputAt = UiTick();
             if (!_launchFinished) { HandleStartupButton(button); Invalidated = true; return; }
+            if (_libraryOpen && !_settingsOpen && _uiOverlay == UiOverlay.None)
+            {
+                if (button == DS4Button.SCE_PAD_BUTTON_OPTIONS) { CloseLibrary(); OpenSettings(); }
+                else HandleLibrary(button);
+                Invalidated = true; return;
+            }
+            if (!_settingsOpen && !_softKbOpen && _uiOverlay == UiOverlay.None &&
+                _tab == TopTab.Search && _screen == BrowseScreen.Search && button == DS4Button.SCE_PAD_BUTTON_TOUCH_PAD)
+            { OpenLibrary(); return; }
+            if (!_settingsOpen && !_softKbOpen && _uiOverlay == UiOverlay.None &&
+                _tab == TopTab.Downloads && button == DS4Button.SCE_PAD_BUTTON_TOUCH_PAD) CloseDownloadDrawer();
             if (!_settingsOpen && !_softKbOpen && _uiOverlay == UiOverlay.None &&
                 _tab == TopTab.Downloads && _downloadFilesTitle != null)
             {
@@ -980,6 +1012,7 @@ namespace Orbis
                 string storageError = PairingStorageError();
                 if (storageError != null) throw new IOException(storageError);
                 _pair.Settings = _cfg;
+                _pair.RefreshLibrary = () => InstalledTitleScan.Scan(256).ToArray();
                 _pair.QueueDownloadLink = url => {
                     string name = Uri.UnescapeDataString(Path.GetFileName(new Uri(url).AbsolutePath));
                     if (string.IsNullOrWhiteSpace(name) || name.Length > 180 || name.IndexOf('.') < 0) name = "Resolving package";
@@ -988,18 +1021,29 @@ namespace Orbis
                         new PkgLink { Kind = "package", Label = "Personal file", Url = url },
                         "personal", "1", "", "Personal", "", "", out message);
                 };
+                _pair.QueueDownloadArchive = volumes => {
+                    string message, name = volumes[0].Name;
+                    var candidate = new PackageCandidate {
+                        SourceId = "personal", SourceVersion = "1", TitleId = "", DisplayName = name,
+                        PackageKindHint = "package", Label = "Multipart archive", Url = volumes[0].Url,
+                        AccessType = PackageAccessType.Unknown, ArchiveVolumes = ArchiveVolumeSet.Encode(volumes)
+                    };
+                    return _dlMgr.Enqueue(new GameHit { TitleId = "", Name = name, ImageUrl = "" }, candidate, out message);
+                };
                 _pair.SetSourceEnabled = (id, enabled) => {
                     string error;
                     if (!_packageSources.SetEnabled(id, enabled, out error)) return error ?? "Source update failed";
                     lock (_lock) { ++_libraryScanGen; _nextUpdateScan = 0; _libraryHasUpdate.Clear(); _libraryUpdateInfo.Clear(); }
                     _pairSourcesChanged = true; return null;
                 };
+                _pairConnectedRevision = Volatile.Read(ref _pair.ConnectedRevision);
+                _pairPersistentError = "";
                 _pair.Start(1440);
                 if (!_pair.Running)
                 {
                     _pairSessionActive = false;
                     _pairUiStage = PairUiStage.Failed;
-                    _pairUiDetail = string.IsNullOrEmpty(_pair.Status)
+                    _pairPersistentError = _pairUiDetail = string.IsNullOrEmpty(_pair.Status)
                         ? "Could not start pairing." : _pair.Status;
                     SetStatus("Pair server fail: " + _pairUiDetail);
                     SspiLog.Write("network", "pairing startup failed: " + _pairUiDetail);
@@ -1011,7 +1055,7 @@ namespace Orbis
                 _pairSessionActive = true;
                 _pairSuccessConsumed = false;
                 _pairUiStage = PairUiStage.Waiting;
-                _pairUiDetail = "Waiting for an API key from the pairing page.";
+                _pairUiDetail = "Waiting for your phone to open the pairing page.";
                 _pairUrlShown = _pair.PairUrl + (_pairDownloadMode ? "#downloads" : "");
                 try { _qr = QrCode.Encode(_pairUrlShown, out _qrSize); }
                 catch { _qr = null; _qrSize = 0; }
@@ -1023,7 +1067,7 @@ namespace Orbis
                     " exception=" + ex.GetType().FullName + " hresult=0x" + ex.HResult.ToString("X8") + " " + ex);
                 _pairSessionActive = false;
                 _pairUiStage = PairUiStage.Failed;
-                _pairUiDetail = "Could not start pairing: " + ex.Message;
+                _pairPersistentError = _pairUiDetail = "Could not start pairing: " + ex.Message;
                 SetStatus("Pair server fail: " + ex.Message);
                 User.NotifyToast("Pairing failed");
                 _pairUrlShown = "";
@@ -1166,18 +1210,24 @@ namespace Orbis
 
         void HandleSettingsAppearance(DS4Button b)
         {
+            if (b == DS4Button.SCE_PAD_BUTTON_SQUARE) { StartPairSession(); _uiOverlay = UiOverlay.QrPair; return; }
             int n = ThemePalette.Presets.Count + 3;
             if (b == DS4Button.SCE_PAD_BUTTON_UP) { _settingsFocus = _settingsFocus == 0 ? n - 1 : _settingsFocus == n - 1 ? n - 2 : _settingsFocus >= 6 ? _settingsFocus - 4 : _settingsFocus >= 2 ? 1 : 0; return; }
             if (b == DS4Button.SCE_PAD_BUTTON_DOWN) { _settingsFocus = _settingsFocus == n - 1 ? 0 : _settingsFocus < 2 ? _settingsFocus + 1 : Math.Min(n - 1, _settingsFocus + 4); return; }
             if (b != DS4Button.SCE_PAD_BUTTON_CROSS && b != DS4Button.SCE_PAD_BUTTON_LEFT && b != DS4Button.SCE_PAD_BUTTON_RIGHT && b != DS4Button.SCE_PAD_BUTTON_TRIANGLE) return;
             if (_settingsFocus >= 2 && _settingsFocus < n - 1 && (b == DS4Button.SCE_PAD_BUTTON_LEFT || b == DS4Button.SCE_PAD_BUTTON_RIGHT)) { _settingsFocus = Math.Max(2, Math.Min(n - 2, _settingsFocus + (b == DS4Button.SCE_PAD_BUTTON_LEFT ? -1 : 1))); return; }
-            string oldMode = _cfg.BackgroundMode, oldAccent = _cfg.Accent, oldName = _cfg.AccentName; bool oldMotion = _cfg.ReduceMotion;
+            string oldMode = _cfg.BackgroundMode, oldAccent = _cfg.Accent, oldName = _cfg.AccentName, oldOverlay = _cfg.BackgroundOverlay; bool oldMotion = _cfg.ReduceMotion;
             if (_settingsFocus == n - 1 || b == DS4Button.SCE_PAD_BUTTON_TRIANGLE) { _cfg.BackgroundMode = "solid"; _cfg.Accent = ThemePalette.DefaultAccentHex; _cfg.AccentName = ThemePalette.DefaultAccentName; _cfg.ReduceMotion = false; }
-            else if (_settingsFocus == 0) { int direction = b == DS4Button.SCE_PAD_BUTTON_LEFT ? -1 : 1; _cfg.BackgroundMode = BackdropPattern.Modes[(BackdropPattern.Index(_cfg.BackgroundMode) + direction + BackdropPattern.Modes.Length) % BackdropPattern.Modes.Length]; }
+            else if (_settingsFocus == 0) {
+                int direction = b == DS4Button.SCE_PAD_BUTTON_LEFT ? -1 : 1;
+                if (_cfg.BackgroundMode == AppSettings.BackgroundImage)
+                    _cfg.BackgroundOverlay = BackdropPattern.Modes[(BackdropPattern.Index(_cfg.BackgroundOverlay) + direction + BackdropPattern.Modes.Length) % BackdropPattern.Modes.Length];
+                else _cfg.BackgroundMode = BackdropPattern.Modes[(BackdropPattern.Index(_cfg.BackgroundMode) + direction + BackdropPattern.Modes.Length) % BackdropPattern.Modes.Length];
+            }
             else if (_settingsFocus == 1) _cfg.ReduceMotion = !_cfg.ReduceMotion;
             else { var preset = ThemePalette.Presets[_settingsFocus - 2]; _cfg.Accent = preset.Hex; _cfg.AccentName = preset.Name; }
             if (_cfg.Save()) { CaptureAppearanceDraft(); SetStatus("Appearance saved"); }
-            else { _cfg.BackgroundMode = oldMode; _cfg.Accent = oldAccent; _cfg.AccentName = oldName; _cfg.ReduceMotion = oldMotion; User.NotifyToast("Could not save appearance"); }
+            else { _cfg.BackgroundMode = oldMode; _cfg.Accent = oldAccent; _cfg.AccentName = oldName; _cfg.BackgroundOverlay = oldOverlay; _cfg.ReduceMotion = oldMotion; User.NotifyToast("Could not save appearance"); }
             Invalidated = true;
         }
 
@@ -1912,6 +1962,7 @@ namespace Orbis
             _detailFocus = _detailScroll = 0;
             _screen = BrowseScreen.Results;
             _tab = TopTab.Search;
+            if (_returnToLibrary) { _returnToLibrary = false; _screen = BrowseScreen.Search; OpenLibrary(); }
         }
 
         void CycleTab(int delta)
@@ -3308,6 +3359,9 @@ namespace Orbis
             UiFont.BindRenderer(r);
             GamepadIcons.Ensure(r);
             if (DrawLaunchBranding(r, FrameTime)) return;
+            if (DrawCachedScene(r)) { DrawHeader(r); DrawFooter(r); DrawToast(r); return; }
+            if (_libraryOpen && _libraryCaptureAttempted && !_settingsOpen)
+            { DrawLibraryOverlay(r); CacheScene(r); DrawHeader(r); DrawFooter(r); DrawToast(r); return; }
 
             UiBackgroundSurface surface = _settingsOpen
                 ? UiBackgroundSurface.Settings
@@ -3342,7 +3396,9 @@ namespace Orbis
                 }
             }
 
-            // No center modal — busy state is footer text + skeleton/panel animation.
+            if (_libraryOpen) DrawLibraryOverlay(r);
+            CacheScene(r);
+            // Busy state is footer text + skeleton/panel animation.
             MarkUiProgress("draw-footer");
             DrawFooter(r);
             if (_uiOverlay != UiOverlay.None) DrawUiOverlay(r);
@@ -3421,8 +3477,10 @@ namespace Orbis
             DrawHeaderBrand(r);
             if (!_settingsOpen)
             {
-                DrawTab(r, 709, 25, 220, "L1", "Search", _tab == TopTab.Search);
-                DrawTab(r, 975, 25, 246, "R1", "Downloads", _tab == TopTab.Downloads);
+                GamepadIcons.Draw(r, "l1", 656, 39, 34);
+                TextCentered(r, new SDL_Rect { x = 709, y = 25, w = 220, h = 56 }, 25, "Search", _tab == TopTab.Search ? White : Muted);
+                TextCentered(r, new SDL_Rect { x = 975, y = 25, w = 246, h = 56 }, 25, "Downloads", _tab == TopTab.Downloads ? White : Muted);
+                GamepadIcons.Draw(r, "r1", 1240, 39, 34);
                 float target = _tab == TopTab.Search ? 709 : 975;
                 uint now = UiTick();
                 if (_navUnderlineX < 0 || _cfg.ReduceMotion) _navUnderlineX = target;
@@ -3522,6 +3580,7 @@ namespace Orbis
             SourceInstallStage sourceStage)
         {
             if (_settingsOpen) return "Settings";
+            if (_libraryOpen) return "Library";
             if (SourceInstallActive(sourceStage)) return SourceInstallTitle(sourceStage);
             if (busy && kind == BusyKind.Searching) return "Searching";
             if (busy && kind == BusyKind.Resolving)
@@ -3540,6 +3599,12 @@ namespace Orbis
 
         void DrawToast(IntPtr r)
         {
+            if (!string.IsNullOrEmpty(_pairPersistentError))
+            {
+                var errorBox = new SDL_Rect { x = 240, y = H - 246, w = 1440, h = 64 };
+                SoftRect(r, errorBox, C(49, 28, 36)); StrokeRect(r, errorBox, Danger, 1);
+                TextFit(r, errorBox.x + 20, errorBox.y + 18, 19, errorBox.w - 40, "Phone: " + _pairPersistentError, Danger);
+            }
             if (!_toastActive || string.IsNullOrEmpty(_toastText)) return;
             if (_settingsOpen && _sourceInstallStage != SourceInstallStage.Idle) return;
             uint age = UiElapsed(_toastStartedAt), total = ToastEnterMs + ToastHoldMs + ToastExitMs;
@@ -3592,6 +3657,8 @@ namespace Orbis
                     _softKbForProxy ? "Save" : "Search"));
                 add("circle", "Close");
             }
+            else if (_libraryOpen && !_settingsOpen)
+            { add("cross", "Open"); add("circle", "Back"); }
             else if (!_settingsOpen && _tab == TopTab.Downloads && _downloadFilesTitle != null)
             {
                 add("cross", DrawerActionLabel());
@@ -3609,7 +3676,7 @@ namespace Orbis
                     add("circle", "Back");
                 }
                 else if (_settingsPage == 1) { add("cross", "Select"); add("square", "QR setup"); add("circle", "Close"); }
-                else if (_settingsPage == 3) { add("cross", "Select"); add("triangle", "Restore"); add("circle", "Close"); }
+                else if (_settingsPage == 3) { add("cross", "Select"); add("square", "Upload background"); add("triangle", "Restore"); add("circle", "Close"); }
                 else if (_settingsPage == 5) { add("cross", _settingsFocus == 2 ? "Volume" : "Toggle"); add("circle", "Close"); }
                 else if (_settingsPage == 0 && _settingsFocus == 0)
                 {
@@ -3625,14 +3692,12 @@ namespace Orbis
             }
             else if (_tab == TopTab.Downloads)
             {
-                add("touchpad", "Add links");
                 // Contextual hints from focused download row (matches actual PKG UX).
                 RefreshQueueModel();
                 var rows = _queueRows;
                 if (rows.Count == 0)
                 {
                     add("circle", "Search");
-                    add("l1", "Tabs");
                     add("options", "Settings");
                 }
                 else
@@ -3660,8 +3725,6 @@ namespace Orbis
                             add("cross", "Action");
 
                         add("square", "Remove game");
-                        if (focused.State == DlState.Queued || focused.State == DlState.Paused || focused.State == DlState.Downloading || focused.State == DlState.Resolving)
-                            add("triangle", "Download next");
                     }
                     else
                     {
@@ -3669,7 +3732,6 @@ namespace Orbis
                     }
                     add("r2", "File drawer");
                     add("circle", "Back");
-                    add("l1", "Tabs");
                     add("options", "Settings");
                 }
             }
@@ -3776,7 +3838,7 @@ namespace Orbis
             SoftRect(r, left, C(29, 29, 29)); StrokeRect(r, left, Border, 1);
             TextCentered(r, new SDL_Rect { x = left.x, y = left.y + 30, w = left.w, h = 44 }, 28, "Connect your phone", White);
             TextCentered(r, new SDL_Rect { x = left.x, y = left.y + 86, w = left.w, h = 34 }, 18, "Services · Sources · Appearance", Muted);
-            if (_qr != null && _qrSize > 0)
+            if (_pairUiStage == PairUiStage.Waiting && _qr != null && _qrSize > 0)
             {
                 int module = Math.Max(2, Math.Min(8, 296 / (_qrSize + 8))), total = (_qrSize + 8) * module;
                 int x = left.x + (left.w - total) / 2, y = left.y + 163;
@@ -3786,7 +3848,7 @@ namespace Orbis
             else
             {
                 DesignIcon(r, "phone", left.x + 214, left.y + 232, 52, Muted);
-                TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 330, w = left.w - 40, h = 60 }, 18, _pairUiStage == PairUiStage.Waiting ? "Starting local pairing…" : "Press SQUARE to start pairing", Muted);
+                TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 330, w = left.w - 40, h = 60 }, 18, _pairUiStage == PairUiStage.Waiting ? "Starting local pairing…" : _pairUiStage == PairUiStage.Complete ? "Phone connected" : "Press SQUARE to start pairing", Muted);
             }
             TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 500, w = left.w - 40, h = 34 }, 18, "Scan on the same Wi-Fi or wired network.", Muted);
             TextCentered(r, new SDL_Rect { x = left.x + 20, y = left.y + 540, w = left.w - 40, h = 34 }, 17, "SSPI is free. Service plans are separate.", Dim);
@@ -3862,8 +3924,8 @@ namespace Orbis
         {
             int x = sheet.x, w = sheet.w, y = sheet.y + 18;
             TextPx(r, x, y, 27, "Appearance", White);
-            TextPx(r, x, y + 45, 19, "Personalize your console. Changes save automatically.", Muted);
-            DrawSettingsRow(r, x, y + 100, w, 83, 0, "Background pattern", "LEFT / RIGHT to change", BackdropPattern.Names[BackdropPattern.Index(_cfg.BackgroundMode)]);
+            TextPx(r, x, y + 45, 19, "Square: upload a pixel background from your phone. Changes save automatically.", Muted);
+            DrawSettingsRow(r, x, y + 100, w, 83, 0, "Background pattern", "LEFT / RIGHT to change", _cfg.BackgroundMode == AppSettings.BackgroundImage ? "Picture + " + BackdropPattern.Names[BackdropPattern.Index(_cfg.BackgroundOverlay)] : BackdropPattern.Names[BackdropPattern.Index(_cfg.BackgroundMode)]);
             DrawSettingsRow(r, x, y + 197, w, 83, 1, "Reduced motion", "Static focus and immediate transitions", _cfg.ReduceMotion ? "ON" : "OFF");
             TextPx(r, x, y + 311, 22, "Accent", White);
             int n = ThemePalette.Presets.Count, columns = 4, cw = (w - 42) / columns;

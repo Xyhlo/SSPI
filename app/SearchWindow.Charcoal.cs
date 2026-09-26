@@ -309,7 +309,8 @@ namespace Orbis
             int visible = Math.Min(count, 5), posterW = 224, gap = 44;
             EnsureVisible(ref _libraryScroll, selected, count, Math.Max(1, visible));
             string countText = count + (count == 1 ? " title" : " titles") + " · installed on this PS4";
-            TextPx(r, ContentX + ContentWidth - UiFont.MeasurePx(18, countText), 330, 18, countText, Dim);
+            TextFit(r, ContentX + 225, 330, 18, ContentWidth - 440, countText, Dim);
+            DrawTouchpadAction(r, ContentX + ContentWidth - 188, 314, "Expand library");
             if (count == 0)
             {
                 DesignIcon(r, "library", 930, 446, 48, Dim);
