@@ -25,10 +25,14 @@ namespace Orbis
         const int SysmodInternalHttp = unchecked((int)0x8000000A);
         const int SysmodInternalSsl = unchecked((int)0x8000000B);
 
-        // Larger pools help concurrent three-range HTTPS downloads.
+        // Sized for up to 25 concurrent transfer connections (each holding a
+        // 256 KiB firmware receive block) alongside API and artwork requests.
+        // Smaller fallbacks keep older or memory-constrained firmware usable.
         const int NetPoolSize = 4 * 1024 * 1024;
-        const int SslPoolSize = 8 * 1024 * 1024;
-        const int HttpPoolSize = 8 * 1024 * 1024;
+        const int SslPoolSize = 16 * 1024 * 1024;
+        const int SslFallbackPoolSize = 8 * 1024 * 1024;
+        const int HttpPoolSize = 32 * 1024 * 1024;
+        static readonly int[] HttpFallbackPoolSizes = { 16 * 1024 * 1024, 8 * 1024 * 1024 };
         const int DlBufSize = 1024 * 1024;
         const long ParallelMinBytes = 8L * 1024 * 1024;
         const int ParallelReadBuf = 256 * 1024;
@@ -86,6 +90,10 @@ namespace Orbis
         // the same key as its served WE1 chain without firmware chain discovery.
         const string TorBoxGoogleIntermediateSha256 =
             "A287FFAB762CC69A26D482037EDF701F653CE899025C62A7E5CB88BB9B419CBB";
+        // The official G2 intermediate avoids legacy firmware following the
+        // server's cross-signed root chain. Its DER fingerprint is pinned.
+        const string GoDaddySecureG2IntermediateSha256 =
+            "973A41276FFD01E027A2AAD49E34C37846D3E976FF6A620B6712E33832041AA6";
         // AllDebrid's file CDN now uses Let's Encrypt Generation Y, while its
         // API uses Google Trust Services. Trust the official Y roots directly
         // so older firmware does not need to assemble their extra cross-sign.
@@ -166,12 +174,23 @@ namespace Orbis
                     LogRc("sceSslInit", _sslCtx);
                     if (_sslCtx < 0)
                     {
+                        _sslCtx = CallInt("sceSslInit fallback", () => sceSslInit((UIntPtr)SslFallbackPoolSize));
+                        LogRc("sceSslInit fallback", _sslCtx);
+                    }
+                    if (_sslCtx < 0)
+                    {
                         Fail("sceSslInit 0x" + _sslCtx.ToString("X"));
                         return;
                     }
 
                     _httpCtx = CallInt("sceHttpInit", () => sceHttpInit(_netPool, _sslCtx, (UIntPtr)HttpPoolSize));
                     LogRc("sceHttpInit", _httpCtx);
+                    foreach (int fallback in HttpFallbackPoolSizes)
+                    {
+                        if (_httpCtx >= 0) break;
+                        _httpCtx = CallInt("sceHttpInit fallback", () => sceHttpInit(_netPool, _sslCtx, (UIntPtr)fallback));
+                        LogRc("sceHttpInit fallback " + (fallback >> 20) + "MiB", _httpCtx);
+                    }
                     if (_httpCtx < 0)
                     {
                         Fail("sceHttpInit 0x" + _httpCtx.ToString("X"));
@@ -315,6 +334,13 @@ namespace Orbis
                     certificates.InsertRange(0, supplement);
                     _log.Append("native_torbox_intermediate=").Append(supplement.Count).Append("; ");
                 }
+                string goDaddyIntermediatePath = FindGenerationYRoots("godaddy-secure-g2.pem");
+                if (!string.IsNullOrEmpty(goDaddyIntermediatePath))
+                {
+                    var supplement = ReadPemCertificates(goDaddyIntermediatePath, false, false, false, false, true);
+                    certificates.InsertRange(0, supplement);
+                    _log.Append("native_godaddy_intermediate=").Append(supplement.Count).Append("; ");
+                }
                 if (!string.IsNullOrEmpty(realDebridIntermediatePath))
                 {
                     List<byte[]> realDebridIntermediates =
@@ -437,7 +463,8 @@ namespace Orbis
         }
 
         static List<byte[]> ReadPemCertificates(string path, bool allowPinnedIntermediate,
-            bool allowGenerationYRoots = false, bool allowGenerationYIntermediates = false, bool allowTorBoxIntermediate = false)
+            bool allowGenerationYRoots = false, bool allowGenerationYIntermediates = false,
+            bool allowTorBoxIntermediate = false, bool allowGoDaddyIntermediate = false)
         {
             const string begin = "-----BEGIN CERTIFICATE-----";
             const string end = "-----END CERTIFICATE-----";
@@ -469,7 +496,7 @@ namespace Orbis
                 try
                 {
                     cert = new X509Certificate2(der);
-                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && !allowTorBoxIntermediate && i < NativeRootSubjectMarkers.Length; i++)
+                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && !allowTorBoxIntermediate && !allowGoDaddyIntermediate && i < NativeRootSubjectMarkers.Length; i++)
                     {
                         if (cert.Subject.IndexOf(NativeRootSubjectMarkers[i], StringComparison.OrdinalIgnoreCase) >= 0)
                         {
@@ -495,6 +522,8 @@ namespace Orbis
                             if (HasSha256Fingerprint(der, pin)) { selected = true; break; }
                     if (!selected && allowTorBoxIntermediate)
                         selected = HasSha256Fingerprint(der, TorBoxGoogleIntermediateSha256);
+                    if (!selected && allowGoDaddyIntermediate)
+                        selected = HasSha256Fingerprint(der, GoDaddySecureG2IntermediateSha256);
                 }
                 catch
                 {
@@ -562,14 +591,16 @@ namespace Orbis
         }
 
         public static string GetString(string url, int timeoutMs, string referer, string bearer, int maxBytes = 0,
-            string userAgent = null)
+            string userAgent = null, Func<bool> cancel = null, Func<Uri, bool> allowOrigin = null,
+            int redirectLimit = MaxRedirects)
         {
             EnsureInit();
             if (!_ready) throw new Exception(_initError);
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             if (maxBytes <= 0) maxBytes = MaxBodyDefault;
             int status;
             string body = Request(MethodGet, url, null, null, referer, bearer, timeoutMs, maxBytes, out status,
-                userAgent, true);
+                userAgent, true, cancel, allowOrigin, redirectLimit);
             return body;
         }
 
@@ -579,18 +610,36 @@ namespace Orbis
             return Request(MethodGet, url, null, null, referer, bearer, timeoutMs, maxBytes, out status, null);
         }
 
-        public static string PostForm(string url, string formBody, int timeoutMs, string referer, string bearer)
+        public static string PostForm(string url, string formBody, int timeoutMs, string referer, string bearer,
+            Func<bool> cancel = null)
         {
             EnsureInit();
             if (!_ready) throw new Exception(_initError);
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             byte[] data = Encoding.UTF8.GetBytes(formBody ?? "");
             int status;
             string body = Request(MethodPost, url, data, "application/x-www-form-urlencoded",
-                referer, bearer, timeoutMs, MaxBodyDefault, out status, null, true);
+                referer, bearer, timeoutMs, MaxBodyDefault, out status, null, true, cancel);
             return body;
         }
 
         public static HttpRangeResult ReadRange(string url, long start, int count, int timeoutMs, string bearer = null)
+        {
+            // Mirror networks redirect each request to a different replica, and a
+            // busy replica answers 5xx. A fresh request usually lands elsewhere, so
+            // retry briefly here instead of parking the whole job for a queue cycle.
+            for (int attempt = 1; ; attempt++)
+            {
+                try { return ReadRangeOnce(url, start, count, timeoutMs, bearer); }
+                catch (DownloadHttpException ex)
+                {
+                    if (attempt >= 4 || (ex.StatusCode != 500 && ex.StatusCode != 502 && ex.StatusCode != 504)) throw;
+                }
+                Thread.Sleep(400 * attempt);
+            }
+        }
+
+        static HttpRangeResult ReadRangeOnce(string url, long start, int count, int timeoutMs, string bearer)
         {
             EnsureInit();
             if (!_ready) throw new Exception(_initError);
@@ -643,7 +692,8 @@ namespace Orbis
                 }
                 if (status == 206 && (output.Length != count || sceHttpReadData(req, buffer, 1) != 0))
                     throw new IOException("Package header response does not match range length");
-                return new HttpRangeResult { Data = output.ToArray(), Total = total, EffectiveUrl = finalUrl };
+                return new HttpRangeResult { Data = output.ToArray(), Total = total, EffectiveUrl = finalUrl,
+                    ContentDisposition = GetHeader(req, "Content-Disposition") };
             }
             finally { Close(tmpl, conn, req); }
         }
@@ -1055,12 +1105,17 @@ namespace Orbis
 
         static string Request(int method, string url, byte[] body, string contentType,
             string referer, string bearer, int timeoutMs, int maxBytes, out int status,
-            string userAgent = null, bool failHttp = false)
+            string userAgent = null, bool failHttp = false, Func<bool> cancel = null,
+            Func<Uri, bool> allowOrigin = null, int redirectLimit = MaxRedirects)
         {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
             string finalUrl;
             int tmpl, conn, req;
             OpenFollow(method, url, body, contentType, referer, bearer, timeoutMs, null, null,
-                userAgent, out tmpl, out conn, out req, out status, out finalUrl);
+                userAgent, out tmpl, out conn, out req, out status, out finalUrl, cancel: cancel,
+                allowOrigin: allowOrigin, redirectLimit: redirectLimit);
+            if (method != MethodPost && cancel != null && cancel()) { Close(tmpl, conn, req); throw new OperationCanceledException(); }
+            var cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(req));
             bool httpFailure = failHttp && (status < 200 || status >= 300);
             string retryAfter = null;
             try
@@ -1072,25 +1127,31 @@ namespace Orbis
                 for (;;)
                 {
                     int n = sceHttpReadData(req, buf, (uint)buf.Length);
-                    if (n < 0) throw new Exception(DescribeRequestError(req, n, "read"));
-                    if (n == 0) break;
+                    if (n < 0)
+                    {
+                        if (method != MethodPost && cancel != null && cancel()) throw new OperationCanceledException();
+                        throw new Exception(DescribeRequestError(req, n, "read"));
+                    }
+                    if (n == 0) { cancellation.Dispose(); break; }
                     if (ms.Length + n > maxBytes)
                         throw new Exception("Response too large");
                     ms.Write(buf, 0, n);
                 }
                 string response = Encoding.UTF8.GetString(ms.ToArray());
+                if (method != MethodPost && cancel != null && cancel()) throw new OperationCanceledException();
                 if (httpFailure) throw new ServiceHttpException(status, retryAfter, response);
                 return response;
                 }
             }
             catch (ServiceHttpException) { throw; }
+            catch (OperationCanceledException) { throw; }
             catch (Exception)
             {
                 // A broken error body must not erase an already received throttle.
                 if (httpFailure) throw new ServiceHttpException(status, retryAfter, "");
                 throw;
             }
-            finally { Close(tmpl, conn, req); }
+            finally { cancellation.Dispose(); Close(tmpl, conn, req); }
         }
 
         static void OpenDownload(string url, string bearer, int timeoutMs, string range, string ifRange,
@@ -1104,7 +1165,8 @@ namespace Orbis
         static void OpenFollow(int method, string url, byte[] body, string contentType,
             string referer, string bearer, int timeoutMs, string rangeHeader, string ifRangeHeader,
             string userAgent, out int tmpl, out int conn, out int req, out int status, out string finalUrl,
-            bool artwork = false)
+            bool artwork = false, Func<bool> cancel = null, Func<Uri, bool> allowOrigin = null,
+            int redirectLimit = MaxRedirects)
         {
             // OpenGate only covers create/config; SendRequest + status run unlocked so
             // parallel range workers overlap network RTT.
@@ -1123,8 +1185,15 @@ namespace Orbis
 
             try
             {
-                for (int hop = 0; hop <= MaxRedirects; hop++)
+                for (int hop = 0; hop <= Math.Min(MaxRedirects, redirectLimit); hop++)
                 {
+                    if (cancel != null && cancel()) throw new OperationCanceledException();
+                    if (allowOrigin != null)
+                    {
+                        var target = new Uri(current, UriKind.Absolute);
+                        if (target.UserInfo.Length != 0 || !allowOrigin(target))
+                            throw new IOException("Source request origin is not permitted");
+                    }
                     Close(tmpl, conn, req);
                     tmpl = conn = req = -1;
 
@@ -1188,51 +1257,60 @@ namespace Orbis
                         }
                     }
 
-                    IntPtr postPtr = IntPtr.Zero;
-                    try
+                    // Publish each active request to a cancellation watcher. The
+                    // watcher is joined before a redirect closes/reuses its ID.
+                    int requestId = req;
+                    using (var cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(requestId)))
                     {
-                        int send;
-                        if (useBody != null && useBody.Length > 0 && useMethod == MethodPost)
+                        IntPtr postPtr = IntPtr.Zero;
+                        try
                         {
-                            postPtr = Marshal.AllocHGlobal(useBody.Length);
-                            Marshal.Copy(useBody, 0, postPtr, useBody.Length);
-                            send = sceHttpSendRequest(req, postPtr, (UIntPtr)(ulong)useBody.Length);
+                            if (cancel != null && cancel()) throw new OperationCanceledException();
+                            int send;
+                            if (useBody != null && useBody.Length > 0 && useMethod == MethodPost)
+                            {
+                                postPtr = Marshal.AllocHGlobal(useBody.Length);
+                                Marshal.Copy(useBody, 0, postPtr, useBody.Length);
+                                send = sceHttpSendRequest(req, postPtr, (UIntPtr)(ulong)useBody.Length);
+                            }
+                            else
+                                send = sceHttpSendRequest(req, IntPtr.Zero, UIntPtr.Zero);
+                            if (send < 0)
+                            {
+                                if (cancel != null && cancel()) throw new OperationCanceledException();
+                                throw new Exception(DescribeRequestError(req, send, "send", current));
+                            }
                         }
-                        else
-                            send = sceHttpSendRequest(req, IntPtr.Zero, UIntPtr.Zero);
-                        if (send < 0) throw new Exception(DescribeRequestError(req, send, "send", current));
-                    }
-                    finally
-                    {
-                        if (postPtr != IntPtr.Zero) Marshal.FreeHGlobal(postPtr);
-                    }
+                        finally { if (postPtr != IntPtr.Zero) Marshal.FreeHGlobal(postPtr); }
 
-                    int st = 0;
-                    if (sceHttpGetStatusCode(req, out st) < 0)
-                        throw new Exception("sceHttpGetStatusCode failed");
-                    status = st;
+                        if (cancel != null && cancel()) throw new OperationCanceledException();
+                        int st = 0;
+                        if (sceHttpGetStatusCode(req, out st) < 0)
+                            throw new Exception("sceHttpGetStatusCode failed");
+                        status = st;
 
-                    if (IsRedirectStatus(status))
-                    {
-                        string loc = GetHeader(req, "Location");
-                        if (string.IsNullOrEmpty(loc))
-                            throw new Exception("Redirect without Location");
-                        string next = ResolveRedirect(current, loc);
-                        EnsureHttpsUrl(next, "redirect");
-                        current = next;
-                        // 307/308 explicitly preserve the request method and entity.
-                        // Match established browser behavior for 301/302/303.
-                        if (status != 307 && status != 308)
+                        if (IsRedirectStatus(status))
                         {
-                            useMethod = MethodGet;
-                            useBody = null;
-                            useContentType = null;
+                            string loc = GetHeader(req, "Location");
+                            if (string.IsNullOrEmpty(loc))
+                                throw new Exception("Redirect without Location");
+                            string next = ResolveRedirect(current, loc);
+                            EnsureHttpsUrl(next, "redirect");
+                            current = next;
+                            // 307/308 explicitly preserve the request method and entity.
+                            // Match established browser behavior for 301/302/303.
+                            if (status != 307 && status != 308)
+                            {
+                                useMethod = MethodGet;
+                                useBody = null;
+                                useContentType = null;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
 
-                    finalUrl = current;
-                    return;
+                        finalUrl = current;
+                        return;
+                    }
                 }
                 throw new Exception("Too many redirects");
             }

@@ -322,11 +322,14 @@ namespace Orbis
                     else if (Eq(key, "eta_format")) EtaFormat = val;
                 }
                 // Migrate legacy use_rd into Link Service selection.
-                // Earlier releases always persisted three lanes even when the user
-                // never changed that default. Preserve intentional single-lane mode.
+                // Earlier releases always persisted their lane default (3, 4, 8,
+                // then 5 and 10) even when the user never changed it. Move those
+                // defaults to the current 25-connection allowance and preserve an
+                // intentional single-lane mode.
                 if ((schedulerVersion < 2 && DownloadRangeCount == 3) ||
                     (schedulerVersion < 3 && DownloadRangeCount == 4) ||
-                    (schedulerVersion < 4 && DownloadRangeCount == 8))
+                    (schedulerVersion < 4 && DownloadRangeCount == 8) ||
+                    (schedulerVersion < 6 && (DownloadRangeCount == 5 || DownloadRangeCount == 10)))
                     DownloadRangeCount = DownloadTransferSettings.DefaultRangeCount;
                 if (string.IsNullOrEmpty(UnlockProviderId))
                     UnlockProviderId = UseRealDebrid ? UnlockProviders.RealDebridId : UnlockProviders.NoneId;
@@ -372,7 +375,7 @@ namespace Orbis
                 sb.AppendLine("proxy_key=" + (ProxyKey ?? ""));
                 sb.AppendLine("dl_stats=" + DownloadStatsMode);
                 sb.AppendLine("download_range_count=" + DownloadRangeCount);
-                sb.AppendLine("download_scheduler_version=4");
+                sb.AppendLine("download_scheduler_version=6");
                 sb.AppendLine("bgft_direct=" + (UseBgftDirect ? "1" : "0"));
                 sb.AppendLine("nerd_stats=" + (NerdStats ? "1" : "0"));
                 sb.AppendLine("retry_source_archive_passwords=" + (RetrySourceArchivePasswords ? "1" : "0"));

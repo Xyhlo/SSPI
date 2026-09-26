@@ -1,4 +1,6 @@
 /* Host adapter only; all network IO, ranges and checkpointing live in transfer/. */
+/* The engine's reason for the last failed stream, kept for the archive caller. */
+static char gs_transfer_error[256];
 static uint64_t gs_stream_clock(void) { return sceKernelGetProcessTime(); }
 static int gs_download_stream(const char *partial)
 {
@@ -22,7 +24,7 @@ retry_storage:
             storage_lost=1;sspi_xfer_pause(handle);break;
         }
         if(gs_paused)sspi_xfer_pause(handle);else if(status.state==GS_PAUSED)sspi_xfer_resume(handle);
-        if(status.state==GS_FAILED){gs_write_status("failed",status.error);break;}
+        if(status.state==GS_FAILED){snprintf(gs_transfer_error,sizeof(gs_transfer_error),"%s",status.error);gs_write_status("failed",status.error);break;}
         if(status.state==GS_COMPLETE){rc=0;break;}
         gs_write_status(gs_paused?"paused":status.state==GS_VALIDATING?"validating":"feeding",NULL);
         sceKernelUsleep(250000);

@@ -158,7 +158,7 @@ static int gs_stage_read_job(int slot, GsJob *job)
     if (has_password && ((!job->borrowed_source && kind != 0) || gs_encoded_line(file, job->password, sizeof(job->password)))) goto done;
     if (has_password && (gs_read_password_fallbacks(file, job) || (kind && job->password_fallback_count))) goto done;
     if (job->total < (job->borrowed_source && !kind ? 8 : 0x1000) || job->total > 8LL * 1024 * 1024 * 1024 * 1024 ||
-        lanes < 1 || lanes > 16 || (kind != 0 && (kind < 6 || kind > 8 || strlen(job->content) != 36)) ||
+        lanes < 1 || lanes > 64 || (kind != 0 && (kind < 6 || kind > 8 || strlen(job->content) != 36)) ||
         !job->id[0] || (job->title[0] && strlen(job->title) != 9)) goto done;
     for (const char *p = job->id; *p; p++)
         if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')) goto done;

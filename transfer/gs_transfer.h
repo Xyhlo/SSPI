@@ -7,7 +7,8 @@
 #define GS_XFER_CHUNK (16U * 1024U * 1024U)
 #define GS_XFER_BUFFER (512U * 1024U)
 #define GS_XFER_JOBS 2
-#define GS_XFER_LANES 5
+#define GS_XFER_LANES 25
+#define GS_RETRY_AFTER_MAX_SECONDS 3600
 enum { GS_QUEUED=1, GS_DOWNLOADING, GS_PAUSED, GS_VALIDATING, GS_COMPLETE, GS_FAILED, GS_CANCELED };
 typedef struct {
     int state, lanes, retries, error_code;
@@ -43,8 +44,13 @@ int sspi_xfer_resume(int handle);
 int sspi_xfer_cancel(int handle);
 int sspi_xfer_destroy(int handle);
 int64_t sspi_xfer_durable(const char *destination);
+/* Receipt-only proof for resident archive workers. The sidecar is tied to the
+ * logical destination, expected SHA-256, exact size, short-file/header identity,
+ * and current file stamp. Empty title/content permits raw archive formats. */
+int sspi_xfer_receipt_matches(const char *path, const char *destination, int64_t total,
+    const char *title, const char *content, const char *sha256);
 /* Verify an explicitly requested source checksum on retained complete input.
- * Reuses a successful transfer receipt; never downloads or modifies the PKG. */
+ * Reuses a successful transfer receipt; never downloads or modifies the file. */
 int sspi_xfer_verify_local(const char *path, const char *destination, int64_t total,
     const char *title, const char *content, const char *sha256, char *error, size_t error_size);
 void sspi_xfer_shutdown(void);

@@ -259,7 +259,9 @@ static int gs_read_job(GsJob *job)
         gs_line(file, line, sizeof(line)) || parse_number(line, &job->total, &end) || *end ||
         job->total < (job->archive == 1 ? 8 : 0x1000) || job->total > (int64_t)8 * 1024 * 1024 * 1024 * 1024) goto done;
     int64_t ranges = 1;
-    if (gs_line(file, line, sizeof(line)) || parse_number(line, &ranges, &end) || *end || ranges < 1 || ranges > 16) goto done;
+    // Accept any sane request and clamp it to the engine's lane count, so an
+    // app with a larger connection allowance never invalidates a queued job.
+    if (gs_line(file, line, sizeof(line)) || parse_number(line, &ranges, &end) || *end || ranges < 1 || ranges > 64) goto done;
     job->ranges = ranges > GS_XFER_LANES ? GS_XFER_LANES : (int)ranges;
     if (identity_version) {
         int64_t kind;
@@ -594,6 +596,8 @@ static int gs_ca_selected(const unsigned char *der, size_t size, int policy)
         !strcmp(hex, "E14FFCAD5B0025731006CAA43A121A22D8E9700F4FB9CF852F02A708AA5D5666");
     if (policy == 2) return !strcmp(hex, "C06E307F7CFC1D32FA72A4C033C87B90019AF216F0775D64978A2ECA6C8A230E");
     if (policy == 4) return !strcmp(hex, "A287FFAB762CC69A26D482037EDF701F653CE899025C62A7E5CB88BB9B419CBB");
+    // GoDaddy's published G2 intermediate avoids firmware cross-sign discovery.
+    if (policy == 5) return !strcmp(hex, "973A41276FFD01E027A2AAD49E34C37846D3E976FF6A620B6712E33832041AA6");
     if (policy == 3) return !strcmp(hex, "13949634D99CD6FD6AA80BC034FEFACCEB1969FEEF986586713ECDBB05758D3F") ||
         !strcmp(hex, "238B85A0099C65B970477D5724F1A1D475CE5058CFFE4EFA8733899BDB863C47") ||
         !strcmp(hex, "A2372D06431E9716365EEED47EC020351497D182FCC038E457E58168A03CAC07") ||
@@ -675,7 +679,7 @@ static int gs_load_ca(const char *path, int policy)
         cert->next = gs_ca_allocations; gs_ca_allocations = cert;
         loaded++; at = end + strlen("-----END CERTIFICATE-----");
     }
-    free(pem); return loaded > 0 && (policy != 1 || loaded == 2) && (policy != 2 || loaded == 1) && (policy != 3 || loaded == 4) ? 0 : -1;
+    free(pem); return loaded > 0 && (policy != 1 || loaded == 2) && (policy != 2 || loaded == 1) && (policy != 3 || loaded == 4) && (policy != 5 || loaded == 1) ? 0 : -1;
 }
 
 static int gs_network_start(void)
@@ -711,13 +715,29 @@ static int gs_network_start(void)
     gs_network_pool = gs_pool_create("GameSearchResident", 8 * 1024 * 1024, 0);
     if (gs_network_pool < 0) { gs_log_write("network", "Resident network pool failed code=0x%08X", (unsigned)gs_network_pool); goto failed; }
     gs_net_runtime_bound = 1;
-    gs_ssl_context = gs_ssl_init(8 * 1024 * 1024);
+    // Pools are sized for up to 25 transfer connections (256 KiB receive block
+    // each) plus provider API calls. Smaller fallbacks keep a memory-constrained
+    // SceShellUI usable; the transfer engine then runs fewer concurrent lanes.
+    int ssl_pool_bytes = 12 * 1024 * 1024;
+    gs_ssl_context = gs_ssl_init((size_t)ssl_pool_bytes);
+    if (gs_ssl_context < 0) {
+        ssl_pool_bytes = 8 * 1024 * 1024;
+        gs_ssl_context = gs_ssl_init((size_t)ssl_pool_bytes);
+    }
     if (gs_ssl_context < 0) { gs_log_write("network", "Resident TLS pool failed code=0x%08X", (unsigned)gs_ssl_context); goto failed; }
-    gs_http = gs_http_init(gs_network_pool, gs_ssl_context, 8 * 1024 * 1024);
+    static const int http_pool_sizes[] = { 24 * 1024 * 1024, 16 * 1024 * 1024, 8 * 1024 * 1024 };
+    int http_pool_bytes = 0;
+    for (unsigned i = 0; i < sizeof(http_pool_sizes) / sizeof(http_pool_sizes[0]); i++) {
+        http_pool_bytes = http_pool_sizes[i];
+        gs_http = gs_http_init(gs_network_pool, gs_ssl_context, (size_t)http_pool_bytes);
+        if (gs_http >= 0) break;
+    }
     if (gs_http < 0) { gs_log_write("network", "Resident HTTP context failed code=0x%08X", (unsigned)gs_http); goto failed; }
+    gs_log_write("network", "Resident HTTP pool bytes=%d TLS pool bytes=%d", http_pool_bytes, ssl_pool_bytes);
     // Certificate verification stays enabled. Add the same shipped roots as the app.
     if (gs_ipc_path(ca_path, sizeof(ca_path), "/certs/letsencrypt-generation-y-intermediates.pem") || gs_load_ca(ca_path, 3) != 0 ||
         gs_ipc_path(ca_path, sizeof(ca_path), "/certs/torbox-google-we1.pem") || gs_load_ca(ca_path, 4) != 0 ||
+        gs_ipc_path(ca_path, sizeof(ca_path), "/certs/godaddy-secure-g2.pem") || gs_load_ca(ca_path, 5) != 0 ||
         gs_ipc_path(ca_path, sizeof(ca_path), "/certs/real-debrid-geotrust-tls-rsa-ca-g1.pem") || gs_load_ca(ca_path, 2) != 0 ||
         gs_ipc_path(ca_path, sizeof(ca_path), "/certs/letsencrypt-generation-y-roots.pem") || gs_load_ca(ca_path, 1) != 0 ||
         gs_ipc_path(ca_path, sizeof(ca_path), "/certs/ca-certificates.crt") || gs_load_ca(ca_path, 0) != 0) goto failed;
