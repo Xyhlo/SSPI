@@ -602,6 +602,15 @@ namespace Orbis
                 string locator = CloudCatalog.ImportLocator(link.Url);
                 if (locator != null) { link.Url = locator; accessType = "Cloud"; }
             }
+            // Personal and cloud files carry no catalog metadata. A "Name-CUSA00000.pkg"
+            // file name supplies the title ID so the normal cover/backdrop lookup runs.
+            if (sourceId == "personal" && string.IsNullOrEmpty(game.TitleId))
+            {
+                string derivedTitleId, derivedName;
+                if (DownloadLinkParser.TryPackageIdentity(game.Name, link.Url, out derivedTitleId, out derivedName))
+                    game = new GameHit { TitleId = derivedTitleId,
+                        Name = derivedName.Length > 0 ? derivedName : (game.Name ?? derivedTitleId), ImageUrl = game.ImageUrl ?? "" };
+            }
             message = "Queued " + link.Kind;
             string existingId = null;
             bool revived = false;
@@ -615,6 +624,22 @@ namespace Orbis
                         string.Equals(existing.HosterUrl, link.Url, StringComparison.Ordinal))
                     {
                         existingId = existing.Id;
+                        // A removal that is still waiting for its writer or resident owner
+                        // must finish first; reviving it would inherit the stop request.
+                        if (existing.ResidentRemovePending || (existing.RemoveRequested &&
+                            (_activeIds.Contains(existing.Id) || !IsTerminal(existing.State))))
+                        {
+                            message = "Previous attempt is still stopping; queue again shortly";
+                            break;
+                        }
+                        // Legacy personal rows were queued without a title ID.
+                        if (sourceId == "personal" && string.IsNullOrEmpty(existing.TitleId) &&
+                            !string.IsNullOrEmpty(game.TitleId) && !existing.Background &&
+                            !_activeIds.Contains(existing.Id) && (existing.State == DlState.Queued || IsTerminal(existing.State)))
+                        {
+                            existing.TitleId = game.TitleId;
+                            changed = true;
+                        }
                         if (!string.IsNullOrEmpty(game.ImageUrl) &&
                             !string.Equals(existing.ImageUrl, game.ImageUrl, StringComparison.Ordinal))
                         {
@@ -671,6 +696,9 @@ namespace Orbis
                             if (_activeIds.Contains(existing.Id)) existing.AttemptId++;
                             existing.PauseRequested = false;
                             existing.CancelRequested = false;
+                            // An explicit re-queue supersedes a terminal row's stale removal
+                            // request; otherwise the new attempt aborts as soon as it starts.
+                            existing.RemoveRequested = false;
                             existing.State = DlState.Queued;
                             existing.TransientHttpRetries = 0;
                             existing.HostSupportRetries = 0;
@@ -841,17 +869,32 @@ namespace Orbis
                 return string.Compare(a.DestPath, b.DestPath, StringComparison.Ordinal);
             });
             var added = new List<DlItem>(); int duplicates = 0;
+            var replaced = new List<KeyValuePair<int, DlItem>>();
             lock (_lock)
             {
                 foreach (DlItem item in pending)
                 {
                     bool duplicate = false;
+                    var stale = new List<DlItem>();
                     foreach (DlItem existing in _items)
                         if (SamePath(existing.DestPath, item.DestPath) ||
                             (existing.LocalSource && !string.IsNullOrEmpty(item.ExpectedContentId) &&
                                 existing.ExpectedContentId == item.ExpectedContentId && existing.LocalSourceFingerprint == item.LocalSourceFingerprint))
-                        { duplicate = true; break; }
+                        {
+                            // A finished row for the same file is history, not a live queue entry.
+                            // Re-uploading after the game was deleted must queue again; the new row
+                            // checks install state freshly instead of inheriting "Installed".
+                            if (IsFinishedLocalRow(existing)) { stale.Add(existing); continue; }
+                            duplicate = true; break;
+                        }
                     if (duplicate) { duplicates++; continue; }
+                    foreach (DlItem old in stale)
+                    {
+                        int index = _items.IndexOf(old);
+                        if (index < 0) continue;
+                        _items.RemoveAt(index); replaced.Add(new KeyValuePair<int, DlItem>(index, old));
+                        PreserveConfirmedDependency(old);
+                    }
                     DlItem previous = null;
                     foreach (DlItem other in _items)
                     {
@@ -867,12 +910,27 @@ namespace Orbis
                 if (added.Count > 0 && !SaveManifest())
                 {
                     foreach (DlItem item in added) _items.Remove(item);
+                    for (int i = replaced.Count - 1; i >= 0; i--)
+                        _items.Insert(Math.Min(replaced[i].Key, _items.Count), replaced[i].Value);
                     error = "USB queue could not be saved; original files are unchanged"; return 0;
                 }
             }
             if (duplicates > 0) problems.Add(duplicates + " file(s) already in the queue");
             if (problems.Count > 0) error = string.Join("; ", problems.ToArray());
             return added.Count;
+        }
+
+        // Caller holds _lock. A local row that finished (installed, canceled or failed)
+        // and that no worker, resident slot or PS4 task still owns can be replaced by a
+        // new selection of the same file.
+        bool IsFinishedLocalRow(DlItem item)
+        {
+            return item != null && item.LocalSource &&
+                (item.State == DlState.Installed || item.State == DlState.Completed ||
+                    item.State == DlState.Canceled || item.State == DlState.Failed) &&
+                !item.Background && !item.ResidentRemovePending && !item.ResidentRetryPending &&
+                !(item.InstallSubmitted && !item.InstallConfirmed) && item.BgftTaskId < 0 &&
+                !_activeIds.Contains(item.Id) && !ResidentDownloadService.HasJob(item.Id);
         }
 
         public bool CanChangeStaging()
@@ -921,10 +979,8 @@ namespace Orbis
                 foreach (string input in inputs)
                 {
                     if (string.IsNullOrEmpty(input)) continue;
-                    string[] suffixes = { "", ".part", ".part.resume", ".part.resume.tmp", ".part.ranges", ".part.ranges.tmp",
-                        ".part.checkpoint.tmp", ".resume", ".ranges", ".map", ".map.tmp", ".sha256-ok", ".sha256-ok.tmp",
-                        ".resident.part", ".resident.map", ".resident.map.tmp" };
-                    foreach (string suffix in suffixes)
+                    if (SamePath(input, full)) return true;
+                    foreach (string suffix in DownloadSidecarSuffixes)
                         if (SamePath(input + suffix, full)) return true;
                 }
                 // Resident extraction has no child queue rows. Its inputs remain owned
@@ -973,6 +1029,20 @@ namespace Orbis
                         if ((File.GetAttributes(parent) & FileAttributes.ReparsePoint) != 0)
                         { detail = "Linked files cannot be deleted here"; return false; }
                     File.Delete(full);
+                    // A deleted package or partial leaves its resume map, checksum
+                    // receipt and hidden transfer lock behind. No job owns this
+                    // download (checked above), so remove those sidecars too.
+                    string basePath = DownloadBasePath(full);
+                    bool baseClaimed = false;
+                    foreach (var job in _items)
+                        if (IsPathClaimedByJob(job, basePath)) { baseClaimed = true; break; }
+                    // Only once no payload remains: deleting a small receipt or map must
+                    // never delete the package or partial download it belongs to.
+                    bool payloadRemains = File.Exists(basePath) || File.Exists(basePath + ".part") ||
+                        File.Exists(basePath + ".resident.part") || File.Exists(basePath + ".parallel.part");
+                    for (int piece = 0; !payloadRemains && piece < DownloadTransferSettings.MaxRangeCount; piece++)
+                        payloadRemains = File.Exists(basePath + ".part.p" + piece);
+                    if (!baseClaimed && !payloadRemains && !DeleteDownloadFiles(basePath)) detail = "File removed; some transfer records remain";
                     return true;
                 } catch (Exception ex) { detail = "Delete failed: " + ex.Message; return false; }
             }
@@ -6055,7 +6125,9 @@ namespace Orbis
                 for (int i = 0; i < entries.Count; i++)
                 {
                     PackageArchiveEntry entry = entries[i];
-                    var probe = new DlItem { DestPath = entry.ExtractedPath, TitleId = job.TitleId };
+                    // A local archive's title ID is read from its file or folder names for
+                    // artwork only. The extracted PKG's own identity decides its title.
+                    var probe = new DlItem { DestPath = entry.ExtractedPath, TitleId = job.LocalSource ? "" : job.TitleId };
                     PkgContentKind entryKind; string entryDetail;
                     if (PkgValidator.TryGetContentKind(entry.ExtractedPath, out entryKind, out entryDetail) && entryKind == PkgContentKind.SystemTheme)
                         probe.TitleId = null;
@@ -6629,6 +6701,7 @@ namespace Orbis
                         if (IsExtractionDirectory(directory)) DeleteExtractionDirectory(directory);
             }
             catch { }
+            RemoveOrphanTransferLocks();
             if (changed) SaveManifest();
         }
 
@@ -9413,16 +9486,8 @@ namespace Orbis
                 catch (IOException) { return false; }
                 catch (UnauthorizedAccessException) { return false; }
             }
-            var files = new List<string> {
-                finalPath, finalPath + ".part", finalPath + ".part.resume", finalPath + ".part.resume.tmp",
-                finalPath + ".part.ranges", finalPath + ".part.ranges.tmp", finalPath + ".part.checkpoint.tmp",
-                finalPath + ".resume", finalPath + ".ranges", finalPath + ".map", finalPath + ".map.tmp",
-                finalPath + ".sha256-ok", finalPath + ".sha256-ok.tmp",
-                finalPath + ".resident.part", finalPath + ".resident.map", finalPath + ".resident.map.tmp",
-                finalPath + ".parallel.part", finalPath + ".parallel.part.ranges",
-                finalPath + ".bgft-meta", finalPath + ".bgft-meta.tail", finalPath + ".bgft-meta.tmp",
-                finalPath + ".bgft-fallback"
-            };
+            var files = new List<string> { finalPath };
+            foreach (string suffix in DownloadSidecarSuffixes) files.Add(finalPath + suffix);
             for (int i = 0; i < DownloadTransferSettings.MaxRangeCount; i++)
                 files.Add(finalPath + ".part.p" + i);
             bool cleaned = true;
@@ -9437,6 +9502,74 @@ namespace Orbis
                 catch (UnauthorizedAccessException) { cleaned = false; }
             }
             return cleaned;
+        }
+
+        // Every file a transfer, checksum receipt or installer handoff keeps beside
+        // a download. The native engine's .xfer-lock stays while it owns the file
+        // and was previously never removed, so installs and cancellations left one
+        // behind per package (hidden from Stored Files).
+        static readonly string[] DownloadSidecarSuffixes = {
+            ".part", ".part.resume", ".part.resume.tmp", ".part.ranges", ".part.ranges.tmp", ".part.checkpoint.tmp",
+            ".resume", ".ranges", ".map", ".map.tmp", ".sha256-ok", ".sha256-ok.tmp", ".xfer-lock",
+            ".resident.part", ".resident.map", ".resident.map.tmp", ".resident.xfer-lock",
+            ".resident.sha256-ok", ".resident.sha256-ok.tmp",
+            ".parallel.part", ".parallel.part.ranges", ".parallel.part.ranges.tmp",
+            ".bgft-meta", ".bgft-meta.tail", ".bgft-meta.tmp", ".bgft-fallback"
+        };
+
+        // The download a stored file belongs to: its own path for a package or
+        // archive, or the path with a partial/sidecar suffix removed.
+        internal static string DownloadBasePath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return path;
+            string best = null;
+            foreach (string suffix in DownloadSidecarSuffixes)
+                if (path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) && path.Length > suffix.Length &&
+                    (best == null || suffix.Length > best.Length)) best = suffix;
+            return best == null ? path : path.Substring(0, path.Length - best.Length);
+        }
+
+        // Startup only runs this when no job is active, background-owned, installing
+        // or submitted. A lock whose download, partial and resume map are all gone
+        // cannot protect anything, so it is removed. Recent locks are left alone.
+        void RemoveOrphanTransferLocks()
+        {
+            var locks = new List<string>();
+            try
+            {
+                foreach (string root in StorageRoots())
+                {
+                    if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+                    foreach (string path in Directory.GetFiles(root, "*.xfer-lock"))
+                    {
+                        if (locks.Count >= 4096) break;
+                        locks.Add(path);
+                    }
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            int removed = 0;
+            foreach (string path in locks)
+            {
+                try
+                {
+                    if (DateTime.UtcNow - File.GetLastWriteTimeUtc(path) < TimeSpan.FromHours(1)) continue;
+                    string owner = path.Substring(0, path.Length - ".xfer-lock".Length);
+                    if (File.Exists(owner) || File.Exists(owner + ".part") || File.Exists(owner + ".map")) continue;
+                    string basePath = DownloadBasePath(owner);
+                    bool claimed = false;
+                    lock (_lock)
+                        foreach (var job in _items)
+                            if (IsPathClaimedByJob(job, basePath) || IsPathClaimedByJob(job, owner)) { claimed = true; break; }
+                    if (claimed) continue;
+                    File.Delete(path);
+                    removed++;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            if (removed > 0) SspiLog.Write("download", "event=orphan-transfer-locks removed=" + removed);
         }
 
         static void DeletePartialOwned(string finalPath)
@@ -9687,6 +9820,30 @@ namespace Orbis
         static string Hex(int value)
         {
             return "0x" + unchecked((uint)value).ToString("X8");
+        }
+
+        // Local archive rows have no package identity until extraction. Their title
+        // ID is taken from the archive or folder names so the cover and backdrop can
+        // be shown while the archive is still waiting.
+        public void AssignLocalArchiveTitles(IList<string> paths)
+        {
+            if (paths == null || paths.Count == 0) return;
+            bool changed = false;
+            lock (_lock)
+            {
+                foreach (DlItem item in _items)
+                {
+                    if (!item.LocalSource || item.Kind != "archive" || !string.IsNullOrEmpty(item.TitleId)) continue;
+                    foreach (string path in paths)
+                    {
+                        if (!SamePath(item.DestPath, path)) continue;
+                        string titleId = LocalInstallSource.TitleIdFromNames(path);
+                        if (titleId.Length > 0) { item.TitleId = titleId; changed = true; }
+                        break;
+                    }
+                }
+            }
+            if (changed) SaveManifest();
         }
     }
 }
