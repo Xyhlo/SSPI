@@ -20,7 +20,15 @@ namespace Orbis
     {
         public const int MaximumVolumes = 512;
         static readonly Regex NewName = new Regex(@"^(.*)\.part(\d+)\.rar$", RegexOptions.IgnoreCase);
-        static readonly Regex OldName = new Regex(@"^(.*)\.(rar|r\d{2,3})$", RegexOptions.IgnoreCase);
+        static readonly Regex OldName = new Regex(@"^(.*)\.(rar|r\d{2,3}|[s-z]\d{2})$", RegexOptions.IgnoreCase);
+        static readonly Regex RepeatedRarExtension = new Regex(@"^(.+\.part\d+\.rar)(?:\.rar)+$", RegexOptions.IgnoreCase);
+
+        internal static string DecoderName(string name)
+        {
+            if (string.IsNullOrEmpty(name) || name.Length > 240) return name;
+            Match match = RepeatedRarExtension.Match(name);
+            return match.Success ? match.Groups[1].Value : name;
+        }
 
         public static string FileName(string url, string label)
         {
@@ -28,9 +36,9 @@ namespace Orbis
             string name = Uri.TryCreate(url, UriKind.Absolute, out uri)
                 ? Uri.UnescapeDataString(Path.GetFileName(uri.AbsolutePath)) : "";
             string set; int index;
-            if (TryIndex(name, out set, out index)) return name;
+            if (TryIndex(name, out set, out index)) return DecoderName(name);
             name = (label ?? "").Trim();
-            return TryIndex(name, out set, out index) ? name : "";
+            return TryIndex(name, out set, out index) ? DecoderName(name) : "";
         }
 
         public static bool TryIndex(string name, out string set, out int index)
@@ -38,6 +46,7 @@ namespace Orbis
             set = ""; index = 0;
             if (string.IsNullOrEmpty(name) || name.Length > 240 ||
                 name.IndexOfAny(new[] { '/', '\\', ':', '\0', '\r', '\n' }) >= 0) return false;
+            name = DecoderName(name);
             Match match = NewName.Match(name);
             if (match.Success)
             {
@@ -48,8 +57,11 @@ namespace Orbis
             match = OldName.Match(name);
             if (!match.Success) return false;
             set = match.Groups[1].Value + ".r*";
-            index = match.Groups[2].Value.Equals("rar", StringComparison.OrdinalIgnoreCase)
-                ? 1 : int.Parse(match.Groups[2].Value.Substring(1), CultureInfo.InvariantCulture) + 2;
+            string extension = match.Groups[2].Value;
+            index = extension.Equals("rar", StringComparison.OrdinalIgnoreCase)
+                ? 1
+                : (char.ToLowerInvariant(extension[0]) - 'r') * 100 +
+                    int.Parse(extension.Substring(1), CultureInfo.InvariantCulture) + 2;
             return true;
         }
 

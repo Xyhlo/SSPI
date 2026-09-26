@@ -874,7 +874,7 @@ namespace Orbis
                     for (int i = 0; i < volumes.Count; i++)
                     {
                         ArchiveVolume volume = volumes[i];
-                        body.Append(Encode(volume.Name)).Append('\n').Append(Encode(volume.Url)).Append('\n')
+                        body.Append(Encode(ArchiveVolumeSet.DecoderName(volume.Name))).Append('\n').Append(Encode(volume.Url)).Append('\n')
                             .Append(Encode(paths[i])).Append('\n').Append(Encode(volume.Sha256)).Append('\n')
                             .Append(volume.Size.ToString(CultureInfo.InvariantCulture)).Append('\n');
                     }
