@@ -42,6 +42,32 @@ namespace Orbis
             return count == 0 ? "" : output.Append("]}").ToString();
         }
 
+        /// <summary>Re-encodes decoded mirrors, for example after one was consumed.</summary>
+        internal static string EncodeMirrors(IList<PackageMirror> mirrors)
+        {
+            if (mirrors == null || mirrors.Count == 0) return "";
+            var output = new StringBuilder("{\"mirrors\":[");
+            int count = 0;
+            foreach (var mirror in mirrors)
+            {
+                if (mirror == null || string.IsNullOrEmpty(mirror.Url)) continue;
+                if (count++ > 0) output.Append(',');
+                output.Append('{');
+                Field(output, "url", mirror.Url);
+                Field(output, "candidate_id", mirror.CandidateId);
+                Field(output, "access_type", mirror.AccessType);
+                Field(output, "source_page_url", mirror.SourcePageUrl);
+                Field(output, "source_attribution", mirror.SourceAttribution);
+                Field(output, "sha256", mirror.ExpectedSha256);
+                Field(output, "content_id", mirror.ExpectedContentId);
+                Field(output, "expires_utc", mirror.ExpiresUtc);
+                Field(output, "archive_password", mirror.ArchivePassword);
+                Field(output, "archive_passwords", mirror.ArchivePasswords);
+                output.Append("\"size\":").Append(Math.Max(0, mirror.ExpectedByteSize).ToString(CultureInfo.InvariantCulture)).Append('}');
+            }
+            return count == 0 ? "" : output.Append("]}").ToString();
+        }
+
         static void Field(StringBuilder output, string name, string value)
         { output.Append('"').Append(name).Append("\":\"").Append(JsonLite.Escape(value)).Append("\","); }
 

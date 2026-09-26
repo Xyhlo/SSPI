@@ -251,8 +251,10 @@ namespace Orbis
 
         static bool Extracting(DlItem item)
         {
-            return item != null && (item.StatusText ?? "").IndexOf("extract", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                (item.State == DlState.Downloading || item.State == DlState.Finalizing);
+            if (item == null || item.State != DlState.Finalizing || item.CancelRequested ||
+                item.RemoveRequested || item.ResidentRemovePending) return false;
+            return item.StatsPhase == "extracting" || (string.IsNullOrEmpty(item.StatsPhase) &&
+                (item.StatusText ?? "").StartsWith("Extracting", StringComparison.OrdinalIgnoreCase));
         }
 
         static string FileBytes(long value)
@@ -264,6 +266,8 @@ namespace Orbis
         static string VisibleState(DlItem item)
         {
             if (item == null) return "Queued";
+            if (item.RemoveRequested || item.ResidentRemovePending) return item.StatusText ?? "Removing";
+            if (item.CancelRequested) return item.StatusText ?? "Canceling";
             if (Extracting(item)) return "Extracting";
             if (item.ParkedForProvider) return "Preparing in TorBox";
             if (item.State == DlState.Submitted && !item.Background && PkgValidator.BgftSubTypeForKind(item.Kind) == 7) return "Installing";
@@ -603,7 +607,7 @@ namespace Orbis
             return DownloadManager.Human(item.Done) + (item.Total > 0 ? " / " + DownloadManager.Human(item.Total) : "");
         }
 
-        static string TransferRateLine(DlItem item)
+        static string TransferRateLine(DlItem item, int statsMode = 0)
         {
             if (item.State == DlState.Failed) return item.Error ?? "Download failed";
             if (item.State == DlState.Paused) return "Paused";
@@ -614,12 +618,13 @@ namespace Orbis
             // read "Measuring speed." forever. Show the resolver's own progress
             // instead: an uncached provider preparing the file reports continuously.
             if (item.State == DlState.Resolving && !string.IsNullOrEmpty(item.StatusText)) return item.StatusText;
-            if (item.State == DlState.Downloading && item.BytesPerSec <= 0 && !string.IsNullOrEmpty(item.StatusText) &&
-                (item.StatusText.StartsWith("RAR part ", StringComparison.Ordinal) ||
-                 item.StatusText.StartsWith("Checking RAR part ", StringComparison.Ordinal))) return item.StatusText;
+            if (item.State == DlState.Downloading && item.BytesPerSec <= 0 && !string.IsNullOrEmpty(item.StatusText))
+                return item.StatusText;
             if (item.State != DlState.Downloading && item.State != DlState.Resolving && !Extracting(item)) return item.StatusText ?? VisibleState(item);
             string rate = item.BytesPerSec > 0 ? (item.BytesPerSec / 1000000.0).ToString("0.00") + " MB/s" : "Measuring speed…";
             string eta = item.EtaSeconds > 0 ? "ETA " + (item.EtaSeconds / 60) + ":" + (item.EtaSeconds % 60).ToString("00") : "ETA —";
+            if (statsMode == 2) return rate;
+            if (statsMode == 3) return eta;
             return rate + "  ·  " + eta + (Extracting(item) ? "  ·  Extracting" : "");
         }
 
