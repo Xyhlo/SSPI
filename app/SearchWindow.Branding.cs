@@ -153,8 +153,22 @@ namespace Orbis
                 if (!File.Exists(path)) path = "/app0/assets/images/" + name;
                 // Fixed, build-generated RGBA avoids image decoding on the startup thread.
                 int expected = checked(width * height * 4);
-                if (!File.Exists(path) || new FileInfo(path).Length != expected) return IntPtr.Zero;
-                byte[] pixels = File.ReadAllBytes(path);
+                byte[] pixels;
+                if (!File.Exists(path) && name.StartsWith("ps4-case-", StringComparison.Ordinal)) {
+                    // Unlisted view sizes are resized once, never on every draw.
+                    string original = Path.Combine(root ?? "/app0", "assets/images/ps4-case.rgba");
+                    if (!File.Exists(original)) original = "/app0/assets/images/ps4-case.rgba";
+                    if (!File.Exists(original) || new FileInfo(original).Length != 556 * 704 * 4) return IntPtr.Zero;
+                    byte[] source = File.ReadAllBytes(original);
+                    pixels = new byte[expected];
+                    for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
+                        int src = ((y * 704 / height) * 556 + x * 556 / width) * 4, dst = (y * width + x) * 4;
+                        for (int channel = 0; channel < 4; channel++) pixels[dst + channel] = source[src + channel];
+                    }
+                } else {
+                    if (!File.Exists(path) || new FileInfo(path).Length != expected) return IntPtr.Zero;
+                    pixels = File.ReadAllBytes(path);
+                }
                 if (pixels.Length != expected) return IntPtr.Zero;
                 texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
                     (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STATIC, width, height);

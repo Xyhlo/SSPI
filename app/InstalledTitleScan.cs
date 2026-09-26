@@ -16,6 +16,7 @@ namespace Orbis
                 "/user/app",
                 "/mnt/ext0/user/app",
                 "/user/appmeta",
+                "/user/appmeta/external",
                 "/mnt/ext0/user/appmeta"
             };
             if (max < 8) max = 8;
@@ -63,6 +64,7 @@ namespace Orbis
             icon = FirstExisting(
                 "/system_data/priv/appmeta/" + titleId + "/icon0.png",
                 "/user/appmeta/" + titleId + "/icon0.png",
+                "/user/appmeta/external/" + titleId + "/icon0.png",
                 "/mnt/ext0/user/appmeta/" + titleId + "/icon0.png",
                 "/mnt/sandbox/pfsmnt/" + titleId + "-app0/sce_sys/icon0.png");
             string[] paths = {
@@ -70,6 +72,7 @@ namespace Orbis
                 "/mnt/ext0/user/patch/" + titleId + "/sce_sys/param.sfo",
                 "/system_data/priv/appmeta/" + titleId + "/param.sfo",
                 "/user/appmeta/" + titleId + "/param.sfo",
+                "/user/appmeta/external/" + titleId + "/param.sfo",
                 "/mnt/ext0/user/appmeta/" + titleId + "/param.sfo",
                 "/user/app/" + titleId + "/sce_sys/param.sfo",
                 "/mnt/ext0/user/app/" + titleId + "/sce_sys/param.sfo",

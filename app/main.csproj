@@ -76,6 +76,11 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="AppSettings.cs" />
+    <Compile Include="PixelBackground.cs" />
+    <Compile Include="CustomCovers.cs" />
+    <Compile Include="PairServer.Library.cs" />
+    <Compile Include="SearchWindow.SceneCache.cs" />
+    <Compile Include="SearchWindow.LibraryOverlay.cs" />
     <Compile Include="CommunitySources.cs" />
     <Compile Include="DistributionSettings.cs" />
     <Compile Include="ArchivePasswordDefaults.cs" />

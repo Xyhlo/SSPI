@@ -47,6 +47,16 @@ namespace Orbis
             }
         }
 
+        void PublishPhoneNotice(string message, bool failed)
+        {
+            lock (_lock)
+            {
+                PhoneError = failed ? message : "";
+                if (_serviceNotices.Count >= 20) _serviceNotices.Dequeue();
+                _serviceNotices.Enqueue(new ServiceNotice(message, false));
+            }
+        }
+
         internal string ServiceSummary(string provider, bool configured)
         {
             lock (_lock)
@@ -96,6 +106,7 @@ namespace Orbis
                 jobs.Add(new KeyValuePair<string, string>(id, key));
             }
             GotKey = true;
+            PhoneError = "";
             PublishServiceNotice(jobs.Count == 0 ? "Services saved on PS4" : "Keys saved on PS4 · validating services", true);
             if (jobs.Count == 0) return;
             ThreadPool.QueueUserWorkItem(delegate

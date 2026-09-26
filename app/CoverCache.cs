@@ -41,6 +41,7 @@ namespace Orbis
         long _useClock;
         long _textureBytes;
         Upload _pendingUpload;
+        internal int Revision { get; private set; }
 
         sealed class Upload
         {
@@ -131,9 +132,40 @@ namespace Orbis
             Enqueue(titleId.ToUpperInvariant(), "local|" + filePath);
         }
 
+        // Every visible cover asks for its key on every frame. Remember keys by
+        // string identity (a title's URL is the same instance frame to frame),
+        // so steady frames neither rebuild the key nor rehash the URL.
+        struct SizedRequest : IEquatable<SizedRequest>
+        {
+            public string TitleId, Url; public int Width, Height;
+            public bool Equals(SizedRequest other)
+            {
+                return ReferenceEquals(TitleId, other.TitleId) && ReferenceEquals(Url, other.Url) &&
+                    Width == other.Width && Height == other.Height;
+            }
+            public override bool Equals(object obj) { return obj is SizedRequest && Equals((SizedRequest)obj); }
+            public override int GetHashCode()
+            {
+                return ((System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(TitleId) * 31 +
+                    System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Url)) * 31 + Width) * 31 + Height;
+            }
+        }
+        readonly Dictionary<SizedRequest, string> _sizedKeys = new Dictionary<SizedRequest, string>();
+
         public string RequestSized(string titleId, string url, int width, int height)
         {
-            string key = ((titleId ?? "") + "@" + width + "x" + height + "-" + (url ?? "").GetHashCode().ToString("x8")).ToUpperInvariant();
+            url = CustomCovers.Resolve(titleId, url);
+            var request = new SizedRequest { TitleId = titleId, Url = url, Width = width, Height = height };
+            string key;
+            lock (_lock)
+            {
+                if (!_sizedKeys.TryGetValue(request, out key))
+                {
+                    key = ((titleId ?? "") + "@" + width + "x" + height + "-" + (url ?? "").GetHashCode().ToString("x8")).ToUpperInvariant();
+                    if (_sizedKeys.Count >= 512) _sizedKeys.Clear();
+                    _sizedKeys[request] = key;
+                }
+            }
             lock (_lock) if (_tex.ContainsKey(key) || _inflight.Contains(key) || _ready.ContainsKey(key) || _uploading.Contains(key)) return key;
             if (string.IsNullOrWhiteSpace(url))
             {
@@ -231,6 +263,7 @@ namespace Orbis
                             SDL_DestroyTexture(old);
                         }
                         _tex[key] = upload.Texture;
+                        Revision++;
                         _texSize[key] = new TextureSize
                         {
                             Width = image.Width,
@@ -319,6 +352,7 @@ namespace Orbis
 
         void Worker()
         {
+            CustomCovers.Load();
             while (_run)
             {
                 Req request;
@@ -411,7 +445,8 @@ namespace Orbis
             if (size < 100 || size > MaxEncodedBytes) throw new IOException("encoded size " + size);
             var pixels = CoverImageDecoder.Decode(path, request.Width, request.Height,
                 request.Key.EndsWith("-BACKDROP", StringComparison.Ordinal),
-                stage => AppendLog(request.Key + " " + stage), request.Width > 0);
+                stage => AppendLog(request.Key + " " + stage), request.Width > 0 &&
+                    !source.StartsWith("local|" + Path.Combine(AppSettings.DataDir, "custom-covers") + Path.DirectorySeparatorChar, StringComparison.Ordinal));
             return new ReadyImage { Pixels = pixels.Pixels, Width = pixels.Width, Height = pixels.Height,
                 Opaque = pixels.Opaque, Generation = request.Gen };
         }

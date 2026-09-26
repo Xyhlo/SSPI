@@ -74,7 +74,9 @@ namespace Orbis
                 " longest_late_run=" + _frameLongestRun + " stalls_over_50ms=" + _frameStalls +
                 " update_max_ms=" + _frameUpdateMax.ToString("0.00", culture) +
                 " draw_max_ms=" + _frameDrawMax.ToString("0.00", culture) +
-                " present_max_ms=" + _framePresentMax.ToString("0.00", culture) + " renderer=software 1920x1080";
+                " present_max_ms=" + _framePresentMax.ToString("0.00", culture) + " renderer=software 1920x1080" +
+                " surface=" + (_settingsOpen ? "settings" : _libraryOpen ? "library" : _tab == TopTab.Downloads ? "downloads" : _screen.ToString()) +
+                " library_titles=" + _libraryGames.Count;
             if (BuildIdentity.OwnerDebug)
             {
                 try { report += " owner_debug=1 managed_heap_bytes=" + GC.GetTotalMemory(false) +
@@ -112,7 +114,6 @@ namespace Orbis
 
         void DrawCase(IntPtr renderer, GameHit game, SDL_Rect box)
         {
-            if (!_caseFrameTried) { _caseFrameTried = true; _caseFrame = LoadBrandTexture(renderer, "ps4-case.rgba", 556, 704); }
             string frameKey = box.w + "x" + box.h;
             IntPtr frame;
             if (!_caseSizes.TryGetValue(frameKey, out frame))
@@ -136,8 +137,24 @@ namespace Orbis
                     TextCentered(renderer, label, 12, _covers.HasFailed(key) ? "Cover unavailable" : "Loading cover…", Dim);
                 }
             }
-            if (frame != IntPtr.Zero) SDL_RenderCopy(renderer, frame, IntPtr.Zero, ref box);
-            else if (_caseFrame != IntPtr.Zero) SDL_RenderCopy(renderer, _caseFrame, IntPtr.Zero, ref box);
+            if (frame != IntPtr.Zero) {
+                // The middle of the stock case is transparent. Preserve its bevel
+                // while avoiding alpha processing over the whole poster every frame.
+                int inset = Math.Max(4, (int)Math.Ceiling(box.w * .03));
+                int left = art.x - box.x + inset, top = art.y - box.y + inset;
+                int right = art.x - box.x + art.w - inset, bottom = art.y - box.y + art.h - inset;
+                CopyCaseStrip(renderer, frame, box, 0, 0, box.w, top);
+                CopyCaseStrip(renderer, frame, box, 0, bottom, box.w, box.h - bottom);
+                CopyCaseStrip(renderer, frame, box, 0, top, left, bottom - top);
+                CopyCaseStrip(renderer, frame, box, right, top, box.w - right, bottom - top);
+            }
+        }
+
+        static void CopyCaseStrip(IntPtr r, IntPtr texture, SDL_Rect box, int x, int y, int width, int height)
+        {
+            var src = new SDL_Rect { x = x, y = y, w = width, h = height };
+            var dst = new SDL_Rect { x = box.x + x, y = box.y + y, w = width, h = height };
+            SDL_RenderCopy(r, texture, ref src, ref dst);
         }
 
         static SDL_Rect CaseArtworkBounds(SDL_Rect box)
@@ -214,6 +231,7 @@ namespace Orbis
             RefreshQueueModel();
             var rows = _queueRows; ClampDownloadFocus(rows);
             bool drawerOpen = _downloadFilesTitle != null;
+            DrawTouchpadAction(renderer, ContentX + ContentWidth - 188, drawerOpen ? 110 : 132, "My files");
             int filterX = ContentX;
             for (int i = 0; i < QueueFilters.Length; i++)
             {
@@ -238,7 +256,9 @@ namespace Orbis
                 var frame = area;
                 if (drawer) frame.h += drawerHeight;
                 MarkUiProgress("downloads-card");
-                SoftRect(renderer, frame, focus ? C(35, 36, 37) : Panel);
+                var frameTone = focus ? C(35, 36, 37) : Panel;
+                if (drawer) frameTone.a = 190;
+                SoftRect(renderer, frame, frameTone);
                 MarkUiProgress("downloads-artwork-lookup");
                 EnsureDownloadArtwork(group);
                 if (focus && !string.IsNullOrEmpty(group.ImageUrl))
