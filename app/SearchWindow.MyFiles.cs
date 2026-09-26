@@ -135,11 +135,18 @@ namespace Orbis
             TextFit(r,sheet.x,sheet.y+61,18,sheet.w,"Queue your own files through the existing download and install pipeline.",Muted);
             if(_cloudFolder=="")
             {string[] names=_cloudMenu?new[]{"Real-Debrid files","Real-Debrid torrents","AllDebrid torrents","TorBox files","TorBox torrents"}:new[]{"Paste a download link","Browse stored debrid files","Install from USB"};for(int i=0;i<names.Length;i++)DrawSettingsRow(r,sheet.x,sheet.y+112+i*96,sheet.w,84,i,names[i],!_cloudMenu&&i==0?"Direct PKG/archive, debrid share link, or supported hoster link":!_cloudMenu&&i==2?"Browse a connected drive and select packages or archives":"Ready files and completed torrents in your own account","Open");}
+            else if(!_cloudBusy&&_cloudFiles.Count==0)
+                TextFit(r,sheet.x,sheet.y+140,22,sheet.w,string.IsNullOrEmpty(_cloudMessage)?"No files in this folder.":_cloudMessage,Muted);
             else if(!_cloudBusy)
-            {EnsureVisible(ref _cloudScroll,_settingsFocus,_cloudFiles.Count,5);for(int i=0;i<5&&_cloudScroll+i<_cloudFiles.Count;i++){int n=_cloudScroll+i;var f=_cloudFiles[n];DrawSettingsRow(r,sheet.x,sheet.y+112+i*96,sheet.w,84,n,f.Name,f.Detail,!f.Ready?"Not ready":f.Folder?"Open":"Queue");}}
-            if(_cloudBusy)DrawActivityRail(r,new SDL_Rect{x=sheet.x,y=sheet.y+102,w=sheet.w,h=3});
-            TextFit(r,sheet.x,sheet.y+617,18,sheet.w,_cloudMessage,Muted);
-            if(_cloudFolder!="")TextFit(r,sheet.x,sheet.y+666,18,sheet.w,(_cloudFolder.IndexOf('/')<0?"LEFT/RIGHT page "+(_cloudPage+1)+"  ·  ":"")+"TRIANGLE refresh  ·  CIRCLE back",Dim);
+            {
+                // One compact row per file: fitted name, size, and a single state chip.
+                EnsureVisible(ref _cloudScroll,_settingsFocus,_cloudFiles.Count,6);
+                for(int i=0;i<6&&_cloudScroll+i<_cloudFiles.Count;i++){int n=_cloudScroll+i;var f=_cloudFiles[n];
+                    DrawSettingsRow(r,sheet.x,sheet.y+112+i*82,sheet.w,72,n,f.Name,f.Folder?"Folder":f.Size>0?FileBytes(f.Size):"",!f.Ready?"Not ready":f.Folder?"Open":"Ready");}
+            }
+            if(_cloudBusy){DrawActivityRail(r,new SDL_Rect{x=sheet.x,y=sheet.y+102,w=sheet.w,h=3});TextPx(r,sheet.x,sheet.y+140,22,"Loading your files...",Muted);}
+            else if(_cloudFolder==""||_cloudFiles.Count>0)TextFit(r,sheet.x,sheet.y+617,18,sheet.w,_cloudMessage,Muted);
+            if(_cloudFolder!="")TextFit(r,sheet.x,sheet.y+666,18,sheet.w,"CROSS "+(_cloudFiles.Count>0&&_settingsFocus<_cloudFiles.Count&&_cloudFiles[_settingsFocus].Folder?"open":"queue")+"  ·  TRIANGLE refresh  ·  "+(_cloudFolder.IndexOf('/')<0?"LEFT/RIGHT page "+(_cloudPage+1)+"  ·  ":"")+"CIRCLE back",Dim);
         }
     }
 }

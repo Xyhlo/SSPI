@@ -33,8 +33,11 @@ namespace Orbis
             string set; int volume;
             if (ArchiveVolumeSet.TryIndex(name, out set, out volume))
             {
-                detail = volume == 1 ? "RAR archive" : "Archive continuation - select its first volume";
-                return volume == 1;
+                // Any volume may be selected; queueing groups it with its set. Numbers past
+                // the set limit are not RAR continuations (split ZIP parts such as .z01).
+                if (volume > ArchiveVolumeSet.MaximumVolumes) { detail = "Unsupported file type"; return false; }
+                detail = volume == 1 ? "RAR archive" : "RAR volume " + volume + " - queued with its set";
+                return true;
             }
             detail = "Unsupported file type";
             return false;
@@ -200,7 +203,12 @@ namespace Orbis
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 int queued = 0; string error = null;
-                try { queued = _dlMgr.QueueLocalFiles(paths, out error); }
+                try
+                {
+                    List<string> sets = LocalInstallSource.FirstVolumes(paths);
+                    queued = _dlMgr.QueueLocalFiles(sets, out error);
+                    _dlMgr.AssignLocalArchiveTitles(sets);
+                }
                 catch { error = "Could not queue the selected files. Check that the drives are still connected."; }
                 string message = queued + (queued == 1 ? " file queued." : " files queued.");
                 if (!string.IsNullOrEmpty(error)) message += " " + error;

@@ -14,6 +14,55 @@ namespace Orbis
         internal long Size;
         internal int ExpectedKind;
 
+        static readonly Regex NameTitleId = new Regex(@"(?<![A-Za-z0-9])CUSA[-_ ]?(\d{5})(?!\d)", RegexOptions.IgnoreCase);
+
+        // Archives are not opened before extraction, so their title comes from the
+        // archive, volume or folder names (for example Game-CUSA12345.part1.rar).
+        internal static string TitleIdFromNames(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return "";
+            string current = path.Replace('\\', '/');
+            for (int depth = 0; depth < 4 && current.Length > 0; depth++)
+            {
+                int slash = current.LastIndexOf('/');
+                Match match = NameTitleId.Match(current.Substring(slash + 1));
+                if (match.Success) return "CUSA" + match.Groups[1].Value;
+                if (slash <= 0) break;
+                current = current.Substring(0, slash);
+            }
+            return "";
+        }
+
+        // Maps any selected RAR volume to the first volume of its set and removes
+        // duplicate selections, so a multi-volume set becomes one queue entry.
+        internal static List<string> FirstVolumes(IList<string> paths)
+        {
+            var result = new List<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string path in paths ?? new string[0])
+            {
+                string chosen = path, set; int index;
+                try
+                {
+                    if (!string.IsNullOrEmpty(path) && ArchiveVolumeSet.TryIndex(System.IO.Path.GetFileName(path), out set, out index) && index != 1)
+                    {
+                        int scanned = 0;
+                        foreach (string candidate in Directory.EnumerateFiles(System.IO.Path.GetDirectoryName(path)))
+                        {
+                            if (++scanned > 8192) break;
+                            string otherSet; int otherIndex;
+                            if (ArchiveVolumeSet.TryIndex(System.IO.Path.GetFileName(candidate), out otherSet, out otherIndex) && otherIndex == 1 &&
+                                string.Equals(otherSet, set, StringComparison.OrdinalIgnoreCase))
+                            { chosen = candidate.Replace('\\', '/'); break; }
+                        }
+                    }
+                }
+                catch { chosen = path; }
+                if (chosen != null && seen.Add(chosen)) result.Add(chosen);
+            }
+            return result;
+        }
+
         internal static bool TryNormalizePath(string value, out string canonical)
         {
             canonical = null;
