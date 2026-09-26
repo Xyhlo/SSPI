@@ -4,6 +4,8 @@
 
 Super Simple Package Installer is a package manager for homebrew-enabled PlayStation 4 consoles. It searches package sources, manages downloads and installs content from a controller-friendly interface.
 
+Current release: [5.11.3 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3), build `07dac5e85610`.
+
 [Releases](https://github.com/Xyhlo/SSPI/releases) · [Guide](https://xyhlo.github.io/SSPI/) · [Discord](https://discord.gg/hF2vw7ybRs) · [Issues](https://github.com/Xyhlo/SSPI/issues)
 
 ## Features
@@ -13,8 +15,14 @@ Super Simple Package Installer is a package manager for homebrew-enabled PlaySta
 - Queue direct links, stored debrid files and packages or archives from USB.
 - Background download, extraction and installation through a resident worker.
 - RAR, ZIP and 7z extraction, including multipart and password-protected RAR archives.
+- FTP inbox installs, RAR sets from USB and multi-part RAR links from your phone.
+- An installed-game library with custom case covers and home-screen icons, plus photo and pixel backgrounds for SSPI.
+- PS4 system theme installs (needs a PS4 test).
+- Adaptive download connections and in-app recovery for unresponsive download links.
 - Staging on internal storage or an exFAT USB drive.
 - Base, update and DLC ordering, with update detection for installed games.
+
+See the [guide](https://xyhlo.github.io/SSPI/) for setup, storage and download details.
 
 ## Requirements
 
@@ -24,16 +32,16 @@ Super Simple Package Installer is a package manager for homebrew-enabled PlaySta
 
 ## Installation
 
-1. Download the `.pkg` file from the latest release. GitHub source archives are not installable packages.
-2. Install it over any existing SSPI application.
-3. Launch SSPI once, fully restart the PS4, re-enable GoldHEN and open SSPI again.
-4. Check that the version and build ID in the footer match the release notes.
+1. Download [`sspi5.11.3.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3) from the 5.11.3 beta release. GitHub source archives are not installable packages.
+2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.3.pkg SHA256` and compare the result with `3fe15c485a71dcfe64c3d0c667ca0ceff5e0d665051715bccc4a7dfd0d9f54af`.
+3. Install it over the existing app; your settings and queue are kept. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI.
+4. The footer should read `BETA 5.11 / 07dac5e85610`. There is no in-app updater, so install updates manually from the release page.
 
 ## Setup
 
 1. Open **Settings → Connections** and scan the pairing QR code with a phone on the same network. Save your service keys and enable the services you want to use.
 2. Open **Manage sources** and enable your installed package sources.
-3. Use **Settings → Storage** to choose a staging location. Keep a selected USB drive connected until installation finishes.
+3. Use **PS4 Settings** to choose where games install. In SSPI, use **Settings → Storage → Staging location** for temporary download and extraction files. Keep a selected USB drive connected until installation finishes.
 
 Runtime data is stored under `/data/SSPI`. Settings and service keys stay on the console.
 
@@ -50,7 +58,7 @@ Runtime data is stored under `/data/SSPI`. Settings and service keys stay on the
 | Triangle | Expand mirrors or refresh |
 | L2 | Change region in details, close the Downloads drawer or cycle queue filters |
 | R2 | Open the Downloads drawer or filter update versions |
-| Touchpad | Add direct links, stored debrid files or USB packages from Downloads |
+| Touchpad | Open the installed-game **Library** from Search, or **My files** from Downloads |
 
 The action row at the bottom of each screen shows the current bindings.
 
