@@ -9,7 +9,7 @@
 int gs_resident_mount_system_data(void);
 
 #define GS_APP_DB "/system_data/priv/mms/app.db"
-#define GS_DAEMON_TID "SRCHD0001"
+#define GS_DAEMON_TID "SRCH00002"
 #define GS_DONOR_TID "NPXS20119"
 #define GS_HOST_TID "SRCH00001"
 
@@ -252,11 +252,11 @@ __attribute__((visibility("default"))) int gs_resident_register_in_appdb(void)
         clone_browse(db, source);
         exec_sql(db,
             "INSERT OR REPLACE INTO tbl_appinfo(titleId,key,val) VALUES"
-            "('SRCHD0001','TITLE_ID','SRCHD0001'),"
-            "('SRCHD0001','TITLE','Game Search Service'),"
-            "('SRCHD0001','CATEGORY','gdd'),"
-            "('SRCHD0001','_org_path','/system/vsh/app/SRCHD0001'),"
-            "('SRCHD0001','_metadata_path','/system/vsh/app/SRCHD0001/sce_sys')");
+            "('SRCH00002','TITLE_ID','SRCH00002'),"
+            "('SRCH00002','TITLE','Game Search Service'),"
+            "('SRCH00002','CATEGORY','gdd'),"
+            "('SRCH00002','_org_path','/system/vsh/app/SRCH00002'),"
+            "('SRCH00002','_metadata_path','/system/vsh/app/SRCH00002/sce_sys')");
     }
     else appdb_log("already present");
 

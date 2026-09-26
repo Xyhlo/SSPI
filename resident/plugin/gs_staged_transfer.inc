@@ -93,7 +93,8 @@ static void gs_stage_status(GsStage *stage, const char *state, const char *error
     gs_stage_lock(&stage->lock);
     if (!stage->job.native_bgft && state && (!strcmp(state, "feeding") || !strcmp(state, "paused")) &&
         strcmp(stage->state, "queued") && strcmp(stage->state, "ready") && strcmp(stage->state, "feeding") && strcmp(stage->state, "paused") && stage->state[0]) {
-        if (!strcmp(stage->state, "storage-wait")) stage->state[0] = 0;
+        if (!strcmp(stage->state, "storage-wait") ||
+            (!strcmp(stage->state, "validating") && !stage->install_owned)) stage->state[0] = 0;
         else { gs_stage_unlock(&stage->lock); return; }
     }
     if (!error) error = "";
@@ -207,7 +208,15 @@ static int gs_stage_validate(GsStage *stage, const char *path)
             memcmp(header, "7z\xbc\xaf\x27\x1c", 6)) error = "Completed file is not a supported RAR, ZIP or 7z archive";
     } else {
         error = gs_pkg_header_error(header, actual_size, stage->job.total, stage->job.title, stage->job.content);
-        if (!error && gs_pkg_kind(path) != stage->job.expected_kind) error = "PKG type does not match the selected base, update or DLC";
+        int actual_kind = error ? 0 : gs_pkg_kind(path);
+        if (!error && actual_kind != stage->job.expected_kind) {
+            // Sources sometimes label an update as the base game; name both kinds.
+            const char *wanted = stage->job.expected_kind == 6 ? "a base game" : stage->job.expected_kind == 8 ? "an update" : "DLC";
+            const char *found = actual_kind == 6 ? "a base game" : actual_kind == 8 ? "an update" : actual_kind == 7 ? "DLC" : "not a recognized PS4 package type";
+            close(fd);
+            snprintf(stage->error, sizeof(stage->error), "PKG type mismatch: the source lists this as %s, but the file is %s. Choose another mirror; complete file retained", wanted, found);
+            return -1;
+        }
     }
     close(fd);
     if (error) { snprintf(stage->error, sizeof(stage->error), "%s; complete file retained", error); return -1; }
@@ -601,7 +610,7 @@ static void gs_stage_install_poll(void)
                     strstr(message, "BGFT_TERMINAL:") ||
                     strstr(message, "0x80990015") || strstr(message, "0x80990086") ||
                     strstr(message, "Archive extraction was interrupted.") || strstr(message, "DLC_UNCONFIRMED:") ||
-                    strstr(message, "ARCHIVE_FAILED:");
+                    strstr(message, "ARCHIVE_FAILED:") || strstr(message, "THEME_UNCONFIRMED:");
                 if (!strcmp(gs_state, "failed") && !addon_rejected && stage->install_retries < 3 && !stage->canceled) {
                     stage->install_retries++;
                     stage->install_retry_at = sceKernelGetProcessTime() + (uint64_t)(3 << stage->install_retries) * 1000000;
@@ -625,7 +634,7 @@ static void gs_stage_install_poll(void)
                     detail[0] ? detail : downloading ? "PS4 is downloading the package directly" : "PS4 is completing installation");
             } else if (gs_worker_running && gs_stream_slot < 0) {
                 const char *phase = !strcmp(gs_state, "extracting") ? "extracting" :
-                    !strcmp(gs_state, "validating") ? "validating" : "installing";
+                    !strcmp(gs_state, "validating") ? "validating" : !strcmp(gs_state, "submitted") ? "submitted" : "installing";
                 if (!strcmp(phase, "extracting")) {
                     char message[96];
                     if (gs_canceled) snprintf(message, sizeof(message), "Canceling extraction; waiting for file cleanup");

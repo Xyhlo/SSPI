@@ -265,6 +265,46 @@ static const char *gs_pkg_type(const char *path)
     }
 }
 
+static int gs_is_system_theme(const char *path)
+{
+    unsigned char header[0x9c];
+    FILE *file = fopen(path, "rb"); if (!file) return 0;
+    int read = fread(header, 1, sizeof(header), file) == sizeof(header); fclose(file);
+    /* CONTENT_TYPE_AC + IRO_TAG_SS_THEME; IRO=1 is a SHAREfactory theme. */
+    if (!read || memcmp(header, "\x7f\x43\x4e\x54", 4) ||
+        gs_pkg_be32(header + 0x74) != 0x1b || gs_pkg_be32(header + 0x98) != 2) return 0;
+    return 1;
+}
+
+static int gs_requires_base(int kind, int theme) { return kind == 8 || (kind == 7 && !theme); }
+static int gs_is_no_data_license(const char *path)
+{
+    unsigned char h[0x438]; FILE *file = fopen(path, "rb"); if (!file) return 0;
+    int read = fread(h, 1, sizeof(h), file) == sizeof(h); fclose(file);
+    return read && !memcmp(h, "\x7f" "CNT", 4) && gs_pkg_be32(h + 0x74) == 0x1c &&
+        !gs_be64(h + 0x410) && !gs_be64(h + 0x418);
+}
+
+static int gs_verify_license_body(FILE *file, const unsigned char *h, int64_t size)
+{
+    uint64_t offset = gs_be64(h + 0x20), remaining = gs_be64(h + 0x28);
+    unsigned char block[65536], digest[32]; SHA256_CTX sha;
+    if (offset < 0x1000 || offset > (uint64_t)size || !remaining || remaining != (uint64_t)size - offset || fseeko(file, offset, SEEK_SET)) return -1;
+    sha256_init(&sha);
+    while (remaining) {
+        if (g_stop || gs_canceled) return -1;
+        size_t count = remaining > sizeof(block) ? sizeof(block) : (size_t)remaining;
+        if (fread(block, 1, count, file) != count) return -1;
+        sha256_update(&sha, block, count); remaining -= count;
+    }
+    sha256_final(&sha, digest); return memcmp(digest, h + 0x160, sizeof(digest)) ? -1 : 0;
+}
+
+static const char *gs_package_register_api(int kind, int theme)
+{
+    return kind == 6 || kind == 9 || theme ? "sceBgftServiceIntDownloadRegisterTask" : "sceBgftServiceIntDebugDownloadRegisterPkg";
+}
+
 static int gs_verify_package(const char *path, int kind)
 {
     unsigned char h[0x1000];
@@ -283,10 +323,13 @@ static int gs_verify_package(const char *path, int kind)
     // alone cannot prove that their executables need newer firmware.
     if (!gs_pkg_sfo(path, "SYSTEM_VER", required, sizeof(required)))
         gs_log_write("resident", "package-firmware job=%s declared=%s eligibility=installer", gs_job.id, required);
-    if (kind != 7 && !gs_be64(h + 0x418)) goto done;
+    if (kind != 7 && kind != 9 && !gs_be64(h + 0x418)) goto done;
     int64_t package_size = gs_job.native_bgft && !strcmp(path, gs_job.destination) ? gs_job.total : st.st_size;
     const char *error = gs_pkg_header_error(h, package_size, 0, gs_job.title, NULL);
     if (error) { gs_write_status("failed", error); goto done; }
+    if (gs_pkg_be32(h + 0x74) == 0x1c && !gs_be64(h + 0x418) && gs_verify_license_body(file, h, package_size)) {
+        gs_write_status("failed", "License body checksum does not match; package retained"); goto done;
+    }
     result = 0;
 done:
     fclose(file);
@@ -573,6 +616,12 @@ static const char *gs_addon_error(int code)
     }
 }
 
+/* A synchronous AppInstUtil rejection is a completed child failure, unlike
+ * local/storage/cancellation failures where later archive work must not run. */
+#define GS_ADDON_INSTALL_REJECTED (-2)
+// Last synchronous AppInstUtil result; ADDCONT_BROKEN selects the BGFT fallback.
+static int gs_addon_last_rc;
+
 static int gs_install_addon(const char *journal, int accepted)
 {
     int module = gs_module("/system/common/lib/libSceAppInstUtil.sprx"), exists = 0;
@@ -599,6 +648,7 @@ static int gs_install_addon(const char *journal, int accepted)
             gs_write_status("failed", "Add-on install journal could not be saved. PKG retained."); return -1;
         }
         int rc = install(gs_job.destination, NULL);
+        gs_addon_last_rc = rc;
         gs_log_write("resident", "install-api api=sceAppInstUtilAppInstallPkg rc=0x%08X task=-1 content=%s subtype=7 bytes=%lld path=%s",
             (unsigned)rc, gs_job.content, (long long)gs_job.total, gs_job.destination);
         if (rc) {
@@ -607,7 +657,7 @@ static int gs_install_addon(const char *journal, int accepted)
                 gs_write_status("failed", "Add-on install journal could not be updated. PKG retained."); return -1;
             }
             char error[512]; snprintf(error, sizeof(error), "%s API=sceAppInstUtilAppInstallPkg rc=0x%08X", gs_addon_error(rc), (unsigned)rc);
-            gs_write_status("failed", error); return -1;
+            gs_write_status("failed", error); return GS_ADDON_INSTALL_REJECTED;
         }
     }
     for (int poll = 0, stable = 0; poll < 240 && !g_stop && !gs_canceled; poll++) {
@@ -654,7 +704,50 @@ typedef struct {
     uint32_t index;
 } GsBgftWatch;
 
-static int gs_bgft_stalled(GsBgftWatch *watch, const GsBgftProgress *p, uint64_t now, int suspended, int local_wait)
+static int gs_theme_registration_matches(const char *path)
+{
+    FILE *file = fopen(path, "rb"); if (!file) return 0;
+    unsigned char data[65536]; char content[64], category[32];
+    size_t size = fread(data, 1, sizeof(data), file); int extra = fgetc(file); fclose(file);
+    return extra == EOF && !gs_sfo_string(data, size, "CONTENT_ID", content, sizeof(content)) &&
+        !strcmp(content, gs_job.content) && !gs_sfo_string(data, size, "CATEGORY", category, sizeof(category)) &&
+        !strncmp(category, "ac", 2);
+}
+
+static int gs_installed_theme_matches(const char *source, int full)
+{
+    if (!gs_is_system_theme(source)) return 0;
+    FILE *input = fopen(source, "rb"); if (!input) return 0;
+    struct stat source_stat; char expected[65];
+    int valid = !gs_file_stat(input, &source_stat) && source_stat.st_size >= 4096 &&
+        !gs_addon_digest(input, full, expected);
+    fclose(input); if (!valid) return 0;
+    const char *roots[] = { "/user/addcont/I00000002", "/mnt/ext0/user/addcont/I00000002" };
+    for (int i = 0; i < 2; i++) {
+        DIR *directory = opendir(roots[i]); if (!directory) continue;
+        struct dirent *entry; int count = 0, matched = 0;
+        while (!matched && ++count <= 4096 && (entry = readdir(directory)) != NULL) {
+            if (entry->d_name[0] == '.' || strchr(entry->d_name, '/') || strchr(entry->d_name, '\\')) continue;
+            char path[768], metadata[768], digest[65]; struct stat installed_stat;
+            snprintf(path, sizeof(path), "%s/%s/ac.pkg", roots[i], entry->d_name);
+            snprintf(metadata, sizeof(metadata), "/system_data/priv/appmeta/addcont/I00000002/%s/param.sfo", entry->d_name);
+            if (!gs_theme_registration_matches(metadata) || gs_nofollow_path(path, 0) != 1) continue;
+            int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+            if (fd < 0) continue;
+            FILE *installed = fdopen(fd, "rb"); if (!installed) { close(fd); continue; }
+            matched = !gs_file_stat(installed, &installed_stat) && installed_stat.st_size == source_stat.st_size &&
+                !gs_addon_digest(installed, full, digest) && !strcmp(expected, digest);
+            fclose(installed);
+        }
+        closedir(directory); if (matched) return 1;
+    }
+    return 0;
+}
+
+
+
+static int gs_bgft_stalled(GsBgftWatch *watch, const GsBgftProgress *p, uint64_t now, int suspended, int local_wait,
+    uint64_t package_bytes)
 {
     int new_piece = watch->initialized && p->index > watch->index;
     int advanced = !watch->initialized || new_piece || p->transferred > watch->transferred ||
@@ -670,6 +763,13 @@ static int gs_bgft_stalled(GsBgftWatch *watch, const GsBgftProgress *p, uint64_t
     uint64_t length = p->length_total ? p->length_total : p->length;
     uint64_t transferred = p->length_total ? p->transferred_total : p->transferred;
     uint64_t limit = (length && transferred >= length ? 600ull : 180ull) * 1000000;
+    /* With no byte counts (the storage route) only whole-percent preparing/copy
+     * steps show progress, and 1% of a 150 GB package is 1.5 GB. Allow each 1%
+     * to take as long as copying it at 2 MiB/s, never less than 180 s. */
+    if (!length) {
+        uint64_t percent_us = package_bytes / 100 * 1000000 / (2 * 1024 * 1024);
+        if (percent_us > limit) limit = percent_us;
+    }
     return !suspended && !local_wait && now - watch->since >= limit;
 }
 
@@ -678,9 +778,10 @@ static int gs_park_task(void);
 static int gs_bgft_receipt_matches(const char *path, const char *content, int kind, int task, int *complete)
 {
     struct stat st; char id[49]; int saved = -1, done = 0, pending = 0, version = 0, subtype = 0;
-    if (lstat(path, &st) || !S_ISREG(st.st_mode)) return 0;
+    if (gs_nofollow_path(path, 0) != 1) return 0;
     int fd = open(path, O_RDONLY | O_NOFOLLOW); if (fd < 0) return 0;
     FILE *file = fdopen(fd, "rb"); if (!file) { close(fd); return 0; }
+    if (gs_file_stat(file, &st)) { fclose(file); return 0; }
     int fields = fscanf(file, "%48s %d %d %d %d %d", id, &saved, &done, &pending, &version, &subtype); fclose(file);
     // Base and patch share a content ID. Legacy records cannot prove the subtype
     // of a recycled task number and must never authorize cross-job removal.
@@ -693,7 +794,7 @@ static int gs_find_bgft_receipt(const char *root, int extracted, const char *con
     char *receipt, size_t capacity, int *complete)
 {
     // Search only SSPI's direct job directories, with a fixed work bound and no symlinks.
-    struct stat st; if (lstat(root, &st) || !S_ISDIR(st.st_mode)) return 0;
+    if (gs_nofollow_path(root, 1) != 1) return 0;
     DIR *jobs = opendir(root); if (!jobs) return 0;
     struct dirent *job; int count = 0, found = 0;
     while (!found && ++count <= 4096 && (job = readdir(jobs)) != NULL) {
@@ -701,7 +802,7 @@ static int gs_find_bgft_receipt(const char *root, int extracted, const char *con
             (extracted && strncmp(job->d_name, "extract-", 8))) continue;
         char directory[1150];
         if (snprintf(directory, sizeof(directory), "%s/%s", root, job->d_name) >= (int)sizeof(directory) ||
-            lstat(directory, &st) || !S_ISDIR(st.st_mode)) continue;
+            gs_nofollow_path(directory, 1) != 1) continue;
         for (int ordinal = 1; ordinal <= 256; ordinal++) {
             char path[1200];
             if (snprintf(path, sizeof(path), "%s/install-%03d.txt", directory, ordinal) >= (int)sizeof(path)) break;
@@ -710,7 +811,7 @@ static int gs_find_bgft_receipt(const char *root, int extracted, const char *con
                 break;
             }
             // Receipts are created in contiguous package order.
-            if (lstat(path, &st) && errno == ENOENT) break;
+            if (gs_nofollow_path(path, 0) == 0) break;
         }
     }
     closedir(jobs); return found;
@@ -749,6 +850,7 @@ static int gs_recover_duplicate_bgft(int module, const char *content, int kind)
 
 static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
 {
+    int theme = kind == 9 || gs_is_system_theme(gs_job.destination);
     char journal[1150], record[256], route[256], id[49]; FILE *file; int task = -1, complete = 0, pending = 0, route_version = 6;
     int bgft, app, users, user = -1, exists = 0, rc, stable = 0, poll_misses = 0, installed_stable = 0, source_retries = 0, copy_confirmed = 0;
     int (*init)(void *), (*user_init)(void *), (*get_user)(int *), (*app_init)(void), (*app_exists)(const char *, int *);
@@ -765,7 +867,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         gs_bind(bgft, "sceBgftServiceDownloadGetProgress", &get_progress)) return -1;
     app_init();
     if (get_user(&user)) { if (!gs_bind(users, "sceUserServiceInitialize", &user_init)) user_init(NULL); if (get_user(&user)) return -1; }
-    if (app_exists(gs_job.title, &exists)) return -1;
+    if (!theme && kind != 9 && app_exists(gs_job.title, &exists)) return -1;
     if (kind == 8 && exists && gs_patch_matches_installed()) { gs_write_status("failed", "Update content ID does not match the installed base game"); return -1; }
     if (kind == 8 && gs_check_installed_base(gs_job.destination)) return -1;
     if (kind == 8) {
@@ -790,7 +892,8 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
             (fields >= 5 && route_version != 4 && route_version != 5 && route_version != 6 && !(fields == 6 && route_version == 7 && kind == 6)) ||
             task < -1 || (complete != 0 && complete != 1) || pending < 0 || pending > 3 ||
             strcmp(id, gs_job.content) || (pending && task < 0 && !(kind == 7 && pending == 2))) return -1;
-        if (complete && kind == 7 && gs_installed_addon_matches(gs_job.destination, 1)) return 0;
+        if (complete && kind == 7 && (theme ? gs_installed_theme_matches(gs_job.destination, 1) : gs_installed_addon_matches(gs_job.destination, 1))) return 0;
+        if (complete && kind == 9) return 0; /* Completed license copy permits its matched theme; payload remains retained. */
         if (complete && kind == 8) {
             char installed_path[256], version[32];
             if (!gs_pkg_sfo(gs_job.destination, "APP_VER", version, sizeof(version)) &&
@@ -815,7 +918,17 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         // always use a distinct URL for each extracted PKG.
         if (task >= 0 && (fields == 4 || route_version == 4)) { route_version = 4; gs_package_legacy_route = 1; }
     }
-    if (kind == 7 && task < 0) return gs_install_addon(journal, pending == 2);
+    int addon_bgft = 0;
+    if (kind == 7 && !theme && task < 0) {
+        gs_addon_last_rc = 0;
+        int addon = gs_install_addon(journal, pending == 2);
+        // Console evidence: AppInstUtil rejects some add-ons with ADDCONT_BROKEN
+        // before creating anything, while the BGFT package route installs them.
+        if (addon != GS_ADDON_INSTALL_REJECTED || (uint32_t)gs_addon_last_rc != 0x80A3000Bu) return addon;
+        gs_log_write("resident", "addon-bgft-fallback job=%s content=%s rc=0x%08X", gs_job.id, gs_job.content, (unsigned)gs_addon_last_rc);
+        gs_write_status("installing", "PS4 add-on installer rejected the package; retrying through the PS4 download service");
+        addon_bgft = 1;
+    }
     // Rebuild only a journal-owned task whose package receive failed.
     // This code alone does not prove an expired remote download link.
     if (task >= 0) {
@@ -849,11 +962,12 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     // still owns this file/route and must be reattached before advancing.
     // Matching metadata without a completed receipt cannot certify a copy.
     // Register/reattach BGFT and require its preparation, bytes and copy evidence.
-    if (kind != 6 && !exists) return -1;
+    if (gs_requires_base(kind, theme) && !exists) return -1;
     if (task < 0) {
         if (g_stop || gs_canceled) return -1;
         // Route 7 registers a completed internal base directly from storage.
-        // Patches, external drives and live streams keep their HTTP handoff.
+        // HTTP lets BGFT copy to the system-selected install drive when extended
+        // storage is present, without relying on a cross-filesystem local move.
         struct { GsBgftParam param; uint32_t slot; } storage_param;
         _Static_assert(sizeof(storage_param) == 112, "BGFT storage parameter ABI");
         int (*storage_reg)(void *, int *) = NULL, (*get_slot)(const char *, uint32_t *);
@@ -869,16 +983,26 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         char display_name[256], package_name[232];
         if (gs_pkg_sfo(gs_job.destination, "TITLE", package_name, sizeof(package_name)))
             snprintf(package_name, sizeof(package_name), "%s", gs_job.title);
-        snprintf(display_name, sizeof(display_name), "[%s] %s", kind == 8 ? "UPDATE" : kind == 7 ? "DLC" : "BASE", package_name);
+        snprintf(display_name, sizeof(display_name), "[%s] %s", theme ? "THEME" : kind == 8 ? "UPDATE" : kind == 7 ? "DLC" : "BASE", package_name);
         FILE *icon_check = fopen("/user/appmeta/SRCH00001/icon0.png", "rb");
         param.name = display_name; param.icon = icon_check ? "http://127.0.0.1:8742/sspi-icon.png" : ""; param.option = 0x10000;
         if (icon_check) fclose(icon_check);
-        param.scenario = "0"; param.type = gs_pkg_type(gs_job.destination); if (!param.type) return -1; param.subtype = ""; param.size = gs_job.total;
+        param.scenario = "0"; param.type = gs_pkg_type(gs_job.destination); if (!param.type) return -1; param.subtype = "";
+        if (read_bgft_package_metadata(gs_job.destination, gs_job.total, &param.size, NULL)) {
+            gs_write_status("failed", "BGFT package declaration does not match the validated file; PKG retained"); return -1;
+        }
+        gs_log_write("resident", "bgft-package-metadata type=%s declared_bytes=%llu transfer_bytes=%lld",
+            param.type, (unsigned long long)param.size, (long long)gs_job.total);
         // Match IntInit with the internal registration ABI (PS4RPI's 0x80990004 fix).
-        const char *api = kind == 6 ? "sceBgftServiceIntDownloadRegisterTask" : "sceBgftServiceIntDebugDownloadRegisterPkg";
+        const char *api = gs_package_register_api(kind, theme);
         if (gs_bind(bgft, api, &reg)) return -1;
-        if (kind == 6 && !gs_job.native_bgft && gs_stream_slot < 0 &&
-            (!strncmp(gs_job.destination, "/data/SSPI/", 11) || !strncmp(gs_job.destination, "/user/data/SSPI/", 16)) &&
+        int storage_candidate = kind == 6 && !gs_job.native_bgft && gs_stream_slot < 0 &&
+            (!strncmp(gs_job.destination, "/data/SSPI/", 11) || !strncmp(gs_job.destination, "/user/data/SSPI/", 16));
+        int extended_storage = storage_candidate ? gs_nofollow_path("/mnt/ext0", 1) : 0;
+        if (storage_candidate && extended_storage != 0)
+            gs_log_write("resident", "bgft-storage-bypassed job=%s extended_storage=%s handoff=http destination=system-default",
+                gs_job.id, extended_storage > 0 ? "present" : "unverified");
+        if (storage_candidate && extended_storage == 0 &&
             !gs_bind(bgft, "sceBgftServiceIntDownloadRegisterTaskByStorageEx", &storage_reg) &&
             !gs_bind(app, "sceAppInstUtilGetPrimaryAppSlot", &get_slot)) {
             memset(&storage_param, 0, sizeof(storage_param));
@@ -914,7 +1038,23 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
             rc = reg(&param, &task);
             gs_log_write("resident", "bgft-register api=%s rc=0x%08X job=%s task=%d mode=http reason=storage-fallback", api, (unsigned)rc, gs_job.id, task);
         }
-        if (route_version != 7 && (uint32_t)rc == 0x80F00633u && task < 0 && kind == 6 &&
+        // Console evidence: BGFT rejects a zero PackageSize for a no-data license
+        // with 0x80990004 before creating a task. Retry once declaring the real
+        // length; the marker makes the plugin's reference JSON declare it too.
+        if (route_version != 7 && task < 0 && (uint32_t)rc == 0x80990004u && !param.size && gs_job.total > 0) {
+            char marker[1150];
+            snprintf(marker, sizeof(marker), "%s.bgft-transfer-size", gs_job.destination);
+            if (!write_atomic(marker, "1\n")) {
+                param.size = (uint64_t)gs_job.total;
+                rc = reg(&param, &task);
+                gs_log_write("resident", "bgft-register api=%s rc=0x%08X job=%s task=%d reason=license-size-fallback bytes=%lld",
+                    api, (unsigned)rc, gs_job.id, task, (long long)gs_job.total);
+            }
+        }
+        // The internal task API also rejects theme licenses with 0x80990004 at both
+        // declared and real sizes; the debug package API installs add-ons on-console.
+        if (route_version != 7 && task < 0 && (((uint32_t)rc == 0x80F00633u && (kind == 6 || theme)) ||
+                ((uint32_t)rc == 0x80990004u && (kind == 9 || theme))) &&
             !gs_bind(bgft, "sceBgftServiceIntDebugDownloadRegisterPkg", &reg)) {
             api = "sceBgftServiceIntDebugDownloadRegisterPkg";
             rc = reg(&param, &task);
@@ -940,7 +1080,8 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
             // Registration returned without creating a task. Clear only our intent.
             snprintf(record, sizeof(record), "%s -1 0 0 6 %d", gs_job.content, kind);
             write_atomic(journal, record);
-            gs_write_status("failed", error); return -1;
+            // A taskless add-on fallback owns nothing; later independent add-ons continue.
+            gs_write_status("failed", error); return addon_bgft ? GS_ADDON_INSTALL_REJECTED : -1;
         }
         gs_archive_task = task;
         snprintf(record, sizeof(record), "%s %d 0 0 %d %d", gs_job.content, task, route_version, kind);
@@ -971,6 +1112,33 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         // The promoted patch plus its exact package identity takes precedence over
         // stale BGFT counters/errors. Reference JSON totals can exclude metadata.
         char installed_path[256];
+        if (theme && gs_stage_stream_finished() == 1 && gs_installed_theme_matches(gs_job.destination, 0)) {
+            if (++installed_stable >= 3) {
+                if (!gs_installed_theme_matches(gs_job.destination, 1)) {
+                    gs_write_status("failed", "THEME_UNCONFIRMED: Installed theme payload does not yet match the downloaded package. Check Settings > Themes, then retry if missing. Task and files retained.");
+                    return -1;
+                }
+                snprintf(record, sizeof(record), "%s %d 1 0 %d %d", gs_job.content, task, route_version, kind);
+                int saved = write_atomic(journal, record);
+                if (!saved) { gs_archive_task = -1; gs_done = gs_job.total; }
+                return saved;
+            }
+            sceKernelUsleep(500000); continue;
+        }
+        // A BGFT-installed add-on is proven by its installed content, like themes.
+        if (addon_bgft && gs_installed_addon_matches(gs_job.destination, 0)) {
+            if (++installed_stable >= 3) {
+                if (!gs_installed_addon_matches(gs_job.destination, 1)) {
+                    gs_write_status("failed", "DLC_UNCONFIRMED: Installed add-on does not yet match the downloaded package. PKG and task retained; retry checks completion first.");
+                    return -1;
+                }
+                snprintf(record, sizeof(record), "%s %d 1 0 %d %d", gs_job.content, task, route_version, kind);
+                int saved = write_atomic(journal, record);
+                if (!saved) { gs_archive_task = -1; gs_done = gs_job.total; gs_download_notification(gs_job.title, "[DLC] Installation confirmed"); }
+                return saved;
+            }
+            sceKernelUsleep(500000); continue;
+        }
         if (kind == 8 && copy_confirmed && gs_installed_patch_matches(gs_job.destination, wanted, installed_path, sizeof(installed_path))) {
             if (++installed_stable >= 8) {
                 // The transfer hash certifies our source file, not BGFT's installed
@@ -995,6 +1163,10 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         if (rc) {
             stable = 0;
             if (++poll_misses >= 120) {
+                if (theme) {
+                    gs_write_status("failed", "THEME_UNCONFIRMED: PS4 theme task stopped reporting progress. Check Settings > Themes, then retry if missing. Task and files retained.");
+                    return -1;
+                }
                 char error[384]; snprintf(error, sizeof(error), "sceBgftServiceDownloadGetProgress rc=0x%08X: %s. Task and PKG retained.", (unsigned int)rc, gs_bgft_error(rc));
                 gs_write_status("failed", error); return -1;
             }
@@ -1046,7 +1218,12 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                 gs_bgft_error_terminal(p.error) ? "BGFT_TERMINAL:" : "", gs_bgft_error(p.error), (unsigned)rc, (unsigned)p.error, task);
             gs_write_status("failed", error); return -1;
         }
-        if (gs_bgft_stalled(&watch, &p, now, gs_paused, gs_stream_slot >= 0 && !gs_stage_stream_finished())) {
+        if (theme && copy_finished && !gs_paused && now - phase_started >= 120000000ULL) {
+            gs_write_status("failed", "THEME_UNCONFIRMED: PS4 finished copying but theme registration is not confirmed. Check Settings > Themes, then retry if missing. Task and files retained.");
+            return -1;
+        }
+        if (gs_bgft_stalled(&watch, &p, now, gs_paused, (theme && copy_finished) || (gs_stream_slot >= 0 && !gs_stage_stream_finished()),
+                gs_job.total > 0 ? (uint64_t)gs_job.total : 0)) {
             gs_log_write("resident", "bgft-stall job=%s task=%d attempt=%d bytes=%llu total=%llu prepare=%d copy=%d",
                 gs_job.id, task, stall_retries, (unsigned long long)p.transferred_total,
                 (unsigned long long)p.length_total, p.preparing, p.copy);
@@ -1096,11 +1273,25 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
             (storage_copy_complete || (p.preparing >= 100 && (base_payload_complete || gs_served || transferred >= (uint64_t)gs_job.total)))) stable++;
         else stable = 0;
         if (stable >= 8) {
+            if (kind == 9 && copy_confirmed) {
+                snprintf(record, sizeof(record), "%s %d 1 0 %d %d", gs_job.content, task, route_version, kind);
+                int saved = write_atomic(journal, record);
+                if (!saved) { gs_archive_task = -1; gs_done = gs_job.total; }
+                return saved;
+            }
             // Updates require the exact installed image identity and metadata
             // above. Version/copy counters cannot distinguish same-version backports.
             int confirmed = kind == 6 ? (!app_exists(gs_job.title, &exists) && exists && gs_installed_base_matches(gs_job.destination, 0))
-                : kind == 7 ? gs_installed_addon_matches(gs_job.destination, 1) : 0;
+                : kind == 7 ? (theme ? gs_installed_theme_matches(gs_job.destination, 1) : gs_installed_addon_matches(gs_job.destination, 1)) : 0;
             if (!confirmed) {
+                if (theme) {
+                    if (stable >= 240) {
+                        gs_write_status("failed", "THEME_UNCONFIRMED: PS4 accepted the theme but registration is not yet confirmed. Check Settings > Themes, then retry if missing. Task and files retained.");
+                        return -1;
+                    }
+                    gs_write_status("submitted", "THEME_UNCONFIRMED: Theme sent to PS4; checking Settings > Themes. Task and files retained.");
+                    sceKernelUsleep(500000); continue;
+                }
                 if (stable >= 240) {
                     gs_write_status("failed", "PS4 finished copying but installed version is unconfirmed. Task and PKG retained; inspect Notifications."); return -1;
                 }
@@ -1305,7 +1496,7 @@ static int gs_prepare_pkg(GsExtractedPkg *pkg)
 
 static int gs_run_package(void)
 {
-    char directory[1024], packages[1150], leaf[256]; struct stat owned;
+    char directory[1024], packages[1150], leaf[256];
     snprintf(leaf, sizeof(leaf), "/packages/%s", gs_job.id);
     if (gs_ipc_path(packages, sizeof(packages), "/packages") || gs_ipc_path(directory, sizeof(directory), leaf)) return -1;
     mkdir(packages, 0700); mkdir(directory, 0700);
@@ -1316,7 +1507,7 @@ static int gs_run_package(void)
     }
     if (kind == 8 && gs_check_installed_base(gs_job.destination)) return -1;
     if (gs_verify_package(gs_job.destination, kind)) return -1;
-    if (!lstat(directory, &owned) && S_ISDIR(owned.st_mode) && kind >= 0 && !g_stop && !gs_canceled)
+    if (gs_nofollow_path(directory, 1) == 1 && kind >= 0 && !g_stop && !gs_canceled)
         result = gs_install_archive_pkg(directory, 1, kind);
     if (gs_canceled) {
         if (gs_cancel_task()) { gs_release = 0; gs_write_status("failed", "BGFT cancellation unconfirmed; ownership retained"); }
@@ -1374,22 +1565,22 @@ static int gs_archive_sync_directory(const char *directory)
 
 static int gs_prepare_archive_extraction(const char *directory)
 {
-    char expected[1024], receipt[1150], path[1150], body[256], stored[256], leaf[256]; struct stat st;
+    char expected[1024], receipt[1150], path[1150], body[256], stored[256], leaf[256];
     int existing_receipt = 0;
     if (gs_job.local_only || gs_job.generation[0]) snprintf(expected, sizeof(expected), "%s/extract-%s", gs_job.storage_root, gs_job.id);
     else {
         snprintf(leaf, sizeof(leaf), "/archives/%s", gs_job.id);
         if (gs_ipc_path(expected, sizeof(expected), leaf)) return -1;
     }
-    if (strcmp(expected, directory) || lstat(directory, &st) || !S_ISDIR(st.st_mode)) return -1;
+    if (strcmp(expected, directory) || gs_nofollow_path(directory, 1) != 1) return -1;
     snprintf(path, sizeof(path), "%s/packages.txt", directory);
-    if (!lstat(path, &st) || errno != ENOENT) {
+    if (gs_nofollow_path(path, 0) != 0) {
         gs_write_status("failed", "Archive package journal cannot be read; extraction files and install ownership retained."); return -1;
     }
     snprintf(receipt, sizeof(receipt), "%s/extraction-in-progress.txt", directory);
     snprintf(body, sizeof(body), "1\n%s\n256\n", gs_job.id);
-    if (!lstat(receipt, &st)) {
-        if (!S_ISREG(st.st_mode)) goto invalid_receipt;
+    int receipt_kind = gs_nofollow_path(receipt, 0);
+    if (receipt_kind == 1) {
         int fd = open(receipt, O_RDONLY | O_NOFOLLOW);
         if (fd < 0) goto invalid_receipt;
         FILE *file = fdopen(fd, "rb");
@@ -1399,21 +1590,22 @@ static int gs_prepare_archive_extraction(const char *directory)
         fclose(file);
         if (!valid) goto invalid_receipt;
         existing_receipt = 1;
-    } else if (errno != ENOENT) goto invalid_receipt;
+    } else if (receipt_kind != 0) goto invalid_receipt;
     // Claim only absent deterministic outputs. Existing install journals take
     // precedence even if the package list was lost or manually removed.
     for (int ordinal = 1; ordinal <= 256; ordinal++) {
         snprintf(path, sizeof(path), "%s/install-%03d.txt", directory, ordinal);
-        if (!lstat(path, &st) || errno != ENOENT) {
+        if (gs_nofollow_path(path, 0) != 0) {
             if (existing_receipt) goto interrupted;
             gs_write_status("failed", "Archive install ownership exists without its package list. Files retained; inspect PS4 Notifications."); return -1;
         }
         for (int partial = 0; partial < 2; partial++) {
             snprintf(path, sizeof(path), "%s/pkg-%03d.pkg%s", directory, ordinal, partial ? ".part" : "");
-            if (!lstat(path, &st)) {
+            int existing = gs_nofollow_path(path, 0);
+            if (existing == 1) {
                 if (existing_receipt) goto interrupted;
                 gs_write_status("failed", "Previous extraction files have no ownership receipt. Files retained; start a new archive job."); return -1;
-            } else if (errno != ENOENT) goto invalid_receipt;
+            } else if (existing != 0) goto invalid_receipt;
         }
     }
     if (g_stop || gs_canceled) return -1;
@@ -1464,8 +1656,9 @@ static int gs_run_archive(void)
 {
     char directory[1024], alias[1300], first[1300], leaf[256], archives[1150];
     const char *names[GS_MAX_VOLUMES], *paths[GS_MAX_VOLUMES];
-    GsExtractedPkg *packages = NULL; int kinds[256], versions[256]; char content_ids[256][49]; int count = 0, result = -1, extraction_started = 0;
+    GsExtractedPkg *packages = NULL; int kinds[256], versions[256]; char content_ids[256][49]; int count = 0, result = -1, extraction_started = 0, addon_rejected = 0;
     char expected_content[49]; snprintf(expected_content, sizeof(expected_content), "%s", gs_job.content);
+    char expected_title[16]; snprintf(expected_title, sizeof(expected_title), "%s", gs_job.title);
     int64_t original_total = gs_job.total;
     if (gs_job.local_only || gs_job.generation[0]) snprintf(directory, sizeof(directory), "%s/extract-%s", gs_job.storage_root, gs_job.id);
     else {
@@ -1478,8 +1671,7 @@ static int gs_run_archive(void)
         mkdir(archives, 0700);
     }
     mkdir(directory, 0700);
-    struct stat owned;
-    if (lstat(directory, &owned) || !S_ISDIR(owned.st_mode)) goto done;
+    if (gs_nofollow_path(directory, 1) != 1) goto done;
     char terminal_path[1150], terminal_line[256], terminal_generation[80], terminal_content[80];
     snprintf(terminal_path, sizeof(terminal_path), "%s/complete.txt", directory);
     FILE *terminal = fopen(terminal_path, "rb");
@@ -1571,7 +1763,8 @@ static int gs_run_archive(void)
     gs_log_write("resident", "archive-dispatch job=%s stage=extract-after format=%s result=%d", gs_job.id, format, count);
     if (count <= 0) {
         char error[256], detail[300];
-        if (gs_canceled || g_stop) { gs_write_status("canceled", "Archive extraction canceled; input retained"); goto done; }
+        // A resident stop is not a cancel; done: reports the job as waiting to resume.
+        if (gs_canceled || g_stop) { if (gs_canceled) gs_write_status("canceled", "Archive extraction canceled; input retained"); goto done; }
         if (seven) snprintf(error, sizeof(error), "%s", seven_error[0] ? seven_error : "Split 7z archives are not supported; original retained");
         else if (!zip && count == -1001) snprintf(error, sizeof(error), "RAR header reading timed out; input retained. Remove the queue entry or retry after checking the archive.");
         else if (!zip && count == -1002) snprintf(error, sizeof(error), "RAR scan found no PKG filename or package signature; archive retained. Check that the source supplied a PS4 package archive.");
@@ -1607,7 +1800,13 @@ validate_packages:
     gs_log_write("resident", "archive-inventory job=%s packages=%d stage=validating", gs_job.id, count);
     for (int i = 0; i < count; i++) {
         kinds[i] = gs_pkg_kind(packages[i].path);
-        if (kinds[i] < 0 || gs_prepare_pkg(&packages[i])) { gs_write_status("failed", "Extracted PKG title or structure mismatch"); goto done; }
+        snprintf(gs_job.title, sizeof(gs_job.title), "%s", gs_is_system_theme(packages[i].path) ? "" : expected_title);
+        uint64_t validation_started = sceKernelGetProcessTime();
+        int validation_result = kinds[i] < 0 ? -1 : gs_prepare_pkg(&packages[i]);
+        uint64_t validation_finished = sceKernelGetProcessTime();
+        gs_log_write("resident", "archive-package-check job=%s candidate=%d stage=prepared-validation result=%d elapsed_ms=%llu",
+            gs_job.id, i + 1, validation_result, (unsigned long long)(validation_finished >= validation_started ? (validation_finished - validation_started) / 1000 : 0));
+        if (validation_result) { gs_write_status("failed", "Extracted PKG title or structure mismatch"); goto done; }
         snprintf(content_ids[i], sizeof(content_ids[i]), "%s", gs_job.content);
         if (gs_check_metadata(packages[i].path, kinds[i])) { gs_write_status("failed", "Extracted PKG header and embedded type/title disagree"); goto done; }
         char version[32] = {0}, firmware[32] = {0};
@@ -1617,9 +1816,19 @@ validate_packages:
         gs_log_write("resident", "archive-package job=%s candidate=%d type=%s content=%s version=%s firmware=%s bytes=%lld",
             gs_job.id, i + 1, kinds[i] == 6 ? "base" : kinds[i] == 8 ? "update-or-backport" : "dlc",
             content_ids[i], version[0] ? version : "unknown", firmware[0] ? firmware : "unknown", (long long)packages[i].size);
-        if (gs_verify_package(packages[i].path, kinds[i])) goto done;
+        uint64_t verify_started = sceKernelGetProcessTime();
+        int verify_result = gs_verify_package(packages[i].path, kinds[i]);
+        uint64_t verify_finished = sceKernelGetProcessTime();
+        gs_log_write("resident", "archive-package-check job=%s candidate=%d stage=package-integrity result=%d elapsed_ms=%llu",
+            gs_job.id, i + 1, verify_result, (unsigned long long)(verify_finished >= verify_started ? (verify_finished - verify_started) / 1000 : 0));
+        if (verify_result) goto done;
     }
-    if (expected_content[0] && (count != 1 || strcmp(expected_content, gs_job.content))) {
+    for (int i = 0; i < count; i++) if (gs_is_no_data_license(packages[i].path)) {
+        for (int j = 0; j < count; j++) if (gs_is_system_theme(packages[j].path) && !strcmp(content_ids[i], content_ids[j])) { kinds[i] = 9; break; }
+    }
+    int matching_pair = count == 2 && ((kinds[0] == 9 && gs_is_system_theme(packages[1].path)) ||
+        (kinds[1] == 9 && gs_is_system_theme(packages[0].path))) && !strcmp(content_ids[0], content_ids[1]);
+    if (expected_content[0] && ((count != 1 && !matching_pair) || strcmp(expected_content, gs_job.content))) {
         gs_write_status("failed", "Archive content ID promise does not match extracted packages"); goto done;
     }
     // Backport is a source/release label, not a PKG type bit. Without that
@@ -1632,11 +1841,11 @@ validate_packages:
         }
     }
     for (int i = 1; i < count; i++) {
-        int j = i, kind = kinds[i], priority = kind == 6 ? 0 : kind == 8 ? 1 : 2;
+        int j = i, kind = kinds[i], priority = kind == 6 ? 0 : kind == 8 ? 1 : kind == 9 ? 2 : 3;
         GsExtractedPkg pkg = packages[i];
         int current = versions[i];
         while (j > 0) {
-            int previous_priority = kinds[j - 1] == 6 ? 0 : kinds[j - 1] == 8 ? 1 : 2;
+            int previous_priority = kinds[j - 1] == 6 ? 0 : kinds[j - 1] == 8 ? 1 : kinds[j - 1] == 9 ? 2 : 3;
             int previous = versions[j - 1];
             if (previous_priority < priority || (previous_priority == priority && (kind != 8 || previous <= current))) break;
             packages[j] = packages[j - 1]; kinds[j] = kinds[j - 1]; versions[j] = versions[j - 1]; j--;
@@ -1651,14 +1860,32 @@ validate_packages:
     for (int i = 0; i < count; i++) {
         gs_validated = 0;
         while (g_client_count && !g_stop && !gs_canceled) sceKernelUsleep(10000);
-        if (g_stop || gs_canceled || gs_prepare_pkg(&packages[i])) goto done;
+        snprintf(gs_job.title, sizeof(gs_job.title), "%s", gs_is_system_theme(packages[i].path) ? "" : expected_title);
+        if (g_stop || gs_canceled) goto done;
+        uint64_t recheck_started = sceKernelGetProcessTime();
+        int recheck_result = gs_prepare_pkg(&packages[i]);
+        uint64_t recheck_finished = sceKernelGetProcessTime();
+        gs_log_write("resident", "archive-package-check job=%s ordinal=%d stage=pre-install-validation result=%d elapsed_ms=%llu",
+            gs_job.id, i + 1, recheck_result, (unsigned long long)(recheck_finished >= recheck_started ? (recheck_finished - recheck_started) / 1000 : 0));
+        if (recheck_result) goto done;
         gs_package_ordinal = i + 1;
         gs_package_legacy_route = 0;
         gs_interval_count = 0; gs_served = 0; __sync_synchronize(); gs_validated = 1;
-        if (gs_install_archive_pkg(directory, i + 1, kinds[i])) {
-            if (strcmp(gs_state, "failed")) gs_write_status("failed", "Archive install paused at an unconfirmed BGFT task; packages and journal retained"); goto done;
+        int install_result = gs_install_archive_pkg(directory, i + 1, kinds[i]);
+        if (install_result) {
+            if (install_result == GS_ADDON_INSTALL_REJECTED && kinds[i] == 7 && !gs_is_system_theme(packages[i].path)) {
+                addon_rejected = 1;
+                gs_log_write("resident", "archive-child-rejected job=%s ordinal=%d type=dlc; continuing independent add-ons", gs_job.id, i + 1);
+            } else {
+                if (strcmp(gs_state, "failed")) gs_write_status("failed", "Archive install paused at an unconfirmed BGFT task; packages and journal retained");
+                goto done;
+            }
         }
         if (i + 1 < count) for (int wait = 0; wait < 30 && !g_stop && !gs_canceled; wait++) sceKernelUsleep(100000);
+    }
+    if (addon_rejected) {
+        gs_write_status("failed", "One or more DLC packages were rejected by the PS4. Failed packages and install journals are retained; resolve the rejected add-on before retrying the archive.");
+        goto done;
     }
 archive_complete:
     ; /* The terminal receipt is durable before deleting any completed input. */
@@ -1670,7 +1897,7 @@ archive_complete:
     /* Cleanup follows every child's durable successful installation receipt. */
     if (gs_storage_matches(gs_job.storage_root, gs_job.storage_token)) {
         while (g_client_count && !g_stop && !gs_canceled) sceKernelUsleep(10000);
-        if (!g_stop && !gs_canceled) for (int i = 0; i < count; i++) unlink(packages[i].path);
+        if (!g_stop && !gs_canceled) for (int i = 0; i < count; i++) if (kinds[i] != 9) unlink(packages[i].path);
         if (!gs_job.borrowed_source && !g_stop && !gs_canceled && gs_volumes) for (int i = 0; i < gs_volume_count; i++) {
             unlink(gs_volumes[i].path);
             char map[1150]; snprintf(map, sizeof(map), "%s.resident.map", gs_volumes[i].path); unlink(map);
@@ -1682,6 +1909,11 @@ done:
         if (gs_cancel_task()) { gs_release = 0; gs_write_status("failed", "BGFT cancellation unconfirmed; archive ownership retained"); }
         else gs_write_status("canceled", NULL);
     }
+    /* A resident stop (shutdown or a newer worker) is not a failure: job.txt stays
+     * and the next worker runs this job again. Before any install call there is
+     * no PS4 task, so report the job as queued, as the app shows it, not failed. */
+    else if (result && g_stop && gs_archive_task < 0 && !gs_archive_journal[0])
+        gs_write_status("queued", "Background service stopped; this archive job resumes when the service restarts. Input retained.");
     else if (result && strcmp(gs_state, "failed")) gs_write_status("failed", "Resident archive preparation failed; input retained");
     free(packages); free(gs_volumes); gs_volumes = NULL; gs_volume_count = 0;
     return result;

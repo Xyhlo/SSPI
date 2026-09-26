@@ -255,7 +255,11 @@ namespace Orbis
         {
             if (header == null || header.Length != 0x1000 || total < 0x1000 || Be32(header, 0) != 0x7f434e54)
                 throw new IOException("Package integrity header is missing");
-            if (Be64(header, 0x430) != total || (!string.IsNullOrEmpty(titleId) &&
+            bool noData = Be32(header, 0x74) == 0x1c && Be64(header, 0x430) == 0 &&
+                Be64(header, 0x410) == 0 && Be64(header, 0x418) == 0 &&
+                Be64(header, 0x20) >= 0x1000 && Be64(header, 0x20) <= total &&
+                Be64(header, 0x28) > 0 && Be64(header, 0x28) == total - Be64(header, 0x20);
+            if ((!noData && Be64(header, 0x430) != total) || (!string.IsNullOrEmpty(titleId) &&
                 !string.Equals(Encoding.ASCII.GetString(header, 0x47, 9), titleId, StringComparison.OrdinalIgnoreCase)))
                 throw new IOException("Package integrity identity does not match");
             long body = Be64(header, 0x20), bodySize = Be64(header, 0x28);
@@ -272,6 +276,48 @@ namespace Orbis
                     throw new IOException("Package integrity header digest mismatch");
                 return BitConverter.ToString(sha.ComputeHash(header)).Replace("-", "");
             }
+        }
+
+        internal static bool IsNoDataLicense(string path)
+        {
+            try { using (var file = File.OpenRead(path)) {
+                byte[] h = Read(file, 0x1000);
+                return Be32(h, 0) == 0x7f434e54 && Be32(h, 0x74) == 0x1c &&
+                    Be64(h, 0x410) == 0 && Be64(h, 0x418) == 0;
+            } } catch { return false; }
+        }
+
+        internal static long BgftPackageSize(string path)
+        {
+            using (var file = File.OpenRead(path))
+            {
+                byte[] header = Read(file, 0x1000);
+                TransferHeaderIdentity(header, file.Length, null);
+                // PS4AL can declare zero while its license container has bytes.
+                // BGFT metadata uses the declaration; HTTP/copy totals use file.Length.
+                return Be64(header, 0x430);
+            }
+        }
+
+        internal static bool VerifyNoDataLicense(string path, out string error)
+        {
+            error = null;
+            try { using (var file = File.OpenRead(path)) {
+                byte[] h = Read(file, 0x1000);
+                if (Be32(h, 0x74) != 0x1c || Be64(h, 0x410) != 0 || Be64(h, 0x418) != 0)
+                    throw new IOException("Package is not a no-data license");
+                TransferHeaderIdentity(h, file.Length, null);
+                long offset = Be64(h, 0x20), remaining = Be64(h, 0x28);
+                if (offset < 0x1000 || offset > file.Length || remaining <= 0 || remaining != file.Length - offset)
+                    throw new IOException("License body does not reach the end of the package");
+                file.Position = offset;
+                using (var sha = CreateSha256()) {
+                    byte[] digest = sha.ComputeHash(file);
+                    for (int i = 0; i < 32; i++) if (digest[i] != h[0x160 + i])
+                        throw new IOException("License body digest mismatch (incomplete or corrupt download)");
+                }
+                return true;
+            } } catch (Exception ex) { error = ex.Message; return false; }
         }
 
         // Bind the completed transfer to its header without rereading the body.

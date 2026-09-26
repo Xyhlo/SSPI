@@ -133,7 +133,7 @@ static void log_package_build(void)
     do { if (!require_export(module, #name, (void**)&name)) return -1; } while (0)
 
 #ifdef RESIDENT_DAEMON
-#define RESIDENT_APP_ROOT "/system/vsh/app/SRCHD0001"
+#define RESIDENT_APP_ROOT "/system/vsh/app/SRCH00002"
 #define RESIDENT_VERSION "4.42"
 #define DOTNET_UNIX_EPOCH_TICKS 621355968000000000ULL
 
@@ -189,10 +189,10 @@ static void write_resident_boot(const char* stage, int code)
 
 static void write_resident_heartbeat(void)
 {
-    char line[128];
+    char line[160];
     unsigned long long ticks = DOTNET_UNIX_EPOCH_TICKS +
         ((unsigned long long)time(0) * 10000000ULL);
-    snprintf(line, sizeof(line), "%s\n%llu\n", RESIDENT_VERSION, ticks);
+    snprintf(line, sizeof(line), "%s\n%llu\nhost=daemon pid=%d\n", RESIDENT_VERSION, ticks, getpid());
     write_resident_named("heartbeat.txt", line, 0);
 }
 

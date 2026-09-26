@@ -169,7 +169,7 @@ static const char *gs_storage_detail(int check)
     case -2: return "PS4 staging folder is missing or inaccessible";
     case -3: return "Selected staging path or saved drive identity is invalid";
     case -4: return "USB mount directory is inaccessible";
-    case -5: return gs_storage_context_unverified ? "Resident USB filesystem access is unverified" : "Selected USB drive is disconnected or inaccessible";
+    case -5: return gs_storage_context_unverified ? "The background service could not open the selected USB drive" : "Selected USB drive is disconnected or inaccessible";
     case -6: return "Selected USB path has no mounted drive";
     case -7: return "Selected drive's SSPI folder is missing, linked or inaccessible";
     case -8: return "Selected drive's SSPI folder belongs to a different device";
@@ -183,11 +183,16 @@ static const char *gs_storage_detail(int check)
 }
 static void gs_storage_wait_detail(char *out, size_t capacity, int check, const GsStorageError *error)
 {
+    /* In the shell process a failed open of /mnt/usbN can persist while the drive
+     * works in SSPI itself; reselecting or reseating it does not help. */
+    const char *action = check == -5 && gs_storage_context_unverified
+        ? "if it is connected, set Staging location to PS4 or Download mode to In-app"
+        : "restore the selected storage to resume";
     if (error && error->code)
-        snprintf(out, capacity, "%s; restore the selected storage to resume. Files retained (storage check %d; %s %s: 0x%08X)",
-            gs_storage_detail(check), check, error->operation, error->path, (unsigned)error->code);
+        snprintf(out, capacity, "%s; %s. Files retained (storage check %d; %s %s: 0x%08X)",
+            gs_storage_detail(check), action, check, error->operation, error->path, (unsigned)error->code);
     else
-        snprintf(out, capacity, "%s; restore the selected storage to resume. Files retained (storage check %d)",
-            gs_storage_detail(check), check);
+        snprintf(out, capacity, "%s; %s. Files retained (storage check %d)",
+            gs_storage_detail(check), action, check);
 }
 #endif

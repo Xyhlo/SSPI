@@ -20,7 +20,9 @@ namespace Orbis
         Unknown,
         BaseGame,
         Patch,
-        AddOn
+        AddOn,
+        SystemTheme,
+        SystemThemeLicense
     }
 
     /// <summary>Structural PS4 PKG checks before mark-complete / install.</summary>
@@ -98,6 +100,8 @@ namespace Orbis
             }
 
             PkgContentKind expectedKind = RequestedKind(requestedKind);
+            if (expectedKind == PkgContentKind.SystemThemeLicense && actualKind == PkgContentKind.AddOn &&
+                PkgIntegrity.IsNoDataLicense(path)) actualKind = PkgContentKind.SystemThemeLicense;
             if (expectedKind != PkgContentKind.Unknown && actualKind != expectedKind)
             {
                 result = PkgValResult.TitleMismatch;
@@ -135,6 +139,8 @@ namespace Orbis
 
         internal static PkgContentKind RequestedKind(string requestedKind)
         {
+            if (string.Equals(requestedKind, "theme-license", StringComparison.OrdinalIgnoreCase))
+                return PkgContentKind.SystemThemeLicense;
             if (string.Equals(requestedKind, "game", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(requestedKind, "base", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(requestedKind, "basegame", StringComparison.OrdinalIgnoreCase))
@@ -147,6 +153,8 @@ namespace Orbis
                 string.Equals(requestedKind, "addon", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(requestedKind, "add-on", StringComparison.OrdinalIgnoreCase))
                 return PkgContentKind.AddOn;
+            if (string.Equals(requestedKind, "theme", StringComparison.OrdinalIgnoreCase))
+                return PkgContentKind.SystemTheme;
             return PkgContentKind.Unknown;
         }
 
@@ -251,7 +259,12 @@ namespace Orbis
                     // (sparse prealloc) or only the start of PFS was written. Installing
                     // those reports "corrupted". Require both the start and the tail of
                     // the payload to contain data.
-                    if (!PayloadLooksPresent(fs, fileSize, bodyOffset, bodySize, pfsOffset, pfsSize))
+                    if (pfsSize == 0 && PkgIntegrity.IsNoDataLicense(path))
+                    {
+                        if (!PkgIntegrity.VerifyNoDataLicense(path, out detail))
+                        { result = PkgValResult.LengthMismatch; return false; }
+                    }
+                    else if (!PayloadLooksPresent(fs, fileSize, bodyOffset, bodySize, pfsOffset, pfsSize))
                     {
                         result = PkgValResult.LengthMismatch;
                         detail = "PKG payload is empty (incomplete download)";
@@ -279,15 +292,22 @@ namespace Orbis
             {
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
                 {
-                    if (fs.Length < 0x7C)
+                    if (fs.Length < 0x9C)
                     {
                         detail = "PKG header too small";
+                        return false;
+                    }
+                    if (ReadU32BE(fs) != 0x7F434E54)
+                    {
+                        detail = "not a PS4 PKG (bad magic)";
                         return false;
                     }
                     fs.Position = 0x74;
                     uint contentType = ReadU32BE(fs);
                     uint contentFlags = ReadU32BE(fs);
-                    return ClassifyContentKind(contentType, contentFlags, out kind, out detail);
+                    fs.Position = 0x98;
+                    uint iroTag = ReadU32BE(fs);
+                    return ClassifyContentKind(contentType, contentFlags, iroTag, out kind, out detail);
                 }
             }
             catch (Exception ex)
@@ -333,12 +353,13 @@ namespace Orbis
         {
             kind = PkgContentKind.Unknown;
             detail = "PKG header too small";
-            if (header == null || header.Length < 0x7C ||
+            if (header == null || header.Length < 0x9C ||
                 header[0] != Magic[0] || header[1] != Magic[1] ||
                 header[2] != Magic[2] || header[3] != Magic[3]) return false;
             uint contentType = ReadU32BE(header, 0x74);
             uint contentFlags = ReadU32BE(header, 0x78);
-            return ClassifyContentKind(contentType, contentFlags, out kind, out detail);
+            uint iroTag = ReadU32BE(header, 0x98);
+            return ClassifyContentKind(contentType, contentFlags, iroTag, out kind, out detail);
         }
 
         internal static bool TryGetPackageSizeFromHeader(byte[] header, out long packageSize)
@@ -351,6 +372,19 @@ namespace Orbis
             if (value == 0 || value > long.MaxValue) return false;
             packageSize = (long)value;
             return true;
+        }
+
+        static string KindPhrase(PkgContentKind kind)
+        {
+            switch (kind)
+            {
+                case PkgContentKind.BaseGame: return "a base game";
+                case PkgContentKind.Patch: return "an update";
+                case PkgContentKind.AddOn: return "DLC";
+                case PkgContentKind.SystemTheme: return "a system theme";
+                case PkgContentKind.SystemThemeLicense: return "a theme license";
+                default: return "an unknown package type";
+            }
         }
 
         internal static bool TryGetTitleIdFromContentId(string contentId, out string titleId)
@@ -372,7 +406,13 @@ namespace Orbis
             error = null;
             PkgContentKind expected = RequestedKind(requestedKind);
             if (expected != PkgContentKind.Unknown && actualKind != expected)
-            { error = "Package type mismatch: requested " + expected + ", received " + actualKind; return false; }
+            {
+                // Sources sometimes label an update as the base game (or the reverse).
+                // Name both so the user can pick the right mirror.
+                error = "Package type mismatch: the source lists this as " + KindPhrase(expected) +
+                    ", but the file is " + KindPhrase(actualKind) + ". Choose another mirror; the file was kept";
+                return false;
+            }
             if (!string.IsNullOrEmpty(titleId) && !ContentIdMatchesTitleId(contentId, titleId))
             { error = "Package does not belong to " + titleId; return false; }
             if (actualKind != PkgContentKind.Patch) return true;
@@ -414,6 +454,8 @@ namespace Orbis
         {
             if (string.IsNullOrEmpty(kind)) return 6;
             string k = kind.ToLowerInvariant();
+            if (k == "theme-license") return 9;
+            if (k == "theme") return 7;
             if (k.Contains("dlc") || k.Contains("addon") || k.Contains("add-on")) return 7;
             if (k.Contains("update") || k.Contains("patch") || k.Contains("backport")) return 8;
             return 6;
@@ -447,12 +489,16 @@ namespace Orbis
                 ((uint)data[offset + 2] << 8) | data[offset + 3];
         }
 
-        static bool ClassifyContentKind(uint contentType, uint contentFlags,
+        static bool ClassifyContentKind(uint contentType, uint contentFlags, uint iroTag,
             out PkgContentKind kind, out string detail)
         {
             bool patchFlags = (contentFlags & (ContentFlagFirstPatch |
                 ContentFlagPatchGo | ContentFlagSubsequentPatch)) != 0;
-            if (contentType == ContentTypeAddOnData || contentType == ContentTypeAddOnNoData)
+            // PS4PKG.bt: AC includes DLC, SHAREfactory themes (IRO=1), and
+            // system software themes (IRO=2). The content type alone is not DLC.
+            if (contentType == ContentTypeAddOnData && iroTag == 2)
+                kind = PkgContentKind.SystemTheme;
+            else if (contentType == ContentTypeAddOnData || contentType == ContentTypeAddOnNoData)
                 kind = PkgContentKind.AddOn;
             else if (contentType == ContentTypeDeltaPatch ||
                 (contentType == ContentTypeGameData && patchFlags))
@@ -466,7 +512,7 @@ namespace Orbis
                 return false;
             }
             detail = kind + " type=0x" + contentType.ToString("X2") +
-                " flags=0x" + contentFlags.ToString("X8");
+                " flags=0x" + contentFlags.ToString("X8") + " iro=" + iroTag;
             return true;
         }
 

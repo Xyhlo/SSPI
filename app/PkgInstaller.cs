@@ -15,7 +15,8 @@ namespace Orbis
         AlreadyInstalled,
         InstallFailed,
         UninstallFailed,
-        NotReady
+        NotReady,
+        QueueRequired
     }
 
     internal sealed class BgftProgress
@@ -59,36 +60,56 @@ namespace Orbis
             lock (InstallRegisterGate)
             {
                 if (_ownedJournalLoaded) return;
-                _ownedJournalLoaded = true;
                 try
                 {
                     string path = OwnedJournalPath();
-                    if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
-                    foreach (var task in BgftOwnershipJournal.Read(File.ReadAllText(path)))
-                        OwnedWebTasks[task.Key] = task.Value;
+                    if (string.IsNullOrEmpty(path)) return;
+                    if (File.Exists(path))
+                        foreach (var task in BgftOwnershipJournal.Read(File.ReadAllText(path)))
+                            OwnedWebTasks[task.Key] = task.Value;
+                    _ownedJournalLoaded = true;
                 }
                 catch { }
             }
         }
 
-        static void SaveOwnedJournal()
+        static bool SaveOwnedJournal(out string error)
         {
+            error = null;
             try
             {
                 string path = OwnedJournalPath();
-                if (string.IsNullOrEmpty(path)) return;
+                if (!_ownedJournalLoaded || string.IsNullOrEmpty(path))
+                    throw new IOException("BGFT ownership journal is unavailable");
                 AtomicFile.WriteText(path, BgftOwnershipJournal.Write(OwnedWebTasks));
+                return true;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                error = "Could not save BGFT ownership: " + ex.Message;
+                LogInstall(error);
+                return false;
+            }
         }
 
-        static void ClaimWebTask(int taskId, string contentId, int subType)
+        static bool PrepareOwnedJournal(out string error)
         {
             lock (InstallRegisterGate)
             {
                 LoadOwnedJournal();
+                return SaveOwnedJournal(out error);
+            }
+        }
+
+        static bool ClaimWebTask(int taskId, string contentId, int subType, out string error)
+        {
+            lock (InstallRegisterGate)
+            {
+                LoadOwnedJournal();
+                // Retain the returned handle in memory even if persistence fails.
+                // The caller can then cancel this exact registered task or keep it visible.
                 OwnedWebTasks[taskId] = BackgroundIdentity(contentId, subType);
-                SaveOwnedJournal();
+                return SaveOwnedJournal(out error);
             }
         }
 
@@ -97,7 +118,8 @@ namespace Orbis
             lock (InstallRegisterGate)
             {
                 LoadOwnedJournal();
-                if (OwnedWebTasks.Remove(taskId)) SaveOwnedJournal();
+                string error;
+                if (OwnedWebTasks.Remove(taskId)) SaveOwnedJournal(out error);
             }
         }
 
@@ -113,6 +135,25 @@ namespace Orbis
                 return OwnedWebTasks.TryGetValue(taskId, out identity) &&
                     string.Equals(identity, BackgroundIdentity(contentId, subType),
                         StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        internal static bool TryGetOwnedBackgroundIdentity(int taskId, out string contentId, out int subType)
+        {
+            contentId = null;
+            subType = 0;
+            if (taskId < 0) return false;
+            lock (InstallRegisterGate)
+            {
+                LoadOwnedJournal();
+                string identity;
+                if (!OwnedWebTasks.TryGetValue(taskId, out identity)) return false;
+                string[] fields = (identity ?? "").Split('\n');
+                if (fields.Length != 2 || string.IsNullOrWhiteSpace(fields[0]) ||
+                    !int.TryParse(fields[1], out subType) || subType <= 0)
+                { subType = 0; return false; }
+                contentId = fields[0];
+                return true;
             }
         }
         static bool _init;
@@ -213,17 +254,8 @@ namespace Orbis
                 return vr == PkgValResult.NativeParseFailed
                     ? InstallOutcome.NotReady : InstallOutcome.InvalidPackage;
             }
-            try
-            {
-                long pkgSize = new FileInfo(pkgPath).Length;
-                ArchiveStorage.RequireFreeSpace(AppSettings.DataDir,
-                    checked(pkgSize + (512L * 1024 * 1024)));
-            }
-            catch (Exception spaceEx)
-            {
-                error = "Not enough free space to install: " + spaceEx.Message;
-                return InstallOutcome.NotReady;
-            }
+            // The installer checks capacity on the system-selected destination.
+            // SSPI's data/staging filesystem may be a different drive entirely.
 
             if (!EnsureReady())
             {
@@ -256,7 +288,7 @@ namespace Orbis
                 string packageContentId;
                 PkgValidator.TryGetContentId(pkgPath, out packageContentId);
                 if (!PkgIntegrity.CheckMetadata(pkgPath, titleId,
-                    contentKind == PkgContentKind.Patch ? "gp" : contentKind == PkgContentKind.AddOn ? "ac" : "gd", out error))
+                    PkgInstallPolicy.MetadataCategory(contentKind), out error))
                     return InstallOutcome.InvalidPackage;
                 if (!PkgValidator.CheckRequestedIdentity(requestedKind, contentKind, expectedTitleId,
                     packageContentId, out error)) return InstallOutcome.InstallFailed;
@@ -285,6 +317,9 @@ namespace Orbis
                     return InstallOutcome.InstallFailed;
                 }
 
+                if (contentKind == PkgContentKind.BaseGame && UseLoopbackInstall(contentKind, pkgPath))
+                    return InstallOutcome.QueueRequired;
+
                 lock (InstallRegisterGate)
                 {
                     if (contentKind == PkgContentKind.AddOn)
@@ -305,7 +340,7 @@ namespace Orbis
                         error = bgftError;
                         return InstallOutcome.AlreadyInstalled;
                     }
-                    if (bgftAttempted && !string.IsNullOrEmpty(bgftError) &&
+                    if (!string.IsNullOrEmpty(bgftError) &&
                         bgftError.StartsWith("BGFT_UNRESOLVED:", StringComparison.Ordinal))
                     {
                         error = bgftError.Substring("BGFT_UNRESOLVED:".Length);
@@ -376,10 +411,16 @@ namespace Orbis
             // zero. Also confirm the promoted base before releasing its input.
             const int MinStableCopyPolls = 8; // ~4s
             const int MinTitlePresentPolls = 4; // ~2s after title appears
+            // Local BGFT installs can take a long time for large games. The limit (about 4 h
+            // of 500 ms polls) counts only polls without progress: a 150 GB package on a slow
+            // drive may need longer while its bytes or install phase still advance.
+            const int MaxPollsWithoutProgress = 28800;
+            int pollsWithoutProgress = 0;
+            ulong mostDone = 0;
+            int mostPhase = -1;
             try
             {
-                // Local BGFT installs can take a long time for large games.
-                for (int i = 0; i < 28800; i++)
+                for (int i = 0; pollsWithoutProgress < MaxPollsWithoutProgress; i++, pollsWithoutProgress++)
                 {
                     if (interrupt != null && interrupt()) { error = "Installation stopped by queue"; return false; }
                     BgftTaskProgress state;
@@ -417,6 +458,12 @@ namespace Orbis
                     bool copySignal = state.LocalCopyPercent >= 100 ||
                                       (state.PreparingPercent >= 100 && state.LocalCopyPercent >= 50);
                     int installPhase = Math.Max(state.PreparingPercent, state.LocalCopyPercent);
+                    if (done > mostDone || installPhase > mostPhase)
+                    {
+                        mostDone = Math.Max(mostDone, done);
+                        mostPhase = Math.Max(mostPhase, installPhase);
+                        pollsWithoutProgress = -1;
+                    }
                     int percent = (transferComplete || copySignal)
                         ? Math.Min(100, Math.Max(installPhase, 1))
                         : (total > 0 ? Math.Min(99, (int)(done * 100UL / total)) : installPhase);
@@ -653,6 +700,9 @@ namespace Orbis
 
         internal static bool IsAddonInstalled(string source, bool full)
         {
+            PkgContentKind kind; string detail;
+            if (PkgValidator.TryGetContentKind(source, out kind, out detail) && kind == PkgContentKind.SystemTheme)
+                return IsThemeInstalled(source, full);
             string content;
             if (!PkgValidator.TryGetContentId(source, out content) || content == null || content.Length != 36) return false;
             string title = content.Substring(7, 9), label = content.Substring(20);
@@ -680,6 +730,53 @@ namespace Orbis
             return false;
         }
 
+        internal static bool MatchesInstalledTheme(string source, string installed, string metadata, bool full)
+        {
+            try
+            {
+                PkgContentKind kind; string detail, content;
+                if (!PkgValidator.TryGetContentKind(source, out kind, out detail) || kind != PkgContentKind.SystemTheme ||
+                    !PkgValidator.TryGetContentId(source, out content) ||
+                    !PkgInstallPolicy.MatchesInstalledContainer(source, installed)) return false;
+                byte[] sfo = File.ReadAllBytes(metadata);
+                if (!string.Equals(PkgIntegrity.SfoValue(sfo, "CONTENT_ID"), content, StringComparison.Ordinal) ||
+                    !PkgIntegrity.SfoValue(sfo, "CATEGORY").StartsWith("ac", StringComparison.Ordinal)) return false;
+                if (!full) return true;
+                using (var a = File.OpenRead(source))
+                using (var b = File.OpenRead(installed))
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] left = sha.ComputeHash(a), right = sha.ComputeHash(b);
+                    for (int i = 0; i < left.Length; i++) if (left[i] != right[i]) return false;
+                    return true;
+                }
+            }
+            catch { return false; }
+        }
+
+        internal static bool IsThemeInstalled(string source, bool full)
+        {
+            // PS4 reserves I00000002 for system themes (Itemzflow libdumper).
+            // Discover its immediate entries: the directory name is not a CUSA base title.
+            foreach (string root in new[] { "/user/addcont/I00000002", "/mnt/ext0/user/addcont/I00000002" })
+            {
+                try
+                {
+                    int count = 0;
+                    foreach (string directory in Directory.EnumerateDirectories(root))
+                    {
+                        if (++count > 4096) break;
+                        string leaf = Path.GetFileName(directory);
+                        if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) continue;
+                        string metadata = "/system_data/priv/appmeta/addcont/I00000002/" + leaf + "/param.sfo";
+                        if (MatchesInstalledTheme(source, directory + "/ac.pkg", metadata, full)) return true;
+                    }
+                }
+                catch { }
+            }
+            return false;
+        }
+
         internal static bool IsBasePackageInstalled(string source, string titleId)
         {
             if (!System.Text.RegularExpressions.Regex.IsMatch(titleId ?? "", "^[A-Z]{4}[0-9]{5}$")) return false;
@@ -698,7 +795,7 @@ namespace Orbis
             error = null;
             PkgContentKind kind; string kindError;
             if (!PkgValidator.TryGetContentKind(pkgPath, out kind, out kindError)) { error = kindError; return false; }
-            if (kind == PkgContentKind.Patch) { error = "Updates require the verified BGFT download queue; local fallback is disabled"; return false; }
+            if (PkgInstallPolicy.UseLoopbackBgft(kind)) { error = "This package requires the verified BGFT download queue; local fallback is disabled"; return false; }
             if (!EnsureReady())
             {
                 error = _lastError;
@@ -1003,6 +1100,9 @@ namespace Orbis
                     PackageSize = packageSize > 0 ? (ulong)packageSize : 0UL
                 };
                 var ex = new BgftDownloadParamEx { Params = p, Slot = slot };
+                string journalError;
+                if (!PrepareOwnedJournal(out journalError))
+                { error = "BGFT_UNRESOLVED:" + journalError + "; PKG retained"; return false; }
                 attempted = true; // register mutates system state
                 int rc = sceBgftServiceIntDownloadRegisterTaskByStorageEx(ref ex, out taskId);
                 LogInstall("api=sceBgftServiceIntDownloadRegisterTaskByStorageEx rc=" + Hex(rc) + " task=" + taskId +
@@ -1019,9 +1119,9 @@ namespace Orbis
                     if (taskId >= 0)
                     {
                         registered = true;
-                        ClaimWebTask(taskId, contentId, 6);
+                        bool saved = ClaimWebTask(taskId, contentId, 6, out journalError);
                         error = "BGFT_UNRESOLVED:Registration returned " + Hex(rc) +
-                            " with task " + taskId + "; task and PKG retained";
+                            " with task " + taskId + "; task and PKG retained" + (saved ? "" : "; " + journalError);
                         LogInstall(error);
                         return false;
                     }
@@ -1044,7 +1144,8 @@ namespace Orbis
                     return false;
                 }
                 registered = true;
-                ClaimWebTask(taskId, contentId, 6);
+                if (!ClaimWebTask(taskId, contentId, 6, out journalError))
+                { error = "BGFT_UNRESOLVED:" + journalError + "; task and PKG retained"; return false; }
                 string startDetail;
                 if (!TryStartOwnedBgftTask(taskId, out startDetail))
                 {
@@ -1078,6 +1179,19 @@ namespace Orbis
             }
         }
 
+        internal static bool UseLoopbackInstall(PkgContentKind kind, string source)
+        {
+            bool extended = false;
+            if (kind == PkgContentKind.BaseGame)
+            {
+                try { File.GetAttributes("/mnt/ext0"); extended = true; }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+                catch { extended = true; }
+            }
+            return PkgInstallPolicy.UseLoopbackBgftForSource(kind, source, extended);
+        }
+
         static bool TryRetireFailedDuplicate(string contentId, int subType, out string detail)
         {
             bool recovered = PkgInstallPolicy.TryRetireFailedBgftTask(
@@ -1092,10 +1206,14 @@ namespace Orbis
 
         static bool TryRegisterBgftWebDownload(string contentUrl, string titleId, string contentId,
             string contentName, int subType, long expectedSize, out int taskId,
-            out string error, string packageType = null)
+            out string error, string packageType = null, PkgContentKind contentKind = PkgContentKind.Unknown,
+            long declaredPackageSize = -1)
         {
             taskId = -1;
             error = null;
+            ulong registrationSize;
+            if (!PkgInstallPolicy.TryBgftPackageSize(contentKind, packageType, expectedSize, declaredPackageSize, out registrationSize))
+            { error = "BGFT declared package size does not match the validated package"; return false; }
             if (string.IsNullOrEmpty(contentUrl))
             {
                 error = "BGFT web: empty URL";
@@ -1131,7 +1249,7 @@ namespace Orbis
 
                 // DLC/patch packages require an installed matching base title.
                 // Transport errors must be diagnosed separately from this check.
-                if ((subType == 7 || subType == 8) && !string.IsNullOrEmpty(titleId))
+                if (PkgInstallPolicy.RequiresWebBase(subType, contentKind) && !string.IsNullOrEmpty(titleId))
                 {
                     try
                     {
@@ -1153,33 +1271,29 @@ namespace Orbis
                     : contentName;
                 if (name.Length > 64) name = name.Substring(0, 64);
 
-                var p = new BgftDownloadParam
-                {
-                    UserId = userId,
-                    EntitlementType = 5,
-                    Id = Ansi(contentId ?? "", allocated),
-                    ContentUrl = Ansi(contentUrl, allocated),
-                    ContentExUrl = IntPtr.Zero,
-                    ContentName = Ansi(name, allocated),
-                    IconPath = Ansi("", allocated),
-                    SkuId = IntPtr.Zero,
-                    Option = BgftDisableCdnQueryParam,
-                    PlaygoScenarioId = Ansi("0", allocated),
-                    ReleaseDate = IntPtr.Zero,
-                    PackageType = Ansi(packageType ?? (subType == 7 ? "PS4AC" : "PS4GD"), allocated),
-                    PackageSubType = Ansi("", allocated),
-                    PackageSize = expectedSize > 0 ? (ulong)expectedSize : 0UL
-                };
+                var p = CreateWebDownloadParam(userId, contentId, contentUrl, name,
+                    packageType ?? (subType == 7 ? "PS4AC" : "PS4GD"), registrationSize, allocated);
 
-                bool debugRegistration = !PkgInstallPolicy.IsBaseBgftSubType(subType);
+                LogInstall("BGFT metadata type=" + (packageType ?? "default") + " declared_bytes=" + registrationSize + " transfer_bytes=" + expectedSize);
+
+                bool debugRegistration = PkgInstallPolicy.UseDebugWebRegistration(subType, contentKind);
                 string registerApi = debugRegistration ? "sceBgftServiceIntDebugDownloadRegisterPkg" : "sceBgftServiceIntDownloadRegisterTask";
                 lock (InstallRegisterGate)
                 {
+                    string journalError;
+                    if (!PrepareOwnedJournal(out journalError))
+                    { error = "BGFT_UNRESOLVED:" + journalError + "; PKG retained"; return false; }
                     int rc = debugRegistration
                         ? sceBgftServiceIntDebugDownloadRegisterPkg(ref p, out taskId)
                         : sceBgftServiceIntDownloadRegisterTask(ref p, out taskId);
                     LogBgftRegistration(registerApi, rc, taskId, contentId, subType, expectedSize, contentUrl);
-                    if (!debugRegistration && taskId < 0 && rc == unchecked((int)0x80F00633))
+                    // Console evidence: the internal task API rejects the theme's PS4AL
+                    // license with 0x80990004 at both declared (0) and real (131072) sizes,
+                    // before creating a task. The debug package API installs add-ons and
+                    // updates on the same console, so themes retry through it once.
+                    bool themeRejected = rc == unchecked((int)0x80990004) &&
+                        (contentKind == PkgContentKind.SystemThemeLicense || contentKind == PkgContentKind.SystemTheme);
+                    if (!debugRegistration && taskId < 0 && (rc == unchecked((int)0x80F00633) || themeRejected))
                     {
                         registerApi = "sceBgftServiceIntDebugDownloadRegisterPkg";
                         taskId = -1;
@@ -1200,8 +1314,9 @@ namespace Orbis
                         if (taskId >= 0)
                         {
                             registered = true;
-                            ClaimWebTask(taskId, contentId, subType);
-                            error = "BGFT_UNRESOLVED:Registration returned " + Hex(rc) + " with task " + taskId + "; task and PKG retained";
+                            bool saved = ClaimWebTask(taskId, contentId, subType, out journalError);
+                            error = "BGFT_UNRESOLVED:Registration returned " + Hex(rc) + " with task " + taskId + "; task and PKG retained" +
+                                (saved ? "" : "; " + journalError);
                             LogInstall(error); return false;
                         }
                         if (rc == BgftTaskDuplicated || rc == BgftContentAlreadyDownloading)
@@ -1223,7 +1338,8 @@ namespace Orbis
                         return false;
                     }
                     registered = true;
-                    ClaimWebTask(taskId, contentId, subType);
+                    if (!ClaimWebTask(taskId, contentId, subType, out journalError))
+                    { error = "BGFT_UNRESOLVED:" + journalError + "; task and PKG retained"; return false; }
 
                     string startDetail;
                     if (!TryStartOwnedBgftTask(taskId, out startDetail))
@@ -1262,6 +1378,28 @@ namespace Orbis
             }
         }
 
+        static BgftDownloadParam CreateWebDownloadParam(int userId, string contentId, string contentUrl,
+            string name, string packageType, ulong packageSize, List<IntPtr> allocated)
+        {
+            return new BgftDownloadParam
+            {
+                UserId = userId,
+                EntitlementType = 5,
+                Id = Ansi(contentId ?? "", allocated),
+                ContentUrl = Ansi(contentUrl, allocated),
+                ContentExUrl = IntPtr.Zero,
+                ContentName = Ansi(name, allocated),
+                IconPath = Ansi("", allocated),
+                SkuId = IntPtr.Zero,
+                Option = BgftDisableCdnQueryParam,
+                PlaygoScenarioId = Ansi("0", allocated),
+                ReleaseDate = IntPtr.Zero,
+                PackageType = Ansi(packageType, allocated),
+                PackageSubType = Ansi("", allocated),
+                PackageSize = packageSize
+            };
+        }
+
         static bool IsAppLoopbackUrl(Uri uri)
         {
             if (uri == null) return false;
@@ -1276,7 +1414,8 @@ namespace Orbis
         }
 
         public static bool TryStartLoopbackBgftDownload(string contentUrl, string titleId, string contentId,
-            string contentName, int subType, long expectedSize, out int taskId, out string error, string packageType = null)
+            string contentName, int subType, long expectedSize, out int taskId, out string error, string packageType = null,
+            PkgContentKind contentKind = PkgContentKind.Unknown, long declaredPackageSize = -1)
         {
             taskId = -1;
             error = null;
@@ -1287,7 +1426,7 @@ namespace Orbis
                 return false;
             }
             return TryRegisterBgftWebDownload(contentUrl + ".json", titleId, contentId, contentName,
-                subType, expectedSize, out taskId, out error, packageType);
+                subType, expectedSize, out taskId, out error, packageType, contentKind, declaredPackageSize);
         }
 
         static string BackgroundIdentity(string contentId, int subType)

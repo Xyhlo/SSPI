@@ -1,7 +1,7 @@
 using System;
 using System.IO;
+using System.Diagnostics;
 using System.Text;
-using System.Threading;
 
 namespace Orbis
 {
@@ -24,16 +24,72 @@ namespace Orbis
 
         internal static bool IsLive(string root, int waitMilliseconds = 1600)
         {
+            if (string.IsNullOrEmpty(root)) return false;
+            string resident = Path.Combine(root, "resident");
             string heartbeat = Path.Combine(root, "resident", "heartbeat.txt");
+            FileAttributes rootAttributes;
             try
             {
-                if (!File.Exists(heartbeat)) return false;
-                string first = File.ReadAllText(heartbeat);
-                DateTime stamp = File.GetLastWriteTimeUtc(heartbeat);
-                Thread.Sleep(waitMilliseconds);
-                return first != File.ReadAllText(heartbeat) || stamp != File.GetLastWriteTimeUtc(heartbeat);
+                rootAttributes = File.GetAttributes(root);
+                if ((rootAttributes & FileAttributes.Directory) == 0) return false;
             }
-            catch { return false; }
+            catch (FileNotFoundException) { return false; }
+            catch (DirectoryNotFoundException) { return false; }
+            catch { return true; }
+
+            FileAttributes residentAttributes;
+            try
+            {
+                residentAttributes = File.GetAttributes(resident);
+                if ((residentAttributes & FileAttributes.Directory) == 0) return true;
+            }
+            catch (FileNotFoundException) { return false; }
+            catch (DirectoryNotFoundException) { return false; }
+            catch { return true; }
+
+            FileAttributes heartbeatAttributes;
+            try
+            {
+                heartbeatAttributes = File.GetAttributes(heartbeat);
+                if ((heartbeatAttributes & FileAttributes.Directory) != 0) return true;
+            }
+            catch (FileNotFoundException) { return false; }
+            catch (DirectoryNotFoundException) { return false; }
+            catch { return true; }
+
+            try
+            {
+                string first = File.ReadAllText(heartbeat);
+                bool processKnown;
+                return IsHeartbeatProcessLive(first, out processKnown) || !processKnown;
+            }
+            catch { return true; }
+        }
+
+        static bool IsHeartbeatProcessLive(string contents, out bool processKnown)
+        {
+            string[] lines = (contents ?? "").Split('\n');
+            processKnown = false;
+            if (lines.Length < 3) return true;
+            int processId = 0;
+            foreach (string field in lines[2].Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (!field.StartsWith("pid=", StringComparison.Ordinal)) continue;
+                if (!int.TryParse(field.Substring(4), System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out processId) || processId <= 0)
+                    return true;
+                processKnown = true;
+                break;
+            }
+            // Older native heartbeats have only version and timestamp lines. They
+            // carry no process identity, so age alone cannot prove the writer stopped.
+            if (!processKnown) return true;
+            try
+            {
+                using (Process process = Process.GetProcessById(processId)) return !process.HasExited;
+            }
+            catch (ArgumentException) { return false; }
+            catch { return true; }
         }
 
         internal static string Prepare(string oldRoot, string newRoot, bool checkWorker = true)
@@ -67,8 +123,8 @@ namespace Orbis
                 if (exists && checkWorker && IsLive(oldRoot))
                 {
                     Pending = true;
-                    Notice = "An older resident is still running. New plugin files can be staged, but restart PS4 and enable GoldHEN to finish moving data to SSPI.";
-                    SspiLog.Write("startup", "data_migration deferred_old_resident");
+                    Notice = "An older resident may still be active. SSPI will keep using its existing data location until the worker is confirmed stopped. New plugin files can still be staged.";
+                    SspiLog.Write("startup", "data_migration deferred_old_resident_or_uncertain");
                     return oldRoot;
                 }
                 At("create destination", newRoot);
