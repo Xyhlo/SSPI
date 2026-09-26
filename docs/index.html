@@ -33,7 +33,7 @@
       <a class="tab" href="#help" data-panel="help">Help</a>
     </div>
   </nav>
-  <p class="status"><a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.2">5.11.2 beta · Download</a></p>
+  <p class="status"><a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3">5.11.3 beta · Download</a></p>
 </header>
 
 <main id="content" tabindex="-1">
@@ -43,9 +43,9 @@
   <div class="panel-head intro">
     <h1 id="start-title" tabindex="-1">SSPI guide</h1>
     <p>SSPI (Super Simple Package Installer) is a homebrew app for the PS4. It searches the package sources you add, downloads through Real-Debrid, TorBox, AllDebrid or Premiumize, and installs the result on the console.</p>
-    <p>This guide covers setup, every setting and how sources work. The current release is the 5.11.2 beta. SSPI is free; service plans are separate.</p>
+    <p>This guide covers setup, every setting and how sources work. The current release is the 5.11.3 beta. SSPI is free; service plans are separate.</p>
     <div class="actions">
-      <a class="button primary" href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.2">Download 5.11.2 beta</a>
+      <a class="button primary" href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3">Download 5.11.3 beta</a>
       <a class="button" href="#setup">Setup steps</a>
     </div>
   </div>
@@ -60,7 +60,7 @@
       </video>
       <ol class="chapters" id="chapters" aria-label="Video chapters"><li><button type="button" data-t="3.6" data-index="1"><time>0:04</time><span>Open SSPI</span></button></li><li><button type="button" data-t="15.0" data-index="2"><time>0:15</time><span>General</span></button></li><li><button type="button" data-t="29.0" data-index="3"><time>0:29</time><span>Connections</span></button></li><li><button type="button" data-t="45.0" data-index="4"><time>0:45</time><span>Package sources</span></button></li><li><button type="button" data-t="64.83" data-index="5"><time>1:05</time><span>Connect your phone</span></button></li><li><button type="button" data-t="73.37" data-index="6"><time>1:13</time><span>Get your Real-Debrid API token</span></button></li><li><button type="button" data-t="99.27" data-index="7"><time>1:39</time><span>Save and validate</span></button></li><li><button type="button" data-t="111.67" data-index="8"><time>1:52</time><span>Sources and appearance</span></button></li><li><button type="button" data-t="127.83" data-index="9"><time>2:08</time><span>Send links and library artwork</span></button></li><li><button type="button" data-t="142.0" data-index="10"><time>2:22</time><span>Appearance</span></button></li><li><button type="button" data-t="159.6" data-index="11"><time>2:40</time><span>Sound and storage</span></button></li><li><button type="button" data-t="171.6" data-index="12"><time>2:52</time><span>Find a game</span></button></li><li><button type="button" data-t="187.6" data-index="13"><time>3:08</time><span>Choose a package</span></button></li><li><button type="button" data-t="207.6" data-index="14"><time>3:28</time><span>Follow the download</span></button></li><li><button type="button" data-t="227.6" data-index="15"><time>3:48</time><span>Add your own files</span></button></li><li><button type="button" data-t="240.57" data-index="16"><time>4:01</time><span>Queue more</span></button></li><li><button type="button" data-t="259.77" data-index="17"><time>4:20</time><span>Your library</span></button></li></ol>
     </div>
-    <div class="note tip"><p>Recorded on a 5.11 beta test build (<code>ee19b0a58628</code>), so a few screens differ from 5.11.2. Features that aren't in 5.11.2 yet are marked <strong>Next beta</strong> in this guide. Account details, pairing codes, file names and host names are blurred.</p></div>
+    <div class="note tip"><p>The walkthrough and screenshots were recorded on an earlier 5.11 beta test build (<code>ee19b0a58628</code>), so some screens differ in 5.11.3. For example, settings pages now share one header style with section labels and value chips. Account details, pairing codes, file names and host names are blurred.</p></div>
   </div>
 
   <div class="section" id="requirements">
@@ -95,8 +95,9 @@
   <div class="steps">
     <article class="step" id="install">
       <h3>Install SSPI</h3>
-      <p>Download <code>sspi5.11.2.pkg</code> from the <a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.2">5.11.2 beta release</a> and install it like any other homebrew package. GitHub's source ZIP isn't an installable package.</p>
-      <p>If you already have SSPI, install over it; your settings stay in place. Then open SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI. That loads the updated background worker. The footer should read <code>BETA 5.11 / 7ef9395e7b2f</code>.</p>
+      <p>Download <code>sspi5.11.3.pkg</code> from the <a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3">5.11.3 beta release page</a>. GitHub's source ZIP isn't an installable package. SSPI has no in-app updater, so install updates manually.</p>
+      <p>Before installing, check the file's SHA-256. On Windows, run <code>certutil -hashfile sspi5.11.3.pkg SHA256</code> and compare it with <code>3fe15c485a71dcfe64c3d0c667ca0ceff5e0d665051715bccc4a7dfd0d9f54af</code>.</p>
+      <p>Install it over the existing app; your settings and queue are kept. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI. The footer should read <code>BETA 5.11 / 07dac5e85610</code>.</p>
       <figure class="media"><div class="shot"><img src="assets/guide/ps4-home.webp" alt="SSPI on the PS4 home screen, labelled Super Simple Package Installer" width="1400" height="331" loading="lazy" decoding="async"></div></figure>
     </article>
     <article class="step" id="open-settings">
@@ -148,8 +149,8 @@
     </article>
     <article class="step" id="search-download">
       <h3>Search and download</h3>
-      <p>On <strong>Search</strong>, press <strong>X</strong> on the search field and type a name or a CUSA ID. Open a title to see its packages, grouped as base game, updates, DLC and backports.</p>
-      <p><strong>L2</strong> switches region, <strong>Triangle</strong> shows the mirrors for a package and <strong>X</strong> queues it. <strong>Square</strong> queues the recommended set: the base game plus the best update for your firmware. SSPI only lists hosts that your enabled services support.</p>
+      <p>On <strong>Search</strong>, press <strong>X</strong> on the search field and type a name or a CUSA ID. Open a title to see its packages, grouped as base game, updates, DLC and backports. Each package can show <strong>Ready</strong>, <strong>Needs base game</strong>, <strong>Needs backport</strong> or <strong>Needs another mirror</strong>.</p>
+      <p><strong>L2</strong> switches region, <strong>Triangle</strong> shows the mirrors for a package and <strong>X</strong> queues it. <strong>Square</strong> queues the recommended set: the base game plus the best update for your firmware. If another region opened during this session has the base game or more packages, a notice appears and <strong>L2</strong> switches to it. SSPI only lists hosts that your enabled services support.</p>
       <figure class="media"><button class="zoom" type="button"><div class="shot"><img src="assets/guide/ps4-details.webp" alt="Package details for a game: package tabs, region, the selected package's version and files" width="1600" height="900" loading="lazy" decoding="async"></div></button><figcaption>Host names are blurred in this guide.</figcaption></figure>
       <p><button class="chapter-link" type="button" data-chapter="12">Watch this step</button></p>
     </article>
@@ -178,7 +179,11 @@
       <div class="row"><div><h3>Order and dependencies</h3><p>Queued games wait their turn. Updates and DLC wait for their base game, whatever order you added them in. To let another job go first, pause the active one.</p></div></div>
       <div class="row"><div><h3>The drawer</h3><p>Press <strong>R2</strong> on a game. <strong>Left</strong> and <strong>Right</strong> switch between Packages, Files and Errors; <strong>L2</strong> closes it. Keep the exact wording from Errors if you report a problem.</p></div></div>
       <div class="row"><div><h3>Pause, remove and retry</h3><p><strong>X</strong> runs the action shown for the selected package, such as Pause or Retry. <strong>Square</strong> removes a package or game after a confirmation.</p></div></div>
+      <div class="row"><div><h3>FTP uploads and background jobs</h3><p>When SSPI is open, FTP uploads appear above the queue and are added when complete. When SSPI is closed, the background service handles uploads and reports through <strong>PS4 Notifications</strong>; they don't appear as <strong>Downloads</strong> cards.</p><p>In <strong>In-app</strong> mode, downloads wait while the background service holds a job, including a failed or paused download or an FTP upload. In <strong>Background</strong> mode, a failed download no longer blocks unrelated jobs, but a failed multi-volume RAR set still holds the queue until you retry or remove it, and packages that depend on a failed download, such as its update, wait for it. <span class="tag">Needs a PS4 test</span></p></div></div>
+      <div class="row"><div><h3>Download connections</h3><p>A download starts with six connections and adds more only while the total speed keeps rising, up to 25. If a server resets several connections at once, SSPI keeps the level that worked and remembers it for that server. A link service's own per-link limit still applies. Saved settings of 5 or 10, the earlier defaults, move to 25; other values you set are kept.</p></div></div>
+      <div class="row"><div><h3>Background service interruptions</h3><p>If the background service stops during an archive download or extraction, the job waits as Queued and resumes when the service starts again. If it stops while the PS4 installs an archive's package, the job can still show failed, but its packages are kept. <span class="tag">Needs a PS4 test</span></p></div></div>
     </div>
+    <p class="small">For link renewal timing and archive limits, see <a href="#archives">Archives and storage</a>.</p>
   </div>
 
   <div class="section" id="own-files">
@@ -186,8 +191,18 @@
     <p class="section-intro">Press the <strong>touchpad</strong> on Downloads to add files that didn't come from a search.</p>
     <div class="setting"><button class="zoom" type="button"><img src="assets/guide/ps4-menu.webp" alt="The Downloads menu: Paste a download link, Browse stored debrid files and Install from USB" width="1600" height="900" loading="lazy" decoding="async"></button><div><h3>Paste a download link</h3><p>A direct PKG or archive link, a debrid share link, or a link from a host your service supports.</p><h3 style="margin-top:14px">Browse stored debrid files</h3><p>Ready files and completed torrents that are already in your own account. SSPI imports the file; the torrent doesn't run on the PS4.</p></div></div>
     <div class="setting"><button class="zoom" type="button"><img src="assets/guide/ps4-chooser.webp" alt="Stored files by service: Real-Debrid files and torrents, AllDebrid torrents, TorBox files and torrents" width="1600" height="900" loading="lazy" decoding="async"></button><div><h3>Pick a service</h3><p>Choose Real-Debrid files or torrents, AllDebrid torrents, or TorBox files or torrents, then select the files to queue.</p></div></div>
-    <div class="setting"><button class="zoom" type="button"><img src="assets/guide/ps4-usb.webp" alt="Install from USB with no drive connected" width="1600" height="900" loading="lazy" decoding="async"></button><div><h3>Install from USB</h3><p>Browse a connected drive and select packages or archives. Keep SSPI open while files wait to start, and keep the drive connected until installation finishes.</p></div></div>
+    <div class="setting"><button class="zoom" type="button"><img src="assets/guide/ps4-usb.webp" alt="Install from USB with no drive connected" width="1600" height="900" loading="lazy" decoding="async"></button><div><h3>Install from USB</h3><p>Browse a connected drive and select packages or archives. You can select any volume of a RAR set; SSPI groups the set, extracts it and installs the package. Keep the volumes together. Keep SSPI open while files wait to start, and keep the drive connected until installation finishes.</p><p>SSPI can also install PS4 system themes and their matching license packages. Select the theme in <strong>PS4 Settings → Themes</strong>. <span class="tag">Needs a PS4 test</span></p></div></div>
   </div>
+
+  <section class="section" id="ftp-inbox">
+    <h2>FTP inbox</h2>
+    <p class="section-intro">SSPI installs PKG files and archives that you upload to the PS4 over FTP. While SSPI is closed, the background service handles them and reports through PS4 notifications.</p>
+    <div class="rows">
+      <div class="row"><div><h3>Upload files</h3><p>Upload PKG files, RAR sets and single ZIP or 7z archives (<code>.zip</code>, <code>.7z</code> or <code>.7zip</code>) to <code>/data/SSPI/pkg-rars/</code>. FTP inbox files use internal storage for staging. A PKG is queued after it stops changing for 10 seconds; an archive waits 60 seconds.</p></div></div>
+      <div class="row"><div><h3>Keep or remove uploads</h3><p>Uploads stay in the inbox after installation. Remove them over FTP when you no longer need them. A failed archive set retries when its file count or total size changes. If you replace a damaged volume with one of the same size, upload part 1 again. Split ZIP sets aren't supported.</p></div></div>
+      <div class="row"><div><h3>Test status</h3><p>Installing uploads from a real FTP client hasn't been tested on a PS4 yet. <span class="tag">Needs a PS4 test</span></p></div></div>
+    </div>
+  </section>
 
   <div class="section" id="send-links">
     <h2>Send links from your phone</h2>
@@ -206,8 +221,10 @@
     <h2>Archives and storage</h2>
     <div class="rows">
       <div class="row"><div><h3>RAR and multipart sets</h3><p>Queue the complete set. SSPI extracts it on the PS4 and checks the extracted package before installing it. Missing or damaged parts need a complete set or another mirror.</p></div></div>
-      <div class="row"><div><h3>Plan for peak space</h3><p>During extraction, the archive and the extracted package exist at the same time. Keep enough free space for both.</p></div></div>
+      <div class="row"><div><h3>Passwords and other archives</h3><p>If a RAR download fails because its password is missing or wrong, choose <strong>Enter archive password</strong> in Downloads to retry extraction with the downloaded parts. A missing-volume error means the set is incomplete. Single ZIP and 7z archives are supported; split ZIP sets aren't.</p><p>For RAR archives with encrypted file names, the password prompt needs a PS4 test. <span class="tag">Needs a PS4 test</span></p></div></div>
+      <div class="row"><div><h3>Plan for peak space</h3><p>During extraction, the archive and the extracted package exist at the same time. Keep enough free space for both. A FAT32 drive can't store a single file larger than 4 GiB; use exFAT for larger extracted files. SSPI's message for this case needs a PS4 test.</p></div></div>
       <div class="row"><div><h3>Staging drive</h3><p>Downloads and extraction stay on the staging drive until installation succeeds. Confirmed installs remove their staging files; failed jobs keep theirs so you can retry. Set it under <a href="#settings-storage">Settings → Storage</a>.</p></div></div>
+      <div class="row"><div><h3>Link renewal</h3><p>In <strong>In-app</strong> mode, SSPI requests a fresh link after 75 seconds without a response for a package, or three minutes for an archive, up to three times without progress. The background service still retries a dead server instead of renewing its link. A renewed single-file archive restarts unless its catalog lists the file's SHA-256; a multi-volume set loses only the volume in progress.</p></div></div>
     </div>
   </div>
 </section>
@@ -216,7 +233,7 @@
 <section class="panel" id="settings" data-title="Settings" aria-labelledby="settings-title">
   <div class="panel-head">
         <h1 id="settings-title" tabindex="-1">Settings</h1>
-    <p>Press <strong>OPTIONS</strong> in SSPI to open Settings, and <strong>L1</strong> or <strong>R1</strong> to move between its five pages. Each option is listed below with what it does.</p>
+      <p>Press <strong>OPTIONS</strong> in SSPI to open Settings, and <strong>L1</strong> or <strong>R1</strong> to move between its five pages. Pages share a header style with section labels, value chips and <strong>On/Off</strong> labels. Saving shows <strong>Saving settings...</strong> without blocking input. Each option is listed below with what it does.</p>
   </div>
 
   <div class="section" id="settings-general">
@@ -234,7 +251,7 @@
 
   <div class="section" id="settings-connections">
     <h2>Connections</h2>
-    <p class="section-intro">Download services, the phone QR code and package sources. All keys stay saved when you switch services.</p>
+    <p class="section-intro">Download services, the phone QR code and package sources. All keys stay saved when you switch services. The PS4 shows a notice when phone settings or a background are saved, or when the phone session ends.</p>
     <figure class="page-shot"><button class="zoom" type="button"><div class="shot"><img src="assets/guide/ps4-connections.webp" alt="Settings, Connections: Connect your phone and Your connections" width="1600" height="900" loading="lazy" decoding="async"></div></button></figure>
     <div class="setting"><img src="assets/guide/row-real-debrid.webp" alt="Real-Debrid: Key validated, account ready, ticked" width="992" height="84" loading="lazy" decoding="async"><div><h3>Real-Debrid, TorBox and AllDebrid</h3><p>Tick a service to use it for downloads. The line underneath shows whether its key is saved and whether it was validated in this session. Add keys from the phone page.</p></div></div>
     <div class="setting"><img src="assets/guide/row-premiumize.webp" alt="Premiumize: Link from your phone, Set up" width="992" height="84" loading="lazy" decoding="async"><div><h3>Premiumize</h3><p><strong>Set up</strong> links Premiumize from your phone.</p></div></div>
@@ -247,8 +264,8 @@
     <h2>Appearance</h2>
     <p class="section-intro">Changes save automatically.</p>
     <figure class="page-shot"><button class="zoom" type="button"><div class="shot"><img src="assets/guide/ps4-appearance.webp" alt="Settings, Appearance: background pattern, reduced motion and accent colors" width="1600" height="900" loading="lazy" decoding="async"></div></button></figure>
-    <div class="setting"><img src="assets/guide/row-background-pattern.webp" alt="Background pattern: Graphite fade" width="1100" height="71" loading="lazy" decoding="async"><div><h3>Background pattern</h3><p>Press <strong>Left</strong> or <strong>Right</strong> to change the background, for example Plain charcoal, Wave, Halo or Graphite fade.</p><p><span class="tag">Next beta</span><br><strong>Square</strong> uploads a custom pixel background from your phone.</p></div></div>
-    <div class="setting"><img src="assets/guide/row-reduced-motion.webp" alt="Reduced motion toggle" width="1100" height="71" loading="lazy" decoding="async"><div><h3>Reduced motion</h3><p>Keeps focus changes static and makes transitions immediate.</p></div></div>
+    <div class="setting"><img src="assets/guide/row-background-pattern.webp" alt="Background pattern: Graphite fade" width="1100" height="71" loading="lazy" decoding="async"><div><h3>Background pattern</h3><p>Press <strong>Left</strong> or <strong>Right</strong> to change the background, for example Plain charcoal, Wave, Halo or Graphite fade. <strong>Square</strong> uploads a pixel background from your phone.</p></div></div>
+    <div class="setting"><img src="assets/guide/row-reduced-motion.webp" alt="Reduced motion toggle" width="1100" height="71" loading="lazy" decoding="async"><div><h3>Reduced motion</h3><p>Turns off the short focus, button, switch and progress animations.</p></div></div>
     <div class="setting"><img src="assets/guide/row-accent.webp" alt="Accent colors: Charcoal, Steel Ice, Arctic, Violet, Crimson, Amber, Teal and Pink" width="1100" height="148" loading="lazy" decoding="async"><div><h3>Accent</h3><p>Sets the highlight color: Charcoal, Steel Ice, Arctic, Violet, Crimson, Amber, Teal or Pink.</p></div></div>
     <div class="setting"><img src="assets/guide/row-restore-charcoal.webp" alt="Restore charcoal" width="1100" height="59" loading="lazy" decoding="async"><div><h3>Restore charcoal</h3><p>Restores the default look. <strong>Triangle</strong> does the same from anywhere on this page.</p></div></div>
   </div>
@@ -264,11 +281,11 @@
 
   <div class="section" id="settings-storage">
     <h2>Storage</h2>
-    <p class="section-intro">Downloads and extraction stay on the staging drive until installation succeeds.</p>
+    <p class="section-intro"><strong>PS4 Settings</strong> chooses where games install. SSPI's <strong>Staging location</strong> holds temporary download and extraction files until installation succeeds. A drive formatted as <strong>PS4 Extended Storage</strong> can't also be an exFAT staging drive.</p>
     <figure class="page-shot"><button class="zoom" type="button"><div class="shot"><img src="assets/guide/ps4-storage.webp" alt="Settings, Storage: staging location and stored files" width="1600" height="900" loading="lazy" decoding="async"></div></button></figure>
-    <div class="setting"><img src="assets/guide/row-staging-location.webp" alt="Staging location: Default, PS4" width="1100" height="77" loading="lazy" decoding="async"><div><h3>Staging location</h3><p>Where SSPI keeps downloads until they're installed: the PS4's internal storage or a USB drive. Use an exFAT USB drive for large packages and keep it connected until installation finishes.</p></div></div>
-    <div class="setting"><img src="assets/guide/row-stored-files.webp" alt="Stored files: Open" width="1100" height="77" loading="lazy" decoding="async"><div><h3>Stored files</h3><p>Browse the files SSPI keeps on internal storage and connected USB drives. <strong>Triangle</strong> refreshes the list and <strong>Square</strong> selects a file for deletion.</p></div></div>
-    <p class="muted">Confirmed installs remove their staging package and transfer files. Failed jobs keep theirs so you can retry without downloading again.</p>
+    <div class="setting"><img src="assets/guide/row-staging-location.webp" alt="Staging location: Default, PS4" width="1100" height="77" loading="lazy" decoding="async"><div><h3>Staging location</h3><p>Choose internal storage or a USB drive for temporary download and extraction files. Use an exFAT USB drive for large packages and keep it connected until installation finishes.</p></div></div>
+    <div class="setting"><img src="assets/guide/row-stored-files.webp" alt="Stored files: Open" width="1100" height="77" loading="lazy" decoding="async"><div><h3>Stored files</h3><p>Browse the files SSPI keeps on internal storage and connected USB drives. <strong>Triangle</strong> refreshes the list and <strong>Square</strong> selects a file for deletion. Deleting a package also removes its leftover transfer files; deleting one leftover file alone keeps the package.</p></div></div>
+    <p class="muted">Confirmed installs remove their staging package and transfer files. Failed jobs keep theirs so you can retry without downloading again. Active archive parts and extracted packages stay protected.</p>
   </div>
 </section>
 
@@ -308,7 +325,7 @@
     <div class="pair">
       <div>
         <p>Choose the accent color and background from the phone. Tap <strong>Save appearance</strong> to apply them on the PS4, or <strong>Restore original charcoal</strong> to go back to the default.</p>
-        <p><span class="tag">Next beta</span><br>Upload your own picture as the background. Your phone crops it and converts it to 320 × 180 pixels; the original stays on your phone. You can add a pattern over it and set the picture opacity and accent strength.</p>
+        <p>Upload your own picture as the background. Your phone crops it and converts it to 320 × 180 pixels; the original stays on your phone. Tap <strong>Upload pixel background</strong> to send it, then <strong>Save appearance</strong>. You can add a pattern over it and set the picture opacity and accent strength.</p>
       </div>
       <div class="phones">
         <figure><div class="phone"><img src="assets/guide/phone-backgrounds.webp" alt="The background list: Plain charcoal, Ripple, Wave, Mosaic, Halo, Graphite fade, Obsidian, Slate glow, ASCII Flowers and Custom pixel background" width="660" height="1268" loading="lazy" decoding="async"></div></figure>
@@ -323,10 +340,10 @@
   </div>
 
   <div class="section" id="phone-library">
-    <h2>Library <span class="tag">Next beta</span></h2>
+    <h2>Library</h2>
     <div class="pair">
       <div>
-        <p>Choose an installed game to change its SSPI case artwork and its PS4 home-screen icon. Pick a JPG, PNG or WebP image and set how it fits, plus an optional outline with its color and thickness. Effects are applied on your phone before upload.</p>
+        <p>From <strong>Search</strong> on the PS4, press the touchpad to open the installed-game library. On the phone page, choose an installed game to change its SSPI case artwork and its PS4 home-screen icon. Pick a JPG, PNG or WebP image and set how it fits, plus an optional outline with its color and thickness. Effects are applied on your phone before upload.</p>
         <p><strong>Save cover</strong> applies it and <strong>Restore original</strong> undoes it. SSPI keeps a backup of the original 512 × 512 icon. Restart the PS4 after saving to refresh the home screen.</p>
       </div>
       <div class="phones">
@@ -349,6 +366,7 @@
   <div class="section" id="where-sources">
     <h2>Where sources come from</h2>
     <p class="section-intro">The community makes and shares sources. You add them in <strong>Settings → Connections → Manage sources</strong>, or from the phone page.</p>
+    <p>If the community directory can't be reached, the browser shows the failure reason and its last loaded list marked as saved. Press <strong>Triangle</strong> to retry the failed page. <span class="tag">Needs a PS4 test</span></p>
     <div class="cards">
       <div class="card"><h3>Community sources</h3><p>Choose <strong>Browse community sources</strong> to see shared sources with their names, tags and descriptions. Pick one and choose Install.</p></div>
       <div class="card"><h3>A source link</h3><p>Choose <strong>Add a source link</strong> and send a <code>.gssource</code> URL from your phone, or use the phone page's Sources tab.</p></div>
@@ -404,7 +422,7 @@
     <h2>Managing sources</h2>
     <div class="rows">
       <div class="row"><div><h3>Turn on, turn off or remove</h3><p>In Package sources, <strong>X</strong> toggles the selected source and <strong>Square</strong> removes it. SSPI remembers your choice.</p></div></div>
-      <div class="row"><div><h3>Updates and new content</h3><p>Installing a newer version of a source can fix results without an app update. Sources that support refreshing fetch new content while cached results stay available.</p></div></div>
+      <div class="row"><div><h3>Updates and new content</h3><p>Installing a newer version of a source can fix results without an app update. Sources that support refreshing fetch new content while cached results stay available. SSPI no longer installs sources by itself. A source installed automatically by an earlier version is removed once if it is still unchanged; sources you imported or updated are kept.</p></div></div>
     </div>
   </div>
 </section>
@@ -416,14 +434,17 @@
     <p>Start with the error message: open the download's drawer with <strong>R2</strong>, choose Errors and note the exact wording.</p>
   </div>
   <div class="faq">
-    <details><summary>SSPI doesn't start</summary><div><p>Check that the SSPI package installed completely and that your homebrew environment is running. If you report it, include the PS4 model, firmware, GoldHEN version and any system error. Firmware coverage is still being tested.</p></div></details>
+    <details><summary>SSPI doesn't start</summary><div><p>Check that the SSPI package installed completely and that your homebrew environment is running. If you report it, include the PS4 model, firmware, GoldHEN version and any system error. Firmware coverage is still being tested. Consoles below firmware 6.72 now load a copy of the runtime made for older firmware; this hasn't been tried on firmware 5.05 yet. <span class="tag">Needs a PS4 test</span></p></div></details>
     <details><summary>The background worker isn't ready</summary><div><p>In Settings → General, choose Retry on Background worker. After installing an update, fully restart the PS4, enable GoldHEN again and reopen SSPI. Until the worker is ready, use In-app mode and keep SSPI open.</p></div></details>
     <details><summary>The phone page won't open</summary><div><p>Keep SSPI open, rescan the current QR code and make sure the phone and PS4 can reach each other. A guest network, network isolation or a phone VPN can block the page.</p></div></details>
     <details><summary>My key isn't validated</summary><div><p>Copy the whole token again from your service's key page, paste it, tick Enable for downloads and tap Save and validate. A validated key doesn't guarantee that every host is supported or that your plan allows every file.</p></div></details>
     <details><summary>A source won't install, or search finds nothing</summary><div><p>Check that the source is enabled and that its URL points to the <code>.gssource</code> file itself. For missing results, try the exact CUSA ID and clear any region filter. A source can be temporarily unavailable or leave out some titles.</p></div></details>
     <details><summary>A title shows no supported mirrors</summary><div><p>SSPI only lists hosts that your enabled services support. Retry the check, choose another region, or enable another service in Settings → Connections.</p></div></details>
-    <details><summary>The PS4 installation fails or stays on Installing</summary><div><p>Note the SSPI error and the full error code in the PS4's notifications. Check that the title ID and base version match the update or DLC. SSPI keeps the files while it can't confirm the result, so don't delete them yet.</p></div></details>
-    <details><summary>A multipart archive won't extract</summary><div><p>Check that every part finished and belongs to the same set, and that there's room for the archive and the extracted package. A damaged or missing part needs a complete set or another mirror.</p></div></details>
+    <details><summary>The PS4 installation fails or stays on Installing</summary><div><p>Note the SSPI error and the full error code in <strong>PS4 Notifications</strong>. Check that the title ID and base version match the update or DLC. SSPI keeps the files while it can't confirm the result, so don't delete them yet. If a background download's link is refused with <code>0x80991401</code> before the transfer finishes, SSPI requests a fresh link. When <strong>PS4 Extended Storage</strong> is connected, base games staged on internal storage are handed to the PS4 through SSPI's local package feed, and SSPI explains the errors for a full installation drive (<code>0x80990039</code>) and a rejected cross-drive install (<code>0x80020012</code>). <span class="tag">Needs a PS4 test</span></p></div></details>
+    <details><summary>A multipart archive won't extract</summary><div><p>Check that every RAR volume finished downloading and belongs to the same set. A damaged or missing part needs a complete set or another mirror. For a missing or wrong password, choose <strong>Enter archive password</strong> in Downloads. Leave room for the archive and the extracted package; a FAT32 drive can't store a single file larger than 4 GiB, so use exFAT for larger files.</p></div></details>
+    <details><summary>Which drive installs games, and which one stages downloads?</summary><div><p>PS4 Settings chooses the game installation drive. SSPI's <strong>Staging location</strong> only holds temporary download and extraction files.</p></div></details>
+    <details><summary>The background worker can't open my USB staging drive</summary><div><p>The worker can't open some selected USB staging drives, and the cause is unknown. Use <strong>Staging location → PS4</strong> or set <strong>Download mode → In-app</strong>.</p></div></details>
+    <details><summary>What happens when a download link stops responding?</summary><div><p><strong>In-app</strong> downloads request a fresh link after 75 seconds for a package or three minutes for an archive, up to three renewals without progress. The background service still retries a dead server. A single-file archive may restart unless its catalog lists its SHA-256.</p></div></details>
     <details><summary>Downloads are slower than expected</summary><div><p>Compare the same file on the same service. Remember that 100 Mbps is about 12.5 MB/s. Waiting for a service to prepare a file is shown separately from the transfer to your PS4.</p></div></details>
   </div>
 
@@ -442,7 +463,7 @@
 </main>
 
 <footer class="site-footer">
-  <span>SSPI 5.11.2 beta</span>
+  <span>SSPI 5.11.3 beta</span>
   <a href="https://github.com/Xyhlo/SSPI">GitHub</a>
   <a href="https://github.com/Xyhlo/SSPI/issues/new">Report an issue</a>
   <a href="https://discord.gg/hF2vw7ybRs">Discord</a>
