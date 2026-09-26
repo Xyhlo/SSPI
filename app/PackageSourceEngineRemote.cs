@@ -24,13 +24,21 @@ namespace Orbis
 
         public static List<SourceTitleResult> Search(InstalledPackageSource source,
             string installedVersionPath, string query)
+        { return Search(source, installedVersionPath, query, null); }
+
+        public static List<SourceTitleResult> Search(InstalledPackageSource source,
+            string installedVersionPath, string query, Func<bool> cancel)
         {
             if (source == null) throw new ArgumentNullException("source");
-            return Search(source.Descriptor, installedVersionPath, query);
+            return Search(source.Descriptor, installedVersionPath, query, cancel);
         }
 
         public static List<SourceTitleResult> Search(PackageSourceDescriptor descriptor,
             string installedVersionPath, string query)
+        { return Search(descriptor, installedVersionPath, query, null); }
+
+        public static List<SourceTitleResult> Search(PackageSourceDescriptor descriptor,
+            string installedVersionPath, string query, Func<bool> cancel)
         {
             ValidateDescriptor(descriptor);
             Dictionary<string, object> config = LoadConfig(descriptor, installedVersionPath);
@@ -43,7 +51,7 @@ namespace Orbis
             DateTime deadline = DateTime.UtcNow.AddSeconds(DeadlineSeconds);
             int requests = 0;
             string url = Expand(template, query, "", "", "", 100, "");
-            string json = Get(descriptor, url, deadline, ref requests);
+            string json = Get(descriptor, url, deadline, ref requests, cancel);
             object root = StrictJson.Parse(json);
             string resultPath = Text(operation, "resultsPath", Text(config, "resultsPath", "results"));
             IList rows = ArrayAt(root, resultPath);
@@ -54,6 +62,7 @@ namespace Orbis
             if (rows == null) return output;
             foreach (object row in rows)
             {
+                CheckCanceled(cancel);
                 if (output.Count >= MaxResults) break;
                 string titleId = Value(row, Field(fields, "titleId", "titleid"), "titleId", "titleid", "title_id");
                 string name = Value(row, Field(fields, "name", "name"), "name", "title", "displayName");
@@ -80,13 +89,21 @@ namespace Orbis
 
         public static List<PackageCandidate> Resolve(InstalledPackageSource source,
             string installedVersionPath, string titleId, string name)
+        { return Resolve(source, installedVersionPath, titleId, name, null); }
+
+        public static List<PackageCandidate> Resolve(InstalledPackageSource source,
+            string installedVersionPath, string titleId, string name, Func<bool> cancel)
         {
             if (source == null) throw new ArgumentNullException("source");
-            return Resolve(source.Descriptor, installedVersionPath, titleId, name, "");
+            return Resolve(source.Descriptor, installedVersionPath, titleId, name, "", cancel);
         }
 
         public static List<PackageCandidate> Resolve(PackageSourceDescriptor descriptor,
             string installedVersionPath, string titleId, string name, string region)
+        { return Resolve(descriptor, installedVersionPath, titleId, name, region, null); }
+
+        public static List<PackageCandidate> Resolve(PackageSourceDescriptor descriptor,
+            string installedVersionPath, string titleId, string name, string region, Func<bool> cancel)
         {
             ValidateDescriptor(descriptor);
             Dictionary<string, object> config = LoadConfig(descriptor, installedVersionPath);
@@ -99,7 +116,7 @@ namespace Orbis
             DateTime deadline = DateTime.UtcNow.AddSeconds(DeadlineSeconds);
             int requests = 0;
             string url = Expand(template, "", titleId, name, region, 100, "");
-            string json = Get(descriptor, url, deadline, ref requests);
+            string json = Get(descriptor, url, deadline, ref requests, cancel);
             object root = StrictJson.Parse(json);
             string resultPath = Text(operation, "resultsPath",
                 Text(operation, "packagesPath", Text(config, "packagesPath", "packages")));
@@ -111,6 +128,7 @@ namespace Orbis
             if (rows == null) return output;
             foreach (object row in rows)
             {
+                CheckCanceled(cancel);
                 if (output.Count >= MaxPackages) break;
                 string packageUrl = Value(row, Field(fields, "url", "url"), "url", "packageUrl", "link");
                 Uri parsed;
@@ -222,7 +240,8 @@ namespace Orbis
             return nested ?? config;
         }
 
-        static string Get(PackageSourceDescriptor descriptor, string url, DateTime deadline, ref int requests)
+        static string Get(PackageSourceDescriptor descriptor, string url, DateTime deadline,
+            ref int requests, Func<bool> cancel)
         {
             Uri uri;
             if (!TryAbsoluteHttp(url, out uri) || !OriginAllowed(descriptor, uri))
@@ -230,15 +249,18 @@ namespace Orbis
                     "Request origin is not permitted");
             for (int attempt = 0; ; attempt++)
             {
+                CheckCanceled(cancel);
                 if (++requests > MaxRequests)
                     throw new PackageSourceRemoteException(SourceFailureCode.LimitExceeded, "HTTP request limit exceeded");
                 if (DateTime.UtcNow >= deadline)
                     throw new PackageSourceRemoteException(SourceFailureCode.TimedOut, "Source deadline exceeded");
                 int remaining = (int)Math.Max(1, (deadline - DateTime.UtcNow).TotalMilliseconds);
                 string result;
-                try { result = NetHttp.GetString(uri.AbsoluteUri, remaining); }
+                try { result = NetHttp.GetString(uri.AbsoluteUri, remaining, cancel: cancel,
+                    allowOrigin: target => OriginAllowed(descriptor, target)); }
                 catch (Exception ex)
                 {
+                    CheckCanceled(cancel);
                     int retryAfter;
                     int status = HttpFailureStatus(ex, out retryAfter);
                     SspiLog.Write("network", "source-request-failed source=" + descriptor.SourceId +
@@ -251,7 +273,17 @@ namespace Orbis
                     // Long Retry-After values are shown to the user, never ignored.
                     if (attempt == 0 && transient && retryAfter <= 2 && requests < MaxRequests &&
                         (deadline - DateTime.UtcNow).TotalMilliseconds > delay + 1000)
-                    { Thread.Sleep(delay); continue; }
+                    {
+                        int remainingDelay = delay;
+                        while (remainingDelay > 0)
+                        {
+                            CheckCanceled(cancel);
+                            int slice = Math.Min(100, remainingDelay);
+                            Thread.Sleep(slice);
+                            remainingDelay -= slice;
+                        }
+                        continue;
+                    }
                     throw new PackageSourceRemoteException(SourceFailureCode.NetworkFailure, HttpFailureMessage(status));
                 }
                 if (result == null || result.Length > MaxResponseChars)
@@ -260,6 +292,9 @@ namespace Orbis
                 return result;
             }
         }
+
+        static void CheckCanceled(Func<bool> cancel)
+        { if (cancel != null && cancel()) throw new OperationCanceledException(); }
 
         static int HttpFailureStatus(Exception error, out int retryAfter)
         {

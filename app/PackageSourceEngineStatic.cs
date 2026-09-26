@@ -229,7 +229,7 @@ namespace Orbis
             foreach (string item in version) if (!int.TryParse(item, NumberStyles.None, CultureInfo.InvariantCulture, out component) || component < 0) throw Bad("Static catalog version component is invalid");
             var root = Parse(read("catalog.json"), MaxJsonBytes);
             if (Text(root, "format", 64, true) != EngineType || Integer(root, "formatVersion", true) != 1)
-                throw Bad("Catalog format needs a newer SSPI version");
+                throw Bad("Catalog format needs a newer SSPI release; install it and restart the PS4");
             if (Text(root, "searchNormalization", 64, true) != "nfkd-lower-alnum-spaces-v1") throw Bad("Unsupported catalog search normalization");
             var indexFiles = Paths(root, "indexFiles", "index/", declared);
             var packageFiles = Paths(root, "packageFiles", "packages/", declared);

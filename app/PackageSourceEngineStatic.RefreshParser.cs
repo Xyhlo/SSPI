@@ -73,18 +73,29 @@ namespace Orbis
         }
         static List<object> RefreshPasswords(string block, RefreshConfiguration config, Dictionary<string, object> inherited)
         {
+            var result = new List<object>();
             Match match = RefreshRegex(@"\bPass?word\s*[:=]\s*(?<value>[^<\r\n]+)").Match(block);
-            if (!match.Success)
+            if (match.Success)
             {
-                var result = new List<object>();
-                foreach (object value in inherited != null && inherited.ContainsKey("archivePasswords") ? (IList)inherited["archivePasswords"] : config.Passwords) result.Add(value);
-                return result;
+                string password = WebUtility.HtmlDecode(match.Groups["value"].Value).Trim();
+                bool configured = false;
+                foreach (string candidate in config.Passwords)
+                    if (string.Equals(password.Trim('[', ']'), candidate.Trim('[', ']'), StringComparison.OrdinalIgnoreCase)) configured = true;
+                if (!configured) RefreshAddPassword(result, password);
             }
-            string password = WebUtility.HtmlDecode(match.Groups["value"].Value).Trim();
-            if (password.Length == 0 || password.Length > 128) return new List<object>(config.Passwords);
-            foreach (string candidate in config.Passwords)
-                if (string.Equals(password.Trim('[', ']'), candidate.Trim('[', ']'), StringComparison.OrdinalIgnoreCase)) return new List<object>(config.Passwords);
-            return new List<object> { password };
+            // A mirror page may supply a different first password, but must not
+            // discard the source's fallback candidates for the same archive.
+            object inheritedValues;
+            if (inherited != null && inherited.TryGetValue("archivePasswords", out inheritedValues) && inheritedValues is IList)
+                foreach (object value in (IList)inheritedValues) RefreshAddPassword(result, value as string);
+            foreach (string candidate in config.Passwords) RefreshAddPassword(result, candidate);
+            return result;
+        }
+        static void RefreshAddPassword(List<object> result, string password)
+        {
+            if (result.Count >= 4 || string.IsNullOrEmpty(password) || password.IndexOf('\0') >= 0 ||
+                Encoding.UTF8.GetByteCount(password) > 256 || result.Contains(password)) return;
+            result.Add(password);
         }
         static string RefreshValue(Dictionary<string, object> item, string key)
         { object value; return item != null && item.TryGetValue(key, out value) ? value as string ?? "" : ""; }

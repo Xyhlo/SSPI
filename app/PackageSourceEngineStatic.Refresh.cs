@@ -48,7 +48,8 @@ namespace Orbis
                 Requests++;
                 RequireRefreshOrigin(Catalog.Descriptor, url);
                 int timeout = (int)Math.Min(Catalog.Refresh.RequestSeconds * 1000, Math.Max(1, (Deadline - DateTime.UtcNow).TotalMilliseconds));
-                string value = SourceHttps.GetString(url, timeout, null, "Mozilla/5.0 SSPI-SourceRefresh/1");
+                string value = SourceHttps.GetString(url, timeout, null, "Mozilla/5.0 SSPI-SourceRefresh/1", Cancel,
+                    target => { RequireRefreshOrigin(Catalog.Descriptor, target.AbsoluteUri); return true; });
                 Check();
                 if (value == null || Encoding.UTF8.GetByteCount(value) > 2 * 1024 * 1024) throw Bad("Refresh response exceeds 2 MiB");
                 return value;

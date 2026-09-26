@@ -55,6 +55,27 @@ namespace Orbis
             lock (_lock) return CloneList(_entries, false);
         }
 
+        internal void RetireBundledSources()
+        {
+            string completed = Path.Combine(_root, "bundled-retirement-v1.done");
+            if (File.Exists(completed)) return;
+            foreach (string marker in Directory.GetFiles(_root, "bundled-*.done"))
+            {
+                if (new FileInfo(marker).Length > 2048) continue;
+                string[] receipt = File.ReadAllLines(marker);
+                if (receipt.Length != 2) continue;
+                foreach (var entry in GetInstalledSources())
+                    if (entry.SourceId == receipt[0] && entry.Version == receipt[1])
+                    {
+                        Remove(entry.SourceId);
+                        break;
+                    }
+            }
+            // Retire only the exact version installed by an earlier bundle.
+            // A later manual import or upgrade remains the user's choice.
+            AtomicFile.WriteText(completed, "1");
+        }
+
         internal void ApplyBundledSources(string directory)
         {
             string manifest = Path.Combine(directory, "bundles.json");
@@ -243,9 +264,13 @@ namespace Orbis
             try { if (File.Exists(_registryPath)) return ParseRegistry(File.ReadAllText(_registryPath, Encoding.UTF8)); } catch { }
             var recovered = new Dictionary<string, PackageSourceRegistryEntry>(StringComparer.Ordinal);
             try { foreach (var entry in ParseRegistry(File.ReadAllText(_registryPath+".bak",Encoding.UTF8))) recovered[entry.SourceId]=entry; } catch { }
-            foreach (string source in Directory.GetDirectories(_installedRoot)) {
+            string[] sourceDirectories = Directory.GetDirectories(_installedRoot);
+            Array.Sort(sourceDirectories, StringComparer.Ordinal);
+            foreach (string source in sourceDirectories) {
                 if ((File.GetAttributes(source)&FileAttributes.ReparsePoint)!=0) continue;
-                foreach (string version in Directory.GetDirectories(source)) try {
+                string[] versions = Directory.GetDirectories(source);
+                Array.Sort(versions, CompareInstalledVersionDescending);
+                foreach (string version in versions) try {
                     var package=PackageSourcePackage.OpenInstalled(version);
                     if (Path.GetFileName(source)!=package.Descriptor.SourceId || Path.GetFileName(version)!=package.Descriptor.Version) continue;
                     if (!recovered.ContainsKey(package.Descriptor.SourceId)) recovered.Add(package.Descriptor.SourceId,FromPackage(package,version,false));
@@ -254,6 +279,89 @@ namespace Orbis
             var result=new List<PackageSourceRegistryEntry>(recovered.Values);
             if (File.Exists(_registryPath)) File.Copy(_registryPath,_registryPath+".corrupt",true);
             SaveRegistry(result);return result;
+        }
+
+        static int CompareInstalledVersionDescending(string leftPath, string rightPath)
+        {
+            int order = CompareInstalledVersion(Path.GetFileName(rightPath), Path.GetFileName(leftPath));
+            return order != 0 ? order : StringComparer.Ordinal.Compare(leftPath, rightPath);
+        }
+
+        static int CompareInstalledVersion(string left, string right)
+        {
+            string leftValue = left ?? "", rightValue = right ?? "";
+            string leftCore, rightCore, leftPre, rightPre;
+            SplitVersion(leftValue, out leftCore, out leftPre);
+            SplitVersion(rightValue, out rightCore, out rightPre);
+            string[] leftParts = leftCore.Split('.'), rightParts = rightCore.Split('.');
+            bool leftNumeric = NumericParts(leftParts), rightNumeric = NumericParts(rightParts);
+            int order;
+            if (leftNumeric && rightNumeric)
+            {
+                int count = Math.Max(leftParts.Length, rightParts.Length);
+                for (int i = 0; i < count; i++)
+                {
+                    string a = i < leftParts.Length ? leftParts[i] : "0";
+                    string b = i < rightParts.Length ? rightParts[i] : "0";
+                    order = CompareNumeric(a, b);
+                    if (order != 0) return order;
+                }
+            }
+            else
+            {
+                order = StringComparer.OrdinalIgnoreCase.Compare(leftCore, rightCore);
+                if (order != 0) return order;
+            }
+
+            if (leftPre.Length == 0 && rightPre.Length != 0) return 1;
+            if (leftPre.Length != 0 && rightPre.Length == 0) return -1;
+            if (leftPre.Length != 0)
+            {
+                string[] leftIds = leftPre.Split('.'), rightIds = rightPre.Split('.');
+                int count = Math.Min(leftIds.Length, rightIds.Length);
+                for (int i = 0; i < count; i++)
+                {
+                    bool aNumeric = IsNumeric(leftIds[i]), bNumeric = IsNumeric(rightIds[i]);
+                    if (aNumeric && bNumeric) order = CompareNumeric(leftIds[i], rightIds[i]);
+                    else if (aNumeric != bNumeric) order = aNumeric ? -1 : 1;
+                    else order = StringComparer.OrdinalIgnoreCase.Compare(leftIds[i], rightIds[i]);
+                    if (order != 0) return order;
+                }
+                order = leftIds.Length.CompareTo(rightIds.Length);
+                if (order != 0) return order;
+            }
+            return StringComparer.Ordinal.Compare(leftValue, rightValue);
+        }
+
+        static void SplitVersion(string value, out string core, out string prerelease)
+        {
+            int plus = value.IndexOf('+');
+            if (plus >= 0) value = value.Substring(0, plus);
+            int dash = value.IndexOf('-');
+            core = dash >= 0 ? value.Substring(0, dash) : value;
+            prerelease = dash >= 0 ? value.Substring(dash + 1) : "";
+        }
+
+        static bool NumericParts(string[] values)
+        {
+            foreach (string value in values) if (!IsNumeric(value)) return false;
+            return values.Length > 0;
+        }
+
+        static bool IsNumeric(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return false;
+            for (int i = 0; i < value.Length; i++) if (value[i] < '0' || value[i] > '9') return false;
+            return true;
+        }
+
+        static int CompareNumeric(string left, string right)
+        {
+            int a = 0, b = 0;
+            while (a < left.Length - 1 && left[a] == '0') a++;
+            while (b < right.Length - 1 && right[b] == '0') b++;
+            int length = (left.Length - a).CompareTo(right.Length - b);
+            return length != 0 ? length : StringComparer.Ordinal.Compare(left.Substring(a), right.Substring(b));
         }
 
         List<PackageSourceRegistryEntry> ParseRegistry(string json)
