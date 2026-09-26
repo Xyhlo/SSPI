@@ -14,7 +14,7 @@ namespace Orbis
         int _frameSamples, _frameMisses, _frameStalls, _frameMissRun, _frameLongestRun;
         double _frameDuration, _frameLongest, _frameUpdateMax, _frameDrawMax, _framePresentMax;
         IntPtr _headerBrand;
-        readonly System.Collections.Generic.Dictionary<string, IntPtr> _caseSizes = new System.Collections.Generic.Dictionary<string, IntPtr>();
+        readonly System.Collections.Generic.Dictionary<int, IntPtr> _caseSizes = new System.Collections.Generic.Dictionary<int, IntPtr>();
         bool _headerBrandTried;
 
         void DrawHeaderBrand(IntPtr renderer)
@@ -114,11 +114,11 @@ namespace Orbis
 
         void DrawCase(IntPtr renderer, GameHit game, SDL_Rect box)
         {
-            string frameKey = box.w + "x" + box.h;
+            int frameKey = box.w << 16 | box.h & 0xFFFF;
             IntPtr frame;
             if (!_caseSizes.TryGetValue(frameKey, out frame))
             {
-                frame = LoadBrandTexture(renderer, "ps4-case-" + frameKey + ".rgba", box.w, box.h);
+                frame = LoadBrandTexture(renderer, "ps4-case-" + box.w + "x" + box.h + ".rgba", box.w, box.h);
                 _caseSizes[frameKey] = frame;
             }
             if (frame == IntPtr.Zero && _caseFrame == IntPtr.Zero) Fill(renderer, box.x, box.y, box.w, box.h, C(20, 77, 157));
@@ -233,18 +233,25 @@ namespace Orbis
             bool drawerOpen = _downloadFilesTitle != null;
             DrawTouchpadAction(renderer, ContentX + ContentWidth - 188, drawerOpen ? 110 : 132, "My files");
             int filterX = ContentX;
+            var filterLine = new SDL_Rect();
             for (int i = 0; i < QueueFilters.Length; i++)
             {
                 TextPx(renderer, filterX, drawerOpen ? 126 : 148, 22, QueueFilters[i], i == _queueFilter ? White : Muted);
-                if (i == _queueFilter) Fill(renderer, filterX, drawerOpen ? 165 : 189, 26, 2, White);
+                if (i == _queueFilter) filterLine = new SDL_Rect { x = filterX, y = drawerOpen ? 165 : 189, w = 26, h = 2 };
                 filterX += UiFont.MeasurePx(22, QueueFilters[i]) + 35;
             }
-            if (rows.Count == 0) { TextPx(renderer, ContentX, 380, 32, "Nothing queued", White); return; }
+            if (filterLine.w > 0) { filterLine = Glide(GlideTabs, filterLine); Fill(renderer, filterLine.x, filterLine.y, filterLine.w, filterLine.h, White); }
+            int listTop = drawerOpen ? 184 : DrawFtpInboxSection(renderer, 224);
+            if (rows.Count == 0) { TextPx(renderer, ContentX, Math.Max(380, listTop + 40), 32, "Nothing queued", White); return; }
+            // One focused card (320) plus the collapsed cards (112 + 20 gap) that fit
+            // above 948: four without the FTP strip, three below it.
+            int visibleRows = Math.Max(1, Math.Min(4, 1 + (948 - listTop - 320) / 132));
             // Focus expands within the list; selection order remains stable while jobs update.
             if (_downloadFilesTitle != null) _dlScroll = _dlFocus;
-            else EnsureVisible(ref _dlScroll, _dlFocus, rows.Count, 4);
-            int y = drawerOpen ? 184 : 224;
-            for (int i = _dlScroll; i < rows.Count && i < _dlScroll + 4; i++)
+            else EnsureVisible(ref _dlScroll, _dlFocus, rows.Count, visibleRows);
+            int y = listTop;
+            var haloFrame = new SDL_Rect(); var haloTone = White; bool haloSet = false;
+            for (int i = _dlScroll; i < rows.Count && i < _dlScroll + visibleRows; i++)
             {
                 var row = rows[i]; var group = row.Group; var item = row.Item;
                 bool focus = i == _dlFocus;
@@ -320,13 +327,21 @@ namespace Orbis
                     SDL_Color stateTone = DownloadRingColor(item);
                     bool moving = DownloadRingAnimating(item);
                     double pulse = !_cfg.ReduceMotion && moving ? .65 + .35 * (.5 + .5 * Math.Sin(UiTick() * Math.PI / 1600.0)) : 1;
-                    var halo = new SDL_Rect { x = frame.x - 2, y = frame.y - 2, w = frame.w + 4, h = frame.h + 4 };
-                    StrokeRect(renderer, halo, C((byte)(stateTone.r * pulse / 3), (byte)(stateTone.g * pulse / 3), (byte)(stateTone.b * pulse / 3)), 1);
-                    StrokeRect(renderer, frame, C((byte)(stateTone.r * pulse), (byte)(stateTone.g * pulse), (byte)(stateTone.b * pulse)), 2);
+                    // The focus outline glides and resizes from the previously focused
+                    // card; it is drawn after the list so later cards cannot cover it.
+                    haloFrame = Glide(GlideHalo, frame);
+                    haloTone = C((byte)(stateTone.r * pulse), (byte)(stateTone.g * pulse), (byte)(stateTone.b * pulse));
+                    haloSet = true;
                 }
                 y += 20;
             }
-            if (!drawerOpen && rows.Count > 4) DrawScrollBar(renderer, new SDL_Rect { x = ContentX + ContentWidth + 16, y = 224, w = 4, h = 716 }, rows.Count, 4, _dlScroll);
+            if (haloSet)
+            {
+                var halo = new SDL_Rect { x = haloFrame.x - 2, y = haloFrame.y - 2, w = haloFrame.w + 4, h = haloFrame.h + 4 };
+                StrokeRect(renderer, halo, C((byte)(haloTone.r / 3), (byte)(haloTone.g / 3), (byte)(haloTone.b / 3)), 1);
+                StrokeRect(renderer, haloFrame, haloTone, 2);
+            }
+            if (!drawerOpen && rows.Count > visibleRows) DrawScrollBar(renderer, new SDL_Rect { x = ContentX + ContentWidth + 16, y = 224, w = 4, h = 716 }, rows.Count, visibleRows, _dlScroll);
             MarkUiProgress("downloads-complete");
         }
 

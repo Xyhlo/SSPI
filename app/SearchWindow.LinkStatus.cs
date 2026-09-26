@@ -15,12 +15,16 @@ namespace Orbis
         DebridMultiProviderStatusLookup _supportRowsLookup;
         readonly Dictionary<PackageCandidate, bool> _supportedPackages = new Dictionary<PackageCandidate, bool>();
         IList<PackageCandidate> _supportedCandidates;
+        // Changes whenever the support answers are discarded, so models built from
+        // PackageSupported (detail rows, region chips and notice) can rebuild.
+        int _supportSnapshot;
 
         bool PackageSupported(PackageCandidate candidate)
         {
             if (!object.ReferenceEquals(_supportedCandidates, _linkCandidates)) {
                 _supportedCandidates = _linkCandidates;
                 _supportedPackages.Clear();
+                _supportSnapshot++;
             }
             if (candidate == null) return false;
             bool supported;
@@ -44,6 +48,7 @@ namespace Orbis
             _supportRowsLookup = _linkStatusLookup;
             _supportRowsRevision = revision;
             _supportedPackages.Clear();
+            _supportSnapshot++;
             RebuildDetailRows();
             _detailScroll = Math.Min(_detailScroll, Math.Max(0, _detailRows.Count - 1));
             Invalidated = true;

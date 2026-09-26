@@ -9,10 +9,17 @@ namespace Orbis
 {
     public partial class SearchWindow
     {
-        const uint LaunchDurationMs = 900;
+        // Launch intro: the cube continues where the system splash left it and
+        // settles upward, then the wordmark, an accent progress track and a
+        // caption follow. Startup work never waits for it; the track follows the
+        // real startup stages and opens over the live UI when they finish.
+        const uint LaunchCubeMs = 560, LaunchWordAtMs = 180, LaunchWordMs = 380, LaunchTrackAtMs = 360, LaunchTrackMs = 340, LaunchCaptionAtMs = 520, LaunchCaptionMs = 320, LaunchHandoffMs = 340, LaunchProgressMs = 240, LaunchDetailsAfterMs = 8000;
+        const int LaunchLift = 100, LaunchWordY = 626, LaunchTrackY = 794, LaunchTrackW = 360;
         IntPtr _launchCube, _launchWordmark;
-        bool _launchStarted, _launchFinished;
-        uint _launchStartedAt;
+        bool _launchStarted, _launchFinished, _launchStill, _launchIntroShown, _launchHandoff, _launchProgressSeen;
+        uint _launchStartedAt, _launchHandoffAt, _launchProgressAt;
+        float _launchProgress;
+        SDL_Color _launchBg = C(20, 20, 20), _launchAccent = C(228, 228, 225), _launchTrack = C(62, 62, 61);
         bool _startupServicesReady, _startupFailed, _startupRetry;
         int _startupStep;
         string _startupStatus = "1 / 3  Checking background download settings";
@@ -56,10 +63,12 @@ namespace Orbis
             if (_startupLines.Count > 96) _startupLines.RemoveRange(0, _startupLines.Count - 96);
         }
 
+        // Startup begins once the first intro frame is presented. A former 1.5 s wait
+        // compared the SDL frame clock with Environment.TickCount, two unrelated clocks,
+        // so it did not reliably wait at all; startup keeps the timing it actually had.
         void PollStartup()
         {
             if (_startupServicesReady || !_firstFramePresented || _startupFailed) return;
-            if (_launchStarted && UiElapsed(_launchStartedAt) < 1500) return;
             if (_startupStep == 0)
             {
                 if (!_cfg.UseBgftDirect) { _startupStep = 1; return; }
@@ -191,38 +200,207 @@ namespace Orbis
             }
         }
 
-        void PrepareLaunchBranding(IntPtr renderer)
+        // Unconfigured settings resolve to plain charcoal and the Charcoal accent,
+        // which is the monochrome launch identity.
+        void ResolveLaunchTheme(string accentHex, string backgroundMode, bool reduceMotion)
         {
-            _launchCube = LoadBrandTexture(renderer, "sspi-startup.rgba", 512, 512);
+            ThemeColor accent = ThemePalette.ResolveAccent(accentHex);
+            ThemeColor surface = ThemePalette.LaunchSurface(backgroundMode, accent);
+            ThemeColor track = ThemePalette.Mix(surface, accent, 0.18);
+            _launchBg = C(surface.R, surface.G, surface.B);
+            _launchAccent = C(accent.R, accent.G, accent.B);
+            _launchTrack = C(track.R, track.G, track.B);
+            _launchStill = reduceMotion;
         }
 
+        void PrepareLaunchBranding(IntPtr renderer)
+        {
+            // The constructor paints before Load(): read only the saved appearance.
+            string accent, background;
+            bool reduceMotion;
+            AppSettings.ReadLaunchAppearance(out accent, out background, out reduceMotion);
+            ResolveLaunchTheme(accent, background, reduceMotion);
+            _launchCube = LoadBrandTexture(renderer, "sspi-startup.rgba", 512, 512);
+            _launchWordmark = LoadBrandTexture(renderer, "sspi-wordmark.rgba", 360, 186);
+        }
+
+        // Constructor paint, before fonts load. With motion the cube stays where
+        // the system splash showed it; reduced motion starts settled, so the
+        // static intro never moves. rise offsets the cube vertically.
         void PaintLaunchBranding(IntPtr renderer, int rise)
         {
-            Fill(renderer, 0, 0, W, H, C(20, 20, 20));
+            Fill(renderer, 0, 0, W, H, _launchBg);
             if (_launchCube != IntPtr.Zero)
             {
-                var cube = new SDL_Rect { x = (W - 512) / 2, y = (H - 512) / 2 + rise, w = 512, h = 512 };
+                var cube = new SDL_Rect { x = (W - 512) / 2, y = (H - 512) / 2 + rise - (_launchStill ? LaunchLift : 0), w = 512, h = 512 };
                 SDL_RenderCopy(renderer, _launchCube, IntPtr.Zero, ref cube);
             }
+            if (_launchStill) PaintLaunchWordmark(renderer, 1f, 0);
+        }
+
+        static float LaunchPhase(uint elapsed, uint at, uint duration)
+        {
+            return elapsed <= at ? 0f : EaseOut((elapsed - at) / (float)duration);
+        }
+
+        static SDL_Color LaunchMix(SDL_Color from, SDL_Color to, float amount)
+        {
+            amount = Math.Max(0f, Math.Min(1f, amount));
+            return C((byte)Math.Round(from.r + (to.r - from.r) * amount),
+                (byte)Math.Round(from.g + (to.g - from.g) * amount),
+                (byte)Math.Round(from.b + (to.b - from.b) * amount));
+        }
+
+        // One target per real startup stage: the same states that record
+        // Program.StartupStage. Display easing never runs ahead of a stage.
+        float LaunchProgressTarget()
+        {
+            if (_startupServicesReady) return 1f;
+            if (_startupStep >= 2) return 0.84f;
+            if (_startupStep == 1) return 0.6f;
+            return _firstFramePresented ? 0.3f : 0.12f;
+        }
+
+        float SmoothLaunchProgress(uint now)
+        {
+            float target = LaunchProgressTarget();
+            if (_launchStill || target < _launchProgress) _launchProgress = target;
+            else if (_launchProgressSeen)
+                _launchProgress += (target - _launchProgress) *
+                    (float)(1 - Math.Exp(-unchecked(now - _launchProgressAt) / (double)LaunchProgressMs));
+            if (target - _launchProgress < 0.002f) _launchProgress = target;
+            _launchProgressSeen = true;
+            _launchProgressAt = now;
+            return _launchProgress;
+        }
+
+        string LaunchCaption()
+        {
+            if (_startupServicesReady) return "Ready";
+            if (_startupStep >= 2) return "Restoring your download queue";
+            if (_startupStep == 1) return "Loading settings and package sources";
+            return _cfg.UseBgftDirect ? "Checking the background downloader" : "Starting SSPI";
+        }
+
+        // The wordmark fades by an opaque colour ramp up from the surface and a
+        // short rise, never by texture alpha. offset moves it with the hand-off.
+        void PaintLaunchWordmark(IntPtr renderer, float shown, int offset)
+        {
+            int y = LaunchWordY + (int)Math.Round(18 * (1 - shown)) + offset;
+            if (y + 186 <= 0) return;
+            if (_launchWordmark != IntPtr.Zero)
+            {
+                int floor = Math.Max(_launchBg.r, Math.Max(_launchBg.g, _launchBg.b));
+                byte ink = (byte)Math.Round(floor + (255 - floor) * shown);
+                SDL_SetTextureColorMod(_launchWordmark, ink, ink, ink);
+                var mark = new SDL_Rect { x = W / 2 - 150, y = y, w = 360, h = 186 };
+                SDL_RenderCopy(renderer, _launchWordmark, IntPtr.Zero, ref mark);
+            }
+        }
+
+        // Two 2 px rows form the 4 px track; the hand-off pulls them apart.
+        void PaintLaunchTrackRow(IntPtr renderer, int from, int to, int fill, int y)
+        {
+            int split = Math.Max(from, Math.Min(to, fill));
+            Fill(renderer, from, y, split - from, 2, _launchAccent);
+            Fill(renderer, split, y, to - split, 2, _launchTrack);
+        }
+
+        // One composition for the intro and its hand-off. open > 0 splits the
+        // surface at the progress track: the upper panel carries the cube and
+        // wordmark up and the lower panel the caption down, revealing the UI.
+        void PaintLaunchIntro(IntPtr renderer, uint elapsed, int open, float progress)
+        {
+            float settle = _launchStill ? 1f : LaunchPhase(elapsed, 0, LaunchCubeMs);
+            float word = _launchStill ? 1f : LaunchPhase(elapsed, LaunchWordAtMs, LaunchWordMs);
+            float track = _launchStill ? 1f : LaunchPhase(elapsed, LaunchTrackAtMs, LaunchTrackMs);
+            float caption = _launchStill ? 1f : LaunchPhase(elapsed, LaunchCaptionAtMs, LaunchCaptionMs);
+            int seam = LaunchTrackY + 2, top = seam - open, bottom = seam + open;
+            if (open <= 0) Fill(renderer, 0, 0, W, H, _launchBg);
+            else
+            {
+                Fill(renderer, 0, 0, W, top, _launchBg);
+                Fill(renderer, 0, bottom, W, H - bottom, _launchBg);
+            }
+            if (_launchCube != IntPtr.Zero)
+            {
+                var cube = new SDL_Rect { x = (W - 512) / 2, y = (H - 512) / 2 - (int)Math.Round(LaunchLift * settle) - open, w = 512, h = 512 };
+                if (cube.y + cube.h > 0) SDL_RenderCopy(renderer, _launchCube, IntPtr.Zero, ref cube);
+            }
+            if (word > 0f)
+            {
+                if (_launchWordmark != IntPtr.Zero) PaintLaunchWordmark(renderer, word, -open);
+                else TextCentered(renderer, new SDL_Rect { x = W / 2 - 300, y = LaunchWordY + 60 + (int)Math.Round(18 * (1 - word)) - open, w = 600, h = 64 },
+                    48, "SSPI", LaunchMix(_launchBg, White, word));
+            }
+            if (track > 0f)
+            {
+                int left = (W - LaunchTrackW) / 2, half = (int)Math.Round(LaunchTrackW / 2 * track);
+                int fill = left + (int)Math.Round(LaunchTrackW * Math.Max(0f, Math.Min(1f, progress)));
+                if (top > 0) PaintLaunchTrackRow(renderer, W / 2 - half, W / 2 + half, fill, top - 2);
+                if (bottom < H) PaintLaunchTrackRow(renderer, W / 2 - half, W / 2 + half, fill, bottom);
+            }
+            if (caption > 0f && bottom + 20 < H)
+            {
+                string text = LaunchCaption();
+                var area = new SDL_Rect { x = W / 2 - 500, y = LaunchTrackY + 20 + open, w = 1000, h = 30 };
+                TextCentered(renderer, area, 18, text, LaunchMix(_launchBg, Muted, caption));
+                string dots = StartupActivity(elapsed, _launchStill, !_startupFailed && !_startupServicesReady);
+                if (dots.Length != 0)
+                {
+                    int width = UiFont.MeasurePx(18, text);
+                    TextPx(renderer, area.x + Math.Max(8, (area.w - width) / 2) + width + 2, area.y + 2, 18, dots,
+                        LaunchMix(_launchBg, _launchAccent, caption));
+                }
+            }
+        }
+
+        // Opens the finished intro from its progress track over the live UI.
+        bool DrawLaunchHandoff(IntPtr renderer, uint now)
+        {
+            uint t = unchecked(now - _launchHandoffAt);
+            if (!_launchHandoff || t >= LaunchHandoffMs) return false;
+            float p = t / (float)LaunchHandoffMs, ease = p * p * (3f - 2f * p);
+            int open = (int)Math.Round((LaunchTrackY + 2) * ease);
+            float progress = _launchProgress + (1f - _launchProgress) * Math.Min(1f, p * 3f);
+            PaintLaunchIntro(renderer, unchecked(now - _launchStartedAt), open, progress);
+            return true;
+        }
+
+        // Runs after DrawFrame (and its scene-cache capture), so the opening
+        // panels never enter cached frames. Any failure simply ends the intro.
+        public override void OnDraw(uint Tick)
+        {
+            base.OnDraw(Tick);
+            if (!_launchHandoff) return;
+            try { if (DrawLaunchHandoff(Renderer.Handler, Tick)) return; }
+            catch { }
+            ReleaseLaunchBranding();
         }
 
         bool DrawLaunchBranding(IntPtr renderer, uint now)
         {
             if (_launchFinished) return false;
-            if (!_launchStarted) { _launchStartedAt = now; _launchStarted = true; }
-            uint elapsed = unchecked(now - _launchStartedAt);
-            Fill(renderer, 0, 0, W, H, C(20, 20, 20));
-            if (elapsed < LaunchDurationMs && _launchCube != IntPtr.Zero)
+            if (!_launchStarted)
             {
-                int rise = 0;
-                if (!_cfg.ReduceMotion)
-                    rise = -(int)Math.Round(9 * (1 - Math.Cos(2 * Math.PI * elapsed / LaunchDurationMs)));
-                PaintLaunchBranding(renderer, rise);
+                _launchStartedAt = now; _launchStarted = true;
+                // Settings are loaded by the first animated frame; no file access here.
+                ResolveLaunchTheme(_cfg.Accent, _cfg.BackgroundMode, _cfg.ReduceMotion);
+            }
+            uint elapsed = unchecked(now - _launchStartedAt);
+            RecordStartupLine(_startupDetail);
+            float progress = SmoothLaunchProgress(now);
+            // The intro covers normal startups. A failure, or a wait long enough
+            // to need an explanation, shows the diagnostic startup panel.
+            _launchIntroShown = _launchCube != IntPtr.Zero && !_startupFailed && elapsed < LaunchDetailsAfterMs;
+            if (_launchIntroShown)
+            {
+                PaintLaunchIntro(renderer, elapsed, 0, progress);
                 return true;
             }
-            RecordStartupLine(_startupDetail);
+            Fill(renderer, 0, 0, W, H, _launchBg);
             Fill(renderer, 280, 180, 1360, 600, C(14, 15, 16));
-            Fill(renderer, 280, 180, 1360, 2, Border);
+            Fill(renderer, 280, 180, 1360, 2, _launchAccent);
             TextPx(renderer, 312, 202, 20, "SSPI / STARTUP", White);
             TextPx(renderer, 1370, 202, 16, "UP / DOWN  Scroll", Dim);
             TextFit(renderer, 312, 250, 24, 1180, _startupStatus, _startupFailed ? Danger : White);
@@ -260,7 +438,18 @@ namespace Orbis
 
         void FinishLaunchBranding()
         {
+            if (_launchFinished) return;
             _launchFinished = true;
+            // Only the animated intro opens over the UI; reduced motion and the
+            // diagnostic panel hand over at once. The UI is live either way.
+            _launchHandoff = _launchIntroShown && !_launchStill;
+            _launchHandoffAt = _frameTime;
+            if (!_launchHandoff) ReleaseLaunchBranding();
+        }
+
+        void ReleaseLaunchBranding()
+        {
+            _launchHandoff = false;
             if (_launchCube != IntPtr.Zero) { SDL_DestroyTexture(_launchCube); _launchCube = IntPtr.Zero; }
             if (_launchWordmark != IntPtr.Zero) { SDL_DestroyTexture(_launchWordmark); _launchWordmark = IntPtr.Zero; }
         }
@@ -269,7 +458,8 @@ namespace Orbis
         {
             StopLinkStatusLookup();
             UiAudio.Shutdown();
-            FinishLaunchBranding();
+            _launchFinished = true;
+            ReleaseLaunchBranding();
             ReleasePattern();
             foreach (var frame in _caseSizes.Values) if (frame != IntPtr.Zero) SDL_DestroyTexture(frame);
             _caseSizes.Clear();

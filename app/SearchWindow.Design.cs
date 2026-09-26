@@ -19,17 +19,40 @@ namespace Orbis
             return text;
         }
 
-        void DesignCard(IntPtr r, SDL_Rect rect, bool selected)
+        // glideSlot: the accent ring glides from the previously focused card of the
+        // same list instead of jumping. A Cross press briefly brightens the card.
+        void DesignCard(IntPtr r, SDL_Rect rect, bool selected, int glideSlot = -1)
         {
             byte level = selected ? (byte)(_cfg.ReduceMotion ? 41 : 33 + Math.Min(8, UiElapsed(_lastInputAt) / 20)) : Panel.r;
+            if (selected && PressActive()) level = (byte)Math.Min(255, level + 14);
             SoftRect(r, rect, selected ? C(level, level, level) : Panel);
-            StrokeRect(r, rect, selected ? Accent : Border, selected ? 2 : 1);
+            if (selected && glideSlot >= 0)
+            {
+                // Rows drawn after this one would cover a ring passing over them,
+                // so the ring waits for FlushGlideRing after the list.
+                StrokeRect(r, rect, Border, 1);
+                _pendingRing = Glide(glideSlot, rect);
+                _pendingRingSet = true;
+            }
+            else StrokeRect(r, rect, selected ? Accent : Border, selected ? 2 : 1);
+        }
+
+        SDL_Rect _pendingRing;
+        bool _pendingRingSet;
+        void FlushGlideRing(IntPtr r)
+        {
+            if (!_pendingRingSet) return;
+            _pendingRingSet = false;
+            StrokeRect(r, _pendingRing, Accent, 2);
         }
 
         void DrawSwitch(IntPtr r, int x, int y, bool enabled)
         {
-            SoftRect(r, new SDL_Rect { x = x, y = y, w = 52, h = 28 }, enabled ? PrimaryFill : C(66, 66, 66));
-            SoftRect(r, new SDL_Rect { x = x + (enabled ? 27 : 4), y = y + 4, w = 21, h = 20 }, enabled ? PrimaryInk : C(174, 174, 174));
+            // The knob slides to its new side; the track takes the new colour at halfway.
+            float position = SwitchPosition(x, y, enabled);
+            bool on = position >= 0.5f;
+            SoftRect(r, new SDL_Rect { x = x, y = y, w = 52, h = 28 }, on ? PrimaryFill : C(66, 66, 66));
+            SoftRect(r, new SDL_Rect { x = x + 4 + (int)Math.Round(23 * position), y = y + 4, w = 21, h = 20 }, on ? PrimaryInk : C(174, 174, 174));
         }
 
         void DrawSettingsSave(IntPtr r, SDL_Rect sheet, int index)

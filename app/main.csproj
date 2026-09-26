@@ -81,6 +81,7 @@
     <Compile Include="PairServer.Library.cs" />
     <Compile Include="SearchWindow.SceneCache.cs" />
     <Compile Include="SearchWindow.LibraryOverlay.cs" />
+    <Compile Include="SearchWindow.Motion.cs" />
     <Compile Include="CommunitySources.cs" />
     <Compile Include="DistributionSettings.cs" />
     <Compile Include="ArchivePasswordDefaults.cs" />
@@ -155,6 +156,7 @@
     <Compile Include="SearchWindow.cs" />
     <Compile Include="SearchWindow.Branding.cs" />
     <Compile Include="SearchWindow.Charcoal.cs" />
+    <Compile Include="SearchWindow.DetailRegions.cs" />
     <Compile Include="SearchWindow.LinkStatus.cs" />
     <Compile Include="SearchWindow.Refined.cs" />
     <Compile Include="SearchWindow.Design.cs" />
