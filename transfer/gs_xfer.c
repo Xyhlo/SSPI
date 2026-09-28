@@ -23,14 +23,14 @@ static OriginLanes origin_lanes[GS_COOLDOWN_SLOTS];
 #define LANE_HOLD_MAX_MS 600000U
 #define LANE_RATE_MIN_MS 4000U
 // A server with no history starts at six lanes and climbs while speed rises,
-// instead of opening all 25 at once and learning its limit from resets.
+// instead of opening all 24 at once and learning its limit from resets.
 #define LANE_START 6
 #ifdef GS_HOST_TEST
 static uint64_t test_clock_offset;
 __declspec(dllexport) void gs_test_advance(unsigned ms){__atomic_add_fetch(&test_clock_offset,ms,__ATOMIC_RELAXED);}
 #endif
 static GsJobState jobs[GS_XFER_JOBS];
-// Twenty-five lanes double-buffer 2 MiB blocks: a 100 MiB ceiling (was 40 MiB
+// Twenty-four lanes double-buffer 2 MiB blocks: a 96 MiB ceiling (was 40 MiB
 // for ten lanes). Only lanes that are transferring hold their 4 MiB; an idle
 // lane returns it, so a quiet worker does not keep the ceiling allocated.
 #define WRITE_BLOCK (2U * 1024U * 1024U)
@@ -145,7 +145,7 @@ static void background_thread(const char *role)
     // renderer starves them, TCP windows close and each lane falls to ~1.5 MiB/s.
     // Every received block must then pass the hash threads and the single disk
     // writer before its lane may read again; below the readers, those consumers
-    // lose the CPU to 25 TLS readers and the renderer, lanes park in wait_write
+    // lose the CPU to 24 TLS readers and the renderer, lanes park in wait_write
     // and throughput collapses until they drain. The checkpoint thread holds the
     // package vnode during fsync, so it must not stall the writer behind it.
     // Only source preparation stays at the lowest level.
@@ -222,7 +222,7 @@ static void log_line(const char *destination,const char *line)
 }
 static void format_log(const GsJobState *j,const char *event,char *line,size_t size)
 {
-    snprintf(line,size,"ms=%llu api=3 engine=sceHttp-chunks revision=twenty-five-lane-background-1 event=%s handle=%d state=%d lanes=%d done=%lld total=%lld network=%lld retries=%d code=%d limit=%d target=%d checkpoint_ms=%llu request_ms=%llu read_ms=%llu write_ms=%llu hash_ms=%llu read_calls=%llu write_calls=%llu write_bytes=%llu buffer_wait_ms=%llu read_interruptions=%llu write_jumps=%llu write_jump_bytes=%llu write_switches=%llu write_max_ms=%llu span_chunks=8 write_run_mib=%u write_block_kib=%u read_block_kib=%u buffer_mib=%u buffer_allocated_mib=%u ceiling=%d hold_ms=%u\n",
+    snprintf(line,size,"ms=%llu api=3 engine=sceHttp-chunks revision=twenty-four-lane-background-1 event=%s handle=%d state=%d lanes=%d done=%lld total=%lld network=%lld retries=%d code=%d limit=%d target=%d checkpoint_ms=%llu request_ms=%llu read_ms=%llu write_ms=%llu hash_ms=%llu read_calls=%llu write_calls=%llu write_bytes=%llu buffer_wait_ms=%llu read_interruptions=%llu write_jumps=%llu write_jump_bytes=%llu write_switches=%llu write_max_ms=%llu span_chunks=8 write_run_mib=%u write_block_kib=%u read_block_kib=%u buffer_mib=%u buffer_allocated_mib=%u ceiling=%d hold_ms=%u\n",
         (unsigned long long)gs_clock(),event,j->handle,j->status.state,j->status.lanes,
         (long long)j->status.done,(long long)j->status.total,(long long)j->status.network_bytes,j->status.retries,j->status.error_code,j->limit,j->target_limit,
         (unsigned long long)j->checkpoint_ms,(unsigned long long)j->request_ms,(unsigned long long)j->read_ms,
