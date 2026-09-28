@@ -366,7 +366,7 @@ namespace Orbis
                     return;
                 }
                 if (Settings != null && method == "POST" &&
-                    (path == pairPrefix + "/services" || path == pairPrefix + "/source" || path == pairPrefix + "/appearance" || path == pairPrefix + "/source-toggle"))
+                    (path == pairPrefix + "/services" || path == pairPrefix + "/source" || path == pairPrefix + "/appearance" || path == pairPrefix + "/download-settings" || path == pairPrefix + "/source-toggle"))
                 {
                     string error = SaveConfiguration(path.Substring(pairPrefix.Length), body);
                     if (error != null) PublishPhoneNotice(error, true);
@@ -569,7 +569,7 @@ $('saveCover').onclick=()=>changeCover(false);$('restoreCover').onclick=()=>chan
 let offline=false;
 refresh(true).then(async()=>{await request('/connected',new URLSearchParams());if(tabs.includes(location.hash.slice(1)))navigate(location.hash.slice(1));note('Phone connected. You can continue using your PS4.');}).catch(e=>showError(e.message));
 setInterval(()=>{if(document.hidden)return;refresh().then(()=>{if(offline){offline=false;clearError();note('PS4 reconnected.')}}).catch(e=>{offline=true;showError(e.message==='Failed to fetch'?'Connection lost. Keep SSPI open and reconnect to the same network.':e.message)})},5000);window.addEventListener('beforeunload',e=>{if(dirty||appearanceDirty||coverDirty||coverBusy){e.preventDefault();e.returnValue=''}});
-</script></body></html>".Replace("__SSPI_BRAND__", PairBrandMarkup());
+</script></body></html>".Replace("__SSPI_BRAND__", PairBrandMarkup()).Replace("</script></body></html>", DownloadSettingsScript() + "</script></body></html>");
         }
 
         string ConfigJson()
@@ -604,7 +604,7 @@ setInterval(()=>{if(document.hidden)return;refresh().then(()=>{if(offline){offli
                 string oldRd = c.RealDebridToken, oldTb = c.TorBoxApiKey, oldAd = c.AllDebridApiKey, oldPm = c.PremiumizeApiKey, oldProvider = c.UnlockProviderId;
                 string oldAccent = c.Accent, oldAccentName = c.AccentName, oldBackground = c.BackgroundMode, oldEnabled = c.EnabledUnlockProviders;
                 string oldOverlay = c.BackgroundOverlay;
-                int oldImageOpacity = c.BackgroundImageOpacity, oldEffectOpacity = c.BackgroundEffectOpacity;
+                int oldImageOpacity = c.BackgroundImageOpacity, oldEffectOpacity = c.BackgroundEffectOpacity, oldDownloadRangeCount = c.DownloadRangeCount;
                 bool oldUse = c.UseUnlockProvider, oldUseRd = c.UseRealDebrid;
                 string oldPending = PendingSource, oldStatus = SourceStatus;
                 if (route == "/services")
@@ -648,6 +648,15 @@ setInterval(()=>{if(document.hidden)return;refresh().then(()=>{if(offline){offli
                     if (!string.IsNullOrEmpty(PendingSource)) return "A source is already waiting to install";
                     PendingSource = source; SourceStatus = "Waiting for PS4 source validation";
                 }
+                else if (route == "/download-settings")
+                {
+                    string raw = ParseForm(body, "download_range_count");
+                    int count;
+                    if (!int.TryParse(raw, out count) || count < DownloadTransferSettings.MinRangeCount ||
+                        count > DownloadTransferSettings.MaxRangeCount)
+                        return "Download segments must be between 1 and " + DownloadTransferSettings.MaxRangeCount + ".";
+                    c.DownloadRangeCount = DownloadTransferSettings.ClampRangeCount(count);
+                }
                 else if (route == "/appearance")
                 {
                     string accent = ParseForm(body, "accent"); ThemeColor color; ThemeAccentPreset preset;
@@ -671,7 +680,7 @@ setInterval(()=>{if(document.hidden)return;refresh().then(()=>{if(offline){offli
                     c.RealDebridToken = oldRd; c.TorBoxApiKey = oldTb; c.AllDebridApiKey = oldAd; c.PremiumizeApiKey = oldPm; c.UnlockProviderId = oldProvider;
                     c.UseUnlockProvider = oldUse; c.UseRealDebrid = oldUseRd; c.EnabledUnlockProviders = oldEnabled;
                     c.Accent = oldAccent; c.AccentName = oldAccentName; c.BackgroundMode = oldBackground;
-                    c.BackgroundOverlay = oldOverlay; c.BackgroundImageOpacity = oldImageOpacity; c.BackgroundEffectOpacity = oldEffectOpacity;
+                    c.BackgroundOverlay = oldOverlay; c.BackgroundImageOpacity = oldImageOpacity; c.BackgroundEffectOpacity = oldEffectOpacity; c.DownloadRangeCount = oldDownloadRangeCount;
                     PendingSource = oldPending; SourceStatus = oldStatus;
                     return "The PS4 could not save settings. Try again.";
                 }
@@ -679,6 +688,21 @@ setInterval(()=>{if(document.hidden)return;refresh().then(()=>{if(offline){offli
                 if (route == "/services") BeginServiceValidation(body);
                 return null;
             }
+        }
+
+        string DownloadSettingsScript()
+        {
+            int current = DownloadTransferSettings.ClampRangeCount(Settings == null
+                ? DownloadTransferSettings.DefaultRangeCount : Settings.DownloadRangeCount);
+            var options = new StringBuilder();
+            for (int i = DownloadTransferSettings.MinRangeCount; i <= DownloadTransferSettings.MaxRangeCount; i++)
+                options.Append("<option value='").Append(i).Append("'")
+                    .Append(i == current ? " selected" : "").Append(">").Append(i).Append("</option>");
+            return "const segmentCard=document.createElement('div');segmentCard.className='card';" +
+                "segmentCard.innerHTML=\"<h2>Download segments</h2><p class='muted'>Choose how many parallel HTTP range tasks the PS4 may use for one file. The file stays single; only the work is split.</p><label for='downloadSegments'>Segments</label><select id='downloadSegments'>" +
+                options.ToString() +
+                "</select><small>1 = single connection. Maximum 24. Providers may use fewer when their own limit is lower.</small><div class='actions'><button class='save' id='saveSegments'>Save download segments</button></div>\";" +
+                "$('downloads').prepend(segmentCard);$('saveSegments').onclick=()=>{const button=$('saveSegments');button.disabled=true;enqueue(async()=>{await request('/download-settings',new URLSearchParams({download_range_count:$('downloadSegments').value}));note('Download segments saved on PS4')}).catch(e=>showError(e.message)).finally(()=>button.disabled=false)};";
         }
 
         static string PairResultHtml(string title, string message, string tag, bool failed, string retryPath)
