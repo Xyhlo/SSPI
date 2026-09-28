@@ -14,8 +14,8 @@ namespace Orbis
         // Per-provider connection ceiling. Providers with a documented lower
         // allowance (AllDebrid, Premiumize, Real-Debrid's per-link chunks)
         // remember that lower limit for their links.
-        public const int MaxRangeCount = 25;
-        public const int DefaultRangeCount = 25;
+        public const int MaxRangeCount = 24;
+        public const int DefaultRangeCount = 24;
 
         public static int ClampRangeCount(int value)
         {
