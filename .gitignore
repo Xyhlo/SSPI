@@ -262,6 +262,8 @@
 !/app/PixelBackground.cs
 !/app/CustomCovers.cs
 !/app/PairServer.Library.cs
+!/app/PairServer.Queue.cs
+!/app/PhoneCompanion.html
 !/app/SearchWindow.SceneCache.cs
 !/app/SearchWindow.Motion.cs
 !/resident/plugin/gs_stage_dependency.h

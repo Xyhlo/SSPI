@@ -21,6 +21,9 @@ namespace Orbis
 
         static readonly string[] ServiceIds = { "real-debrid", "torbox", "alldebrid", "premiumize" };
         static readonly string[] ServiceFields = { "key", "tb_key", "ad_key", "pm_key" };
+        // Account pages that show each service's API key; the phone page links to them.
+        static readonly string[] ServiceKeyPages = { "https://real-debrid.com/apitoken", "https://torbox.app/settings",
+            "https://alldebrid.com/apikeys", "https://www.premiumize.me/account" };
         readonly Dictionary<string, ServiceValidation> _serviceValidation = new Dictionary<string, ServiceValidation>();
         readonly Queue<ServiceNotice> _serviceNotices = new Queue<ServiceNotice>();
         int _serviceGeneration, _serviceRevision;
@@ -85,7 +88,8 @@ namespace Orbis
                     { state = value.State; message = value.Message; }
                     if (i > 0) json.Append(',');
                     json.Append('"').Append(id).Append("\":{\"state\":\"").Append(state)
-                        .Append("\",\"message\":\"").Append(JsonLite.Escape(message)).Append("\"}");
+                        .Append("\",\"message\":\"").Append(JsonLite.Escape(message))
+                        .Append("\",\"key_page\":\"").Append(ServiceKeyPages[i]).Append("\"}");
                 }
                 return json.Append('}').ToString();
             }

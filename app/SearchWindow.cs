@@ -1110,6 +1110,15 @@ namespace Orbis
                     lock (_lock) { ++_libraryScanGen; _nextUpdateScan = 0; _libraryHasUpdate.Clear(); _libraryUpdateInfo.Clear(); }
                     _pairSourcesChanged = true; return null;
                 };
+                _pair.QueueSnapshot = () => {
+                    List<DlItem> snapshot;
+                    for (int attempt = 0; attempt < 6; attempt++) {
+                        if (_dlMgr != null && _dlMgr.TrySnapshot(out snapshot)) return snapshot;
+                        Thread.Sleep(15);
+                    }
+                    return null;
+                };
+                _pair.QueueAction = PhoneQueueAction;
                 _pairConnectedRevision = Volatile.Read(ref _pair.ConnectedRevision);
                 _pairPersistentError = ""; _pairErrorTransient = false;
                 _pair.Start(1440);
@@ -3148,6 +3157,58 @@ namespace Orbis
                     Interlocked.Exchange(ref _downloadActionBusy, 0);
                 }
             });
+        }
+
+        // Phone downloader actions reuse the console's guarded queue actions, one at a time.
+        string PhoneQueueAction(string id, string action)
+        {
+            if (_dlMgr == null) return "Downloads are not ready. Reopen Downloads on your PS4.";
+            if (Volatile.Read(ref _downloadActionBusy) != 0) return "Another queue action is still finishing. Try again in a moment.";
+            var snapshot = _dlMgr.Snapshot();
+            if (action == "clear")
+            {
+                if (id != "finished") return "Unknown download action.";
+                var finished = snapshot.FindAll(x => x.State == DlState.Installed).ConvertAll(x => x.Id);
+                if (finished.Count == 0) return "There are no finished downloads to clear.";
+                RunDownloadAction(() => {
+                    int removed = 0;
+                    foreach (string finishedId in finished)
+                    { string error; if (_dlMgr.Remove(finishedId, out error) || error == "Download not found") removed++; }
+                    User.NotifyToast("Cleared " + removed + " finished downloads from your phone");
+                });
+                return null;
+            }
+            DlItem item = snapshot.Find(x => x.Id == id);
+            if (item == null) return "This download is no longer in the queue.";
+            switch (action)
+            {
+                case "pause":
+                    if (item.State != DlState.Downloading && item.State != DlState.Resolving && item.State != DlState.Queued)
+                        return "This download is not running.";
+                    break;
+                case "resume":
+                    if (item.State != DlState.Paused) return "This download is not paused.";
+                    break;
+                case "retry":
+                    if (NeedsArchivePassword(item)) return "Enter the archive password on your PS4 to continue.";
+                    if (item.State != DlState.Failed && item.State != DlState.Canceled) return "Only failed downloads can be retried.";
+                    break;
+                case "install":
+                    if (item.State != DlState.Completed) return "This package is not ready to install.";
+                    StartInstall(item, false);
+                    return null;
+                case "remove":
+                    RunDownloadAction(() => {
+                        string error;
+                        bool removed = _dlMgr.Remove(item.Id, out error);
+                        User.NotifyToast(removed ? "Removal requested from your phone" : Clip(error ?? "Remove failed", 48));
+                    });
+                    return null;
+                default:
+                    return "Unknown download action.";
+            }
+            RunDownloadAction(() => _dlMgr.TogglePause(item.Id));
+            return null;
         }
 
         void PrepareInstall(DlItem item, bool uninstallFirst)

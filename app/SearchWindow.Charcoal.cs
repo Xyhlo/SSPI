@@ -261,7 +261,7 @@ namespace Orbis
                 !string.IsNullOrEmpty(item.ArchiveVolumes));
         }
 
-        static bool Extracting(DlItem item)
+        internal static bool Extracting(DlItem item)
         {
             if (item == null || item.State != DlState.Finalizing || item.CancelRequested ||
                 item.RemoveRequested || item.ResidentRemovePending) return false;

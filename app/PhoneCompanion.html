@@ -1,0 +1,1603 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#09090a">
+<meta name="referrer" content="no-referrer">
+<title>SSPI</title>
+<style>
+/* SSPI phone downloader. SSPI Windows tokens with the PS4 Cartridge silver. One dark look; no page backgrounds. */
+:root{color-scheme:dark;--world:#09090a;--card:#141416;--well:#0d0d0f;--raised:#1f1f23;--raised-2:#27272c;--line:rgba(255,255,255,.07);--line-2:rgba(255,255,255,.11);--line-3:rgba(255,255,255,.2);--ink:#f0f0ee;--ink-2:#cfcfd3;--muted:#a3a3a9;--faint:#76767d;--accent:#e4e4e1;--accent-ink:#111113;--good:#46a758;--warn:#d4a13d;--fail:#e5484d;--good-ink:#9dccaf;--warn-ink:#e4bf7a;--fail-ink:#eca3a7;--accent-grad:linear-gradient(90deg,color-mix(in srgb,var(--accent) 42%,#161616),var(--accent) 70%,color-mix(in srgb,var(--accent) 50%,#fff));--accent-face:linear-gradient(180deg,color-mix(in srgb,var(--accent) 62%,#fff),var(--accent) 50%,color-mix(in srgb,var(--accent) 82%,#000));--accent-glow:color-mix(in srgb,var(--accent) 55%,transparent);--metal:linear-gradient(145deg,#2d2d32,#19191c 58%,#121214);--glass:rgba(15,15,17,.74);--font:"Geist","Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,Roboto,sans-serif;--mono:"Geist Mono",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;--snappy:cubic-bezier(.2,.9,.25,1);--soft:cubic-bezier(.2,.8,.2,1);--bouncy:cubic-bezier(.3,1.4,.5,1);--bar-h:54px;--rail-h:68px;padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
+@supports not (color:color-mix(in srgb,red 50%,blue)){:root{--accent-grad:var(--accent);--accent-face:var(--accent);--accent-glow:transparent}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{height:100%;box-sizing:border-box;background:var(--world)}
+body{height:100%;margin:0;overflow:hidden;background:var(--world);color:var(--ink);font:400 14px/1.5 var(--font);-webkit-font-smoothing:antialiased;overscroll-behavior:none}
+button,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer;-webkit-user-select:none;user-select:none;touch-action:manipulation}
+h1,h2,p{margin:0}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.i{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.i.sm{width:16px;height:16px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;opacity:0}
+.glass{background:var(--glass);-webkit-backdrop-filter:blur(22px) saturate(1.6);backdrop-filter:blur(22px) saturate(1.6)}
+
+/* Shell: glass title bar and a floating rail over the swipe pager */
+.app{position:relative;height:100%;max-width:600px;margin:0 auto;overflow:hidden;background:var(--world)}
+@media(min-width:640px){.app{border-inline:1px solid var(--line)}}
+.titlebar{position:absolute;inset:0 0 auto;z-index:30;display:flex;align-items:center;gap:10px;height:var(--bar-h);padding:0 10px 0 16px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
+.brand svg{width:26px;height:26px;flex:none;filter:drop-shadow(0 3px 8px rgba(0,0,0,.7))}
+.brand b{font-size:15px;font-weight:800;letter-spacing:.16em;background:linear-gradient(180deg,#fafafa 20%,#9d9d9d);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand span{font-size:12px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conn{display:flex;align-items:center;gap:8px;height:34px;padding:0 13px;border-radius:99px;border:1px solid var(--line-2);background:rgba(255,255,255,.04);color:var(--ink-2);font-size:11.5px;transition:background .15s,transform .15s var(--snappy)}
+.conn:active{background:rgba(255,255,255,.09);transform:scale(.95)}
+.conn.offline .ping{background:var(--warn);animation:none}
+.conn.ended{color:var(--fail-ink)}
+.conn.ended .ping{background:var(--fail);animation:none}
+.ping{width:7px;height:7px;flex:none;border-radius:50%;background:var(--good);animation:ping 2.4s infinite}
+@keyframes ping{0%{box-shadow:0 0 0 0 rgba(70,167,88,.55)}70%,100%{box-shadow:0 0 0 7px rgba(70,167,88,0)}}
+.pager{position:absolute;inset:0;display:flex;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x mandatory;overscroll-behavior-x:contain;scrollbar-width:none}
+.pager::-webkit-scrollbar,.page::-webkit-scrollbar{display:none}
+.page{flex:0 0 100%;min-width:0;scroll-snap-align:start;scroll-snap-stop:always;overflow-y:auto;overscroll-behavior-y:contain;scrollbar-width:none;padding:calc(var(--bar-h) + 16px) 16px calc(var(--rail-h) + 48px);display:flex;flex-direction:column;gap:16px}
+.page>*{flex-shrink:0}
+.pager.peek .page{animation:peek 1.1s var(--soft)}
+@keyframes peek{40%{transform:translateX(-36px)}}
+.heading h1{font-size:26px;font-weight:750;letter-spacing:-.04em;line-height:1.1;text-wrap:balance}
+.heading p{font-size:13px;color:var(--muted);margin-top:2px}
+.rail{position:absolute;left:12px;right:12px;bottom:12px;z-index:30;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));padding:6px;border-radius:26px;border:1px solid var(--line-2);box-shadow:0 22px 48px -18px rgba(0,0,0,.95),inset 0 1px 0 rgba(255,255,255,.07)}
+.rail button{position:relative;z-index:1;display:grid;justify-items:center;gap:3px;padding:7px 0 6px;border:0;background:none;color:var(--faint);font-size:10.5px;font-weight:550;letter-spacing:.01em;transition:color .2s}
+.rail button[aria-current=page]{color:var(--ink)}
+.rail .i{width:22px;height:22px;transition:transform .3s var(--bouncy)}
+.rail button[aria-current=page] .i{transform:translateY(-1px) scale(1.07)}
+.rail button:active .i{transform:scale(.84)}
+.rail .pill{position:absolute;top:6px;bottom:6px;left:6px;width:calc((100% - 12px) / 5);pointer-events:none;will-change:transform;border-radius:20px;background:linear-gradient(180deg,rgba(255,255,255,.14),rgba(255,255,255,.05));box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 8px 18px -10px #000}
+.rail .bar{display:none}
+.rail .badge{position:absolute;top:2px;left:calc(50% + 7px);min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--ink);color:var(--world);font:700 10px/18px var(--font);font-style:normal;box-shadow:0 0 0 2px #151517;animation:pop .45s var(--bouncy)}
+.rail .badge.alert{background:var(--fail);color:#fff}
+@keyframes pop{from{transform:scale(.4)}}
+
+/* Surfaces */
+.card{position:relative;display:flex;flex-direction:column;gap:14px;min-width:0;padding:16px;border-radius:22px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.015));box-shadow:inset 0 1px 0 rgba(255,255,255,.045)}
+.card-head{display:flex;align-items:center;gap:12px;min-width:0}
+.card-head>div:not(.tile){flex:1;min-width:0}
+.card-head h2{font-size:16px;font-weight:650;letter-spacing:-.02em}
+.card-head p{margin-top:1px;font-size:12.5px;line-height:1.45;color:var(--muted)}
+.tile,.mono-tile{width:40px;height:40px;flex:none;display:grid;place-items:center;border-radius:12px;background:var(--metal);border:1px solid rgba(255,255,255,.09);box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 8px 16px -10px #000;color:var(--ink-2)}
+.mono-tile{font:700 11.5px var(--mono);letter-spacing:.06em;color:#d9d9d9;text-shadow:0 1px 0 rgba(0,0,0,.7)}
+.label{font-size:12px;font-weight:550;color:var(--ink-2)}
+.label output{float:right;color:var(--muted)}
+.hint{font-size:12.5px;line-height:1.55;color:var(--faint)}
+.hint.bad{color:var(--fail-ink)}
+.stack{display:flex;flex-direction:column;gap:8px}
+.list{display:flex;flex-direction:column;gap:2px;margin:0 -6px}
+.row{display:flex;align-items:center;gap:10px;min-height:62px;border-radius:16px;transition:background .15s,transform .15s var(--snappy)}
+.row:has(>button.row-main:active){background:rgba(255,255,255,.05);transform:scale(.985)}
+.row-main{flex:1;min-width:0;display:flex;align-items:center;gap:12px;padding:10px 8px;border:0;border-radius:16px;background:none;text-align:left}
+.row>.switch,.row>.tag{margin-right:8px}
+.row-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.row-text strong{font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row-text small{font-size:11.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.state{display:flex;align-items:center;gap:6px;min-width:0;font-size:12px;color:var(--muted)}
+.state>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dot{width:7px;height:7px;flex:none;border-radius:50%;background:var(--faint)}
+.state[data-state=valid]{color:var(--good-ink)}.state[data-state=valid] .dot{background:var(--good);box-shadow:0 0 8px rgba(70,167,88,.8)}
+.state[data-state=limited],.state[data-state=plan_unknown],.state[data-state=unavailable]{color:var(--warn-ink)}
+.state[data-state=limited] .dot,.state[data-state=plan_unknown] .dot,.state[data-state=unavailable] .dot{background:var(--warn);box-shadow:0 0 8px rgba(212,161,61,.7)}
+.state[data-state=rejected]{color:var(--fail-ink)}.state[data-state=rejected] .dot{background:var(--fail);box-shadow:0 0 8px rgba(229,72,77,.7)}
+.state[data-state=checking] .dot{width:11px;height:11px;background:none;border:1.5px solid var(--line-3);border-top-color:var(--ink);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Controls */
+.switch{position:relative;width:50px;height:30px;flex:none;border:0;padding:0;border-radius:99px;background:#26262b;box-shadow:inset 0 1px 3px rgba(0,0,0,.6),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .25s}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:linear-gradient(180deg,#f6f6f4,#b4b4b1);box-shadow:0 2px 5px rgba(0,0,0,.5),inset 0 1px 0 #fff;transition:transform .42s var(--bouncy),width .16s,background .2s}
+.switch[aria-checked=true]{background:var(--accent-grad);box-shadow:inset 0 1px 2px rgba(0,0,0,.3),0 0 16px -4px var(--accent-glow)}
+.switch[aria-checked=true]::after{transform:translateX(20px);background:linear-gradient(180deg,#2c2c31,#101012);box-shadow:0 2px 5px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.12)}
+.switch:active::after{width:29px}
+.switch[aria-checked=true]:active::after{transform:translateX(15px)}
+.switch:disabled{opacity:.45}
+.toggle-row{display:flex;align-items:center;gap:14px;padding:12px 14px;border-radius:16px;background:rgba(255,255,255,.03);border:1px solid var(--line)}
+.toggle-row>div{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.toggle-row strong{font-size:14.5px;font-weight:600}
+.toggle-row small{font-size:12px;line-height:1.45;color:var(--muted)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:50px;padding:0 18px;border-radius:16px;border:1px solid var(--line-2);background:rgba(255,255,255,.05);color:var(--ink);font-size:15px;font-weight:550;white-space:nowrap;transition:transform .16s var(--snappy),background .15s,opacity .15s,filter .15s}
+.btn:active{transform:scale(.96);background:rgba(255,255,255,.1)}
+.btn.primary{border-color:transparent;background:var(--accent-face);color:var(--accent-ink);font-weight:650;box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 12px 26px -14px var(--accent-glow)}
+.btn.primary:active{filter:brightness(.9)}
+.btn.danger{color:var(--fail-ink);border-color:rgba(229,72,77,.35)}
+.btn.block{width:100%}
+.btn:disabled{opacity:.4;pointer-events:none}
+.btn.busy{pointer-events:none}
+.btn.busy>.i{display:none}
+.btn.busy::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}
+.btn-row{display:flex;gap:10px}
+.btn-row>.btn{flex:1;min-width:0}
+.icon-btn{width:42px;height:42px;flex:none;display:grid;place-items:center;border:0;border-radius:99px;background:transparent;color:var(--muted);transition:background .15s,transform .15s var(--snappy)}
+.icon-btn:active{background:rgba(255,255,255,.08);transform:scale(.9)}
+.link{display:inline-flex;align-items:center;gap:8px;min-height:40px;align-self:flex-start;color:var(--ink-2);font-size:13.5px;text-decoration:none;border-bottom:1px solid var(--line-2)}
+.field{display:flex;align-items:center;gap:8px;min-height:50px;padding:0 4px 0 14px;border-radius:16px;border:1px solid var(--line-2);background:var(--well);transition:border-color .15s,box-shadow .15s}
+.field:focus-within{border-color:rgba(255,255,255,.3);box-shadow:0 0 0 4px rgba(255,255,255,.06)}
+.field input{flex:1;min-width:0;height:48px;border:0;outline:0;background:none;font-size:16px}
+.field input::placeholder,.area::placeholder{color:var(--faint)}
+.field>.i{color:var(--faint)}
+.field.bad{border-color:rgba(229,72,77,.65)}
+.shake{animation:shake .36s}
+@keyframes shake{20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
+.area{display:block;width:100%;min-height:150px;resize:vertical;padding:13px 14px;border-radius:16px;border:1px solid var(--line-2);background:var(--well);font:16px/1.5 var(--mono);color:var(--ink);outline:0;word-break:break-all;transition:border-color .15s,box-shadow .15s}
+.area:focus{border-color:rgba(255,255,255,.3);box-shadow:0 0 0 4px rgba(255,255,255,.06)}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{height:36px;padding:0 15px;border-radius:99px;border:1px solid var(--line-2);background:transparent;color:var(--muted);font-size:13px;font-weight:550;transition:background .2s,color .2s,border-color .2s,transform .15s var(--snappy)}
+.chip:active{transform:scale(.94)}
+.chip[aria-checked=true]{border-color:transparent;background:var(--ink);color:var(--world)}
+.tag{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:99px;font-size:11.5px;font-weight:550;color:var(--ink-2);background:rgba(255,255,255,.06);white-space:nowrap;animation:pop .35s var(--bouncy)}
+.tag.good{color:var(--good-ink);background:rgba(70,167,88,.12)}.tag.warn{color:var(--warn-ink);background:rgba(212,161,61,.12)}.tag.bad{color:var(--fail-ink);background:rgba(229,72,77,.12)}
+.seg{display:flex;gap:3px;padding:4px;border-radius:16px;background:rgba(255,255,255,.04);border:1px solid var(--line)}
+.seg button{flex:1;height:38px;border:0;border-radius:12px;background:transparent;color:var(--muted);font-size:13px;font-weight:550;transition:background .2s,color .2s}
+.seg button[aria-checked=true]{background:linear-gradient(180deg,rgba(255,255,255,.14),rgba(255,255,255,.07));color:var(--ink);box-shadow:inset 0 1px 0 rgba(255,255,255,.12),0 4px 10px -6px #000}
+input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
+.note{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:16px;background:rgba(212,161,61,.08);border:1px solid rgba(212,161,61,.25);color:var(--warn-ink);font-size:13px}
+.note.bad{background:rgba(229,72,77,.08);border-color:rgba(229,72,77,.3);color:var(--fail-ink)}
+.kv{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--line);font-size:13.5px;color:var(--muted)}
+.kv b{color:var(--ink);font-weight:550}
+
+/* Library */
+.toolbar{display:flex;gap:8px;align-items:center}
+.toolbar .field{flex:1}
+.games{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px 14px}
+@media(min-width:480px){.games{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.game{display:flex;flex-direction:column;gap:9px;min-width:0;padding:0;border:0;background:none;text-align:left;-webkit-touch-callout:none}
+.case{position:relative;display:block;aspect-ratio:1080/1379;max-width:100%;border-radius:10px;overflow:hidden;background:#151515;box-shadow:0 18px 30px -18px #000,0 0 0 1px rgba(255,255,255,.06);transition:transform .22s var(--soft),box-shadow .22s}
+.case::after{content:"";position:absolute;inset:0;background:linear-gradient(125deg,rgba(255,255,255,.16),transparent 38%);pointer-events:none}
+.case img{display:block;width:100%;height:100%;object-fit:contain}
+.case.plain{display:grid;place-items:center;color:var(--faint)}
+.game:active .case{transform:translateY(-3px) scale(.98)}
+.game.held .case{transform:scale(1.06);box-shadow:0 26px 50px -16px #000,0 0 0 1px rgba(255,255,255,.12)}
+.game b{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.game small{margin-top:-5px;font-size:11px;color:var(--faint)}
+.case .flag{position:absolute;right:7px;bottom:7px;z-index:1;height:22px;padding:0 9px;border-radius:99px;background:rgba(12,12,14,.85);color:var(--ink);font-size:10.5px;font-weight:650;line-height:22px}
+.previews{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.previews figure{margin:0;display:flex;flex-direction:column;gap:6px;min-width:0}
+.previews canvas{display:block;width:100%;height:auto;max-width:100%;border-radius:12px;background:#1c1e22;box-shadow:0 14px 26px -16px #000}
+.previews figcaption{font-size:11.5px;color:var(--faint)}
+.dots{display:flex;flex-wrap:wrap;gap:12px}
+.dots button{width:34px;height:34px;border-radius:50%;border:0;background:radial-gradient(circle at 34% 28%,rgba(255,255,255,.6),transparent 42%),var(--c);box-shadow:inset 0 0 0 1px rgba(255,255,255,.2);transition:transform .2s var(--bouncy),box-shadow .2s}
+.dots button:active{transform:scale(.86)}
+.dots button[aria-checked=true]{box-shadow:0 0 0 3px var(--world),0 0 0 5px var(--c)}
+.swatches{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.swatch{position:relative;display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px 4px 11px;border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.025);color:var(--muted);font-size:12px;cursor:pointer;transition:transform .2s var(--bouncy),border-color .2s,background .2s}
+.swatch:active{transform:scale(.94)}
+.swatch i{width:34px;height:34px;border-radius:50%;background:radial-gradient(circle at 34% 28%,rgba(255,255,255,.6),transparent 42%),var(--c);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18),0 8px 18px -8px var(--c);transition:box-shadow .25s,transform .3s var(--bouncy)}
+.swatch[aria-checked=true]{border-color:var(--line-3);background:rgba(255,255,255,.07);color:var(--ink)}
+.swatch[aria-checked=true] i{transform:scale(1.08);box-shadow:0 0 0 3px var(--world),0 0 0 5px var(--c),0 10px 22px -8px var(--c)}
+
+/* Downloads: hero, filters, transfer rows and the Finished folder */
+.heading.with-action{display:flex;align-items:flex-end;justify-content:space-between;gap:12px}
+.add-btn{width:42px;height:42px;flex:none;display:grid;place-items:center;border:0;border-radius:99px;background:var(--accent-face);color:var(--accent-ink);box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 12px 26px -12px var(--accent-glow);transition:transform .3s var(--bouncy)}
+.add-btn:active{transform:scale(.86) rotate(90deg)}
+.add-btn .i{width:24px;height:24px;stroke-width:2.2}
+.hero{position:relative;isolation:isolate;overflow:hidden;padding:12px 14px 12px 12px;border-radius:20px;border:1px solid var(--line-2);background:#111113;box-shadow:0 20px 44px -30px #000,inset 0 1px 0 rgba(255,255,255,.07);cursor:pointer;transition:transform .2s var(--snappy)}
+.hero:active{transform:scale(.985)}
+.hero-glow{position:absolute;inset:-40%;z-index:-2;opacity:.5;filter:blur(34px) saturate(1.8)}
+.hero-glow img{display:block;width:100%;height:100%;object-fit:cover}
+.hero::after{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(90deg,rgba(9,9,10,.2),rgba(9,9,10,.72) 70%)}
+.hero-row{display:flex;align-items:center;gap:13px}
+.hero-case{width:52px;flex:none;aspect-ratio:1080/1379;border-radius:7px;overflow:hidden;box-shadow:0 12px 24px -10px rgba(0,0,0,.95),0 0 0 1px rgba(255,255,255,.1)}
+.hero-case img{display:block;width:100%;height:100%;object-fit:cover}
+.hero-case.plain,.hero .tile{display:grid;place-items:center;background:var(--metal);color:var(--ink-2)}
+.hero-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.eyebrow{display:flex;align-items:center;gap:7px;min-width:0;font-size:10.5px;font-weight:650;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2)}
+.eyebrow .via{margin-left:auto;font-weight:550;letter-spacing:0;text-transform:none;color:var(--muted);white-space:nowrap}
+.hero-title{font-size:16px;font-weight:700;letter-spacing:-.02em;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hero-meta{font-size:12px;color:var(--muted)}
+.hero-line{display:flex;align-items:center;gap:10px;margin-top:5px}
+.meter{position:relative;display:block;flex:1;height:6px;border-radius:99px;background:rgba(255,255,255,.1);overflow:hidden}
+.hero-pct{min-width:3.4ch;font:700 15px var(--mono);letter-spacing:-.02em;text-align:right}
+.meter-fill,.x-fill{position:relative;display:block;height:100%;width:0;overflow:hidden;border-radius:inherit;background:var(--accent-grad);transition:width .9s linear}
+.meter-fill{box-shadow:0 0 14px -2px var(--accent-glow)}
+.meter-fill.moving::after,.x-fill.moving::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 25%,rgba(255,255,255,.65) 50%,transparent 75%);transform:translateX(-100%);animation:sheen 2.2s ease-in-out infinite}
+@keyframes sheen{to{transform:translateX(100%)}}
+.hero-foot{font-size:12px;font-weight:500;font-variant-numeric:tabular-nums;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hero-next{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.hero-chip{height:28px;padding:0 11px;border-radius:99px;border:1px solid var(--line-2);background:rgba(255,255,255,.05);color:var(--ink-2);font-size:12px;font-weight:550;transition:transform .15s var(--snappy)}
+.hero-chip:active{transform:scale(.94)}
+.hero.idle{cursor:pointer}
+.hero.idle .tile{color:var(--good-ink)}
+.xgroup{border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.028);overflow:hidden}
+.xgroup.failed{border-color:rgba(229,72,77,.3)}
+.xgroup-head{display:flex;align-items:center;gap:12px;padding:10px 12px 4px 10px}
+.xgroup-text{flex:1;min-width:0;display:flex;flex-direction:column}
+.xgroup-text strong{font-size:14.5px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xgroup-text small{font-size:12px;color:var(--muted)}
+.xgroup-body{display:flex;flex-direction:column;padding:0 4px 4px 58px}
+.xgroup .xfer{border:0;border-radius:12px;background:transparent}
+.xgroup .xfer+.xfer{border-top:1px solid var(--line);border-radius:0}
+.xgroup .xfer.failed{background:rgba(229,72,77,.06)}
+.xgroup .x-main{grid-template-columns:minmax(0,1fr);padding:9px 4px 9px 6px}
+.xgroup .x-main .thumb{display:none}
+.xgroup .x-top strong{font-size:13.5px;font-weight:600}
+.xgroup .x-track{margin-top:7px}
+.since{font-size:13px;line-height:1.5;color:var(--muted)}
+.since b{color:var(--ink);font-weight:650}
+.since b.bad{color:var(--fail-ink)}
+.filters{display:flex;flex-wrap:wrap;gap:8px}
+.filters button{height:36px;padding:0 14px;border-radius:99px;border:1px solid var(--line-2);background:transparent;color:var(--muted);font-size:13px;font-weight:550;transition:background .2s,color .2s,border-color .2s,transform .15s var(--snappy)}
+.filters button b{margin-left:6px;font:650 12px var(--mono);color:var(--faint)}
+.filters button[aria-checked=true]{border-color:transparent;background:var(--ink);color:var(--world)}
+.filters button[aria-checked=true] b{color:#5c5c62}
+.filters button.alert b{color:var(--fail)}
+.filters button:active{transform:scale(.94)}
+.xlist{display:flex;flex-direction:column;gap:8px}
+.group-label{margin:6px 4px -2px;font-size:11px;font-weight:650;letter-spacing:.09em;text-transform:uppercase;color:var(--faint)}
+.xfer{display:flex;align-items:center;gap:4px;border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.028);transition:background .15s,transform .15s var(--snappy),border-color .2s}
+.xfer:has(>.x-main:active){background:rgba(255,255,255,.07);transform:scale(.985)}
+.xfer.failed{border-color:rgba(229,72,77,.3);background:linear-gradient(90deg,rgba(229,72,77,.1),rgba(229,72,77,.02))}
+.xfer.warn{border-color:rgba(212,161,61,.3);background:linear-gradient(90deg,rgba(212,161,61,.09),rgba(212,161,61,.015))}
+.xfer.fresh{animation:fresh 1.4s var(--soft)}
+@keyframes fresh{from{box-shadow:0 0 0 2px var(--accent),0 0 24px -4px var(--accent-glow)}}
+.x-main{flex:1;min-width:0;display:grid;grid-template-columns:46px minmax(0,1fr);gap:12px;align-items:center;padding:10px 6px 10px 10px;border:0;border-radius:18px;background:none;text-align:left}
+.thumb{display:grid;place-items:center;width:46px;aspect-ratio:1080/1379;max-width:100%;border-radius:7px;overflow:hidden;background:var(--metal);color:var(--ink-2);box-shadow:0 8px 16px -10px #000,0 0 0 1px rgba(255,255,255,.07)}
+.thumb img{display:block;width:100%;height:100%;object-fit:cover}
+.x-body{min-width:0;display:flex;flex-direction:column}
+.x-top{display:flex;align-items:center;gap:8px;min-width:0}
+.x-top strong{flex:1;min-width:0;font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.x-line{margin-top:2px;font-size:12px;line-height:1.45;color:var(--muted);overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.xfer.failed .x-line,.x-line.failed{color:var(--fail-ink)}
+.xfer.warn .x-line,.x-line.warn{color:var(--warn-ink)}
+.xfer.done .x-line{color:var(--good-ink)}
+.x-track,.bar-track{display:block;height:4px;margin-top:9px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden}
+.bar-fill{display:block;height:100%;width:0;border-radius:inherit;background:var(--accent-grad);transition:width .9s linear}
+.xfer.failed .x-fill,.bar-fill.failed{background:var(--fail)}
+.xfer.warn .x-fill,.bar-fill.warn{background:var(--warn)}
+.xfer.done .x-fill,.bar-fill.done{background:var(--good)}
+.x-act{flex:none;height:34px;margin-right:10px;padding:0 15px;border:0;border-radius:99px;background:var(--ink);color:var(--world);font-size:13px;font-weight:650;transition:transform .2s var(--bouncy),opacity .2s}
+.x-act:active{transform:scale(.9)}
+.x-act.busy{opacity:.5;pointer-events:none}
+.steps{display:flex;gap:4px;flex:none}
+.steps i{padding:0 6px;border-radius:99px;font:650 9.5px/17px var(--mono);font-style:normal;color:var(--faint);box-shadow:inset 0 0 0 1px var(--line-2)}
+.steps i.on{color:var(--world);background:var(--ink-2);box-shadow:none}
+.steps i.now{color:var(--ink);box-shadow:inset 0 0 0 1px var(--line-3);animation:blink 1.4s ease-in-out infinite}
+@keyframes blink{50%{opacity:.4}}
+.stagger>*{animation:rise .5s var(--soft) backwards;animation-delay:calc(var(--i,0) * 40ms)}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}}
+.folder{border-radius:20px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.015));overflow:hidden}
+.folder-head{display:flex;align-items:center;gap:12px;width:100%;padding:12px 14px;border:0;background:none;text-align:left;transition:background .15s}
+.folder-head:active{background:rgba(255,255,255,.05)}
+.folder-icon{width:42px;height:42px;flex:none;display:grid;place-items:center;border-radius:13px;background:var(--metal);border:1px solid rgba(255,255,255,.09);box-shadow:inset 0 1px 0 rgba(255,255,255,.09);color:var(--good-ink)}
+.folder-text{flex:1;min-width:0;display:flex;flex-direction:column}
+.folder-text strong{font-size:15px;font-weight:650}
+.folder-text small{font-size:12px;color:var(--muted)}
+.fan{display:flex;align-items:center;padding-left:12px}
+.fan img{width:26px;height:auto;margin-left:-12px;border-radius:4px;box-shadow:0 6px 12px -4px #000,0 0 0 1px rgba(0,0,0,.5);transform:rotate(var(--r));transition:transform .45s var(--bouncy)}
+.folder[data-open=true] .fan img{transform:rotate(0) translateY(-3px)}
+.chev{color:var(--faint);transition:transform .4s var(--snappy)}
+.folder[data-open=true] .chev{transform:rotate(90deg)}
+.folder-body{display:grid;grid-template-rows:0fr;overflow:hidden;transition:grid-template-rows .45s var(--snappy)}
+.folder[data-open=true] .folder-body{grid-template-rows:1fr}
+.folder-inner{min-height:0;overflow:hidden}
+.folder-pad{display:flex;flex-direction:column;gap:4px;padding:0 6px 10px;opacity:0;transform:translateY(-8px);transition:opacity .3s,transform .4s var(--snappy)}
+.folder[data-open=true] .folder-pad{opacity:1;transform:none}
+.folder-pad .xfer{border-color:transparent;background:transparent}
+.text-btn{align-self:center;height:38px;padding:0 16px;border:0;border-radius:99px;background:none;color:var(--muted);font-size:13px;font-weight:550;transition:background .15s}
+.text-btn:active{background:rgba(255,255,255,.07)}
+.detail-top{display:flex;align-items:flex-start;gap:14px}
+.detail-top .thumb{width:84px;border-radius:10px}
+.detail-top>div{flex:1;min-width:0}
+
+/* Overlays: toasts, pull to refresh, sheet */
+.toasts{position:absolute;left:12px;right:12px;bottom:calc(var(--rail-h) + 26px);z-index:40;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none}
+.toast{pointer-events:auto;width:100%;max-width:440px;display:grid;grid-template-columns:36px minmax(0,1fr) 36px;gap:10px;align-items:center;padding:10px 4px 10px 10px;border-radius:20px;border:1px solid var(--line-2);background:rgba(22,22,25,.84);-webkit-backdrop-filter:blur(22px) saturate(1.6);backdrop-filter:blur(22px) saturate(1.6);box-shadow:0 20px 44px -18px rgba(0,0,0,.95);touch-action:pan-y;animation:tin .5s var(--bouncy);transition:transform .25s var(--snappy),opacity .25s}
+.toast.success{--tone:var(--good)}.toast.warning{--tone:var(--warn)}.toast.error{--tone:var(--fail);border-color:rgba(229,72,77,.32)}
+.t-icon{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:rgba(255,255,255,.07);color:var(--tone,var(--ink-2))}
+.toast b{display:block;font-size:13.5px;font-weight:600}
+.toast small{display:block;font-size:12.5px;line-height:1.4;color:var(--muted);overflow-wrap:anywhere}
+.toast.out{opacity:0}
+@keyframes tin{from{transform:translateY(20px) scale(.94);opacity:0}}
+.ptr{position:absolute;top:calc(var(--bar-h) + 8px);left:50%;z-index:20;width:40px;height:40px;margin-left:-20px;display:grid;place-items:center;border-radius:50%;border:1px solid var(--line-2);background:rgba(30,30,34,.9);color:var(--muted);box-shadow:0 12px 26px -10px #000;opacity:0;transform:translateY(-50px);pointer-events:none;transition:transform .3s var(--snappy),opacity .2s}
+.ptr.armed{color:var(--accent)}
+.ptr.spin .i{animation:spin .8s linear infinite}
+.scrim{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .3s;-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
+.scrim.open{opacity:1;pointer-events:auto}
+.sheet{position:fixed;left:0;right:0;bottom:0;z-index:51;max-width:600px;max-height:88%;margin:0 auto;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom,0px);border-radius:28px 28px 0 0;border:1px solid var(--line-2);border-bottom:0;background:rgba(20,20,23,.94);-webkit-backdrop-filter:blur(26px) saturate(1.5);backdrop-filter:blur(26px) saturate(1.5);box-shadow:0 -24px 60px -24px #000;transform:translateY(105%);visibility:hidden;transition:transform .45s var(--snappy),visibility 0s .45s}
+.sheet.open{transform:none;visibility:visible;transition:transform .45s var(--snappy),visibility 0s}
+.sheet:focus{outline:0}
+.grab{display:grid;place-items:center;height:24px;touch-action:none;cursor:grab}
+.grab::before{content:"";width:42px;height:5px;border-radius:3px;background:rgba(255,255,255,.22)}
+.sheet-head{display:flex;align-items:center;gap:12px;padding:0 8px 8px 18px;touch-action:none}
+.sheet-head h2{flex:1;min-width:0;font-size:19px;font-weight:700;letter-spacing:-.025em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sheet-body{overflow-y:auto;overscroll-behavior:contain;padding:4px 16px 22px;display:flex;flex-direction:column;gap:14px}
+.action{display:flex;align-items:center;gap:12px;width:100%;padding:14px;border-radius:16px;border:1px solid var(--line);background:rgba(255,255,255,.03);font-size:14.5px;text-align:left;transition:background .15s,transform .15s var(--snappy)}
+.action:active{background:rgba(255,255,255,.08);transform:scale(.985)}
+.action:disabled{opacity:.4}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></symbol>
+<symbol id="i-library" viewBox="0 0 24 24"><path d="m16 6 4 14"/><path d="M12 6v14"/><path d="M8 8v12"/><path d="M4 4v16"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/></symbol>
+<symbol id="i-gamepad" viewBox="0 0 24 24"><line x1="6" x2="10" y1="11" y2="11"/><line x1="8" x2="8" y1="9" y2="13"/><line x1="15" x2="15.01" y1="12" y2="12"/><line x1="18" x2="18.01" y1="10" y2="10"/><path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5z"/></symbol>
+<symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m17 8-5-5-5 5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/></symbol>
+<symbol id="i-rotate" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol>
+<symbol id="i-vibrate" viewBox="0 0 24 24"><path d="m2 8 2 2-2 2 2 2-2 2"/><path d="m22 8-2 2 2 2-2 2 2 2"/><rect width="8" height="14" x="8" y="5" rx="1"/></symbol>
+<symbol id="i-archive" viewBox="0 0 24 24"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></symbol>
+<symbol id="i-package" viewBox="0 0 24 24"><path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><path d="M3.29 7 12 12l8.71-5"/><path d="m7.5 4.27 9 5.15"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></symbol>
+<symbol id="i-wifi" viewBox="0 0 24 24"><path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.859a10 10 0 0 1 14 0"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol>
+<symbol id="i-folder-open" viewBox="0 0 24 24"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+</svg>
+
+<div class="app" id="app">
+  <header class="titlebar glass">
+    <div class="brand">
+      <svg viewBox="-48 -48 96 96" aria-hidden="true"><defs><linearGradient id="silver" gradientUnits="userSpaceOnUse" x1="-30" y1="-34" x2="30" y2="36"><stop stop-color="#fafafa"/><stop offset=".3" stop-color="#dddddd"/><stop offset=".62" stop-color="#a1a1a1"/><stop offset="1" stop-color="#5a5a5a"/></linearGradient></defs><g transform="matrix(.98 -.13 .07 .96 0 0)" fill="url(#silver)"><path d="M-25-31H-7V-12L5 0V23H-27V-25Z"/><path d="M-3-31H12L27-16V17L21 23H9V-2L-3-14Z"/><path d="M-23 27H21L14 34H-16Z"/></g></svg>
+      <b>SSPI</b><span>PS4 · Phone companion</span>
+    </div>
+    <button class="conn" id="conn" type="button" aria-label="Connection details"><i class="ping"></i><span class="mono" id="connText">PS4</span></button>
+  </header>
+
+  <main class="pager" id="pager">
+    <section class="page" id="services" aria-label="Services">
+      <div class="heading"><h1>Services</h1><p>Link a download service to your PS4.</p></div>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-key"/></svg></div><div><h2>Download services</h2><p>Tap a service to paste its API key. Switch it on to use it for downloads.</p></div></div>
+        <div class="list" id="serviceList"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-star"/></svg></div><div><h2>Preferred service</h2><p>Your PS4 tries this one first.</p></div></div>
+        <div class="chips" id="preferred" role="radiogroup" aria-label="Preferred service"></div>
+      </div>
+      <p class="hint">Keys are saved on your PS4. Keep SSPI open and both devices on the same network.</p>
+    </section>
+
+    <section class="page" id="packages" aria-label="Sources" data-refresh="sources">
+      <div class="heading"><h1>Sources</h1><p>Package sources your PS4 can search.</p></div>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-library"/></svg></div><div><h2>Install a source</h2><p>Paste a .gssource URL. Your PS4 checks it before installing.</p></div></div>
+        <div class="field" id="srcField"><svg class="i sm" aria-hidden="true"><use href="#i-link"/></svg><input id="sourceUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste a .gssource link" aria-label="Source URL"></div>
+        <button class="btn primary block" id="installSource" type="button"><svg class="i sm"><use href="#i-download"/></svg><span>Install on PS4</span></button>
+      </div>
+      <div class="card">
+        <div class="card-head"><div><h2>Installed on your PS4</h2><p>Switch a source off to hide it from search.</p></div><button class="icon-btn" id="refreshSources" type="button" aria-label="Refresh sources"><svg class="i sm"><use href="#i-refresh"/></svg></button></div>
+        <div class="list" id="sourceList"></div>
+        <p class="hint" id="sourceStatus" hidden></p>
+      </div>
+    </section>
+
+    <section class="page" id="downloads" aria-label="Downloads" data-refresh="downloads">
+      <div class="heading with-action"><div><h1>Downloads</h1><p>Live from your PS4.</p></div><button class="add-btn" id="addLinks" type="button" aria-label="Send download links"><svg class="i"><use href="#i-plus"/></svg></button></div>
+      <div class="hero" id="hero" role="button" tabindex="0" aria-label="Current download"></div>
+      <p class="since" id="xferSince"></p>
+      <div class="filters" id="xferFilter" role="radiogroup" aria-label="Show downloads">
+        <button type="button" role="radio" data-v="all">All<b>0</b></button>
+        <button type="button" role="radio" data-v="active">Active<b>0</b></button>
+        <button type="button" role="radio" data-v="errors">Errors<b>0</b></button>
+        <button type="button" role="radio" data-v="done">Done<b>0</b></button>
+      </div>
+      <div class="xlist" id="xferList"></div>
+      <p class="hint">This page stays connected while SSPI is open, so you can check progress and errors later, even the next morning.</p>
+    </section>
+
+    <section class="page" id="library" aria-label="Library" data-refresh="library">
+      <div class="heading"><h1>Library</h1><p>Change case art and home screen icons.</p></div>
+      <div class="toolbar">
+        <div class="field"><svg class="i sm" aria-hidden="true"><use href="#i-search"/></svg><input id="libFilter" type="search" autocomplete="off" placeholder="Find a game" aria-label="Find a game"></div>
+        <button class="icon-btn" id="refreshLibrary" type="button" aria-label="Refresh library"><svg class="i"><use href="#i-refresh"/></svg></button>
+      </div>
+      <p class="hint" id="libCount"></p>
+      <div class="games" id="games"></div>
+      <p class="hint">Tap a game to edit its cover. Press and hold for quick actions. Pull down to refresh.</p>
+    </section>
+
+    <section class="page" id="appearance" aria-label="Appearance">
+      <div class="heading"><h1>Appearance</h1><p>Accent color and phone feedback.</p></div>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-palette"/></svg></div><div><h2>Accent</h2><p>Used for highlights on your PS4 and on this page.</p></div></div>
+        <div class="swatches" id="swatches" role="radiogroup" aria-label="Accent color"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-vibrate"/></svg></div><div><h2>Haptic feedback</h2><p>Your phone taps back when you switch sections, flip a switch or finish a save.</p></div></div>
+        <div class="toggle-row"><div><strong>Haptics</strong><small id="hapticSupport"></small></div><button class="switch" id="hapticsOn" type="button" role="switch" aria-checked="true" aria-label="Haptic feedback"></button></div>
+        <div class="btn-row"><button class="btn" type="button" data-try="tick">Tick</button><button class="btn" type="button" data-try="success">Success</button><button class="btn" type="button" data-try="error">Error</button></div>
+      </div>
+    </section>
+  </main>
+
+  <nav class="rail glass" id="rail" aria-label="Sections">
+    <span class="pill" aria-hidden="true"></span>
+    <button type="button" data-page="services" aria-current="page"><svg class="i"><use href="#i-key"/></svg><span>Services</span></button>
+    <button type="button" data-page="packages"><svg class="i"><use href="#i-library"/></svg><span>Sources</span></button>
+    <button type="button" data-page="downloads"><svg class="i"><use href="#i-download"/></svg><span>Downloads</span><em class="badge" id="dlBadge" hidden></em></button>
+    <button type="button" data-page="library"><svg class="i"><use href="#i-gamepad"/></svg><span>Library</span></button>
+    <button type="button" data-page="appearance"><svg class="i"><use href="#i-palette"/></svg><span>Appearance</span></button>
+  </nav>
+
+  <div class="ptr" id="ptr" aria-hidden="true"><svg class="i sm"><use href="#i-refresh"/></svg></div>
+  <div class="toasts" id="toasts"></div>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle" aria-hidden="true" tabindex="-1">
+  <div class="grab" id="grab"></div>
+  <div class="sheet-head" id="sheetHead"><h2 id="sheetTitle"></h2><button class="icon-btn" id="sheetClose" type="button" aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button></div>
+  <div class="sheet-body" id="sheetBody"></div>
+</div>
+<script>
+(() => {
+'use strict';
+const base = location.pathname.replace(/\/$/, '');
+const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const icon = (id, cls = 'i') => `<svg class="${cls}" aria-hidden="true"><use href="#i-${id}"/></svg>`;
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('sspi.phone.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('sspi.phone.' + k, JSON.stringify(v)); } catch {} }
+};
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const clock = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+/* Haptics. Android browsers vibrate. Safari has no vibration API, but iOS 18 plays a system tick when a
+   switch-style checkbox toggles, so a hidden one is clicked instead. Other browsers ignore both. */
+const haptics = (() => {
+  const vibrate = typeof navigator.vibrate === 'function';
+  const ios = !vibrate && (/iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+  const patterns = { tick: [8], tap: [12], toggle: [10], bump: [6], armed: [10], heavy: [28], success: [12, 70, 20], warning: [22, 60, 22], error: [30, 50, 30, 50, 40] };
+  const iosTicks = { success: [0, 110], warning: [0, 140], error: [0, 90, 180] };
+  let on = store.get('haptics', true), last = 0;
+  function iosTick() {
+    try {
+      const label = document.createElement('label'), input = document.createElement('input');
+      label.setAttribute('aria-hidden', 'true'); label.style.display = 'none';
+      input.type = 'checkbox'; input.setAttribute('switch', '');
+      label.appendChild(input); document.head.appendChild(label); label.click(); label.remove();
+    } catch {}
+  }
+  function fire(kind = 'tap') {
+    if (!on) return;
+    const now = performance.now();
+    if ((kind === 'tick' || kind === 'bump') && now - last < 45) return;
+    last = now;
+    if (navigator.userActivation && !navigator.userActivation.hasBeenActive) return;
+    try {
+      if (vibrate) navigator.vibrate(patterns[kind] || patterns.tap);
+      else if (ios) (iosTicks[kind] || [0]).forEach(d => d ? setTimeout(iosTick, d) : iosTick());
+    } catch {}
+  }
+  return { fire, support: vibrate ? 'vibrate' : ios ? 'ios' : 'none', get on() { return on; }, set on(v) { on = v; store.set('haptics', v); } };
+})();
+const buzz = kind => haptics.fire(kind);
+
+/* Toasts: swipe sideways to dismiss. Errors stay longer. */
+const toastBox = $('#toasts');
+const toastIcons = { success: 'check-circle', warning: 'alert', error: 'alert', info: 'info' };
+function toast(title, text = '', tone = 'success', quiet = false) {
+  const t = document.createElement('div');
+  t.className = 'toast ' + tone;
+  t.setAttribute('role', tone === 'error' ? 'alert' : 'status');
+  t.innerHTML = `<div class="t-icon">${icon(toastIcons[tone])}</div><div><b></b><small></small></div><button class="icon-btn" type="button" aria-label="Dismiss">${icon('x', 'i sm')}</button>`;
+  t.querySelector('b').textContent = title;
+  if (text) t.querySelector('small').textContent = text; else t.querySelector('small').remove();
+  toastBox.append(t);
+  while (toastBox.children.length > 3) toastBox.firstElementChild.remove();
+  if (!quiet && tone !== 'info') buzz(tone);
+  const close = (dir = 0) => {
+    if (t.dataset.closing) return; t.dataset.closing = '1';
+    t.classList.add('out'); t.style.transform = dir ? `translateX(${dir * 110}%)` : 'translateY(10px) scale(.97)';
+    setTimeout(() => t.remove(), 260);
+  };
+  const hold = tone === 'error' ? 9000 : 4800;
+  let timer = setTimeout(close, hold), x0 = null, dx = 0;
+  t.querySelector('button').onclick = () => { buzz('tap'); close(); };
+  t.addEventListener('pointerdown', e => {
+    if (e.target.closest('button')) return;
+    x0 = e.clientX; dx = 0; clearTimeout(timer); t.style.transition = 'none'; t.setPointerCapture(e.pointerId);
+  });
+  t.addEventListener('pointermove', e => {
+    if (x0 == null) return;
+    dx = e.clientX - x0; t.style.transform = `translateX(${dx}px)`; t.style.opacity = String(1 - Math.min(.9, Math.abs(dx) / 240));
+  });
+  const release = () => {
+    if (x0 == null) return;
+    x0 = null; t.style.transition = '';
+    if (Math.abs(dx) > 80) { buzz('tick'); close(Math.sign(dx)); }
+    else { t.style.transform = ''; t.style.opacity = ''; timer = setTimeout(close, 3000); }
+  };
+  t.addEventListener('pointerup', release); t.addEventListener('pointercancel', release);
+}
+
+/* Bottom sheet: drag the handle or title down to dismiss. */
+const sheet = $('#sheet'), scrim = $('#scrim'), sheetBody = $('#sheetBody');
+let sheetClosed = null, sheetReturn = null;
+sheet.inert = true;
+function openSheet(title, html, ready, closed) {
+  if (sheetClosed) { const previous = sheetClosed; sheetClosed = null; previous(); }
+  sheetReturn = document.activeElement;
+  $('#sheetTitle').textContent = title;
+  sheetBody.innerHTML = html; sheetBody.scrollTop = 0;
+  sheet.style.transform = ''; sheet.inert = false; sheet.removeAttribute('aria-hidden');
+  sheet.classList.add('open'); scrim.classList.add('open');
+  sheetClosed = closed || null;
+  buzz('tap');
+  if (ready) ready(sheetBody);
+  sheet.focus({ preventScroll: true });
+}
+function closeSheet() {
+  if (!sheet.classList.contains('open')) return;
+  sheet.classList.remove('open'); scrim.classList.remove('open');
+  sheet.style.transform = ''; sheet.inert = true; sheet.setAttribute('aria-hidden', 'true');
+  const done = sheetClosed; sheetClosed = null; if (done) done();
+  if (sheetReturn && sheetReturn.focus) sheetReturn.focus({ preventScroll: true });
+}
+scrim.addEventListener('click', closeSheet);
+$('#sheetClose').addEventListener('click', () => { buzz('tap'); closeSheet(); });
+addEventListener('keydown', e => { if (e.key === 'Escape') closeSheet(); });
+(() => {
+  let y0 = null, dy = 0, t0 = 0, armed = false;
+  const down = e => {
+    if (e.target.closest('button')) return;
+    y0 = e.clientY; dy = 0; t0 = performance.now(); armed = false;
+    sheet.style.transition = 'none'; e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const move = e => {
+    if (y0 == null) return;
+    dy = Math.max(0, e.clientY - y0); sheet.style.transform = `translateY(${dy}px)`;
+    if ((dy > 110) !== armed) { armed = dy > 110; buzz(armed ? 'armed' : 'bump'); }
+  };
+  const up = () => {
+    if (y0 == null) return;
+    y0 = null; sheet.style.transition = '';
+    const flick = dy > 30 && dy / Math.max(1, performance.now() - t0) > .8;
+    if (dy > 110 || flick) closeSheet(); else sheet.style.transform = '';
+  };
+  for (const el of [$('#grab'), $('#sheetHead')]) {
+    el.addEventListener('pointerdown', down); el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+  }
+})();
+
+/* Swipe pager. Native scroll snapping moves the pages; the rail indicator follows the finger. */
+const pager = $('#pager'), pages = $$('.page', pager), railButtons = $$('#rail button');
+const pill = $('#rail .pill'), ids = pages.map(p => p.id);
+const onEnter = {};
+let index = -1, raf = 0, touching = false, swiped = store.get('swiped', false);
+function setProgress(p) { pill.style.transform = `translateX(${p * 100}%)`; }
+function setIndex(i, user) {
+  if (i === index) return;
+  const first = index < 0;
+  index = i;
+  railButtons.forEach((b, k) => k === i ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current'));
+  try { history.replaceState(null, '', '#' + ids[i]); } catch {}
+  if (!first) buzz('tick');
+  if (user && !swiped) { swiped = true; store.set('swiped', true); }
+  if (onEnter[ids[i]]) onEnter[ids[i]]();
+}
+function go(i, smooth = true) {
+  i = Math.max(0, Math.min(pages.length - 1, i));
+  pager.scrollTo({ left: i * pager.clientWidth, behavior: smooth && !reduced ? 'smooth' : 'auto' });
+}
+pager.addEventListener('scroll', () => {
+  if (raf) return;
+  raf = requestAnimationFrame(() => {
+    raf = 0;
+    const p = pager.scrollLeft / Math.max(1, pager.clientWidth);
+    setProgress(p);
+    setIndex(Math.max(0, Math.min(pages.length - 1, Math.round(p))), touching);
+  });
+}, { passive: true });
+railButtons.forEach((b, i) => b.addEventListener('click', () => {
+  if (i === index) { buzz('tap'); pages[i].scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' }); return; }
+  go(i);
+}));
+(() => {
+  let sx = null, sy = 0, bumped = false;
+  pager.addEventListener('touchstart', e => { touching = true; sx = e.touches[0].clientX; sy = e.touches[0].clientY; bumped = false; }, { passive: true });
+  pager.addEventListener('touchmove', e => {
+    if (sx == null || bumped) return;
+    const dx = e.touches[0].clientX - sx, dy = e.touches[0].clientY - sy;
+    if (Math.abs(dx) < Math.abs(dy) * 1.5) return;
+    if ((index === 0 && dx > 48) || (index === pages.length - 1 && dx < -48)) { bumped = true; buzz('bump'); }
+  }, { passive: true });
+  const end = () => { touching = false; sx = null; };
+  pager.addEventListener('touchend', end, { passive: true }); pager.addEventListener('touchcancel', end, { passive: true });
+})();
+addEventListener('keydown', e => {
+  if (sheet.classList.contains('open') || e.target.closest('input,textarea')) return;
+  if (e.key === 'ArrowRight') go(index + 1); else if (e.key === 'ArrowLeft') go(index - 1);
+});
+addEventListener('resize', () => { pager.scrollLeft = index * pager.clientWidth; setProgress(index); });
+
+/* Pull to refresh on pages that list PS4 data. */
+const ptr = $('#ptr'), refreshers = {};
+function showPtr(p) { ptr.style.transition = 'none'; ptr.style.opacity = String(Math.min(1, p / 40)); ptr.style.transform = `translateY(${p - 44}px) rotate(${p * 3}deg)`; }
+function hidePtr() { ptr.style.transition = ''; ptr.style.opacity = ''; ptr.style.transform = ''; ptr.classList.remove('armed', 'spin'); }
+for (const page of pages.filter(p => p.dataset.refresh)) {
+  let y0 = null, x0 = 0, armed = false, busy = false;
+  page.addEventListener('touchstart', e => {
+    y0 = busy || page.scrollTop > 0 || e.touches.length > 1 ? null : e.touches[0].clientY;
+    x0 = e.touches[0].clientX; armed = false;
+  }, { passive: true });
+  page.addEventListener('touchmove', e => {
+    if (y0 == null) return;
+    const dy = e.touches[0].clientY - y0, dx = e.touches[0].clientX - x0;
+    if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 10) { y0 = null; hidePtr(); return; }
+    if (dy <= 0 || page.scrollTop > 0) { showPtr(0); return; }
+    const pull = Math.min(120, dy * .55);
+    showPtr(pull);
+    if ((pull >= 64) !== armed) { armed = pull >= 64; ptr.classList.toggle('armed', armed); buzz(armed ? 'armed' : 'bump'); }
+  }, { passive: true });
+  page.addEventListener('touchend', async () => {
+    if (y0 == null) return;
+    y0 = null;
+    if (!armed) { hidePtr(); return; }
+    busy = true; ptr.classList.add('spin'); showPtr(64);
+    try { await refreshers[page.dataset.refresh](); } catch (e) { toast('Could not refresh', e.message, 'error'); }
+    finally { hidePtr(); busy = false; }
+  }, { passive: true });
+}
+
+/* Small helpers */
+function pressable(el, tap, hold) {
+  let timer = 0, held = false, sx = 0, sy = 0;
+  const cancel = () => clearTimeout(timer);
+  el.addEventListener('pointerdown', e => {
+    held = false; sx = e.clientX; sy = e.clientY; cancel();
+    timer = setTimeout(() => { held = true; el.classList.add('held'); buzz('heavy'); setTimeout(() => el.classList.remove('held'), 380); hold(); }, 480);
+  });
+  el.addEventListener('pointermove', e => { if (Math.hypot(e.clientX - sx, e.clientY - sy) > 10) cancel(); });
+  el.addEventListener('pointerup', cancel); el.addEventListener('pointercancel', cancel); el.addEventListener('pointerleave', cancel);
+  el.addEventListener('contextmenu', e => e.preventDefault());
+  el.addEventListener('click', e => { if (held) { e.preventDefault(); held = false; return; } tap(); });
+}
+function shake(el) { el.classList.remove('shake'); void el.offsetWidth; el.classList.add('shake'); }
+function busy(btn, on) { btn.classList.toggle('busy', on); btn.setAttribute('aria-busy', String(on)); }
+function switchOn(btn) { return btn.getAttribute('aria-checked') === 'true'; }
+function flip(btn) { const v = !switchOn(btn); btn.setAttribute('aria-checked', String(v)); buzz('toggle'); return v; }
+function fromTemplate(html) { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; }
+
+/* PS4 requests. A 410 means this QR session ended; a network error means the PS4 is out of reach. */
+const conn = $('#conn');
+let ended = false, lastContact = 0, offlineSince = 0;
+function markOnline() {
+  lastContact = Date.now();
+  if (!offlineSince) return;
+  offlineSince = 0; conn.classList.remove('offline'); $('#connText').textContent = location.hostname;
+  toast('PS4 reconnected', 'Downloads are up to date again.');
+}
+function markOffline() {
+  if (offlineSince || ended) return;
+  offlineSince = Date.now(); conn.classList.add('offline'); $('#connText').textContent = 'Reconnecting…';
+}
+function markEnded() {
+  if (ended) return;
+  ended = true; conn.classList.remove('offline'); conn.classList.add('ended'); $('#connText').textContent = 'Session ended';
+  toast('This phone session ended', 'Open a new QR code in SSPI on your PS4 and scan it again.', 'error');
+}
+async function request(path, body, type) {
+  if (ended) throw Error('This phone session ended. Open a new QR code in SSPI on your PS4.');
+  let r;
+  try {
+    r = await fetch(base + path, { method: body === undefined ? 'GET' : 'POST', body, cache: 'no-store', headers: type ? { 'Content-Type': type } : undefined });
+  } catch {
+    markOffline();
+    throw Error('Your PS4 is not answering. Keep SSPI open and stay on the same network.');
+  }
+  if (r.status === 410) { markEnded(); throw Error('This phone session ended. Open a new QR code in SSPI on your PS4.'); }
+  markOnline();
+  if (!r.ok) {
+    const text = await r.text();
+    throw Error(text && !text.startsWith('<') ? text.slice(0, 300) : `Your PS4 could not do that (error ${r.status}).`);
+  }
+  return (r.headers.get('Content-Type') || '').includes('json') ? r.json() : r.text();
+}
+let chain = Promise.resolve();
+function enqueue(fn) { const run = chain.catch(() => {}).then(fn); chain = run.catch(() => {}); return run; }
+
+/* Services: keys and service choice live on the PS4 (/config, /services). */
+const services = [
+  { id: 'real-debrid', name: 'Real-Debrid', mark: 'RD', flag: 'rd', field: 'key' },
+  { id: 'torbox', name: 'TorBox', mark: 'TB', flag: 'tb', field: 'tb_key' },
+  { id: 'alldebrid', name: 'AllDebrid', mark: 'AD', flag: 'ad', field: 'ad_key' },
+  { id: 'premiumize', name: 'Premiumize', mark: 'PM', flag: 'pm', field: 'pm_key' }
+].map(s => ({ ...s, key: false, enabled: false, state: 'missing', message: 'Not connected', url: '' }));
+let preferred = 'none', serviceRevision = -1, configReady = false, fastConfigUntil = 0, servicesBusy = 0;
+function fixPreferred() {
+  const on = services.filter(s => s.enabled);
+  if (!on.length) preferred = 'none';
+  else if (!on.some(s => s.id === preferred)) preferred = on[0].id;
+}
+function servicePayload(extra) {
+  const body = new URLSearchParams({ provider: preferred, enabled_providers: services.filter(s => s.enabled).map(s => s.id).join(',') });
+  for (const k in extra || {}) body.set(k, extra[k]);
+  return body;
+}
+function serviceTone(message) {
+  if (/rejected/i.test(message)) return 'error';
+  if (/restrict|unverified|busy|unavailable|superseded/i.test(message)) return 'warning';
+  if (/validated/i.test(message)) return 'success';
+  return 'info';
+}
+function renderServices() {
+  const list = $('#serviceList');
+  list.replaceChildren();
+  for (const s of services) {
+    const row = fromTemplate(`<div class="row"><button class="row-main" type="button"><span class="mono-tile">${s.mark}</span><span class="row-text"><strong>${esc(s.name)}</strong><span class="state" data-state="${esc(s.state)}"><i class="dot"></i><span>${esc(s.message)}</span></span></span></button><button class="switch" type="button" role="switch" aria-checked="${s.enabled}" aria-label="Use ${esc(s.name)} for downloads"></button></div>`);
+    row.querySelector('.row-main').onclick = () => openKeySheet(s);
+    row.querySelector('.switch').onclick = e => toggleService(s, e.currentTarget);
+    list.append(row);
+  }
+  renderPreferred();
+}
+function renderPreferred() {
+  const box = $('#preferred');
+  box.replaceChildren();
+  for (const o of [...services, { id: 'none', name: 'Direct links' }]) {
+    const b = fromTemplate('<button class="chip" type="button" role="radio"></button>');
+    b.setAttribute('aria-checked', String(preferred === o.id)); b.textContent = o.name;
+    b.onclick = () => choosePreferred(o.id);
+    box.append(b);
+  }
+}
+function saveServices(extra, undo, done, quiet) {
+  servicesBusy++;
+  return enqueue(() => request('/services', servicePayload(extra)))
+    .then(() => { fastConfigUntil = Date.now() + 25000; if (done) done(); return loadConfig(); })
+    .catch(e => { if (undo) undo(); renderServices(); if (!quiet) toast('Could not save services', e.message, 'error'); throw e; })
+    .finally(() => { servicesBusy--; });
+}
+function toggleService(s, btn) {
+  if (!s.key) { buzz('warning'); openKeySheet(s, `Paste a key to use ${s.name} for downloads.`); return; }
+  const before = { enabled: s.enabled, preferred };
+  s.enabled = flip(btn); fixPreferred(); renderPreferred();
+  saveServices(null, () => { s.enabled = before.enabled; preferred = before.preferred; },
+    () => toast('Services saved on PS4', `${s.name} is ${s.enabled ? 'on' : 'off'} for downloads.`)).catch(() => {});
+}
+function choosePreferred(id) {
+  if (id === preferred) return;
+  const s = services.find(x => x.id === id);
+  if (s && !s.key) { buzz('warning'); openKeySheet(s, `Paste a key to make ${s.name} your preferred service.`); return; }
+  const before = { preferred, enabled: services.map(x => x.enabled) };
+  buzz('tick');
+  preferred = id;
+  if (s) s.enabled = true; else services.forEach(x => { x.enabled = false; });
+  renderServices();
+  saveServices(null, () => { preferred = before.preferred; services.forEach((x, k) => { x.enabled = before.enabled[k]; }); },
+    () => toast('Services saved on PS4', s ? `${s.name} is tried first.` : 'Direct links only. Your keys stay saved.')).catch(() => {});
+}
+function openKeySheet(s, note = '') {
+  openSheet(s.name, `${note ? `<p class="note">${icon('alert', 'i sm')}<span>${esc(note)}</span></p>` : ''}
+    <div class="stack"><label class="label" for="apiKey">API key</label>
+    <div class="field" id="keyField"><input id="apiKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${s.key ? 'Saved on PS4 · paste to replace' : 'Paste your API key'}"><button class="icon-btn" id="eye" type="button" aria-label="Show key" aria-pressed="false">${icon('eye')}</button></div>
+    <p class="hint" id="keyMsg">Your key is sent to your PS4 only. Leave it blank to keep a saved key.</p></div>
+    ${/^https:[/][/]/.test(s.url) ? `<a class="link" href="${esc(s.url)}" target="_blank" rel="noreferrer">${icon('external', 'i sm')}Get your ${esc(s.name)} API key</a>` : ''}
+    <div class="toggle-row"><div><strong>Use for downloads</strong><small>Enabled services are used for downloads. The preferred one is tried first.</small></div><button class="switch" id="keyUse" type="button" role="switch" aria-checked="${s.enabled || !s.key}" aria-label="Use for downloads"></button></div>
+    <button class="btn primary block" id="keySave" type="button">${icon('check', 'i sm')}<span>Save and validate</span></button>`, body => {
+    const input = $('#apiKey', body), field = $('#keyField', body), msg = $('#keyMsg', body), eye = $('#eye', body);
+    eye.onclick = () => {
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      eye.setAttribute('aria-pressed', String(show)); eye.setAttribute('aria-label', show ? 'Hide key' : 'Show key');
+      eye.innerHTML = icon(show ? 'eye-off' : 'eye'); buzz('tick');
+    };
+    $('#keyUse', body).onclick = e => flip(e.currentTarget);
+    input.oninput = () => { field.classList.remove('bad'); msg.classList.remove('bad'); };
+    const fail = text => { field.classList.add('bad'); msg.classList.add('bad'); msg.textContent = text; shake(field); buzz('error'); };
+    $('#keySave', body).onclick = async e => {
+      const key = input.value.trim(), use = switchOn($('#keyUse', body)), btn = e.currentTarget;
+      if (!key && !s.key) return fail('Paste the API key first.');
+      if (key && (key.length < 8 || key.length > 4096 || /[\r\n\0]/.test(key))) return fail('Check the API key length and remove line breaks.');
+      const before = { enabled: s.enabled, preferred };
+      s.enabled = use; fixPreferred();
+      busy(btn, true);
+      try {
+        await saveServices(key ? { [s.field]: key } : null, () => { s.enabled = before.enabled; preferred = before.preferred; }, null, true);
+        closeSheet();
+        toast(key ? 'Key saved on PS4' : 'Saved on PS4', key ? `Your PS4 is checking it with ${s.name}.` : `${s.name} is ${use ? 'on' : 'off'} for downloads.`);
+      } catch (err) { fail(err.message); }
+      finally { busy(btn, false); }
+    };
+  });
+}
+
+/* Sources (/source installs a URL, /source-toggle switches one on or off). */
+let sources = [], sourceStatus = '';
+function renderSources() {
+  const list = $('#sourceList');
+  list.replaceChildren();
+  if (!sources.length) list.innerHTML = '<p class="hint">No package sources installed yet.</p>';
+  for (const src of sources) {
+    const row = fromTemplate(`<div class="row"><div class="row-main"><span class="tile">${icon('library', 'i sm')}</span><span class="row-text"><strong></strong><small class="mono"></small></span></div><button class="switch" type="button" role="switch"></button></div>`);
+    row.querySelector('strong').textContent = src.name;
+    row.querySelector('small').textContent = `v${src.version} · ${src.enabled ? 'searched' : 'hidden from search'}`;
+    const sw = row.querySelector('.switch');
+    sw.setAttribute('aria-checked', String(!!src.enabled)); sw.setAttribute('aria-label', 'Search ' + src.name);
+    sw.onclick = () => {
+      const on = flip(sw);
+      sw.disabled = true;
+      enqueue(() => request('/source-toggle', new URLSearchParams({ source_id: src.id, enabled: on ? 'on' : 'off' })))
+        .then(() => { toast('Source selection saved on PS4', `${src.name} is ${on ? 'searched' : 'hidden from search'}.`); return loadConfig(); })
+        .catch(e => { sw.setAttribute('aria-checked', String(!on)); toast('Could not change the source', e.message, 'error'); })
+        .finally(() => { sw.disabled = false; });
+    };
+    list.append(row);
+  }
+  const status = $('#sourceStatus'), text = /^idle\b/i.test(sourceStatus) ? '' : sourceStatus.replace(/ · $/, '');
+  status.hidden = !text; status.textContent = text;
+}
+$('#sourceUrl').addEventListener('input', () => $('#srcField').classList.remove('bad'));
+$('#installSource').onclick = async e => {
+  const btn = e.currentTarget, input = $('#sourceUrl'), field = $('#srcField');
+  let url;
+  try { url = new URL(input.value.trim()); if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw Error(); }
+  catch { field.classList.add('bad'); shake(field); toast('Paste a valid source URL', 'Use a complete http or https link to a .gssource file.', 'error'); return; }
+  busy(btn, true); buzz('tap');
+  try {
+    await enqueue(() => request('/source', new URLSearchParams({ source_url: url.href })));
+    input.value = ''; fastConfigUntil = Date.now() + 60000;
+    toast('Source sent to your PS4', 'Your PS4 checks it before installing.', 'info');
+    await loadConfig();
+  } catch (err) { toast('Could not send the source', err.message, 'error'); }
+  finally { busy(btn, false); }
+};
+refreshers.sources = async () => { await loadConfig(); toast('Sources refreshed', `${sources.length} installed on your PS4.`); };
+$('#refreshSources').onclick = async e => { buzz('tap'); const b = e.currentTarget; b.disabled = true; try { await refreshers.sources(); } catch (err) { toast('Could not refresh', err.message, 'error'); } b.disabled = false; };
+
+/* Appearance: the PS4 accent (/appearance). Haptics are a setting on this phone only. */
+const presets = [['Charcoal', '#E4E4E1'], ['Steel Ice', '#7EB6FF'], ['Arctic', '#E8EEF7'], ['Violet', '#A78BFA'], ['Crimson', '#FF4D4D'], ['Amber', '#F5A623'], ['Teal', '#2EE6C5'], ['Pink', '#F58BBF']];
+const accent = { hex: '#E4E4E1', dirty: false };
+function inkFor(hex) {
+  const n = parseInt(hex.slice(1), 16), lin = v => { v /= 255; return v <= .03928 ? v / 12.92 : Math.pow((v + .055) / 1.055, 2.4); };
+  return .2126 * lin(n >> 16 & 255) + .7152 * lin(n >> 8 & 255) + .0722 * lin(n & 255) > .36 ? '#111113' : '#f5f5f7';
+}
+function applyAccent(hex) {
+  if (!/^#[0-9a-f]{6}$/i.test(hex || '')) return;
+  accent.hex = hex.toUpperCase();
+  document.documentElement.style.setProperty('--accent', hex);
+  document.documentElement.style.setProperty('--accent-ink', inkFor(hex));
+}
+let accentSaved = accent.hex, accentTimer = 0;
+function saveAccent(name) {
+  clearTimeout(accentTimer);
+  accent.dirty = true;
+  accentTimer = setTimeout(() => {
+    const hex = accent.hex;
+    enqueue(() => request('/appearance', new URLSearchParams({ accent: hex })))
+      .then(() => { accentSaved = hex; toast('Accent saved on PS4', `${name} · ${hex}`); })
+      .catch(e => { applyAccent(accentSaved); renderSwatches(); toast('Could not save the accent', e.message, 'error'); })
+      .finally(() => { if (accent.hex === hex) accent.dirty = false; });
+  }, 600);
+}
+function renderSwatches() {
+  const box = $('#swatches'), known = presets.some(([, c]) => c === accent.hex);
+  box.replaceChildren();
+  for (const [name, c] of presets) {
+    const b = fromTemplate(`<button class="swatch" type="button" role="radio"><i></i><span>${name}</span></button>`);
+    b.setAttribute('aria-checked', String(c === accent.hex)); b.style.setProperty('--c', c);
+    b.onclick = () => { if (c === accent.hex) return; buzz('tick'); applyAccent(c); renderSwatches(); saveAccent(name); };
+    box.append(b);
+  }
+  const custom = fromTemplate(`<label class="swatch"><i></i><span>Custom</span><input class="sr" id="customAccent" type="color" aria-label="Custom accent color"></label>`);
+  custom.setAttribute('aria-checked', String(!known));
+  custom.style.setProperty('--c', known ? 'conic-gradient(#ff4d4d,#f5a623,#2ee6c5,#7eb6ff,#a78bfa,#f58bbf,#ff4d4d)' : accent.hex);
+  const input = custom.querySelector('input');
+  input.value = known ? '#c7a4ff' : accent.hex.toLowerCase();
+  input.oninput = () => { applyAccent(input.value); custom.style.setProperty('--c', input.value); $$('.swatch', box).forEach(s => s.setAttribute('aria-checked', String(s === custom))); };
+  input.onchange = () => { buzz('tick'); saveAccent('Custom'); };
+  box.append(custom);
+}
+$('#hapticSupport').textContent = haptics.support === 'vibrate'
+  ? 'This phone vibrates with each tap, switch and save.'
+  : haptics.support === 'ios'
+    ? 'iPhone plays a light system tap on iOS 18 or later.'
+    : 'This browser has no haptic support, so nothing will vibrate.';
+const hapticsSwitch = $('#hapticsOn');
+hapticsSwitch.setAttribute('aria-checked', String(haptics.on));
+hapticsSwitch.onclick = () => { const next = !haptics.on; haptics.on = true; buzz('toggle'); haptics.on = next; hapticsSwitch.setAttribute('aria-checked', String(next)); };
+$$('[data-try]').forEach(b => { b.onclick = () => haptics.on ? buzz(b.dataset.try) : toast('Haptics are off', 'Turn them on to test them.', 'info'); });
+
+/* Config from the PS4 */
+function applyConfig(c) {
+  configReady = true;
+  if (!servicesBusy) {
+    for (const s of services) {
+      const status = (c.service_status || {})[s.id];
+      s.key = !!c[s.flag];
+      s.state = status ? status.state : s.key ? 'saved' : 'missing';
+      s.message = status ? status.message : s.key ? 'Key saved on PS4' : 'Not connected';
+      s.enabled = (c.enabled_providers || '').split(',').includes(s.id);
+      s.url = status && status.key_page || '';
+    }
+    preferred = c.provider || 'none';
+    renderServices();
+  }
+  if (c.service_revision !== serviceRevision) {
+    if (serviceRevision >= 0 && c.service_message) toast(c.service_message, '', serviceTone(c.service_message));
+    serviceRevision = c.service_revision;
+  }
+  sources = Array.isArray(c.source_choices) ? c.source_choices : [];
+  sourceStatus = c.source_status || '';
+  renderSources();
+  if (!accent.dirty && c.accent) { applyAccent(c.accent); accentSaved = accent.hex; renderSwatches(); }
+}
+async function loadConfig() { const c = await request('/config'); applyConfig(c); return c; }
+
+/* Connection details */
+$('#conn').onclick = () => {
+  const state = ended ? 'Session ended' : offlineSince ? 'Not answering' : 'Connected';
+  openSheet(ended ? 'Phone session ended' : 'Connected to your PS4', `<div><div class="kv"><span>PS4 address</span><b class="mono">${esc(location.host)}</b></div>
+    <div class="kv"><span>Status</span><b>${state}</b></div>
+    <div class="kv"><span>Last update</span><b class="mono">${lastContact ? clock(lastContact) : 'Not yet'}</b></div></div>
+    <p class="hint">${ended ? 'Open a new QR code in SSPI on your PS4 and scan it again.' : 'This page stays connected while you use it, so you can check downloads later, even overnight. Keep SSPI open on your PS4 and both devices on the same network. If SSPI restarts, scan the new QR code.'}</p>
+    ${ended ? '' : `<button class="btn block" id="checkConn" type="button">${icon('wifi', 'i sm')}<span>Check connection</span></button>`}`, body => {
+    const check = $('#checkConn', body);
+    if (check) check.onclick = async () => {
+      busy(check, true);
+      try { await loadConfig(); await pollQueue(true); toast('PS4 connected', `SSPI answered from ${location.hostname}.`); }
+      catch (e) { toast('Your PS4 is not answering', e.message, 'error'); }
+      finally { busy(check, false); }
+    };
+  });
+};
+
+/* Downloads: the live PS4 queue (/queue). Actions go through /queue/<id>/<action>. */
+const fmtSize = b => b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' GB' : b >= 1048576 ? Math.round(b / 1048576) + ' MB' : Math.max(0, Math.round(b / 1024)) + ' KB';
+const fmtSpeed = b => (b / 1048576).toFixed(1) + ' MB/s';
+const fmtLeft = s => s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.round(s % 3600 / 60)} min left` : s >= 60 ? `${Math.round(s / 60)} min left` : `${Math.max(1, Math.round(s))} s left`;
+const kindLabel = k => ({ update: 'Update', dlc: 'DLC', base: 'Game', game: 'Game', theme: 'Theme', 'theme-license': 'Theme license', backport: 'Backport' })[k] || 'Package';
+const isActive = i => ['resolving', 'downloading', 'extracting', 'verifying', 'installing', 'submitted'].includes(i.phase);
+const needsAttention = i => ['failed', 'attention', 'canceled'].includes(i.phase);
+const groups = [
+  ['Needs attention', needsAttention],
+  ['In progress', isActive],
+  ['Waiting', i => ['queued', 'waiting', 'finalizing', 'held', 'ready'].includes(i.phase)],
+  ['Finished', i => i.phase === 'installed']
+];
+const filters = { all: () => true, active: i => !needsAttention(i) && i.phase !== 'installed', errors: needsAttention, done: i => i.phase === 'installed' };
+const rows = new Map(), finishedAt = store.get('finishedAt', {});
+let queue = [], queueLoaded = false, lastQueueAt = 0, filter = 'all', detail = null, heroKey = '', structureKey = '';
+let finishedOpen = store.get('finishedOpen', false), known = null, since = null, away = [], catchingUp = false, queueTimer = 0, queueBusy = false;
+
+function phaseOf(r) {
+  switch (r.state) {
+    case 'queued': return r.after ? 'waiting' : r.parked ? 'resolving' : 'queued';
+    case 'paused': return r.error ? 'attention' : 'held';
+    case 'completed': return r.error ? 'attention' : 'ready';
+    // Extraction and package verification both arrive as finalizing; activity names which.
+    case 'finalizing': return r.activity || 'finalizing';
+    case 'resolving': case 'downloading': case 'failed': case 'canceled':
+    case 'installing': case 'submitted': case 'installed': return r.state;
+  }
+  return 'queued';
+}
+const normalize = r => ({ ...r, phase: phaseOf(r), kindText: kindLabel(r.kind), title: r.title || 'Package' });
+const heroItem = () => queue.find(i => i.phase === 'downloading') || queue.find(isActive) || null;
+function statusOf(i) {
+  const size = i.total ? `${fmtSize(i.done)} of ${fmtSize(i.total)}` : i.done ? `${fmtSize(i.done)} downloaded` : '';
+  switch (i.phase) {
+    case 'downloading': return [size, i.bps ? fmtSpeed(i.bps) : 'Waiting for data', i.eta ? fmtLeft(i.eta) : ''].filter(Boolean).join(' · ');
+    case 'resolving': return i.status || (i.parked ? 'Preparing in TorBox' : 'Connecting…');
+    case 'extracting': return i.total ? [`Extracting · ${Math.floor(progressOf(i) * 100)}%`, `${fmtSize(i.done)} of ${fmtSize(i.total)}`,
+      i.bps ? fmtSpeed(i.bps) : '', i.eta ? fmtLeft(i.eta) : ''].filter(Boolean).join(' · ') : i.status || 'Extracting…';
+    case 'verifying': return i.status || 'Verifying package integrity';
+    case 'installing': return i.status || 'Installing on your PS4';
+    case 'submitted': return i.status || 'Sent to your PS4 · checking the install';
+    case 'finalizing': return i.status || 'Downloaded · waiting to install';
+    case 'queued': return i.status || 'Queued';
+    case 'waiting': return 'Waiting for its base game';
+    case 'held': return size ? `Paused · ${size}` : 'Paused';
+    case 'ready': return 'Downloaded · ready to install';
+    case 'installed': return ['Installed' + (finishedAt[i.id] ? ' at ' + clock(finishedAt[i.id]) : ''), i.total ? fmtSize(i.total) : ''].filter(Boolean).join(' · ');
+  }
+  return i.error || i.status || (i.phase === 'canceled' ? 'Canceled' : 'Failed');
+}
+const progressOf = i => ['installed', 'finalizing', 'ready', 'submitted'].includes(i.phase) ? 1 : i.total ? Math.min(1, i.done / i.total) : 0;
+const toneOf = i => i.phase === 'failed' || i.phase === 'canceled' ? 'failed' : i.phase === 'attention' ? 'warn' : i.phase === 'installed' ? 'done' : '';
+function stepsOf(i) {
+  const names = i.archive ? ['DL', 'EX', 'IN'] : ['DL', 'IN'], last = names.length - 1;
+  const at = i.phase === 'installed' ? 9 : i.phase === 'extracting' ? 1 : i.phase === 'verifying' ? last - 1
+    : ['installing', 'submitted', 'finalizing', 'ready'].includes(i.phase) ? last
+    : i.phase === 'queued' || i.phase === 'waiting' ? -1 : 0;
+  const moving = isActive(i);
+  return names.map((n, k) => `<i class="${k < at ? 'on' : k === at && moving ? 'now' : ''}">${n}</i>`).join('');
+}
+function quickAction(i) {
+  if ((i.phase === 'failed' || i.phase === 'canceled') && !i.password) return ['retry', 'Retry'];
+  if (i.phase === 'held' || (i.phase === 'attention' && i.state === 'paused')) return ['resume', 'Resume'];
+  if (i.phase === 'ready' || (i.phase === 'attention' && i.state === 'completed')) return ['install', 'Install'];
+  return null;
+}
+// Cover art: the package source image first, then the installed game's art on the PS4.
+function setCover(box, i) {
+  const urls = [i.image, i.titleId ? `${base}/cover/${i.titleId}` : ''].filter(Boolean);
+  box.replaceChildren(); box.classList.remove('plain'); box.dataset.src = urls.join(' ');
+  const fallback = () => { box.classList.add('plain'); box.innerHTML = icon(i.archive ? 'archive' : 'package', 'i sm'); };
+  if (!urls.length) { fallback(); return; }
+  const img = new Image();
+  let k = 0;
+  img.alt = ''; img.decoding = 'async'; img.referrerPolicy = 'no-referrer';
+  img.onerror = () => { if (++k < urls.length) img.src = urls[k]; else fallback(); };
+  img.src = urls[0];
+  box.append(img);
+}
+function rowFor(i) {
+  let el = rows.get(i.id);
+  if (el) return el;
+  const id = i.id;
+  el = fromTemplate('<div class="xfer"><button class="x-main" type="button"><span class="thumb"></span><span class="x-body"><span class="x-top"><strong></strong><span class="steps"></span></span><span class="x-line"></span><span class="x-track"><span class="x-fill"></span></span></span></button><button class="x-act" type="button" hidden></button></div>');
+  el.querySelector('.x-main').onclick = () => { const current = queue.find(q => q.id === id); if (current) openTransfer(current); };
+  const quick = el.querySelector('.x-act');
+  quick.onclick = () => { const current = queue.find(q => q.id === id), action = current && quickAction(current); if (action) act(action[0], current, quick); };
+  rows.set(id, el);
+  return el;
+}
+const coverKey = i => [i.image, i.titleId ? `${base}/cover/${i.titleId}` : ''].filter(Boolean).join(' ');
+function updateRow(el, i) {
+  const grouped = !!el.closest('.xgroup'), thumb = el.querySelector('.thumb');
+  if (!grouped && thumb.dataset.src !== coverKey(i)) setCover(thumb, i);
+  if (el.dataset.phase !== i.phase) {
+    el.dataset.phase = i.phase;
+    el.className = 'xfer ' + toneOf(i);
+    el.querySelector('.steps').innerHTML = stepsOf(i);
+    const quick = el.querySelector('.x-act'), action = quickAction(i);
+    quick.hidden = !action; quick.textContent = action ? action[1] : ''; quick.classList.remove('busy');
+    el.querySelector('.x-fill').classList.toggle('moving', i.phase === 'downloading' || i.phase === 'extracting');
+  }
+  el.querySelector('strong').textContent = grouped ? i.kindText : i.title;
+  el.querySelector('.x-line').textContent = grouped ? statusOf(i) : `${i.kindText} · ${statusOf(i)}`;
+  el.querySelector('.x-fill').style.width = (progressOf(i) * 100).toFixed(2) + '%';
+  el.querySelector('.x-main').setAttribute('aria-label', `${i.title}, ${i.kindText}. ${statusOf(i)}`);
+}
+// A game's base, update and DLC share a title ID; the console groups them the same way.
+const groupKey = i => i.titleId ? 't:' + i.titleId : 'i:' + i.id;
+const rankOf = i => needsAttention(i) ? 0 : isActive(i) ? 1 : i.phase === 'installed' ? 3 : 2;
+const kindRank = i => ({ base: 0, game: 0, update: 1, dlc: 2 })[i.kind] ?? 3;
+const sections = ['Needs attention', 'In progress', 'Waiting', 'Finished'];
+const leadOf = members => members.find(i => i.kind === 'base' || i.kind === 'game') || members[0];
+function titleGroups(items) {
+  const map = new Map(), out = [];
+  for (const i of items) {
+    let g = map.get(groupKey(i));
+    if (!g) { g = { key: groupKey(i), items: [] }; map.set(g.key, g); out.push(g); }
+    g.items.push(i);
+  }
+  return out;
+}
+function entryFor(members) {
+  if (members.length === 1) { const el = rowFor(members[0]); updateRow(el, members[0]); return el; }
+  const lead = leadOf(members), sorted = [...members].sort((a, b) => kindRank(a) - kindRank(b));
+  const card = fromTemplate('<div class="xgroup"><div class="xgroup-head"><span class="thumb"></span><div class="xgroup-text"><strong></strong><small></small></div></div><div class="xgroup-body"></div></div>');
+  setCover($('.thumb', card), lead);
+  $('.xgroup-text strong', card).textContent = lead.title;
+  $('.xgroup-text small', card).textContent = sorted.map(i => i.kindText).join(' + ');
+  card.classList.toggle('failed', members.some(needsAttention));
+  for (const i of sorted) { const el = rowFor(i); $('.xgroup-body', card).append(el); updateRow(el, i); }
+  return card;
+}
+function folderFor(entries) {
+  const items = entries.flat(), total = items.reduce((a, i) => a + (i.total || 0), 0);
+  const box = fromTemplate(`<div class="folder" data-open="${finishedOpen}"><button class="folder-head" type="button" aria-expanded="${finishedOpen}"><span class="folder-icon">${icon(finishedOpen ? 'folder-open' : 'folder')}</span><span class="folder-text"><strong>Finished</strong><small></small></span><span class="fan"></span>${icon('chevron', 'i sm chev')}</button><div class="folder-body"><div class="folder-inner"><div class="folder-pad"></div></div></div></div>`);
+  $('.folder-text small', box).textContent = `${items.length} installed${total ? ' · ' + fmtSize(total) : ''}`;
+  entries.map(leadOf).filter(i => i.image || i.titleId).slice(0, 3).forEach((i, k) => {
+    const img = new Image();
+    img.alt = ''; img.decoding = 'async'; img.referrerPolicy = 'no-referrer';
+    img.onerror = () => img.remove();
+    img.src = i.image || `${base}/cover/${i.titleId}`;
+    img.style.setProperty('--r', [-12, 3, 14][k] + 'deg');
+    $('.fan', box).append(img);
+  });
+  const pad = $('.folder-pad', box);
+  for (const members of entries) pad.append(entryFor(members));
+  const clear = fromTemplate('<button class="text-btn" type="button">Clear finished</button>');
+  clear.onclick = async () => {
+    busy(clear, true); buzz('tap');
+    try {
+      await enqueue(() => request('/queue/finished/clear', new URLSearchParams()));
+      toast('Clearing finished downloads', 'The games stay installed.', 'info');
+      setTimeout(pollQueue, 800);
+    } catch (e) { toast('Could not clear the list', e.message, 'error'); }
+    finally { busy(clear, false); }
+  };
+  pad.append(clear);
+  const head = $('.folder-head', box);
+  head.onclick = () => {
+    finishedOpen = box.dataset.open !== 'true';
+    store.set('finishedOpen', finishedOpen);
+    box.dataset.open = String(finishedOpen); head.setAttribute('aria-expanded', String(finishedOpen));
+    $('.folder-icon', box).innerHTML = icon(finishedOpen ? 'folder-open' : 'folder');
+    buzz('toggle');
+  };
+  return box;
+}
+function renderQueue(animate = false) {
+  const list = $('#xferList'), counts = {}, top = heroItem(), topKey = top ? groupKey(top) : null;
+  for (const k in filters) counts[k] = queue.filter(filters[k]).length;
+  $$('#xferFilter [data-v]').forEach(b => {
+    b.setAttribute('aria-checked', String(b.dataset.v === filter));
+    b.querySelector('b').textContent = queueLoaded ? counts[b.dataset.v] : '·';
+    b.classList.toggle('alert', b.dataset.v === 'errors' && counts.errors > 0);
+  });
+  list.replaceChildren();
+  if (!queueLoaded) list.innerHTML = '<p class="hint">Loading your downloads…</p>';
+  else {
+    const buckets = [[], [], [], []];
+    for (const g of titleGroups(queue)) {
+      // The downloading strip shows its title; only members that need attention repeat below.
+      const members = g.items.filter(i => filters[filter](i) && (g.key !== topKey || needsAttention(i)));
+      if (members.length) buckets[Math.min(...members.map(rankOf))].push(members);
+    }
+    let n = 0;
+    buckets.forEach((entries, s) => {
+      if (!entries.length) return;
+      if (s === 3 && filter !== 'done') { const f = folderFor(entries); f.style.setProperty('--i', n++); list.append(f); return; }
+      const h = fromTemplate('<p class="group-label"></p>');
+      h.textContent = sections[s]; h.style.setProperty('--i', n++);
+      list.append(h);
+      for (const members of entries) { const el = entryFor(members); el.style.setProperty('--i', n++); list.append(el); }
+    });
+    if (!list.children.length) list.innerHTML = `<p class="hint">${filter === 'errors' ? 'No errors. Everything is running or finished.' : filter === 'done' ? 'Nothing has finished yet.' : top ? 'Nothing else in the queue.' : 'Your queue is empty. Tap + to send download links.'}</p>`;
+  }
+  if (animate && !reduced) { list.classList.remove('stagger'); void list.offsetWidth; list.classList.add('stagger'); setTimeout(() => list.classList.remove('stagger'), 1000); }
+  for (const id of [...rows.keys()]) if (!queue.some(i => i.id === id)) rows.delete(id);
+  renderHero(); renderSummary();
+}
+function refreshQueueView(animate = false) {
+  const key = filter + '|' + queueLoaded + '|' + queue.map(i => i.id + ':' + i.phase + ':' + i.titleId).join(',');
+  if (animate || key !== structureKey) { structureKey = key; renderQueue(animate); return; }
+  for (const i of queue) { const el = rows.get(i.id); if (el && el.isConnected) updateRow(el, i); }
+  renderHero(); renderSummary();
+}
+const fmtOf = (d, t) => t >= 1073741824 ? `${(d / 1073741824).toFixed(1)} of ${(t / 1073741824).toFixed(1)} GB` : `${fmtSize(d)} of ${fmtSize(t)}`;
+const shortState = q => ({ queued: 'Queued', waiting: 'Waiting for the game', resolving: 'Connecting', held: 'Paused', ready: 'Ready to install',
+  finalizing: 'Waiting to install', verifying: 'Verifying', installing: 'Installing', submitted: 'Checking', installed: 'Installed' })[q.phase] ||
+  (q.phase === 'downloading' ? Math.floor(progressOf(q) * 100) + '%' : q.phase === 'extracting' ? 'Extracting ' + Math.floor(progressOf(q) * 100) + '%' : statusOf(q));
+function renderHero() {
+  const hero = $('#hero'), i = heroItem();
+  if (!i) {
+    const key = queueLoaded ? 'idle' : 'loading';
+    if (heroKey !== key) {
+      heroKey = key; hero.className = 'hero idle';
+      hero.innerHTML = `<div class="hero-row"><span class="tile">${icon(queueLoaded ? 'check-circle' : 'download')}</span><div class="hero-info"><span class="eyebrow">${queueLoaded ? 'All caught up' : 'Connecting'}</span><strong class="hero-title">${queueLoaded ? 'Nothing downloading' : 'Checking your PS4'}</strong><span class="hero-meta">Tap + to send links to your PS4.</span></div></div>`;
+      hero.onclick = () => openSendSheet();
+    }
+    return;
+  }
+  if (heroKey !== i.id) {
+    heroKey = i.id; hero.className = 'hero';
+    hero.innerHTML = '<div class="hero-glow"></div><div class="hero-row"><span class="hero-case"></span><div class="hero-info"><span class="eyebrow"><i class="ping"></i><span id="heroState"></span><span class="via" id="heroVia"></span></span><strong class="hero-title"></strong><div class="hero-line"><span class="meter"><span class="meter-fill" id="heroBar"></span></span><b class="hero-pct" id="heroPct"></b></div><span class="hero-foot" id="heroDone"></span></div></div><div class="hero-next" id="heroNext" hidden></div>';
+    setCover($('.hero-case', hero), i);
+    if (i.image || i.titleId) setCover($('.hero-glow', hero), i);
+    hero.onclick = e => { if (e.target.closest('.hero-chip')) return; const current = queue.find(q => q.id === heroKey); if (current) openTransfer(current); };
+  }
+  const moving = i.phase === 'downloading' || i.phase === 'extracting';
+  $('#heroState').textContent = ({ resolving: 'Connecting', downloading: 'Downloading now', extracting: 'Extracting', verifying: 'Verifying',
+    installing: 'Installing', submitted: 'Checking the install' }[i.phase] || 'Working') + ' · ' + i.kindText;
+  $('#heroVia').textContent = i.provider || 'Direct link';
+  $('.hero-title', hero).textContent = i.title;
+  $('#heroPct').textContent = Math.floor(progressOf(i) * 100) + '%';
+  $('#heroDone').textContent = i.phase === 'downloading'
+    ? [i.total ? fmtOf(i.done, i.total) : `${fmtSize(i.done)} downloaded`, i.bps ? fmtSpeed(i.bps) : '', i.eta ? fmtLeft(i.eta) : ''].filter(Boolean).join(' · ')
+    : statusOf(i);
+  const bar = $('#heroBar');
+  bar.style.width = (progressOf(i) * 100).toFixed(2) + '%';
+  bar.classList.toggle('moving', moving);
+  // The rest of this title (update, DLC) stays with it as chips; errors also appear in the list.
+  const others = queue.filter(q => q !== i && groupKey(q) === groupKey(i) && !needsAttention(q)).sort((a, b) => kindRank(a) - kindRank(b));
+  const next = $('#heroNext'), sig = others.map(q => q.id + ':' + shortState(q)).join(',');
+  if (next.dataset.sig !== sig) {
+    next.dataset.sig = sig; next.hidden = !others.length; next.replaceChildren();
+    for (const q of others) {
+      const chip = fromTemplate('<button class="hero-chip" type="button"></button>');
+      chip.textContent = `${q.kindText} · ${shortState(q)}`;
+      chip.onclick = () => openTransfer(q);
+      next.append(chip);
+    }
+  }
+}
+function renderSummary() {
+  const el = $('#xferSince'), attention = queue.filter(needsAttention).length;
+  const moving = queue.filter(i => i.phase === 'downloading'), speed = moving.reduce((a, i) => a + (i.bps || 0), 0);
+  const extracting = queue.filter(i => i.phase === 'extracting').length;
+  const need = n => `<b class="bad">${n} need${n === 1 ? 's' : ''} attention</b>`;
+  if (!queueLoaded) el.textContent = offlineSince ? 'Your PS4 is not answering yet.' : 'Checking your PS4…';
+  else if (offlineSince) el.innerHTML = `<b class="bad">Your PS4 is not answering.</b> Showing the update from ${clock(lastQueueAt)}.`;
+  else if (since) el.innerHTML = `Since ${clock(since.at)}: <b>${since.installed} installed</b> and <b class="${since.failed ? 'bad' : ''}">${since.failed} failed</b>.`;
+  else if (moving.length || extracting) el.innerHTML = [moving.length ? `<b>${moving.length} downloading</b> at ${fmtSpeed(speed)}` : '',
+    extracting ? `<b>${extracting} extracting</b>` : '', attention ? need(attention) : ''].filter(Boolean).join(' · ') + '.';
+  else el.innerHTML = attention ? need(attention) + '.' : queue.length ? 'Nothing downloading right now.' : 'Your queue is empty.';
+  const badge = $('#dlBadge'), active = queue.filter(isActive).length, n = attention || active;
+  badge.hidden = !n; badge.textContent = n; badge.classList.toggle('alert', attention > 0);
+}
+
+/* Change tracking: toasts while open, a summary after the phone slept, and "since" after a return visit. */
+function report(kind, i) {
+  if (document.hidden || catchingUp) { away.push(kind); return; }
+  if (kind === 'installed') toast('Installed', `${i.title} · ${i.kindText}`);
+  else toast('Download needs attention', `${i.title}: ${statusOf(i)}`, 'error');
+}
+function detect(items) {
+  const phases = {};
+  for (const i of items) phases[i.id] = i.phase;
+  if (!known) {
+    const seen = store.get('seen', null);
+    if (seen && seen.phases && Date.now() - seen.at > 120000) {
+      let installed = 0, failed = 0;
+      for (const i of items) {
+        const before = seen.phases[i.id];
+        if (i.phase === 'installed' && before !== 'installed') installed++;
+        if (needsAttention(i) && i.phase !== 'canceled' && !['failed', 'attention', 'canceled'].includes(before)) failed++;
+      }
+      if (installed || failed) since = { at: seen.at, installed, failed };
+    }
+  } else {
+    let changed = false;
+    for (const i of items) {
+      const before = known[i.id];
+      if (!before || before === i.phase) continue;
+      if (i.phase === 'installed') { finishedAt[i.id] = Date.now(); changed = true; report('installed', i); }
+      else if (needsAttention(i) && i.phase !== 'canceled' && !['failed', 'attention'].includes(before)) report('failed', i);
+    }
+    for (const id in finishedAt) if (!(id in phases)) { delete finishedAt[id]; changed = true; }
+    if (changed) store.set('finishedAt', finishedAt);
+  }
+  known = phases;
+}
+function rememberSeen() { if (known) store.set('seen', { at: Date.now(), phases: known }); }
+function summarizeAway() {
+  if (!away.length) return;
+  const installed = away.filter(k => k === 'installed').length, failed = away.length - installed;
+  away = [];
+  toast('While you were away', [installed && `${installed} installed`, failed && `${failed} need attention`].filter(Boolean).join(' · '), failed ? 'warning' : 'success');
+}
+async function loadQueue() {
+  const data = await request('/queue');
+  if (data.ready === false && !queueLoaded) return;
+  const items = (data.items || []).map(normalize);
+  detect(items);
+  queue = items; queueLoaded = true; lastQueueAt = Date.now();
+  refreshQueueView();
+  if (detail) renderDetail();
+}
+function scheduleQueue() {
+  clearTimeout(queueTimer);
+  if (ended || document.hidden) return;
+  queueTimer = setTimeout(pollQueue, ids[index] === 'downloads' ? 2000 : offlineSince ? 8000 : 6000);
+}
+async function pollQueue() {
+  clearTimeout(queueTimer);
+  if (queueBusy) return;
+  queueBusy = true;
+  try { await loadQueue(); } catch { renderSummary(); } finally { queueBusy = false; scheduleQueue(); }
+}
+$$('#xferFilter [data-v]').forEach(b => { b.onclick = () => { if (filter === b.dataset.v) return; filter = b.dataset.v; buzz('tick'); refreshQueueView(true); }; });
+$('#hero').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('#hero').click(); } });
+refreshers.downloads = async () => { await loadQueue(); refreshQueueView(true); toast('Downloads updated', $('#xferSince').textContent); };
+
+/* One download: details and actions. */
+function detailActions(i) {
+  switch (i.phase) {
+    case 'downloading': case 'resolving': case 'queued': case 'waiting': return [['pause', 'Pause', ''], ['remove', 'Remove', 'danger']];
+    case 'held': return [['resume', 'Resume', 'primary'], ['remove', 'Remove', 'danger']];
+    case 'attention': return [i.state === 'completed' ? ['install', 'Install again', 'primary'] : ['resume', 'Resume', 'primary'], ['remove', 'Remove', 'danger']];
+    case 'failed': case 'canceled': return i.password ? [['remove', 'Remove', 'danger']] : [['retry', 'Retry', 'primary'], ['remove', 'Remove', 'danger']];
+    case 'ready': return [['install', 'Install', 'primary'], ['remove', 'Remove', 'danger']];
+    case 'installed': return [['remove', 'Remove from list', '']];
+  }
+  return [];
+}
+function renderDetail() {
+  const body = detail.body, i = queue.find(q => q.id === detail.id);
+  if (!i) { closeSheet(); return; }
+  if (body.dataset.phase !== i.phase) {
+    body.dataset.phase = i.phase;
+    const tone = toneOf(i), actions = detailActions(i);
+    body.innerHTML = `<div class="detail-top"><span class="thumb"></span><div><p class="hint mono">${esc(i.kindText)}${i.titleId ? ' · ' + i.titleId : ''}</p><p class="x-line ${tone}" id="dStatus"></p><span class="bar-track"><span class="bar-fill ${tone}" id="dBar"></span></span><span class="steps" style="margin-top:10px">${stepsOf(i)}</span></div></div>
+      ${i.password ? `<p class="note">${icon('alert', 'i sm')}<span>This archive needs a password. Enter it on your PS4 to continue.</span></p>` : ''}
+      ${needsAttention(i) && i.error ? `<p class="note bad">${icon('alert', 'i sm')}<span>${esc(i.error)}</span></p>` : ''}
+      <div><div class="kv"><span>Size</span><b class="mono">${i.total ? fmtSize(i.total) : 'Not known yet'}</b></div><div class="kv"><span>Service</span><b>${esc(i.provider || 'Direct link')}</b></div>${i.parts > 1 ? `<div class="kv"><span>Archive parts</span><b class="mono">${i.parts}</b></div>` : ''}</div>
+      ${actions.length ? `<div class="btn-row">${actions.map(([a, label, cls]) => `<button class="btn ${cls}" type="button" data-act="${a}">${label}</button>`).join('')}</div><p class="hint">Removing takes a package off the queue. Installed games and USB originals are kept.</p>` : '<p class="hint">Your PS4 is finishing this one. You can close this page.</p>'}`;
+    setCover($('.thumb', body), i);
+    $$('[data-act]', body).forEach(b => { b.onclick = () => { const current = queue.find(q => q.id === detail.id); if (current) act(b.dataset.act, current, b); }; });
+  }
+  $('#dStatus', body).textContent = statusOf(i);
+  $('#dBar', body).style.width = (progressOf(i) * 100).toFixed(2) + '%';
+}
+function openTransfer(i) {
+  openSheet(i.title, '', body => { body.dataset.phase = ''; detail = { id: i.id, body }; renderDetail(); }, () => { detail = null; });
+}
+const actionToasts = { pause: 'Pausing on your PS4', resume: 'Resuming on your PS4', retry: 'Retrying on your PS4', install: 'Installing on your PS4', remove: 'Removing from the queue' };
+async function act(action, i, btn) {
+  if (action === 'remove' && !btn.dataset.armed) {
+    btn.dataset.armed = '1'; btn.textContent = 'Tap again to remove'; buzz('warning');
+    setTimeout(() => { if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = i.phase === 'installed' ? 'Remove from list' : 'Remove'; } }, 3000);
+    return;
+  }
+  busy(btn, true); buzz('tap');
+  try {
+    await enqueue(() => request(`/queue/${encodeURIComponent(i.id)}/${action}`, new URLSearchParams()));
+    toast(actionToasts[action], i.title, 'info');
+    if (action === 'remove') closeSheet();
+    setTimeout(pollQueue, 700); setTimeout(pollQueue, 2500);
+  } catch (e) { toast('Could not update the download', e.message, 'error'); }
+  finally { if (btn.isConnected) busy(btn, false); }
+}
+
+/* Send links: the + button opens this sheet. The draft stays on this phone until it is queued. */
+const fileName = u => { try { return decodeURIComponent(new URL(u).pathname.split('/').pop() || ''); } catch { return ''; } };
+const partOf = name => { const m = name.match(/^(.+?)\.part0*(\d+)\.rar$/i) || name.match(/^(.+?)\.r(\d\d)$/i); return m ? m[1].toLowerCase() : null; };
+function parseLinks(text) {
+  const out = { valid: [], invalid: 0, repeated: 0 }, seen = new Set();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.length > 8192 || !/^https?:\/\/[^\s/?#]+\S*$/i.test(line)) { out.invalid++; continue; }
+    if (seen.has(line)) { out.repeated++; continue; }
+    seen.add(line); out.valid.push(line);
+  }
+  return out;
+}
+function batchCount(urls, multipart) {
+  if (multipart) return urls.length ? 1 : 0;
+  const sets = new Set();
+  let singles = 0;
+  for (const u of urls) { const set = partOf(fileName(u)); if (set) sets.add(set); else singles++; }
+  return singles + sets.size;
+}
+function openSendSheet() {
+  openSheet('Send download links', `<p class="hint">Up to 50 links, one per line. Your PS4 uses its selected service and staging drive.</p>
+    <textarea class="area" id="links" rows="6" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste download links, one per line" aria-label="Download links"></textarea>
+    <div class="chips" id="linkTags" aria-live="polite"></div>
+    <div class="toggle-row"><div><strong>One RAR archive</strong><small>Turn on when the links are parts of one archive, in volume order. Named parts are grouped automatically.</small></div><button class="switch" id="multipart" type="button" role="switch" aria-checked="false" aria-label="Links are parts of one RAR archive"></button></div>
+    <div class="btn-row"><button class="btn" id="clearLinks" type="button">Clear</button><button class="btn primary" id="queueLinks" type="button">${icon('send', 'i sm')}<span>Queue on PS4</span></button></div>`, body => {
+    const area = $('#links', body), multi = $('#multipart', body), queueBtn = $('#queueLinks', body);
+    area.value = store.get('draft', '');
+    let lastValid = parseLinks(area.value).valid.length;
+    const tags = () => {
+      const r = parseLinks(area.value), m = switchOn(multi), count = batchCount(r.valid, m), out = [];
+      if (!r.valid.length && !r.invalid) out.push(['', 'Paste links, one per line']);
+      else {
+        out.push(['', `${r.valid.length} link${r.valid.length === 1 ? '' : 's'}`]);
+        if (m) out.push(r.valid.length > 1 ? ['good', `One archive · ${r.valid.length} parts`] : ['warn', 'Add every part of the archive']);
+        else if (count < r.valid.length) out.push(['good', `RAR parts grouped into ${count} item${count === 1 ? '' : 's'}`]);
+        if (r.repeated) out.push(['warn', `${r.repeated} repeated`]);
+        if (r.invalid) out.push(['bad', `${r.invalid} not a link`]);
+        if (r.valid.length > 50) out.push(['bad', 'More than 50 links']);
+      }
+      $('#linkTags', body).innerHTML = out.map(([tone, text]) => `<span class="tag ${tone}">${esc(text)}</span>`).join('');
+      const ok = r.valid.length > 0 && !r.invalid && r.valid.length <= 50 && (!m || r.valid.length > 1);
+      queueBtn.disabled = !ok;
+      $('span', queueBtn).textContent = ok ? `Queue ${count} ${count === 1 ? 'item' : 'items'}` : 'Queue on PS4';
+      if (r.valid.length > lastValid) buzz('tick');
+      lastValid = r.valid.length;
+      store.set('draft', area.value);
+    };
+    area.addEventListener('input', tags);
+    multi.onclick = () => { flip(multi); tags(); };
+    $('#clearLinks', body).onclick = () => { buzz('tap'); area.value = ''; tags(); area.focus(); };
+    queueBtn.onclick = async () => {
+      const text = area.value;
+      busy(queueBtn, true); buzz('tap');
+      try {
+        const r = await enqueue(() => request('/downloads', new URLSearchParams({ links: text, multipart: switchOn(multi) ? '1' : '0' })));
+        const note = `${r.queued} queued, ${r.duplicates} duplicate${r.duplicates === 1 ? '' : 's'} skipped` + (r.failed ? `, ${r.failed} could not be queued. Send the batch again; accepted links are skipped.` : '.');
+        toast(r.queued ? 'Queued on PS4' : 'Nothing new to queue', note, r.failed || !r.queued ? 'warning' : 'success');
+        if (!r.failed && area.value === text) { area.value = ''; store.set('draft', ''); }
+        closeSheet();
+        filter = 'all'; setTimeout(pollQueue, 600);
+      } catch (e) { toast('Could not queue the links', e.message, 'error'); }
+      finally { busy(queueBtn, false); }
+    };
+    tags();
+  });
+}
+$('#addLinks').onclick = openSendSheet;
+
+/* Library: installed games (/library) and their covers (/cover/<id>). */
+let libraryGames = [], libraryLoaded = false, libraryLoading = null, coverBusy = false;
+const coverVersion = {};
+const coverUrl = g => `${base}/cover/${g.id}` + (coverVersion[g.id] ? '#v' + coverVersion[g.id] : '');
+function loadLibrary() {
+  if (!libraryLoading) libraryLoading = request('/library')
+    .then(d => { libraryGames = Array.isArray(d.games) ? d.games : []; libraryLoaded = true; renderGames(); })
+    .finally(() => { libraryLoading = null; });
+  return libraryLoading;
+}
+function renderGames() {
+  const q = $('#libFilter').value.trim().toLowerCase(), box = $('#games');
+  box.replaceChildren();
+  if (!libraryLoaded) { box.innerHTML = '<p class="hint">Loading your library…</p>'; $('#libCount').textContent = ''; return; }
+  const shown = libraryGames.filter(g => (g.name + ' ' + g.id).toLowerCase().includes(q));
+  for (const g of shown) {
+    const b = fromTemplate('<button class="game" type="button"><span class="case"></span><b></b><small class="mono"></small></button>');
+    const art = b.firstElementChild, img = new Image();
+    img.alt = ''; img.loading = 'lazy'; img.decoding = 'async';
+    img.onerror = () => { art.classList.add('plain'); art.innerHTML = icon('gamepad'); };
+    img.src = coverUrl(g);
+    art.append(img);
+    if (g.custom) art.insertAdjacentHTML('beforeend', '<span class="flag">Custom</span>');
+    b.querySelector('b').textContent = g.name; b.querySelector('small').textContent = g.id;
+    b.setAttribute('aria-label', `${g.name}, ${g.id}. Edit cover`);
+    pressable(b, () => openCoverEditor(g), () => openQuick(g));
+    box.append(b);
+  }
+  if (!shown.length) box.innerHTML = `<p class="hint">${libraryGames.length ? 'No matching games.' : 'No installed games yet. Wait for your PS4 to finish scanning, then pull down to refresh.'}</p>`;
+  $('#libCount').textContent = shown.length === libraryGames.length ? `${libraryGames.length} installed game${libraryGames.length === 1 ? '' : 's'}` : `${shown.length} of ${libraryGames.length} games`;
+}
+$('#libFilter').addEventListener('input', renderGames);
+refreshers.library = async () => { await loadLibrary(); toast('Library refreshed', `${libraryGames.length} installed games found.`); };
+$('#refreshLibrary').onclick = async e => { buzz('tap'); const b = e.currentTarget; b.disabled = true; try { await refreshers.library(); } catch (err) { toast('Could not load your library', err.message, 'error'); } b.disabled = false; };
+function openQuick(g) {
+  openSheet(g.name, `<p class="hint mono">${esc(g.id)}</p>
+    <button class="action" id="qaEdit" type="button">${icon('image')}<span>Change cover</span></button>
+    <button class="action" id="qaRestore" type="button"${g.custom ? '' : ' disabled'}>${icon('rotate')}<span>Restore original cover</span></button>`, body => {
+    $('#qaEdit', body).onclick = () => { closeSheet(); setTimeout(() => openCoverEditor(g), 280); };
+    $('#qaRestore', body).onclick = e => changeCover(g, null, e.currentTarget);
+  });
+}
+async function changeCover(g, pixels, btn) {
+  if (coverBusy) return;
+  coverBusy = true; busy(btn, true); buzz('tap');
+  try {
+    const result = await enqueue(() => request(`/cover/${g.id}${pixels ? '' : '/restore'}`, pixels || '', pixels ? 'application/octet-stream' : 'application/x-www-form-urlencoded'));
+    const warn = ['failed', 'unavailable', 'partial'].includes(result.ps4);
+    coverVersion[g.id] = Date.now();
+    closeSheet();
+    toast(pixels ? 'Cover saved' : 'Original cover restored', result.message || '', warn ? 'warning' : 'success');
+    await loadLibrary();
+  } catch (e) { toast('Could not change the cover', e.message, 'error'); }
+  finally { coverBusy = false; if (btn.isConnected) busy(btn, false); }
+}
+
+/* Cover effects are baked on the phone: a 384 × 432 SSPI case and a 512 × 512 PS4 home screen icon. */
+const artCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+function colorMask(image, color) { const c = artCanvas(image.width, image.height), x = c.getContext('2d'); x.drawImage(image, 0, 0); x.globalCompositeOperation = 'source-in'; x.fillStyle = color; x.fillRect(0, 0, c.width, c.height); return c; }
+function insetMask(mask, radius) {
+  const c = artCanvas(mask.width, mask.height), x = c.getContext('2d');
+  x.drawImage(mask, 0, 0);
+  if (radius <= 0) return c;
+  const shifted = artCanvas(c.width, c.height), s = shifted.getContext('2d');
+  x.globalCompositeOperation = 'destination-in';
+  for (let i = 0; i < 16; i++) { const a = i * Math.PI / 8; s.clearRect(0, 0, c.width, c.height); s.drawImage(mask, Math.cos(a) * radius, Math.sin(a) * radius); x.drawImage(shifted, 0, 0); }
+  return c;
+}
+function ring(mask, inset, width, color) { const c = insetMask(mask, inset), x = c.getContext('2d'); x.globalCompositeOperation = 'destination-out'; x.drawImage(insetMask(mask, inset + width), 0, 0); return colorMask(c, color); }
+function outlined(image, w, h, o) {
+  const iw = image.naturalWidth || image.width, ih = image.naturalHeight || image.height, t = o.width * w / 512;
+  const scale = (o.fit === 'contain' ? Math.min : Math.max)(w / iw, h / ih), dw = iw * scale, dh = ih * scale;
+  const art = artCanvas(w, h), a = art.getContext('2d');
+  a.imageSmoothingEnabled = true; a.imageSmoothingQuality = 'high'; a.drawImage(image, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  const out = artCanvas(w, h), x = out.getContext('2d');
+  x.fillStyle = '#1c1e22'; x.fillRect(0, 0, w, h); x.drawImage(art, 0, 0);
+  if (o.style === 'none') return out;
+  let mask = art;
+  if (o.edge === 'frame' || o.style === 'arcade') { mask = artCanvas(w, h); const m = mask.getContext('2d'); m.fillStyle = '#fff'; m.fillRect(0, 0, w, h); }
+  mask = colorMask(mask, o.color);
+  const fx = artCanvas(w, h), e = fx.getContext('2d');
+  if (o.style === 'neon') { const glow = ring(mask, t * .6, t, o.color); e.save(); e.shadowColor = o.color; e.shadowBlur = t * 3; e.drawImage(glow, 0, 0); e.drawImage(glow, 0, 0); e.restore(); e.drawImage(ring(mask, t * .9, t * .4, '#ffffff'), 0, 0); }
+  if (o.style === 'clean') e.drawImage(ring(mask, t * .5, t, o.color), 0, 0);
+  if (o.style === 'retro') for (const [inset, color] of [[.5, '#ffffff'], [2, o.color], [3.5, o.color]]) e.drawImage(ring(mask, t * inset, t * .55, color), 0, 0);
+  // Effects overlay the fitted picture; they never shrink it or add a dark border.
+  e.globalCompositeOperation = 'destination-in'; e.drawImage(mask, 0, 0); x.drawImage(fx, 0, 0);
+  if (o.style === 'arcade') {
+    x.strokeStyle = o.color; x.lineWidth = t; x.lineCap = 'square';
+    const len = Math.min(w, h) * .18;
+    x.beginPath();
+    for (const [px, py, sx, sy] of [[t, t, 1, 1], [w - t, t, -1, 1], [t, h - t, 1, -1], [w - t, h - t, -1, -1]]) { x.moveTo(px + sx * len, py); x.lineTo(px, py); x.lineTo(px, py + sy * len); }
+    x.stroke();
+  }
+  return out;
+}
+function openCoverEditor(g) {
+  const o = { fit: 'crop', style: 'none', color: presets.some(([, c]) => c === accent.hex) ? accent.hex : '#A78BFA', width: 5, edge: 'alpha' };
+  const names = { none: 'None', neon: 'Neon glow', retro: 'Retro lines', clean: 'Clean', arcade: 'Arcade corners' };
+  let source = null, frame = 0;
+  openSheet(g.name, `<div class="previews"><figure><canvas id="pvCase" width="384" height="432"></canvas><figcaption>SSPI case</figcaption></figure><figure><canvas id="pvIcon" width="512" height="512"></canvas><figcaption>PS4 home screen</figcaption></figure></div>
+    <label class="btn block">${icon('upload', 'i sm')}<span id="pickLabel">Choose a picture</span><input class="sr" id="coverFile" type="file" accept="image/jpeg,image/png,image/webp"></label>
+    <p class="hint" id="coverHint">Loading the current cover…</p>
+    <div class="stack"><span class="label">Fit</span><div class="seg" id="fitSeg" role="radiogroup" aria-label="Fit"><button type="button" role="radio" data-v="crop">Fill the case</button><button type="button" role="radio" data-v="contain">Whole picture</button></div></div>
+    <div class="stack"><span class="label">Outline</span><div class="chips" id="styleChips" role="radiogroup" aria-label="Outline style">${Object.keys(names).map(v => `<button class="chip" type="button" role="radio" data-v="${v}">${names[v]}</button>`).join('')}</div></div>
+    <div class="stack"><span class="label">Color</span><div class="dots" id="colorDots" role="radiogroup" aria-label="Outline color">${presets.map(([n, c]) => `<button type="button" role="radio" aria-label="${n}" data-v="${c}" style="--c:${c}"></button>`).join('')}</div></div>
+    <div class="stack"><label class="label" for="fxWidth">Thickness <output id="fxWidthOut" class="mono">5</output></label><input id="fxWidth" type="range" min="2" max="12" step="1" value="5"></div>
+    <div class="stack"><span class="label">Outline follows</span><div class="seg" id="edgeSeg" role="radiogroup" aria-label="Outline follows"><button type="button" role="radio" data-v="alpha">Picture edges</button><button type="button" role="radio" data-v="frame">Rectangle frame</button></div></div>
+    <p class="hint">Effects are baked on your phone before upload. The PS4 keeps a backup of the original icon. Restart your PS4 after saving to refresh the home screen.</p>
+    <div class="btn-row"><button class="btn" id="coverRestore" type="button"${g.custom ? '' : ' disabled'}>${icon('rotate', 'i sm')}<span>Restore</span></button><button class="btn primary" id="coverSave" type="button" disabled>${icon('check', 'i sm')}<span>Save cover</span></button></div>`, body => {
+    const save = $('#coverSave', body), hint = $('#coverHint', body);
+    const draw = () => {
+      if (!source) return;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        try {
+          for (const id of ['pvCase', 'pvIcon']) { const cv = $('#' + id, body); cv.getContext('2d').drawImage(outlined(source, cv.width, cv.height, o), 0, 0); }
+          save.disabled = false;
+        } catch { save.disabled = true; hint.textContent = 'Could not prepare this cover. Choose a smaller picture.'; }
+      });
+    };
+    const group = (sel, key) => {
+      const buttons = $$(sel + ' [data-v]', body);
+      const sync = () => buttons.forEach(b => b.setAttribute('aria-checked', String(b.dataset.v === o[key])));
+      buttons.forEach(b => { b.onclick = () => { if (o[key] === b.dataset.v) return; o[key] = b.dataset.v; buzz('tick'); sync(); draw(); }; });
+      sync();
+    };
+    group('#fitSeg', 'fit'); group('#styleChips', 'style'); group('#colorDots', 'color'); group('#edgeSeg', 'edge');
+    const range = $('#fxWidth', body);
+    range.oninput = () => { const v = Number(range.value); if (v === o.width) return; o.width = v; $('#fxWidthOut', body).textContent = v; buzz('tick'); draw(); };
+    const current = new Image();
+    current.onload = () => { if (source) return; source = current; hint.textContent = 'Showing the current cover. Choose a picture to replace it, or add an outline.'; draw(); };
+    current.onerror = () => { if (!source) hint.textContent = 'Choose a picture to start.'; };
+    current.src = coverUrl(g);
+    $('#coverFile', body).onchange = e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      if (!/^image\/(jpeg|png|webp)$/.test(file.type) || file.size > 20 * 1024 * 1024) { toast('Choose a JPG, PNG or WebP under 20 MB', '', 'error'); return; }
+      const url = URL.createObjectURL(file), img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        if (img.naturalWidth * img.naturalHeight > 48000000) { toast('Choose a picture smaller than 48 megapixels', '', 'error'); return; }
+        source = img; $('#pickLabel', body).textContent = file.name; hint.textContent = 'Preview ready. These exact effects are saved to both covers.';
+        buzz('success'); draw();
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); toast('That picture could not be read', 'Try another image.', 'error'); };
+      img.src = url;
+    };
+    save.onclick = () => {
+      const caseArt = $('#pvCase', body), iconArt = $('#pvIcon', body);
+      let pixels;
+      try {
+        const a = caseArt.getContext('2d').getImageData(0, 0, caseArt.width, caseArt.height).data, b = iconArt.getContext('2d').getImageData(0, 0, iconArt.width, iconArt.height).data;
+        pixels = new Uint8Array(a.length + b.length); pixels.set(a); pixels.set(b, a.length);
+      } catch { toast('Could not read the preview', 'Choose the picture again, then save.', 'error'); return; }
+      changeCover(g, pixels, save);
+    };
+    $('#coverRestore', body).onclick = e => changeCover(g, null, e.currentTarget);
+  });
+}
+
+/* Start */
+document.addEventListener('touchstart', () => {}, { passive: true });
+$('#connText').textContent = location.hostname;
+renderServices(); renderSources(); renderSwatches(); renderQueue(); renderGames();
+onEnter.downloads = () => { refreshQueueView(true); pollQueue(); };
+onEnter.library = () => { if (!libraryLoaded) loadLibrary().catch(e => toast('Could not load your library', e.message, 'error')); };
+const start = Math.max(0, ids.indexOf(location.hash.slice(1)));
+pager.scrollLeft = start * pager.clientWidth; setProgress(start); setIndex(start, false);
+loadConfig()
+  .then(() => request('/connected', new URLSearchParams()))
+  .then(() => toast('Phone connected', 'You can keep using your PS4. Swipe left or right to switch sections.', 'success', true))
+  .catch(e => toast('Could not reach your PS4', e.message, 'error'));
+pollQueue();
+(function configLoop() {
+  setTimeout(async () => {
+    if (!document.hidden && !ended) { try { await loadConfig(); } catch {} }
+    configLoop();
+  }, Date.now() < fastConfigUntil ? 1500 : 5000);
+})();
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { rememberSeen(); clearTimeout(queueTimer); return; }
+  catchingUp = true;
+  pollQueue().finally(() => { catchingUp = false; summarizeAway(); });
+  loadConfig().catch(() => {});
+});
+addEventListener('pagehide', rememberSeen);
+addEventListener('beforeunload', e => { if (coverBusy) { e.preventDefault(); e.returnValue = ''; } });
+if (!swiped && !reduced) setTimeout(() => { if (swiped) return; pager.classList.add('peek'); setTimeout(() => pager.classList.remove('peek'), 1150); }, 1500);
+})();
+</script>
+</body>
+</html>
