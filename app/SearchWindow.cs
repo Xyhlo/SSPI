@@ -669,6 +669,8 @@ namespace Orbis
         {
             var sourceCompletion = Interlocked.Exchange(ref _sourceBrowserComplete, null);
             if (sourceCompletion != null) sourceCompletion();
+            ApplySourceUpdates();
+            StartSourceUpdateCheck();
             if (_pairErrorTransient && UiElapsed(_pairErrorShownAt) >= PairNoticeMs)
             { _pairErrorTransient = false; _pairPersistentError = ""; Invalidated = true; }
             if (!_pairSessionActive) return;

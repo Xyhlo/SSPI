@@ -205,5 +205,23 @@ namespace Orbis
 
         [DllImport("libkernel")]
         static extern void sceKernelSendNotificationRequest(long unk1, IntPtr Buffer, long size, long unk2);
+
+        /// <summary>A PS4 system notification with the SSPI icon, as the resident sends.
+        /// Best effort: host builds and older firmware simply show nothing.</summary>
+        public static void NotifySystem(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message)) return;
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                var request = new NotifyBuffer { Message = message.Length > 900 ? message.Substring(0, 900) : message, Uri = "file:///user/appmeta/SRCH00001/icon0.png" };
+                int size = Marshal.SizeOf(typeof(NotifyBuffer));
+                buffer = Marshal.AllocHGlobal(size);
+                Marshal.StructureToPtr(request, buffer, false);
+                sceKernelSendNotificationRequest(0, buffer, size, 0);
+            }
+            catch { }
+            finally { if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer); }
+        }
     }
 }

@@ -233,6 +233,7 @@
 !/resident/plugin/gs_transfer_host.inc
 !/app/CloudCatalog.cs
 !/app/CommunitySources.cs
+!/app/CommunitySourceUpdates.cs
 !/app/PackageSourceEngineStatic.cs
 !/app/PackageSourceEngineStatic.Refresh.cs
 !/app/PackageSourceEngineStatic.RefreshParser.cs

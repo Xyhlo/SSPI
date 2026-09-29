@@ -136,9 +136,20 @@ namespace Orbis
         }
 
         public PackageSourceRegistryEntry InstallFromFile(string packagePath) { return Install(packagePath); }
+
+        /// <summary>Installs a newer revision of an installed source. It must carry the same
+        /// source ID; a revision that keeps its version number replaces those files, and
+        /// the source keeps its enabled state.</summary>
+        internal PackageSourceRegistryEntry InstallUpdate(byte[] packageBytes, string expectedSourceId)
+        {
+            PackageSourcePackage package = PackageSourcePackage.Open(packageBytes);
+            if (!string.Equals(package.Descriptor.SourceId, expectedSourceId, StringComparison.Ordinal))
+                throw new InvalidDataException("The new revision declares a different source ID");
+            return Commit(package, true);
+        }
         public PackageSourceRegistryEntry InstallBytes(byte[] packageBytes) { return Install(packageBytes); }
 
-        PackageSourceRegistryEntry Commit(PackageSourcePackage package)
+        PackageSourceRegistryEntry Commit(PackageSourcePackage package, bool replaceSameVersion = false)
         {
             string id = package.Descriptor.SourceId;
             string version = package.Descriptor.Version;
@@ -147,6 +158,7 @@ namespace Orbis
             string staging = OwnedChild(_stagingRoot, Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(staging);
             bool moved = false;
+            string retired = null;
             try
             {
                 package.ExtractTo(staging);
@@ -160,12 +172,26 @@ namespace Orbis
                     if (Directory.Exists(finalPath))
                     {
                         string existingDescriptor = Path.Combine(finalPath, "source.json");
-                        if (!File.Exists(existingDescriptor) ||
-                            !BytesEqual(File.ReadAllBytes(existingDescriptor), package.GetFile("source.json")))
-                            throw new InvalidDataException("Source id/version already exists with different contents");
-                        if (!DirectoryTreeEqual(finalPath, staging))
+                        bool same = File.Exists(existingDescriptor) &&
+                            BytesEqual(File.ReadAllBytes(existingDescriptor), package.GetFile("source.json")) &&
+                            DirectoryTreeEqual(finalPath, staging);
+                        if (same) Directory.Delete(staging, true);
+                        else if (!replaceSameVersion)
+                        {
+                            if (!File.Exists(existingDescriptor) ||
+                                !BytesEqual(File.ReadAllBytes(existingDescriptor), package.GetFile("source.json")))
+                                throw new InvalidDataException("Source id/version already exists with different contents");
                             throw new InvalidDataException("Source id/version already exists with different payload files");
-                        Directory.Delete(staging, true);
+                        }
+                        else
+                        {
+                            // Set the current files aside until the registry points at the new
+                            // ones; any failure below moves them back.
+                            retired = OwnedChild(_stagingRoot, "retired-" + Guid.NewGuid().ToString("N"));
+                            Directory.Move(finalPath, retired);
+                            Directory.Move(staging, finalPath);
+                            moved = true;
+                        }
                     }
                     else
                     {
@@ -183,6 +209,7 @@ namespace Orbis
                     SaveRegistry(replacement);
                     _entries = replacement;
                     PackageSourceEngineStatic.Invalidate();
+                    if (retired != null) TryDeleteDirectory(retired);
                     return Clone(entry);
                 }
             }
@@ -191,6 +218,8 @@ namespace Orbis
                 TryDeleteDirectory(staging);
                 // If activation failed after move, remove only the just-created immutable version.
                 if (moved) TryDeleteDirectory(finalPath);
+                if (retired != null && Directory.Exists(retired) && !Directory.Exists(finalPath))
+                    try { Directory.Move(retired, finalPath); } catch { }
                 throw;
             }
         }

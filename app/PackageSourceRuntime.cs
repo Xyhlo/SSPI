@@ -269,6 +269,16 @@ namespace Orbis
             catch (Exception ex) { error = RootMessage(ex); return false; }
         }
 
+        internal List<PackageSourceRegistryEntry> InstalledSources() { return Store().GetInstalledSources(); }
+
+        /// <summary>Replaces an installed source with a newer revision of the same source ID.</summary>
+        internal bool InstallUpdate(byte[] bytes, string sourceId, out string error)
+        {
+            error = null;
+            try { Store().InstallUpdate(bytes, sourceId); InvalidateCatalogs(); return true; }
+            catch (Exception ex) { error = RootMessage(ex); return false; }
+        }
+
         public SourceSearchPage SearchPage(string query, int offset, int limit,
             Action<SourceSearchPage> progress, Func<bool> cancel, out string error, string region = "", bool freshSearch = false)
         {

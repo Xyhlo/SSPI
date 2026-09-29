@@ -119,12 +119,59 @@ namespace Orbis
                     UpdateSourceInstall(SourceInstallStage.Validating,0,0,"Checking source format and limits...");
                     string error;bool installed=bytes!=null?_packageSources.Install(bytes,out error):_packageSources.Install(path,out error);
                     if (!installed) throw new IOException(error);
+                    // Follow this directory source so its maintainer's revisions reach this console.
+                    if (entry!=null) CommunitySourceUpdates.RecordInstall(PackageSourcePackage.Open(bytes).Descriptor.SourceId,entry);
                     Interlocked.Exchange(ref _sourceBrowserComplete, () => { _sourceBrowserBusy=false;UpdateSourceInstall(SourceInstallStage.Complete,1,1,"Source installed and ready");SourcesChanged();SetStatus("Source installed and ready");Invalidated=true; });
                 } catch(Exception ex) {
                     string error=Clip(ex.Message,120);
                     Interlocked.Exchange(ref _sourceBrowserComplete, () => { _sourceBrowserBusy=false;UpdateSourceInstall(SourceInstallStage.Failed,0,0,error);SetStatus("Source could not be installed: "+error);Invalidated=true; });
                 }
             });
+        }
+        // Installed community sources follow their maintainers' revisions: checked a little
+        // after launch and then every six hours (30 minutes after a failed check), on a
+        // background thread. Updates are applied there; the UI thread reloads and notifies.
+        long _nextSourceUpdateCheck;
+        volatile bool _sourceUpdateBusy;
+        CommunitySourceUpdates.Result _sourceUpdateResult;
+        void StartSourceUpdateCheck()
+        {
+            if (!_startupServicesReady || !_launchFinished || _sourceUpdateBusy || _sourceBrowserBusy || _packageSources == null) return;
+            long now = DateTime.UtcNow.Ticks;
+            if (_nextSourceUpdateCheck == 0) { _nextSourceUpdateCheck = DateTime.UtcNow.AddSeconds(20).Ticks; return; }
+            if (now < _nextSourceUpdateCheck) return;
+            try { if (string.IsNullOrEmpty(CommunitySources.Endpoint)) throw new InvalidOperationException(); }
+            catch { _nextSourceUpdateCheck = DateTime.UtcNow.AddHours(6).Ticks; return; }
+            _nextSourceUpdateCheck = DateTime.UtcNow.AddHours(6).Ticks;
+            _sourceUpdateBusy = true;
+            new Thread(() =>
+            {
+                try
+                {
+                    var result = CommunitySourceUpdates.Check(_packageSources, null);
+                    if (result.Error.Length > 0) _nextSourceUpdateCheck = DateTime.UtcNow.AddMinutes(30).Ticks;
+                    if (result.Updated.Count > 0) Interlocked.Exchange(ref _sourceUpdateResult, result);
+                }
+                catch (Exception ex)
+                {
+                    _nextSourceUpdateCheck = DateTime.UtcNow.AddMinutes(30).Ticks;
+                    SspiLog.Write("network", "event=community_source_updates result=failed exception=" + ex.GetType().Name + ": " + ex.Message);
+                }
+                finally { _sourceUpdateBusy = false; Invalidated = true; }
+            }) { IsBackground = true, Name = "SSPI source updates" }.Start();
+        }
+        void ApplySourceUpdates()
+        {
+            var result = Interlocked.Exchange(ref _sourceUpdateResult, null);
+            if (result == null) return;
+            SourcesChanged();
+            string text = result.Updated.Count == 1
+                ? "Source updated: " + Clip(result.Updated[0].Name, 60) + " (revision " + result.Updated[0].Revision + ")"
+                : result.Updated.Count + " sources updated to their latest revisions";
+            User.NotifyToast(text);
+            User.NotifySystem("SSPI: " + text);
+            SetStatus(text);
+            Invalidated = true;
         }
         // The source is always downloaded live and verified (identity, size, hash and
         // format) by CommunitySources.Download; only the wording of network failures changes.
@@ -156,7 +203,7 @@ namespace Orbis
             int start=Math.Max(0,_settingsFocus-4);
             for(int i=0;i<5 && start+i<count;i++) {
                 int n=start+i;string name,detail,action;
-                if(community && n<_communityEntries.Count) {var e=_communityEntries[n];name=e.Name.Length>0?e.Name:"Community source";detail=Clip(e.Tags+" · "+e.Date+" · "+(e.Size/1024)+" KiB",100);action="Install";}
+                if(community && n<_communityEntries.Count) {var e=_communityEntries[n];name=e.Name.Length>0?e.Name:"Community source";detail=Clip(e.Tags+" · "+(e.Revision>1?"Updated "+e.Date+" · revision "+e.Revision:e.Date)+" · "+(e.Size/1024)+" KiB",100);action="Install";}
                 else if(community){name="Next page";detail="More community sources";action="Browse";}
                 else {string p=_sourcePaths[n];name=_sourceBrowseMode==1?SourceUsbName(p):Path.GetFileName(p);detail=_sourceBrowseMode==1?"USB drive "+(p[8]-'0'+1)+" · Browse source files":Directory.Exists(p)?"Open folder":"Package source file";action=Directory.Exists(p)?"Open":"Install";}
                 DrawSettingsRow(r,x,sheet.y+115+i*97,w,86,n,name,detail,action);
@@ -164,7 +211,7 @@ namespace Orbis
             if(count==0)TextWrapped(r,x,sheet.y+160,23,w,_sourceBrowseError.Length>0?_sourceBrowseError:community?DistributionSettings.EmptyDirectoryMessage:"No sources found. Connect a USB drive with .gssource files.",Muted);
             if(community && _settingsFocus<_communityEntries.Count) {
                 var e=_communityEntries[_settingsFocus];TextPx(r,x,sheet.y+630,17,Clip(e.Message,135),Muted);
-                TextPx(r,x,sheet.y+665,14,DistributionSettings.ReportLabel+e.Id,Dim);
+                TextPx(r,x,sheet.y+665,14,DistributionSettings.ReportLabel+(e.Source.Length>0?e.Source:e.Id),Dim);
             }
         }
     }

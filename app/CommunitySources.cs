@@ -16,8 +16,20 @@ namespace Orbis
 {
     internal sealed class CommunitySourceEntry
     {
-        internal string Id, Name, Message, Tags, Date;
+        // Id is the SHA-256 of the entry's current file. Source is its permanent
+        // directory ID, which stays the same when the maintainer publishes a revision.
+        internal string Id, Name, Message, Tags, Date, Source = "";
         internal long Size;
+        internal int Revision = 1;
+    }
+
+    /// <summary>One answer of the directory's status lookup: the current revision of the
+    /// source a permanent ID or file hash belongs to, or Missing when it is not listed.</summary>
+    internal sealed class CommunitySourceStatus
+    {
+        internal string Query = "";
+        internal CommunitySourceEntry Entry;
+        internal bool Missing, Removed;
     }
 
     internal enum CommunityDirectoryProblem
@@ -128,17 +140,53 @@ namespace Orbis
             if (rows == null || rows.Count > 30) throw new InvalidDataException("Invalid directory entries");
             var result = new List<CommunitySourceEntry>();
             foreach (object row in rows) {
-                try {
-                    var d = row as Dictionary<string, object>; if (d == null) continue;
-                    string id = Text(d, "id", 64); if (!ValidId(id)) continue;
-                    string encoded = Text(d, "meta", 12000);
-                    var metadata = PackageSourceJson.Parse(Encoding.UTF8.GetString(OpenEnvelope(encoded, 8192))) as Dictionary<string, object>;
-                    if (metadata == null || Text(metadata,"id",64) != id) continue;
-                    long size = Convert.ToInt64(d["size"]); if (size < 1 || size > PackageSourcePackage.MaximumCompressedBytes) continue;
-                    var tags = new List<string>(); object raw; var list = metadata.TryGetValue("tags", out raw) ? raw as IList : null;
-                    if (list != null) foreach (var tag in list) { if (tag is string && tags.Count < 5) tags.Add(Text(new Dictionary<string, object>{{"t",tag}},"t",24)); }
-                    result.Add(new CommunitySourceEntry { Id=id, Name=Text(metadata,"name",80), Message=Text(metadata,"message",500), Tags=string.Join(" · ",tags.ToArray()), Date=Text(d,"date",10),Size=size });
-                } catch { /* An invalid submission must not break the whole page. */ }
+                try { var entry = ParseEntry(row as Dictionary<string, object>); if (entry != null) result.Add(entry); }
+                catch { /* An invalid submission must not break the whole page. */ }
+            }
+            return result;
+        }
+        /// <summary>One authenticated directory row, or null. The encrypted metadata must
+        /// name the same file hash as the row, as published clients also require.</summary>
+        static CommunitySourceEntry ParseEntry(Dictionary<string, object> d)
+        {
+            if (d == null) return null;
+            string id = Text(d, "id", 64); if (!ValidId(id)) return null;
+            string encoded = Text(d, "meta", 12000);
+            var metadata = PackageSourceJson.Parse(Encoding.UTF8.GetString(OpenEnvelope(encoded, 8192))) as Dictionary<string, object>;
+            if (metadata == null || Text(metadata,"id",64) != id) return null;
+            long size = Convert.ToInt64(d["size"]); if (size < 1 || size > PackageSourcePackage.MaximumCompressedBytes) return null;
+            var tags = new List<string>(); object raw; var list = metadata.TryGetValue("tags", out raw) ? raw as IList : null;
+            if (list != null) foreach (var tag in list) { if (tag is string && tags.Count < 5) tags.Add(Text(new Dictionary<string, object>{{"t",tag}},"t",24)); }
+            // Entries shared before revisions existed use their first file hash as source ID.
+            string source = Text(d, "source", 64); if (!ValidId(source)) source = id;
+            int revision = 1; object value;
+            if (d.TryGetValue("revision", out value) && value != null) { try { revision = Math.Max(1, Math.Min(1000000, Convert.ToInt32(value, CultureInfo.InvariantCulture))); } catch { } }
+            return new CommunitySourceEntry { Id=id, Source=source, Revision=revision, Name=Text(metadata,"name",80), Message=Text(metadata,"message",500), Tags=string.Join(" · ",tags.ToArray()), Date=Text(d,"date",10),Size=size };
+        }
+        internal const int MaximumStatusQueries = 64;
+        /// <summary>Current revisions for permanent source IDs or file hashes (a hash of any
+        /// retained revision resolves to its source). Throws on a network or format failure.</summary>
+        internal static List<CommunitySourceStatus> Status(IList<string> queries, int timeoutMs = 30000, Func<bool> cancel = null)
+        {
+            if (queries == null || queries.Count == 0 || queries.Count > MaximumStatusQueries) throw new ArgumentException("Invalid status request");
+            foreach (string query in queries) if (!ValidId(query)) throw new ArgumentException("Invalid status request");
+            string response = NetHttp.GetStringDirect(Endpoint + "status?ids=" + string.Join(",", new List<string>(queries).ToArray()), timeoutMs, null, Client,
+                null, NetHttp.DefaultResponseBytes, cancel);
+            if (response == null || response.Length > MaximumDirectoryResponse * 2) throw new InvalidDataException("Directory response too large");
+            var root = PackageSourceJson.Parse(response) as Dictionary<string, object>;
+            object value; var rows = root != null && root.TryGetValue("items", out value) ? value as IList : null;
+            if (rows == null || rows.Count > queries.Count) throw new InvalidDataException("Invalid status response");
+            var result = new List<CommunitySourceStatus>();
+            foreach (object row in rows)
+            {
+                var d = row as Dictionary<string, object>; if (d == null) continue;
+                string query = Text(d, "query", 64); if (!queries.Contains(query)) continue;
+                var status = new CommunitySourceStatus { Query = query };
+                object flag;
+                if (d.TryGetValue("missing", out flag) && Equals(flag, true))
+                { status.Missing = true; status.Removed = d.TryGetValue("removed", out flag) && Equals(flag, true); }
+                else { try { status.Entry = ParseEntry(d); } catch { } if (status.Entry == null) continue; }
+                result.Add(status);
             }
             return result;
         }
