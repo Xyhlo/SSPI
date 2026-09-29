@@ -30,6 +30,15 @@ namespace Orbis
                     NeedsAction = NeedsAction, RetryAfterSeconds = RetryAfterSeconds, HttpStatusCode = HttpStatusCode };
         }
 
+        /// <summary>A host this build cannot download from without a link service (a wait
+        /// or captcha page, or an app-only host). The package's other mirrors may work.</summary>
+        internal static DebridResolutionError FreeHostUnavailable(string url, string message)
+        {
+            return new DebridResolutionError("Free download", HostName(url), message, true, "FREE_HOST_UNAVAILABLE");
+        }
+
+        internal string Reason { get { return Detail; } }
+
         internal static DebridResolutionError AmbiguousCreate(string provider, string url, string code, string message)
         {
             return new DebridResolutionError(provider, HostName(url), message, false, code, false) { NeedsAction = true };

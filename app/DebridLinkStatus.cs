@@ -61,6 +61,7 @@ namespace Orbis
             foreach (var lookup in lookups)
             {
                 var current = lookup.Get(candidate);
+                if (current == null) continue;
                 if (best == null || Rank(current) < Rank(best)) best = current;
             }
             return best;
@@ -141,7 +142,9 @@ namespace Orbis
             lock (stateLock)
             {
                 DebridLinkStatus status;
-                return states.TryGetValue(candidate, out status) ? status : Unknown;
+                // Only the first MaximumCandidates rows are checked. Null lets the caller
+                // fall back to the saved host list instead of hiding later mirrors.
+                return states.TryGetValue(candidate, out status) ? status : null;
             }
         }
 

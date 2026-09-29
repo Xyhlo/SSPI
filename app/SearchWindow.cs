@@ -2744,10 +2744,22 @@ namespace Orbis
             }
         }
 
+        // No enabled link service's host list could be read (only cached lists are
+        // consulted; no request is made here), so every mirror is unverified.
+        bool HostListsUnavailable()
+        {
+            string[] enabled = UnlockProviders.EnabledIds(_cfg);
+            if (_cfg == null || enabled.Length == 0) return false;
+            foreach (string id in enabled)
+                if (DebridHostSupport.Load(_cfg, id, false) != null) return false;
+            return true;
+        }
+
         string ResolveEmptyHeading()
         {
             if (string.IsNullOrEmpty(_resolveError) && _links.Count > 0 && _detailTypeCounts[0] == 0)
-                return _linkStatusLookup != null && _linkStatusLookup.IsChecking ? "Checking supported mirrors" : "No supported mirrors";
+                return _linkStatusLookup != null && _linkStatusLookup.IsChecking ? "Checking supported mirrors" :
+                    HostListsUnavailable() ? "Supported hosts could not be checked" : "No supported mirrors";
             return !string.IsNullOrEmpty(_resolveError) ? "Packages unavailable" :
                 _links.Count == 0 ? "No packages published" : "No matching packages";
         }
@@ -2756,7 +2768,9 @@ namespace Orbis
         {
             if (!string.IsNullOrEmpty(_resolveError)) return _resolveError;
             if (_links.Count > 0 && _detailTypeCounts[0] == 0)
-                return "Only hosts supported by your enabled services are shown. Retry the check, choose another region, or check Connections.";
+                return HostListsUnavailable()
+                    ? "SSPI could not read your link service's list of supported hosts, so no mirror can be shown yet. Check the network, then retry the check or check Connections."
+                    : "Only hosts supported by your enabled services are shown. Retry the check, choose another region, or check Connections.";
             if (_links.Count > 0) return "Choose another package type, host or version.";
             return "This source has no published packages for the selected title and region. Try another title or region.";
         }

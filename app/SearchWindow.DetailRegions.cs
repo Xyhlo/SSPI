@@ -134,7 +134,7 @@ namespace Orbis
                 string name = RegionName(variants[best]);
                 if (bestSummary.Base > 0 && current.Base == 0)
                 {
-                    _regionNoticeHeadline = current.Total == 0 ? "No packages in this region" :
+                    _regionNoticeHeadline = current.Total == 0 ? EmptyRegionHeadline() :
                         current.Update > 0 && current.Dlc == 0 && current.Other == 0 ? "Updates only in this region" : "No base game in this region";
                     _regionNoticeDetail = name + " has the base game" + (more > 0 ? " and " + more + " more" : "");
                 }
@@ -149,12 +149,19 @@ namespace Orbis
             }
             if (current.Base == 0 && firstUnchecked >= 0)
             {
-                _regionNoticeHeadline = current.Total == 0 ? "No packages in this region" :
+                _regionNoticeHeadline = current.Total == 0 ? EmptyRegionHeadline() :
                     current.Update > 0 && current.Dlc == 0 && current.Other == 0 ? "Updates only in this region" : "No base game in this region";
                 _regionNoticeDetail = uncheckedCount + (uncheckedCount == 1 ? " other region not checked yet" : " other regions not checked yet");
                 _regionNoticeAction = "Check " + RegionName(variants[firstUnchecked]);
                 _regionNoticeTarget = firstUnchecked;
             }
+        }
+
+        // The summary counts supported mirrors only; listed packages on unsupported
+        // hosts are not "no packages".
+        string EmptyRegionHeadline()
+        {
+            return _linkPresentation != null && _linkPresentation.Count > 0 ? "No supported mirrors in this region" : "No packages in this region";
         }
 
         // L2 target: the most complete known region, then an unchecked region

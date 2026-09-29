@@ -3997,8 +3997,7 @@ namespace Orbis
                     }
                     try
                     {
-                        direct = FreeHosterClient.ResolveDirect(job.HosterUrl,
-                            string.Equals(job.AccessType, "HosterLanding", StringComparison.OrdinalIgnoreCase));
+                        direct = ResolveFreeHost(job, attempt);
                         foregroundStatus = "Downloading (free)...";
                     }
                     catch (Exception freeEx)
@@ -4463,6 +4462,13 @@ namespace Orbis
                     ? "Real-Debrid temporary error " + wait.State + " · retry " + job.ProviderTransientRetries + "/" + RealDebridClient.TransientCreateRetries + " · other downloads continue"
                     : wait.State == "provider request slot"
                         ? "Waiting for " + UnlockProviders.DisplayName(provider) + " request slot · other downloads continue"
+                    // TorBox refuses new cloud downloads while every slot on the plan is busy.
+                    : wait.State == "ACTIVE_LIMIT"
+                        ? "Waiting for a free " + UnlockProviders.DisplayName(provider) + " download slot · retries automatically"
+                    : wait.State == "COOLDOWN_LIMIT"
+                        ? "Waiting for the " + UnlockProviders.DisplayName(provider) + " cooldown · retries automatically"
+                    : wait.State == "waiting for capacity"
+                        ? "Waiting for " + UnlockProviders.DisplayName(provider) + " capacity (download slots or cooldown) · retries automatically"
                         : "Preparing in " + UnlockProviders.DisplayName(provider) + " · other downloads continue";
                 _nextJobStartAt = TransferClockMs();
             }
@@ -5770,6 +5776,50 @@ namespace Orbis
             if (cancel()) throw new OperationCanceledException();
             if (!SaveManifest()) throw new IOException("Could not save the renewed provider lease for archive part " + (index + 1));
             return fresh;
+        }
+
+        /// <summary>Free path. When the chosen mirror's host cannot be used without a link
+        /// service (a wait or captcha page, or an app-only host), the package's other
+        /// mirrors are tried before the job stops; the first host's reason is reported.</summary>
+        string ResolveFreeHost(DlItem job, int attempt)
+        {
+            string original = job.HosterUrl, firstFailure = null;
+            var mirrors = PackageMirrorFallback.Decode(job.MirrorCandidates);
+            Func<bool> cancelled = () => job.AttemptId != attempt || job.CancelRequested || job.PauseRequested;
+            try
+            {
+                return PackageMirrorFallback.Resolve(original, job.MirrorCandidates,
+                    url =>
+                    {
+                        var mirror = url == original ? null : mirrors.Find(candidate => candidate.Url == url);
+                        string access = mirror != null ? mirror.AccessType : job.AccessType;
+                        if (mirror != null && IsDirectAccess(access)) return url;
+                        try { return FreeHosterClient.ResolveDirect(url, string.Equals(access, "HosterLanding", StringComparison.OrdinalIgnoreCase)); }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception ex)
+                        {
+                            if (firstFailure == null) firstFailure = ex.Message;
+                            throw DebridResolutionError.FreeHostUnavailable(url, ex.Message);
+                        }
+                    },
+                    () => !cancelled() && CanSwitchMirror(job),
+                    mirror =>
+                    {
+                        lock (_lock)
+                        {
+                            if (cancelled()) throw new OperationCanceledException();
+                            mirrors.RemoveAll(candidate => candidate.Url == original || candidate.Url == mirror.Url);
+                            ApplyMirrorLocked(job, mirror);
+                            job.MirrorCandidates = PackageMirrorFallback.EncodeMirrors(mirrors);
+                        }
+                        SspiLog.Write("download", "event=free-mirror-selected from=" + DebridResolutionError.HostName(original) +
+                            " to=" + DebridResolutionError.HostName(mirror.Url));
+                        if (!SaveManifest()) throw new IOException("Could not save the selected package mirror");
+                    },
+                    text => { lock (_lock) { if (job.AttemptId == attempt) job.StatusText = text; } },
+                    cancelled);
+            }
+            catch (DebridResolutionError ex) { throw new Exception(firstFailure ?? ex.Reason); }
         }
 
         string ResolveJobHost(DlItem job, int attempt, ISet<string> unavailable = null, DebridResolutionError prepareFailure = null)

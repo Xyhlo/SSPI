@@ -16,6 +16,9 @@ namespace Orbis
             string text = error ?? "Download failed";
             if (text.IndexOf("hoster_unsupported", StringComparison.OrdinalIgnoreCase) >= 0) return "This host is not supported by your link service. Try another mirror.";
             if (text.IndexOf("80991404", StringComparison.OrdinalIgnoreCase) >= 0) return text + " — package link expired (HTTP 404). Files kept; retry refreshes the local link.";
+            // A pasted direct link that the host has retired answers 410 Gone; only a new link helps.
+            if (text.StartsWith("HTTP 410", StringComparison.Ordinal))
+                return "The download link has expired (HTTP 410). Send a fresh link or choose another mirror.";
             return text;
         }
 
