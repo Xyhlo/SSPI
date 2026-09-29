@@ -59,6 +59,12 @@ namespace Orbis
         static extern int gs_extract_rar_password_diagnostic(IntPtr first, IntPtr destination,
             IntPtr names, IntPtr paths, int volumes, IntPtr packages, int capacity,
             NativeArchiveProgress progress, IntPtr password, NativeRarDiagnostic diagnostic);
+        // Same decoder; an archive that holds only another archive has that archive
+        // written to destination/nested and listed in volume order (gs_unrar.h).
+        [DllImport("libGameSearchResident.prx", CallingConvention = CallingConvention.Cdecl)]
+        static extern int gs_extract_rar_nested(IntPtr first, IntPtr destination,
+            IntPtr names, IntPtr paths, int volumes, IntPtr packages, int capacity,
+            NativeArchiveProgress progress, IntPtr password, NativeRarDiagnostic diagnostic, out int nested);
 
         /// <summary>Regression seam. Null in production, where the console's UnRAR module is
         /// called directly; the managed harness substitutes a decoder double so the retry
@@ -79,6 +85,17 @@ namespace Orbis
             Func<bool> cancel, Action<long, long> progress, string password,
             IList<string> volumeNames = null, Action<string> diagnostic = null)
         {
+            bool nested;
+            return ReadNativeRar(paths, destination, cancel, progress, password, volumeNames, diagnostic, false, out nested);
+        }
+
+        /// <summary>With allowNested, a RAR that holds only another archive returns that
+        /// archive's files (nested = true) instead of the "holds another archive" error.</summary>
+        static List<PackageArchiveEntry> ReadNativeRar(IList<string> paths, string destination,
+            Func<bool> cancel, Action<long, long> progress, string password,
+            IList<string> volumeNames, Action<string> diagnostic, bool allowNested, out bool nested)
+        {
+            nested = false;
             if (paths == null || paths.Count == 0 || paths.Count > 512 ||
                 (volumeNames != null && volumeNames.Count != paths.Count))
                 throw new InvalidDataException("Invalid RAR volume set");
@@ -133,16 +150,34 @@ namespace Orbis
                 IntPtr first = Marshal.ReadIntPtr(nativePaths);
                 IntPtr archiveDestination = ArchiveUtf8(destination, allocations);
                 IntPtr suppliedPassword = ArchiveUtf8(password ?? "", allocations);
-                int count = NativeRarOverride != null
-                    ? NativeRarOverride(first, archiveDestination, nativeNames, nativePaths, paths.Count,
-                        packages, MaximumPackageEntries, callback, suppliedPassword, trace)
-                    : gs_extract_rar_password_diagnostic(first, archiveDestination, nativeNames, nativePaths,
+                int nestedResult = 0, count;
+                if (NativeRarOverride != null)
+                    count = NativeRarOverride(first, archiveDestination, nativeNames, nativePaths, paths.Count,
+                        packages, MaximumPackageEntries, callback, suppliedPassword, trace);
+                else if (allowNested)
+                {
+                    // The entry point is resolved before the decoder runs, so a module
+                    // without it falls back to the plain reader and its 1007 result.
+                    try {
+                        count = gs_extract_rar_nested(first, archiveDestination, nativeNames, nativePaths,
+                            paths.Count, packages, MaximumPackageEntries, callback, suppliedPassword, trace, out nestedResult);
+                    }
+                    catch (EntryPointNotFoundException) {
+                        count = gs_extract_rar_password_diagnostic(first, archiveDestination, nativeNames, nativePaths,
+                            paths.Count, packages, MaximumPackageEntries, callback, suppliedPassword, trace);
+                    }
+                }
+                else
+                    count = gs_extract_rar_password_diagnostic(first, archiveDestination, nativeNames, nativePaths,
                         paths.Count, packages, MaximumPackageEntries, callback, suppliedPassword, trace);
                 if (callbackError != null) throw callbackError;
                 if (count <= 0 || count > MaximumPackageEntries) {
                     string detail;
                     switch (-count) {
                         case 22: case 24: detail = "RAR password rejected; check the password supplied by the source"; break;
+                        case 1011: detail = "RAR password is probably incorrect: an encrypted package did not decode to a PKG. Enter its password and retry"; break;
+                        case 1012: detail = "RAR set is incomplete: a later volume is missing. Supply every volume, then retry"; break;
+                        case 1013: detail = "RAR data check failed on an encrypted file: the password is probably incorrect, or the archive is damaged. Enter its password and retry"; break;
                         case 15: case 18: detail = "RAR volume could not be read; check that every volume finished downloading"; break;
                         case 11: case 25: detail = "RAR dictionary or expanded size exceeds the supported memory limit"; break;
                         // Same causes and wording as the background worker (gs_archive_job.inc).
@@ -164,6 +199,7 @@ namespace Orbis
                         case 1002: detail = "RAR was read successfully but contains no PKG files; check that the source supplied a PS4 package archive"; break;
                         case 1006: detail = "RAR holds an extracted game folder (eboot.bin/sce_sys), not an installable PKG. SSPI installs PKG files only; choose another mirror"; break;
                         case 1007: detail = "RAR holds another archive instead of a PKG. Extract it on a computer or choose another mirror"; break;
+                        case 1010: detail = "RAR holds another archive. Unpacking it needs free space of about twice that archive's size on the staging drive; free space and retry, or extract it on a computer"; break;
                         case 1008: detail = "RAR holds split PKG pieces that must be joined first; choose another mirror"; break;
                         case 1003: detail = "Another RAR extraction is still running; retry after it finishes"; break;
                         case 1005: detail = "RAR decoder initialization failed; restart SSPI after installing the updated package"; break;
@@ -184,6 +220,7 @@ namespace Orbis
                     entries.Add(new PackageArchiveEntry { Name = Path.GetFileName(path),
                         Size = Marshal.ReadInt64(entry, 1024), ExtractedPath = path });
                 }
+                nested = nestedResult == 1;
                 return entries;
             }
             catch (DllNotFoundException) { throw new IOException("RAR decoder is unavailable; reinstall the current SSPI package. Archive retained."); }
@@ -525,6 +562,13 @@ namespace Orbis
             string destination, Func<bool> cancel, Action<long, long> progress, string password = null, string[] passwordFallbacks = null,
             IList<string> volumeNames = null, Action<string> diagnostic = null)
         {
+            return ExtractPackages(paths, destination, cancel, progress, password, passwordFallbacks, volumeNames, diagnostic, true);
+        }
+
+        static List<PackageArchiveEntry> ExtractPackages(IList<string> paths,
+            string destination, Func<bool> cancel, Action<long, long> progress, string password, string[] passwordFallbacks,
+            IList<string> volumeNames, Action<string> diagnostic, bool allowNested)
+        {
             if (paths == null || paths.Count == 0) throw new InvalidDataException("Missing archive volume 1");
             CheckCancel(cancel);
             Directory.CreateDirectory(destination);
@@ -538,13 +582,22 @@ namespace Orbis
             {
                 var tried = new HashSet<string>(StringComparer.Ordinal);
                 int next = 0;
+#if SSPI_PS4
+                List<PackageArchiveEntry> inner = null;
+#endif
                 for (;;)
                 {
                     CheckCancel(cancel);
                     tried.Add(password ?? "");
                     try {
 #if SSPI_PS4
-                        return ReadNativeRar(paths, Path.GetFullPath(destination), cancel, progress, password, volumeNames, diagnostic);
+                        bool nested;
+                        var entries = ReadNativeRar(paths, Path.GetFullPath(destination), cancel, progress, password,
+                            volumeNames, diagnostic, allowNested, out nested);
+                        if (!nested) return entries;
+                        // Outside this retry: the inner archive has its own password attempts.
+                        inner = entries;
+                        break;
 #else
                         return ReadRar(paths, Path.GetFullPath(destination), cancel, progress, password);
 #endif
@@ -567,11 +620,42 @@ namespace Orbis
                         if (progress != null) progress(0, 0);
                     }
                 }
+#if SSPI_PS4
+                return ExtractInnerArchive(inner, Path.GetFullPath(destination), cancel, progress, password, passwordFallbacks, diagnostic);
+#endif
             }
             if (paths.Count == 1 && kind == PackageObjectKind.Zip)
                 return ReadZip(paths[0], Path.GetFullPath(destination), cancel, progress);
             if (kind == PackageObjectKind.Zip) throw new InvalidDataException(ZipFailureMessage(2001));
             throw new InvalidDataException("Not a supported archive");
+        }
+
+        /// <summary>The download held only another archive, which the decoder wrote to
+        /// destination/nested. Extract it with the normal readers (never nesting again),
+        /// then remove those temporary copies; the downloaded archive stays retained.</summary>
+        static List<PackageArchiveEntry> ExtractInnerArchive(List<PackageArchiveEntry> files, string destination,
+            Func<bool> cancel, Action<long, long> progress, string password, string[] passwordFallbacks, Action<string> diagnostic)
+        {
+            var paths = files.ConvertAll(file => file.ExtractedPath);
+            try
+            {
+                if (diagnostic != null) diagnostic("decoder=nested stage=inner-archive files=" + paths.Count + " first=" + Path.GetFileName(paths[0]));
+                PackageObjectKind kind = Detect(paths[0]);
+                if (kind != PackageObjectKind.Rar4 && kind != PackageObjectKind.Rar5 &&
+                    kind != PackageObjectKind.Zip && kind != PackageObjectKind.SevenZip)
+                    throw new InvalidDataException("The archive inside this download is not a supported RAR, ZIP or 7z archive. Extract it on a computer or choose another mirror. Archive retained.");
+                if (progress != null) progress(0, 0);
+                return ExtractPackages(paths, destination, cancel, progress, password, passwordFallbacks, null, diagnostic, false);
+            }
+            finally
+            {
+                foreach (string path in paths)
+                {
+                    try { File.Delete(path); } catch (Exception) { }
+                    try { File.Delete(path + ".part"); } catch (Exception) { }
+                }
+                try { Directory.Delete(Path.Combine(destination, "nested")); } catch (Exception) { }
+            }
         }
 
         static void CheckCancel(Func<bool> cancel)
@@ -581,9 +665,10 @@ namespace Orbis
 
         /// <summary>Decides whether a decoder failure may spend another source password.
         /// Executed by ExtractPackages and by the managed regression harness, so the
-        /// policy under test is the policy that ships. Only two things are retryable:
-        /// an explicit password rejection (native 22/24) and an open/list failure that
-        /// happened before any entry payload was decoded while a password was supplied.
+        /// policy under test is the policy that ships. Only three things are retryable:
+        /// an explicit password rejection (native 22/24), an encrypted PKG whose first
+        /// decoded bytes are not a PKG (1011), and an open/list failure that happened
+        /// before any entry payload was decoded while a password was supplied.
         /// A payload CRC or data failure after output work, cancellation, storage and
         /// I/O errors are terminal, so a failure after gigabytes of decoding can never
         /// restart extraction.</summary>
@@ -593,6 +678,8 @@ namespace Orbis
             var evidence = error?.Data?[RarFailureKey] as RarFailureEvidence;
             if (evidence == null) return false;
             if (evidence.Code == 22 || evidence.Code == 24) return true;
+            // Found in the first decoded block of an encrypted PKG, so another try is cheap.
+            if (evidence.Code == 1011) return evidence.Password.Length > 0;
             return evidence.Code == 12 && evidence.Password.Length > 0 &&
                 !evidence.PayloadStarted && evidence.HeaderPhaseReported;
         }

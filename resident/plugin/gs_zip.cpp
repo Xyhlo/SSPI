@@ -167,8 +167,6 @@ extern "C" int gs_extract_zip(const char *first, const char *destination,
                 mz_zip_reader_get_filename(&archive, i, name, sizeof(name)) != needed ||
                 strlen(name) + 1 != needed || !zip_name(name, needed - 1)) throw 2004;
             unsigned mode = stat.m_external_attr >> 16;
-            if (stat.m_is_encrypted || !stat.m_is_supported ||
-                ((mode & 0170000) && (mode & 0170000) != 0100000 && (mode & 0170000) != 0040000)) throw 2005;
             if (stat.m_uncomp_size > zip_max_expanded - ctx.total) throw 2006;
             ctx.total += stat.m_uncomp_size;
             std::string key(name);
@@ -176,6 +174,10 @@ extern "C" int gs_extract_zip(const char *first, const char *destination,
                 if (key[k] == '\\') key[k] = '/';
                 else if (key[k] >= 'A' && key[k] <= 'Z') key[k] += 'a' - 'A';
             }
+            // Only packages are written. An encrypted or unusual bonus file next to
+            // them (a readme, cheats, a patch note archive) is skipped, not fatal.
+            if (!stat.m_is_directory && zip_is_package(key) && (stat.m_is_encrypted || !stat.m_is_supported ||
+                ((mode & 0170000) && (mode & 0170000) != 0100000))) throw 2005;
             if (!seen.insert(key).second) throw 2004;
             if (!stat.m_is_directory) content_hints |= gs_archive_entry_hint(key.c_str(), key.size());
             if (!stat.m_is_directory && zip_is_package(key)) {

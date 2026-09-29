@@ -60,6 +60,12 @@ static inline int gs_archive_write_cause(int error)
 {
     return error == EFBIG ? GS_ARCHIVE_WRITE_TOO_LARGE : error == ENOSPC ? GS_ARCHIVE_WRITE_NO_SPACE : GS_ARCHIVE_WRITE_FAILED;
 }
+/* RAR results beyond UnRAR's own codes. 1011: an encrypted package's first
+ * decoded bytes are not a PKG, so the password is wrong (found at once, cheap to
+ * retry). 1012: a later volume the set refers to was not supplied. 1013: an
+ * encrypted entry failed its data check after decoding: a wrong password or
+ * damage (never retried automatically, it may follow gigabytes of work). */
+enum { GS_RAR_WRONG_PASSWORD = 1011, GS_RAR_MISSING_VOLUME = 1012, GS_RAR_ENCRYPTED_BAD_DATA = 1013 };
 typedef int (*GsArchiveProgress)(int64_t done, int64_t total);
 typedef void (*GsArchiveDiagnostic)(const char *stage, unsigned entry, int result,
     uint32_t dictionary_kib, uint32_t method, uint64_t unpacked_bytes);
@@ -74,6 +80,18 @@ int gs_extract_rar_password_diagnostic(const char *first, const char *destinatio
     const char *const *names, const char *const *paths, int volume_count,
     GsExtractedPkg *packages, int capacity, GsArchiveProgress progress, const char *password,
     GsArchiveDiagnostic diagnostic);
+/* Same as gs_extract_rar_password_diagnostic, but an archive that holds no PKG
+ * and only one other archive (one RAR volume set, ZIP or 7z file) has that
+ * archive written to destination/nested under its own names. packages[] then
+ * lists those files in volume order, the first one to open first, and *nested
+ * is 1; the caller extracts them with its normal reader and removes them with
+ * gs_nested_archive_cleanup. Otherwise *nested is 0. -1010: not enough free
+ * space for the inner archive plus its extracted PKG (about twice its size). */
+int gs_extract_rar_nested(const char *first, const char *destination,
+    const char *const *names, const char *const *paths, int volume_count,
+    GsExtractedPkg *packages, int capacity, GsArchiveProgress progress, const char *password,
+    GsArchiveDiagnostic diagnostic, int *nested);
+void gs_nested_archive_cleanup(const char *destination, const GsExtractedPkg *files, int count);
 int gs_extract_zip(const char *first, const char *destination,
     const char *const *names, const char *const *paths, int volume_count,
     GsExtractedPkg *packages, int capacity, GsArchiveProgress progress);

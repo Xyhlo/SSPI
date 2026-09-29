@@ -110,6 +110,7 @@ error:
     free(gs_volumes); gs_volumes = NULL; gs_volume_count = 0; fclose(file); return -1;
 }
 
+static int gs_archive_nested_pass; /* extracting the archive found inside the download */
 static int gs_archive_progress(int64_t done, int64_t total)
 {
     static uint64_t last, storage_check, control_check;
@@ -134,8 +135,10 @@ static int gs_archive_progress(int64_t done, int64_t total)
     if (!last || changed_total || finished_now || now - last >= 1000000) {
         char message[80];
         last = now; gs_done = done;
-        if (!total && !done) snprintf(message, sizeof(message), "Extracting: reading archive headers");
-        else if (total > 0) snprintf(message, sizeof(message), "Extracting: %lld / %lld MiB", (long long)(done / (1024 * 1024)), (long long)(total / (1024 * 1024)));
+        const char *stage = gs_archive_nested_pass ? "Extracting inner archive" : "Extracting";
+        if (!total && !done) snprintf(message, sizeof(message), "%s: reading archive headers", stage);
+        else if (total > 0) snprintf(message, sizeof(message), "%s: %lld / %lld MiB", stage, (long long)(done / (1024 * 1024)), (long long)(total / (1024 * 1024)));
+        else if (gs_archive_nested_pass) snprintf(message, sizeof(message), "%s: %lld MiB", stage, (long long)(done / (1024 * 1024)));
         else snprintf(message, sizeof(message), "Extracted %lld MiB", (long long)(done / (1024 * 1024)));
         gs_write_status("extracting", message);
     }
@@ -146,7 +149,10 @@ static int gs_rar_header_bad_data, gs_rar_process_started;
 static void gs_reset_rar_retry_evidence(void) { gs_rar_header_bad_data = gs_rar_process_started = 0; }
 static int gs_retry_rar_password(int result, const char *password)
 {
-    if (g_stop || gs_canceled || gs_done > 0) return 0;
+    if (g_stop || gs_canceled) return 0;
+    /* A wrong password on an encrypted PKG is caught in its first decoded block. */
+    if (result == -GS_RAR_WRONG_PASSWORD) return password && password[0];
+    if (gs_done > 0) return 0;
     return result == -22 || result == -24 || (result == -12 && password && password[0] &&
         gs_rar_header_bad_data && !gs_rar_process_started);
 }
@@ -1599,11 +1605,20 @@ static int gs_prepare_archive_extraction(const char *directory)
             if (existing_receipt) goto interrupted;
             gs_write_status("failed", "Archive install ownership exists without its package list. Files retained; inspect PS4 Notifications."); return -1;
         }
+    }
+    for (int ordinal = 1; ordinal <= 256; ordinal++) {
         for (int partial = 0; partial < 2; partial++) {
             snprintf(path, sizeof(path), "%s/pkg-%03d.pkg%s", directory, ordinal, partial ? ".part" : "");
             int existing = gs_nofollow_path(path, 0);
             if (existing == 1) {
-                if (existing_receipt) goto interrupted;
+                /* This job's own receipt and no install journal: outputs of an
+                 * extraction that was interrupted or failed validation. The
+                 * downloaded archive is intact, so extract it again. */
+                if (existing_receipt) {
+                    if (unlink(path) && errno != ENOENT) goto invalid_receipt;
+                    gs_log_write("resident", "archive-retry-cleanup job=%s file=pkg-%03d.pkg%s", gs_job.id, ordinal, partial ? ".part" : "");
+                    continue;
+                }
                 gs_write_status("failed", "Previous extraction files have no ownership receipt. Files retained; start a new archive job."); return -1;
             } else if (existing != 0) goto invalid_receipt;
         }
@@ -1739,16 +1754,25 @@ static int gs_run_archive(void)
     if (gs_prepare_archive_extraction(directory)) goto done;
     extraction_started = 1;
     gs_done = 0; gs_job.total = 0; // The decoder supplies the expanded header total.
-    gs_write_status("extracting", NULL);
+    /* The set being extracted: the download, then once the archive found inside
+     * it (a RAR wrapping another RAR set, ZIP or 7z). Those files are temporary
+     * copies in directory/nested; the download itself is always retained. */
+    const char *set_first = first; const char *const *set_names = names; const char *const *set_paths = paths;
+    int set_count = gs_volume_count, nested = 0, nested_failed = 0, inner_count = 0;
+    GsExtractedPkg *inner = NULL; const char *inner_names[256], *inner_paths[256];
+    gs_archive_nested_pass = 0;
+extract_set:
+    gs_write_status("extracting", inner ? "Extracting the archive found inside the download" : NULL);
     const char *format = seven ? "7z" : zip ? "zip" : "rar";
-    gs_log_write("resident", "archive-dispatch job=%s stage=extract-before format=%s signature_bytes=%u signature=%02x%02x%02x%02x%02x%02x volumes=%d password_set=%d",
-        gs_job.id, format, (unsigned)signature_bytes, signature[0], signature[1], signature[2], signature[3], signature[4], signature[5], gs_volume_count, gs_job.password[0] != 0);
+    gs_log_write("resident", "archive-dispatch job=%s stage=extract-before format=%s signature_bytes=%u signature=%02x%02x%02x%02x%02x%02x volumes=%d password_set=%d nested=%d",
+        gs_job.id, format, (unsigned)signature_bytes, signature[0], signature[1], signature[2], signature[3], signature[4], signature[5], set_count, gs_job.password[0] != 0, inner != NULL);
     char seven_error[256] = {0};
     gs_reset_rar_retry_evidence();
     const char *attempt_password = gs_job.password;
-    count = seven ? (gs_volume_count == 1 ? gs_7z_extract_local_ex(first, directory, packages, 256, gs_archive_progress, seven_error, sizeof(seven_error)) : -3001)
-                : zip ? gs_extract_zip(first, directory, names, paths, gs_volume_count, packages, 256, gs_archive_progress)
-                : gs_extract_rar_password_diagnostic(first, directory, names, paths, gs_volume_count, packages, 256, gs_archive_progress, gs_job.password, gs_archive_diagnostic);
+    count = seven ? (set_count == 1 ? gs_7z_extract_local_ex(set_first, directory, packages, 256, gs_archive_progress, seven_error, sizeof(seven_error)) : -3001)
+                : zip ? gs_extract_zip(set_first, directory, set_names, set_paths, set_count, packages, 256, gs_archive_progress)
+                : inner ? gs_extract_rar_password_diagnostic(set_first, directory, set_names, set_paths, set_count, packages, 256, gs_archive_progress, gs_job.password, gs_archive_diagnostic)
+                : gs_extract_rar_nested(set_first, directory, set_names, set_paths, set_count, packages, 256, gs_archive_progress, gs_job.password, gs_archive_diagnostic, &nested);
     for (int i = 0; rar && gs_retry_rar_password(count, attempt_password) && i < gs_job.password_fallback_count; i++) {
         if (gs_archive_progress(0, 0)) break;
         const char *password = gs_job.password_fallbacks[i];
@@ -1758,14 +1782,49 @@ static int gs_run_archive(void)
         gs_log_write("resident", "archive-password-retry job=%s attempt=%d limit=%d", gs_job.id, i + 2, gs_job.password_fallback_count + 1);
         gs_write_status("extracting", "Extracting: trying another source password");
         gs_reset_rar_retry_evidence(); attempt_password = password;
-        count = gs_extract_rar_password_diagnostic(first, directory, names, paths, gs_volume_count, packages, 256, gs_archive_progress, password, gs_archive_diagnostic);
+        count = inner ? gs_extract_rar_password_diagnostic(set_first, directory, set_names, set_paths, set_count, packages, 256, gs_archive_progress, password, gs_archive_diagnostic)
+            : gs_extract_rar_nested(set_first, directory, set_names, set_paths, set_count, packages, 256, gs_archive_progress, password, gs_archive_diagnostic, &nested);
     }
-    gs_log_write("resident", "archive-dispatch job=%s stage=extract-after format=%s result=%d", gs_job.id, format, count);
+    gs_log_write("resident", "archive-dispatch job=%s stage=extract-after format=%s result=%d nested=%d", gs_job.id, format, count, nested);
+    if (count > 0 && nested && !inner) {
+        /* packages[] lists the inner archive's files in volume order. Keep them and
+         * run this dispatch once more on that archive; its PKGs replace the list. */
+        inner = (GsExtractedPkg *)malloc((size_t)count * sizeof(*inner));
+        if (!inner) {
+            gs_nested_archive_cleanup(directory, packages, count);
+            gs_write_status("failed", "ARCHIVE_FAILED: Not enough memory to open the archive found inside the download. Archive retained.");
+            goto done;
+        }
+        memcpy(inner, packages, (size_t)count * sizeof(*inner)); inner_count = count;
+        for (int i = 0; i < inner_count; i++) {
+            const char *leaf = strrchr(inner[i].path, '/');
+            inner_names[i] = leaf ? leaf + 1 : inner[i].path; inner_paths[i] = inner[i].path;
+        }
+        set_first = inner[0].path; set_names = inner_names; set_paths = inner_paths; set_count = inner_count; nested = 0;
+        memset(signature, 0, sizeof(signature)); input = fopen(set_first, "rb");
+        signature_bytes = input ? fread(signature, 1, sizeof(signature), input) : 0;
+        if (input) fclose(input);
+        zip = signature_bytes >= 4 && (!memcmp(signature, "PK\3\4", 4) || !memcmp(signature, "PK\5\6", 4) || !memcmp(signature, "PK\7\10", 4));
+        seven = signature_bytes >= 6 && !memcmp(signature, "7z\xbc\xaf\x27\x1c", 6);
+        rar = (signature_bytes >= 7 && !memcmp(signature, "Rar!\x1a\7\0", 7)) || (signature_bytes >= 8 && !memcmp(signature, "Rar!\x1a\7\1\0", 8));
+        gs_log_write("resident", "archive-nested job=%s files=%d first=%s format=%s", gs_job.id, inner_count, inner_names[0],
+            seven ? "7z" : zip ? "zip" : rar ? "rar" : "unknown");
+        if (zip || seven || rar) { gs_archive_nested_pass = 1; gs_done = 0; gs_job.total = 0; goto extract_set; }
+        gs_nested_archive_cleanup(directory, inner, inner_count); free(inner); inner = NULL;
+        gs_write_status("failed", "ARCHIVE_FAILED: The archive inside this download is not a supported RAR, ZIP or 7z archive. Extract it on a computer or choose another mirror. Archive retained.");
+        goto done;
+    }
+    if (inner) {
+        /* The inner archive's copies are no longer needed, whatever the result. */
+        gs_nested_archive_cleanup(directory, inner, inner_count); free(inner); inner = NULL;
+        gs_archive_nested_pass = 0; nested_failed = count <= 0;
+    }
     if (count <= 0) {
-        char error[256], detail[300];
+        char error[256], detail[400];
         // A resident stop is not a cancel; done: reports the job as waiting to resume.
         if (gs_canceled || g_stop) { if (gs_canceled) gs_write_status("canceled", "Archive extraction canceled; input retained"); goto done; }
         if (seven) snprintf(error, sizeof(error), "%s", seven_error[0] ? seven_error : "Split 7z archives are not supported; original retained");
+        else if (!zip && count == -1010) snprintf(error, sizeof(error), "RAR holds another archive. Unpacking it needs free space of about twice that archive's size on the staging drive; archive retained. Free space and retry, or extract it on a computer.");
         else if (!zip && count == -1001) snprintf(error, sizeof(error), "RAR header reading timed out; input retained. Remove the queue entry or retry after checking the archive.");
         else if (!zip && count == -1002) snprintf(error, sizeof(error), "RAR scan found no PKG filename or package signature; archive retained. Check that the source supplied a PS4 package archive.");
         else if (count == -1006 || count == -2016) snprintf(error, sizeof(error), "%s holds an extracted game folder (eboot.bin/sce_sys), not an installable PKG. SSPI installs PKG files only; choose another mirror. Archive retained.", zip ? "ZIP" : "RAR");
@@ -1785,6 +1844,9 @@ static int gs_run_archive(void)
         else if (!zip && count == -1005) snprintf(error, sizeof(error), "RAR decoder initialization failed; archive retained. Restart the console after updating SSPI and its background worker.");
         else if (!zip && count == -24) snprintf(error, sizeof(error), "RAR password is incorrect; archive retained. Update its password and retry.");
         else if (!zip && count == -22) snprintf(error, sizeof(error), "RAR password is required; archive retained. Enter its password and retry.");
+        else if (!zip && count == -GS_RAR_WRONG_PASSWORD) snprintf(error, sizeof(error), "RAR password is probably incorrect: an encrypted package did not decode to a PKG. Archive retained; enter its password and retry.");
+        else if (!zip && count == -GS_RAR_MISSING_VOLUME) snprintf(error, sizeof(error), "RAR set is incomplete: a later volume is missing. Archive retained; supply every volume, then retry.");
+        else if (!zip && count == -GS_RAR_ENCRYPTED_BAD_DATA) snprintf(error, sizeof(error), "RAR data check failed on an encrypted file: the password is probably incorrect, or the archive is damaged. Archive retained; enter its password and retry.");
         else if (!zip && count == -15) snprintf(error, sizeof(error), "RAR input could not be opened; archive retained. Check that its storage and all supplied volumes are accessible.");
         // A header block that fails before any entry is decoded is how UnRAR
         // reports encrypted headers opened with a missing or wrong password.
@@ -1792,7 +1854,7 @@ static int gs_run_archive(void)
         else if (!zip && count == -12 && gs_rar_header_bad_data && !gs_rar_process_started)
             snprintf(error, sizeof(error), "RAR headers could not be read: the archive password is missing or incorrect, or the first volume is damaged. Enter its password and retry; archive retained.");
         else snprintf(error, sizeof(error), "%s extraction failed (%d); check missing volumes, storage or archive integrity", zip ? "ZIP" : "RAR", -count);
-        snprintf(detail, sizeof(detail), "ARCHIVE_FAILED: %s", error);
+        snprintf(detail, sizeof(detail), "ARCHIVE_FAILED: %s%s", nested_failed ? "Archive inside the download: " : "", error);
         gs_write_status("failed", detail); goto done;
     }
 validate_packages:

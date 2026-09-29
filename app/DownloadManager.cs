@@ -5866,8 +5866,10 @@ namespace Orbis
                             (url, durable) =>
                             {
                                 lastAttemptUrl = url;
+                                // A volume is an archive part, not a PKG: it has no package ID,
+                                // and the engine refuses any ID longer than 48 characters.
                                 return NetHttp.DownloadFileResumable(url, path, durable,
-                                    null, canceled, 60000, null, null, volume.Sha256, volume.Sha256,
+                                    null, canceled, 60000, null, null, null, volume.Sha256,
                                     (done, total, received) =>
                                     {
                                         lock (_lock)

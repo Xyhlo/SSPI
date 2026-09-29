@@ -13,8 +13,10 @@
 #include <sys/statfs.h>
 #include "../native/storage_space.h"
 #include <new>
+#include <algorithm>
 #include <set>
 #include <string>
+#include <vector>
 #include "../../SDK/vendor/unrar/dll.hpp"
 #include "gs_unrar.h"
 #ifdef GS_RAR_PS4
@@ -107,6 +109,15 @@ struct Extraction {
     unsigned char signature[4];
     unsigned signature_bytes;
     int sniff_error;
+    // An encrypted .pkg entry whose first decoded bytes are not a PKG was opened
+    // with a wrong password (RAR4 file data has no password check value).
+    bool magic_check;
+    unsigned magic_bytes;
+    unsigned char magic[4];
+    // The decoder asked for a volume after the last one supplied.
+    bool missing_volume;
+    // The caller's progress callback asked to stop (cancel or shutdown).
+    bool stopped;
     const char *sniff_destination, *sniff_output;
     const char *sniff_package_path;
     uint64_t sniff_size;
@@ -114,6 +125,8 @@ struct Extraction {
     uint64_t process_us, output_write_us, output_sync_us;
     unsigned content_hints;
     int write_error;
+    // Collected by the header scan only when the caller accepts a nested archive.
+    struct NestedVolumes *nested;
 };
 
 static Extraction *active_extraction;
@@ -156,6 +169,7 @@ static bool rar_progress_stopped(Extraction *ctx)
     uint64_t after = sceKernelGetProcessTime();
     if (ctx->opening && after > before) ctx->opening_since += after - before;
 #endif
+    if (stopped) ctx->stopped = true;
     return stopped;
 }
 
@@ -270,6 +284,7 @@ static int callback(UINT message, LPARAM opaque, LPARAM p1, LPARAM p2)
             ctx->volume_index = i;
             return 1;
         }
+        ctx->missing_volume = true;
         return -1;
     }
     if (message == UCM_PROCESSDATA) {
@@ -309,6 +324,14 @@ static int callback(UINT message, LPARAM opaque, LPARAM p1, LPARAM p2)
             uint64_t write_finished = rar_now_us();
             if (write_finished >= write_started) ctx->output_write_us += write_finished - write_started;
             ctx->written = 4;
+        }
+        if (ctx->magic_check && ctx->magic_bytes < 4) {
+            size_t take = 4 - ctx->magic_bytes;
+            if (take > length) take = length;
+            memcpy(ctx->magic + ctx->magic_bytes, data, take);
+            ctx->magic_bytes += static_cast<unsigned>(take);
+            if (ctx->magic_bytes == 4 && memcmp(ctx->magic, "\x7f\x43\x4e\x54", 4))
+            { ctx->sniff_error = GS_RAR_WRONG_PASSWORD; return -1; }
         }
         if (ctx->output) {
             if (length > ctx->expected - ctx->written) return -1;
@@ -352,6 +375,135 @@ static unsigned entry_hint(const Character *name, size_t capacity)
     return gs_archive_entry_hint(narrow, length);
 }
 
+// Nested archives. A download whose only archive-like entries form one RAR
+// volume set, one ZIP or one 7z (a wrapper around the real archive) is unpacked
+// in two passes: the inner archive keeps its own file names in
+// destination/nested so the decoder finds each next volume by name, then the
+// caller extracts it with its normal reader. Byte-split sets (name.7z.001) and
+// split ZIPs (name.z01) are not joined, so they keep the nested-archive result.
+enum { NESTED_NONE, NESTED_VOLUME, NESTED_UNSUPPORTED };
+enum { NESTED_RAR_PARTS = 1, NESTED_RAR = 2, NESTED_ZIP = 3, NESTED_7Z = 4 };
+struct NestedVolume { std::string group; unsigned order; int format; };
+struct NestedVolumes { std::vector<NestedVolume> volumes; uint64_t total; unsigned unsupported; };
+static const uint64_t nested_margin_bytes = 128ULL * 1024 * 1024;
+
+static bool nested_digits(const char *text, size_t length)
+{
+    if (!length) return false;
+    for (size_t i = 0; i < length; i++) if (text[i] < '0' || text[i] > '9') return false;
+    return true;
+}
+
+// base is a lowercase ASCII file name. RAR orders: name.partN.rar is N;
+// old-style name.rar is 0, name.r00-.r99 are 1-100 and name.s00-.s99 101-200.
+static int nested_volume(const char *base, NestedVolume *volume)
+{
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot == base) return NESTED_NONE;
+    const char *extension = dot + 1;
+    size_t length = strlen(extension);
+    std::string stem(base, dot - base);
+    volume->order = 0;
+    if (length == 3 && !memcmp(extension, "rar", 3)) {
+        size_t part = stem.rfind(".part");
+        size_t digits = part == std::string::npos ? 0 : stem.size() - part - 5;
+        if (part != std::string::npos && part > 0 && digits <= 4 && nested_digits(stem.c_str() + part + 5, digits)) {
+            volume->group = stem.substr(0, part);
+            volume->order = (unsigned)atoi(stem.c_str() + part + 5);
+            volume->format = NESTED_RAR_PARTS;
+        } else { volume->group = stem; volume->format = NESTED_RAR; }
+        return NESTED_VOLUME;
+    }
+    if (length == 3 && (extension[0] == 'r' || extension[0] == 's') && nested_digits(extension + 1, 2)) {
+        volume->group = stem; volume->format = NESTED_RAR;
+        volume->order = (extension[0] == 'r' ? 1 : 101) + (unsigned)atoi(extension + 1);
+        return NESTED_VOLUME;
+    }
+    if ((length == 3 && !memcmp(extension, "zip", 3)) || (length == 2 && !memcmp(extension, "7z", 2))) {
+        volume->group = stem; volume->format = length == 3 ? NESTED_ZIP : NESTED_7Z;
+        return NESTED_VOLUME;
+    }
+    if ((length == 3 && extension[0] == 'z' && nested_digits(extension + 1, 2)) ||
+        (length >= 3 && length <= 4 && nested_digits(extension, length))) return NESTED_UNSUPPORTED;
+    return NESTED_NONE;
+}
+
+// Lowercase ASCII basename for classification; other characters become '?'.
+template <typename Character>
+static void nested_base(const Character *name, size_t capacity, char *base, size_t base_capacity)
+{
+    size_t length = 0, start = 0, used = 0;
+    while (length < capacity && name[length]) length++;
+    for (size_t i = 0; i < length; i++) if (name[i] == '/' || name[i] == '\\') start = i + 1;
+    for (size_t i = start; i < length && used + 1 < base_capacity; i++) {
+        unsigned value = static_cast<unsigned>(name[i]);
+        char c = value < 128 ? static_cast<char>(value) : '?';
+        base[used++] = c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c;
+    }
+    base[used] = 0;
+}
+
+// One group in one format with consecutive volume numbers: partN sets start at
+// 1, old-style sets at the .rar volume, and ZIP/7z are single files.
+static bool nested_set_valid(const NestedVolumes &nested, int capacity)
+{
+    const std::vector<NestedVolume> &volumes = nested.volumes;
+    if (volumes.empty() || nested.unsupported || volumes.size() > static_cast<size_t>(capacity)) return false;
+    std::vector<unsigned> orders;
+    for (size_t i = 0; i < volumes.size(); i++) {
+        if (volumes[i].group != volumes[0].group || volumes[i].format != volumes[0].format) return false;
+        orders.push_back(volumes[i].order);
+    }
+    std::sort(orders.begin(), orders.end());
+    int format = volumes[0].format;
+    if ((format == NESTED_ZIP || format == NESTED_7Z) && orders.size() != 1) return false;
+    unsigned first = format == NESTED_RAR_PARTS ? 1 : 0;
+    for (size_t i = 0; i < orders.size(); i++) if (orders[i] != first + i) return false;
+    return true;
+}
+
+// The inner archive keeps its own name, so the decoder derives each next volume
+// name itself. Characters outside a portable set become '_'.
+static bool nested_disk_name(const std::wstring &name, char *output, size_t capacity)
+{
+    static const char punctuation[] = " ._-()[]+,&'!~@#$%^={}";
+    size_t start = name.find_last_of(L"/\\"), used = 0;
+    start = start == std::wstring::npos ? 0 : start + 1;
+    for (size_t i = start; i < name.size(); i++) {
+        unsigned value = static_cast<unsigned>(name[i]);
+        bool safe = (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') ||
+            (value && value < 128 && strchr(punctuation, static_cast<char>(value)));
+        if (used + 1 >= capacity || used >= 200) return false;
+        output[used++] = safe ? static_cast<char>(value) : '_';
+    }
+    output[used] = 0;
+    return used && strcmp(output, ".") && strcmp(output, "..");
+}
+
+static bool nested_directory(const char *destination, char *path, size_t capacity)
+{
+    int length = snprintf(path, capacity, "%s/nested", destination);
+    if (length < 0 || static_cast<size_t>(length) >= capacity) return false;
+    if (mkdir(path, 0700) && errno != EEXIST) return false;
+#ifdef O_DIRECTORY
+    // A real directory only; never write through a link placed at this name.
+    int descriptor = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (descriptor < 0) return false;
+    close(descriptor);
+#endif
+    return true;
+}
+
+extern "C" void gs_nested_archive_cleanup(const char *destination, const GsExtractedPkg *files, int count)
+{
+    char path[1100];
+    for (int i = 0; files && i < count; i++) {
+        unlink(files[i].path);
+        if (snprintf(path, sizeof(path), "%s.part", files[i].path) < static_cast<int>(sizeof(path))) unlink(path);
+    }
+    if (destination && snprintf(path, sizeof(path), "%s/nested", destination) < static_cast<int>(sizeof(path))) rmdir(path);
+}
+
 static int measure_archive(RAROpenArchiveDataEx open, Extraction &ctx)
 {
     uint64_t started = rar_now_us();
@@ -390,6 +542,14 @@ static int measure_archive(RAROpenArchiveDataEx open, Extraction &ctx)
                     if (size > maximum_expanded_bytes - package_total) { rc = ERAR_LARGE_DICT; break; }
                     package_total += size; packages++;
                 }
+                if (ctx.nested) {
+                    char base[260]; NestedVolume volume;
+                    if (header.FileNameW[0]) nested_base(header.FileNameW, sizeof(header.FileNameW) / sizeof(wchar_t), base, sizeof(base));
+                    else nested_base(header.FileName, sizeof(header.FileName), base, sizeof(base));
+                    int kind = nested_volume(base, &volume);
+                    if (kind == NESTED_VOLUME) { ctx.nested->total += size; ctx.nested->volumes.push_back(volume); }
+                    else if (kind == NESTED_UNSUPPORTED) ctx.nested->unsupported++;
+                }
             }
             rc = RARProcessFile(archive, RAR_SKIP, NULL, NULL);
         }
@@ -427,11 +587,36 @@ extern "C" int gs_extract_rar_password(const char *first, const char *destinatio
         packages, capacity, progress, password, NULL);
 }
 
+static int extract_rar(const char *first, const char *destination,
+    const char *const *names, const char *const *paths, int volume_count,
+    GsExtractedPkg *packages, int capacity, GsArchiveProgress progress, const char *password,
+    GsArchiveDiagnostic diagnostic, int *nested);
+
 extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char *destination,
     const char *const *names, const char *const *paths, int volume_count,
     GsExtractedPkg *packages, int capacity, GsArchiveProgress progress, const char *password,
     GsArchiveDiagnostic diagnostic)
 {
+    return extract_rar(first, destination, names, paths, volume_count, packages, capacity, progress,
+        password, diagnostic, NULL);
+}
+
+extern "C" int gs_extract_rar_nested(const char *first, const char *destination,
+    const char *const *names, const char *const *paths, int volume_count,
+    GsExtractedPkg *packages, int capacity, GsArchiveProgress progress, const char *password,
+    GsArchiveDiagnostic diagnostic, int *nested)
+{
+    if (!nested) return -ERAR_BAD_DATA;
+    return extract_rar(first, destination, names, paths, volume_count, packages, capacity, progress,
+        password, diagnostic, nested);
+}
+
+static int extract_rar(const char *first, const char *destination,
+    const char *const *names, const char *const *paths, int volume_count,
+    GsExtractedPkg *packages, int capacity, GsArchiveProgress progress, const char *password,
+    GsArchiveDiagnostic diagnostic, int *nested)
+{
+    if (nested) *nested = 0;
     if (!first || !destination || !names || !paths || !packages || volume_count < 1 ||
         volume_count > 512 || capacity < 1) return -ERAR_BAD_DATA;
     ExtractionLease lease;
@@ -443,6 +628,8 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
     rar_checkpoint(diagnostic, "runtime-ready", 0, 0);
     if (capacity > 256) capacity = 256;
     Extraction ctx = { names, paths, volume_count, NULL, 0, 0, 0, progress, password ? password : "", {}, 0, diagnostic, 0, true, false, 0, 0, 0 };
+    NestedVolumes nested_scan = {};
+    ctx.nested = nested ? &nested_scan : NULL;
     ActiveExtraction active(&ctx);
 #ifdef GS_RAR_PS4
     ctx.opening_since = sceKernelGetProcessTime();
@@ -455,14 +642,36 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
     open.ArcNameW = archive_path;
     open.Callback = callback; open.UserData = reinterpret_cast<LPARAM>(&ctx);
     int measured = measure_archive(open, ctx);
+    if (measured == ERAR_EOPEN) measured = ctx.open_timed_out ? 1001 : ctx.missing_volume ? GS_RAR_MISSING_VOLUME : measured;
     if (measured) return -measured;
     if (ctx.package_total) {
         int64_t available = gs_storage_available_bytes(destination);
         if (available < 0 || static_cast<uint64_t>(available) < ctx.package_total + 64 * 1024 * 1024)
             return -ERAR_EWRITE;
     }
+    // Only an archive with no PKG and exactly one inner archive set is unpacked
+    // in two passes. Game folders and split PKG pieces keep their own results.
+    bool nested_mode = nested && !ctx.named_packages &&
+        !(ctx.content_hints & (GS_ARCHIVE_HINT_DUMP | GS_ARCHIVE_HINT_SPLIT_PKG)) &&
+        nested_set_valid(nested_scan, capacity);
+    char nested_path[1100] = {};
+    unsigned nested_orders[256] = {};
+    if (diagnostic && nested && (ctx.content_hints & GS_ARCHIVE_HINT_NESTED))
+        diagnostic("nested-scan", static_cast<unsigned>(nested_scan.volumes.size()), nested_mode ? 1 : 0,
+            nested_scan.unsupported, nested_scan.volumes.empty() ? 0 : nested_scan.volumes[0].format, nested_scan.total);
+    if (nested_mode) {
+        // The inner archive and the PKG extracted from it both need room while
+        // the downloaded archive is kept; their sizes are about the same.
+        int64_t available = gs_storage_available_bytes(destination);
+        if (available < 0 || static_cast<uint64_t>(available) < nested_scan.total * 2 + nested_margin_bytes) {
+            rar_checkpoint(diagnostic, "nested-space", 0, 1010);
+            return -1010;
+        }
+        if (!nested_directory(destination, nested_path, sizeof(nested_path))) return -ERAR_ECREATE;
+    }
     ctx.volume_index = 0;
     ctx.password_requests = 0;
+    ctx.missing_volume = false;
     if (progress && progress(0, ctx.total)) return -ERAR_UNKNOWN;
 #ifdef GS_RAR_PS4
     ctx.opening_since = sceKernelGetProcessTime();
@@ -530,23 +739,41 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
                 rc = ERAR_BAD_DATA; rar_checkpoint(diagnostic, "entry-duplicate-rejected", entries, rc, &header); break;
             }
             bool selected = !(header.Flags & RHDF_DIRECTORY) && key.size() >= 4 && key.compare(key.size() - 4, 4, L".pkg") == 0;
+            // In a nested pass the inner archive's volumes are the outputs.
+            bool nested_entry = false;
+            unsigned nested_order = 0;
+            if (nested_mode && !(header.Flags & RHDF_DIRECTORY)) {
+                char base[260]; NestedVolume volume;
+                nested_base(name.c_str(), name.size() + 1, base, sizeof(base));
+                nested_entry = nested_volume(base, &volume) == NESTED_VOLUME;
+                nested_order = volume.order;
+            }
             // If the listing had no .pkg names, inspect decoded entry signatures.
             // Some sources store a PKG under an opaque filename. Nested paths are
             // already accepted by the suffix check above; only the filename is new.
             // Split PKG pieces (name.pkg.001, ...) are not packages on their own:
             // the first piece carries the PKG signature, so never sniff them.
-            bool sniff = !selected && !ctx.named_packages && !(header.Flags & RHDF_DIRECTORY) && size >= 4 &&
+            bool sniff = !selected && !nested_mode && !ctx.named_packages && !(header.Flags & RHDF_DIRECTORY) && size >= 4 &&
                 !(ctx.content_hints & GS_ARCHIVE_HINT_SPLIT_PKG);
             ctx.sniff = sniff;
+            ctx.magic_check = selected && !nested_entry && (header.Flags & RHDF_ENCRYPTED);
+            ctx.magic_bytes = 0;
             ctx.sniff_decided = ctx.sniff_found = false;
             ctx.signature_bytes = 0;
             ctx.sniff_error = 0;
-            if (selected || sniff) {
-                if (selected && count >= capacity) { rc = ERAR_BAD_DATA; break; }
+            if (selected || sniff || nested_entry) {
+                if ((selected || nested_entry) && count >= capacity) { rc = ERAR_BAD_DATA; break; }
                 if (count < capacity) {
-                    int path_length = snprintf(packages[count].path, sizeof(packages[count].path), "%s/pkg-%03d.pkg", destination, count + 1);
+                    int path_length;
+                    if (nested_entry) {
+                        char disk[256];
+                        if (!nested_disk_name(name, disk, sizeof(disk))) { rc = ERAR_ECREATE; break; }
+                        path_length = snprintf(packages[count].path, sizeof(packages[count].path), "%s/%s", nested_path, disk);
+                    } else path_length = snprintf(packages[count].path, sizeof(packages[count].path), "%s/pkg-%03d.pkg", destination, count + 1);
                     if (path_length < 0 || static_cast<size_t>(path_length) >= sizeof(packages[count].path)) { rc = ERAR_ECREATE; break; }
                     snprintf(output, sizeof(output), "%s.part", packages[count].path);
+                    // destination/nested belongs to this extraction; remove what an interrupted attempt left.
+                    if (nested_entry) { unlink(packages[count].path); unlink(output); }
                 }
                 if (sniff) {
                     ctx.sniff_destination = destination;
@@ -556,7 +783,7 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
                     ctx.sniff_output_owned = &output_owned;
                 }
             }
-            if (selected) {
+            if (selected || nested_entry) {
                 int64_t available = gs_storage_available_bytes(destination);
                 if (available < 0 || static_cast<uint64_t>(available) < size + 64 * 1024 * 1024)
                 { rc = ERAR_EWRITE; break; }
@@ -582,6 +809,8 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
             if (process_finished >= process_started) ctx.process_us += process_finished - process_started;
             rar_checkpoint(diagnostic, "process-after", entries, rc, &header);
             if (ctx.sniff_error) rc = ctx.sniff_error;
+            // A data check failure on encrypted data is usually the password.
+            else if (rc == ERAR_BAD_DATA && (header.Flags & RHDF_ENCRYPTED)) rc = GS_RAR_ENCRYPTED_BAD_DATA;
             if (sniff && ctx.signature_bytes == 4) {
                 const char *signature = ctx.sniff_found ? "entry-signature-pkg" :
                     !memcmp(ctx.signature, "PK\x03\x04", 4) ? "entry-signature-zip" :
@@ -605,13 +834,13 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
                 // The errno is the console evidence for a FAT32 limit (27, EFBIG) or a full drive (28).
                 if (ctx.write_error) rar_checkpoint(diagnostic, "write-failed", entries, ctx.write_error, &header);
                 if (!rc && ctx.written != ctx.expected) rc = ERAR_BAD_DATA;
-                if (!rc) {
+                if (!rc && !nested_entry) {
                     unsigned char magic[4]; FILE *check = fopen(output, "rb");
                     if (!check || fread(magic, 1, 4, check) != 4 || memcmp(magic, "\x7f\x43\x4e\x54", 4)) rc = ERAR_BAD_DATA;
                     if (check) fclose(check);
                 }
                 if (!rc && (!rar_output_absent(packages[count].path) || rename(output, packages[count].path))) rc = ERAR_EWRITE;
-                if (!rc) { count++; output[0] = 0; output_owned = false; }
+                if (!rc) { if (nested_entry) nested_orders[count] = nested_order; count++; output[0] = 0; output_owned = false; }
             }
             if (rc) break;
         }
@@ -620,29 +849,51 @@ extern "C" int gs_extract_rar_password_diagnostic(const char *first, const char 
     rar_checkpoint(diagnostic, "close-before", 0, 0);
     int close_result = RARCloseArchive(archive);
     rar_checkpoint(diagnostic, "close-after", 0, close_result);
+    if (rc == ERAR_EOPEN) rc = ctx.open_timed_out ? 1001 : ctx.missing_volume ? GS_RAR_MISSING_VOLUME : rc;
+    // Every named package came out whole (checksum, size and PKG signature all
+    // passed) and only a later entry failed: a bonus file with a bad checksum, an
+    // encrypted extra, or a last volume holding no package. Keep the packages;
+    // each one is still fully validated before it is installed.
+    bool packages_done = rc && !nested_mode && ctx.named_packages && count == static_cast<int>(ctx.named_packages) &&
+        !output_owned && !ctx.stopped && rc != ERAR_EWRITE && rc != ERAR_ECREATE && rc != 1009 && rc != ERAR_NO_MEMORY;
+    if (packages_done) { rar_checkpoint(diagnostic, "trailing-entry-ignored", static_cast<unsigned>(entries), rc); rc = 0; }
     // No PKG: name the likely cause (extracted game folder, split PKG pieces or
     // a nested archive) as 1006/1008/1007 instead of the generic 1002.
     if (!rc && count == 0) rc = 1002 + gs_archive_no_pkg_offset(ctx.content_hints);
+    // Every volume the scan listed must have been written.
+    if (!rc && nested_mode && count != static_cast<int>(nested_scan.volumes.size())) rc = ERAR_BAD_DATA;
     if (rc) {
         if (diagnostic) diagnostic("extract-timing", count, -rc, rar_elapsed_ms(ctx.output_write_us),
             rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
         if (output_owned) unlink(output);
         for (int i = 0; i < count; i++) unlink(packages[i].path);
+        if (nested_mode) gs_nested_archive_cleanup(destination, NULL, 0);
         return -rc;
     }
-    if (ctx.processed != ctx.total) {
+    if (!packages_done && ctx.processed != ctx.total) {
         if (diagnostic) diagnostic("extract-timing", count, -ERAR_BAD_DATA, rar_elapsed_ms(ctx.output_write_us),
             rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
         for (int i = 0; i < count; i++) unlink(packages[i].path);
+        if (nested_mode) gs_nested_archive_cleanup(destination, NULL, 0);
         return -ERAR_BAD_DATA;
     }
     if (progress && progress(ctx.processed, ctx.total)) {
         if (diagnostic) diagnostic("extract-timing", count, -ERAR_UNKNOWN, rar_elapsed_ms(ctx.output_write_us),
             rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
         for (int i = 0; i < count; i++) unlink(packages[i].path);
+        if (nested_mode) gs_nested_archive_cleanup(destination, NULL, 0);
         return -ERAR_UNKNOWN;
     }
     if (diagnostic) diagnostic("extract-timing", count, rc, rar_elapsed_ms(ctx.output_write_us),
         rar_elapsed_ms(ctx.output_sync_us), ctx.process_us);
+    if (nested_mode) {
+        // Volume order, so packages[0] is the volume to open.
+        for (int i = 1; i < count; i++)
+            for (int j = i; j > 0 && nested_orders[j - 1] > nested_orders[j]; j--) {
+                std::swap(nested_orders[j - 1], nested_orders[j]);
+                std::swap(packages[j - 1], packages[j]);
+            }
+        *nested = 1;
+    }
     return count;
 }
