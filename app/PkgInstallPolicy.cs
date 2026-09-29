@@ -121,16 +121,16 @@ namespace Orbis
             try { internalRc = internalStart(); }
             catch (EntryPointNotFoundException) { internalAvailable = false; }
             if (internalAvailable && internalRc == 0)
-            { detail = "start=internal public=" + DescribeBgftError(publicRc) + " rc=0"; return true; }
-            detail = "start=unconfirmed public=" + DescribeBgftError(publicRc) +
-                " internal=" + (internalAvailable ? DescribeBgftError(internalRc) : "unavailable");
+            { detail = "start=internal public=" + DescribeBgftProgressError(publicRc) + " rc=0"; return true; }
+            detail = "start=unconfirmed public=" + DescribeBgftProgressError(publicRc) +
+                " internal=" + (internalAvailable ? DescribeBgftProgressError(internalRc) : "unavailable");
             BgftStartProgress prior = new BgftStartProgress();
             for (int probe = 0; probe <= 10; probe++)
             {
                 if (probe != 0) delay(500);
                 BgftStartProgress current = progress();
                 if (!current.Readable) continue;
-                if (current.Error != 0) { detail += " progress=" + DescribeBgftError(current.Error); return false; }
+                if (current.Error != 0) { detail += " progress=" + DescribeBgftProgressError(current.Error); return false; }
                 bool complete = current.Total > 0 && current.Done >= current.Total && current.Copy >= 100;
                 bool advanced = prior.Readable && (current.Done > prior.Done ||
                     current.Preparing > prior.Preparing || current.Copy > prior.Copy);
@@ -157,11 +157,21 @@ namespace Orbis
                 case 0x80990088: reason = "installed content conflict"; break;
                 case 0x80F00633: reason = "NP environment rejected registration; a retry repeats the same system rejection"; break;
                 case 0x80991401: reason = "package source rejected authorization (HTTP 401)"; break;
+                case 0x80991403: reason = "package source refused the PS4 download request (403 Forbidden)"; break;
                 case 0x80991404: reason = "package source unavailable"; break;
                 case 0x80020012: reason = "PS4 rejected a cross-device install; check Settings > Storage and the selected install drive, then cancel the matching failed PS4 download before retrying"; break;
                 default: reason = "system error"; break;
             }
             return "0x" + unchecked((uint)code).ToString("X8") + " (" + reason + ")";
+        }
+
+        // Start and GetProgress codes belong to a task BGFT already accepted. Their
+        // 0x80990004 is task state, so registration wording would misreport it.
+        internal static string DescribeBgftProgressError(int code)
+        {
+            return unchecked((uint)code) == 0x80990004u
+                ? "0x80990004 (PS4 download task reported an argument error after registration)"
+                : DescribeBgftError(code);
         }
 
         internal static bool IsBgftDuplicate(int code)

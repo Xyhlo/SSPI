@@ -374,6 +374,20 @@ namespace Orbis
             return true;
         }
 
+        /// <summary>Package size for a remote preflight. A no-data license (content type 0x1C,
+        /// no PFS) declares package_size 0; its body runs to the end, so the transfer length is its size.</summary>
+        internal static bool TryGetTransferPackageSize(byte[] header, long total, out long packageSize)
+        {
+            if (TryGetPackageSizeFromHeader(header, out packageSize)) return true;
+            if (header == null || header.Length < 0x438 || total < 0x1000 ||
+                ReadU32BE(header, 0x74) != 0x1c || ReadU64BE(header, 0x430) != 0 ||
+                ReadU64BE(header, 0x410) != 0 || ReadU64BE(header, 0x418) != 0) return false;
+            ulong body = ReadU64BE(header, 0x20), bodySize = ReadU64BE(header, 0x28);
+            if (body < 0x1000 || body > (ulong)total || bodySize == 0 || bodySize != (ulong)total - body) return false;
+            packageSize = total;
+            return true;
+        }
+
         static string KindPhrase(PkgContentKind kind)
         {
             switch (kind)

@@ -902,6 +902,7 @@ static const char *gs_bgft_error(int code)
         case 0x80990088u: return "installed content conflict";
         case 0x80F00633u: return "NP environment rejected registration; a retry repeats the same system rejection";
         case 0x80991401u: return "package source rejected authorization (HTTP 401)";
+        case 0x80991403u: return "package source refused the PS4 download request (403 Forbidden)";
         case 0x80991404u: return "package source unavailable";
         case 0x80020012u: return "PS4 rejected a cross-device install; check Settings > Storage and the selected install drive, then cancel the matching failed PS4 download before retrying";
         default: return "system error";
@@ -925,6 +926,13 @@ static int gs_bgft_error_terminal(int code)
         case 0x80020012u: return 1; /* cross-device path rejected */
         default: return 0;
     }
+}
+
+/* Start and GetProgress codes belong to a task BGFT already accepted. Their
+ * 0x80990004 is task state, so registration wording would misreport it. */
+static const char *gs_bgft_progress_error(int code)
+{
+    return (uint32_t)code == 0x80990004u ? "PS4 download task reported an argument error after registration" : gs_bgft_error(code);
 }
 
 static int gs_start_owned_bgft(int module, int task)
@@ -965,7 +973,7 @@ static int gs_start_owned_bgft(int module, int task)
     if (!accepted && !g_stop && !gs_canceled) {
         int code = progress_error ? progress_error : internal_rc;
         snprintf(record, sizeof(record), "BGFT start unconfirmed: 0x%08X (%s). Task and PKG retained; inspect PS4 Notifications.",
-            (unsigned)code, gs_bgft_error(code));
+            (unsigned)code, gs_bgft_progress_error(code));
         gs_write_status("failed", record);
     }
     return accepted ? 0 : -1;

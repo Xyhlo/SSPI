@@ -447,7 +447,7 @@ namespace Orbis
 
                     if (state.ErrorResult != 0)
                     {
-                        error = "BGFT install " + PkgInstallPolicy.DescribeBgftError(state.ErrorResult);
+                        error = "BGFT install " + PkgInstallPolicy.DescribeBgftProgressError(state.ErrorResult);
                         return false;
                     }
 
@@ -565,7 +565,7 @@ namespace Orbis
                         " task=" + activeTask + " content=" + contentId + " subtype=" + subType);
                 if (rc != 0)
                 {
-                    error = "sceBgftServiceDownloadGetProgress " + PkgInstallPolicy.DescribeBgftError(rc);
+                    error = "sceBgftServiceDownloadGetProgress " + PkgInstallPolicy.DescribeBgftProgressError(rc);
                     return false;
                 }
 
@@ -727,6 +727,33 @@ namespace Orbis
                     }
                 } catch { }
             }
+            return PkgIntegrity.IsNoDataLicense(source) && IsLicenseRegistered("/user/license", content);
+        }
+
+        // A no-data license creates no /user/addcont folder. The PS4 records it in the
+        // game's license index (/user/license/...<content prefix>.idx: "ridx", then one
+        // 48-byte entry per entitlement from offset 32, each starting with its label).
+        internal static bool IsLicenseRegistered(string directory, string contentId)
+        {
+            if (contentId == null || contentId.Length != 36) return false;
+            string suffix = contentId.Substring(0, 19) + ".idx";
+            byte[] label = Encoding.ASCII.GetBytes(contentId.Substring(20));
+            try
+            {
+                foreach (string path in Directory.GetFiles(directory, "*.idx"))
+                {
+                    if (!path.EndsWith(suffix, StringComparison.Ordinal) || new FileInfo(path).Length > 65536) continue;
+                    byte[] data = File.ReadAllBytes(path);
+                    if (data.Length < 80 || data[0] != 'r' || data[1] != 'i' || data[2] != 'd' || data[3] != 'x') continue;
+                    for (int at = 32; at + 48 <= data.Length; at += 48)
+                    {
+                        int i = 0;
+                        while (i < 16 && data[at + i] == label[i]) i++;
+                        if (i == 16) return true;
+                    }
+                }
+            }
+            catch { }
             return false;
         }
 

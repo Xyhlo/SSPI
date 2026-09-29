@@ -291,6 +291,29 @@ static int gs_is_no_data_license(const char *path)
         !gs_be64(h + 0x410) && !gs_be64(h + 0x418);
 }
 
+/* A no-data license creates no /user/addcont folder. The PS4 records it in the
+ * game's license index (/user/license/...<content prefix>.idx: "ridx", then one
+ * 48-byte entry per entitlement from offset 32, each starting with its label). */
+static int gs_license_registered(const char *content)
+{
+    if (strlen(content) != 36) return 0;
+    char suffix[32]; snprintf(suffix, sizeof(suffix), "%.19s.idx", content);
+    size_t suffix_length = strlen(suffix);
+    DIR *directory = opendir("/user/license"); if (!directory) return 0;
+    struct dirent *entry; int found = 0, count = 0;
+    while (!found && ++count <= 8192 && (entry = readdir(directory)) != NULL) {
+        size_t length = strlen(entry->d_name);
+        if (length < suffix_length || strcmp(entry->d_name + length - suffix_length, suffix)) continue;
+        char path[512]; unsigned char data[65536];
+        if (snprintf(path, sizeof(path), "/user/license/%s", entry->d_name) >= (int)sizeof(path)) continue;
+        FILE *file = fopen(path, "rb"); if (!file) continue;
+        size_t size = fread(data, 1, sizeof(data), file); fclose(file);
+        if (size < 80 || memcmp(data, "ridx", 4)) continue;
+        for (size_t at = 32; !found && at + 48 <= size; at += 48) found = !memcmp(data + at, content + 20, 16);
+    }
+    closedir(directory); return found;
+}
+
 static int gs_verify_license_body(FILE *file, const unsigned char *h, int64_t size)
 {
     uint64_t offset = gs_be64(h + 0x20), remaining = gs_be64(h + 0x28);
@@ -577,6 +600,11 @@ static int gs_installed_addon_matches(const char *source, int full)
     if (strlen(gs_job.content) != 36 || strspn(gs_job.content + 20, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != 16) return 0;
     GsAddonIdentity identity; int saved = gs_read_addon_identity(gs_archive_journal, &identity);
     if (saved < 0 || (saved && (strcmp(identity.content, gs_job.content) || identity.size != gs_job.total))) return 0;
+    // The marker keeps the license route when AppInstUtil consumed the source.
+    char marker[1200];
+    if (snprintf(marker, sizeof(marker), "%s.license", gs_archive_journal) < (int)sizeof(marker) &&
+        (gs_is_no_data_license(source) || (gs_archive_journal[0] && !access(marker, F_OK))))
+        return gs_license_registered(gs_job.content);
     const char *roots[] = { "/user/addcont", "/mnt/ext0/user/addcont" };
     for (int i = 0; i < 2; i++) {
         char path[256]; struct stat a, b;
@@ -642,6 +670,12 @@ static int gs_install_addon(const char *journal, int accepted)
     // AppInstUtil may consume the source. Persist its identity before handing it over.
     if (!accepted && gs_save_addon_identity(journal)) {
         gs_write_status("failed", "DLC_UNCONFIRMED: Could not save the add-on verification record; installation was not submitted."); return -1;
+    }
+    if (!accepted && gs_is_no_data_license(gs_job.destination)) {
+        char marker[1200];
+        if (snprintf(marker, sizeof(marker), "%s.license", journal) >= (int)sizeof(marker) || write_atomic(marker, "1\n")) {
+            gs_write_status("failed", "DLC_UNCONFIRMED: Could not save the license verification record; installation was not submitted."); return -1;
+        }
     }
     GsAddonIdentity identity;
     if (accepted && gs_read_addon_identity(journal, &identity) != 1 && access(gs_job.destination, F_OK)) {
@@ -756,6 +790,10 @@ static int gs_bgft_stalled(GsBgftWatch *watch, const GsBgftProgress *p, uint64_t
     uint64_t package_bytes)
 {
     int new_piece = watch->initialized && p->index > watch->index;
+    /* BGFT can report copy=100 at startup, then count the real copy up from 0
+     * (storage tasks carry no bytes). A drop from 100 restarts the copy mark;
+     * other regressions stay stale snapshots. */
+    if (watch->initialized && watch->copy >= 100 && p->copy < 100) watch->copy = p->copy > 0 ? p->copy : 0;
     int advanced = !watch->initialized || new_piece || p->transferred > watch->transferred ||
         p->transferred_total > watch->transferred_total || p->preparing > watch->preparing || p->copy > watch->copy;
     if (advanced || suspended || local_wait || now < watch->since) watch->since = now;
@@ -862,6 +900,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     int (*init)(void *), (*user_init)(void *), (*get_user)(int *), (*app_init)(void), (*app_exists)(const char *, int *);
     int (*reg)(GsBgftParam *, int *), (*get_progress)(int, GsBgftProgress *);
     GsBgftParam param; struct { void *heap; size_t size; } heap;
+    static char storage_refused[49]; /* content whose accepted storage task failed; retry it over HTTP */
     if (!gs_storage_matches(gs_job.storage_root, gs_job.storage_token)) {
         gs_write_status("failed", "Selected staging drive disconnected; package and installer journal retained"); return -1;
     }
@@ -1002,7 +1041,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         // Match IntInit with the internal registration ABI (PS4RPI's 0x80990004 fix).
         const char *api = gs_package_register_api(kind, theme);
         if (gs_bind(bgft, api, &reg)) return -1;
-        int storage_candidate = kind == 6 && !gs_job.native_bgft && gs_stream_slot < 0 &&
+        int storage_candidate = kind == 6 && !gs_job.native_bgft && gs_stream_slot < 0 && strcmp(storage_refused, gs_job.content) &&
             (!strncmp(gs_job.destination, "/data/SSPI/", 11) || !strncmp(gs_job.destination, "/user/data/SSPI/", 16));
         int extended_storage = storage_candidate ? gs_nofollow_path("/mnt/ext0", 1) : 0;
         if (storage_candidate && extended_storage != 0)
@@ -1107,10 +1146,14 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     if (kind == 8 && wanted < 0) return -1;
     if (g_stop || gs_canceled) return -1;
     if (gs_start_owned_bgft(bgft, task)) return -1;
+    /* A pause accepted while no task was owned made no BGFT call. Apply it now;
+     * on failure clear the flag so the listener retries the pause next poll. */
+    if (gs_paused && gs_pause_archive_task(1)) gs_paused = 0;
     // BGFT posts its own added/install notices. Do not duplicate them here.
     uint64_t logged_at = 0, install_started = sceKernelGetProcessTime(), phase_started = install_started;
     const char *last_phase = "";
-    GsBgftWatch watch = {0}; int stall_retries = 0, storage_copy_progress = 0;
+    GsBgftWatch watch = {0}; int stall_retries = 0, storage_copy_progress = 0, storage_installed_polls = 0;
+    uint64_t stall_bytes = 0; /* bytes received when the last stall restart was used */
     while (!g_stop && !gs_canceled) {
         if (gs_stream_slot >= 0 && gs_stage_stream_finished() < 0) {
             gs_write_status("failed", "Resident stream interrupted or validation failed; completed data retained"); return -1;
@@ -1173,7 +1216,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                     gs_write_status("failed", "THEME_UNCONFIRMED: PS4 theme task stopped reporting progress. Check Settings > Themes, then retry if missing. Task and files retained.");
                     return -1;
                 }
-                char error[384]; snprintf(error, sizeof(error), "sceBgftServiceDownloadGetProgress rc=0x%08X: %s. Task and PKG retained.", (unsigned int)rc, gs_bgft_error(rc));
+                char error[384]; snprintf(error, sizeof(error), "sceBgftServiceDownloadGetProgress rc=0x%08X: %s. Task and PKG retained.", (unsigned int)rc, gs_bgft_progress_error(rc));
                 gs_write_status("failed", error); return -1;
             }
             sceKernelUsleep(500000); continue;
@@ -1182,7 +1225,19 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         uint64_t now = sceKernelGetProcessTime();
         uint64_t phase_length = p.length_total ? p.length_total : p.length;
         uint64_t phase_done = p.length_total ? p.transferred_total : p.transferred;
+        /* Real progress after a stall restart gives a later stall its own restart. */
+        if (stall_retries && phase_done > stall_bytes + (64ull << 20)) stall_retries = 0;
         if (route_version == 7 && p.copy > 0 && p.copy < 100) storage_copy_progress = 1;
+        /* A storage copy that started at, or jumped to, 100 shows no progression.
+         * The installed package is then the evidence: its size, header and tail
+         * must match the source for 20 polls before normal confirmation runs. */
+        if (route_version == 7 && kind == 6 && !phase_length && !storage_copy_progress &&
+            p.preparing >= 100 && p.copy >= 100 && gs_installed_base_matches(gs_job.destination, 0)) {
+            if (++storage_installed_polls >= 20) {
+                storage_copy_progress = 1;
+                gs_log_write("resident", "bgft-storage-installed job=%s task=%d evidence=installed-package", gs_job.id, task);
+            }
+        } else storage_installed_polls = 0;
         int copy_finished = p.copy >= 100 && ((phase_length && phase_done >= phase_length) ||
             (route_version == 7 && !phase_length && storage_copy_progress));
         const char *phase = copy_finished ? "confirming" : phase_length && phase_done < phase_length ? "receiving" :
@@ -1220,8 +1275,20 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                     continue;
                 }
             }
-            char error[384]; snprintf(error, sizeof(error), "%s%s. API=sceBgftServiceDownloadGetProgress rc=0x%08X error=0x%08X task=%d. PKG retained.",
-                gs_bgft_error_terminal(p.error) ? "BGFT_TERMINAL:" : "", gs_bgft_error(p.error), (unsigned)rc, (unsigned)p.error, task);
+            /* The codes below describe an accepted task, not its registration. A native
+             * task refused by its remote source (HTTP 401/403) passed SSPI's own range
+             * probe: remove it and mark BGFT_SOURCE: so the staged poll hands the package
+             * to the SSPI download. A task-state 0x80990004 is removed so the staged retry
+             * registers a fresh task (over HTTP after a failed storage task); restarting
+             * the same task would only repeat its stored error. */
+            int source = gs_job.native_bgft && ((uint32_t)p.error == 0x80991401u || (uint32_t)p.error == 0x80991403u);
+            int removed = (source || (uint32_t)p.error == 0x80990004u) && !gs_cancel_task();
+            if (removed && route_version == 7) snprintf(storage_refused, sizeof(storage_refused), "%s", gs_job.content);
+            gs_log_write("resident", "bgft-task-error job=%s task=%d error=0x%08X mode=%s removed=%d next=%s", gs_job.id, task, (unsigned)p.error,
+                route_version == 7 ? "storage" : "http", removed, !removed ? "retain" : source ? "sspi-download" : route_version == 7 ? "http-registration" : "fresh-registration");
+            char error[384]; snprintf(error, sizeof(error), "%s%s. API=sceBgftServiceDownloadGetProgress rc=0x%08X error=0x%08X task=%d. %s",
+                removed && source ? "BGFT_SOURCE:" : !removed && gs_bgft_error_terminal(p.error) ? "BGFT_TERMINAL:" : "", gs_bgft_progress_error(p.error),
+                (unsigned)rc, (unsigned)p.error, task, removed ? "Task removed for a fresh attempt; PKG retained." : "PKG retained.");
             gs_write_status("failed", error); return -1;
         }
         if (theme && copy_finished && !gs_paused && now - phase_started >= 120000000ULL) {
@@ -1230,20 +1297,32 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         }
         if (gs_bgft_stalled(&watch, &p, now, gs_paused, (theme && copy_finished) || (gs_stream_slot >= 0 && !gs_stage_stream_finished()),
                 gs_job.total > 0 ? (uint64_t)gs_job.total : 0)) {
-            gs_log_write("resident", "bgft-stall job=%s task=%d attempt=%d bytes=%llu total=%llu prepare=%d copy=%d",
-                gs_job.id, task, stall_retries, (unsigned long long)p.transferred_total,
-                (unsigned long long)p.length_total, p.preparing, p.copy);
+            gs_log_write("resident", "bgft-stall job=%s task=%d attempt=%d mode=%s bytes=%llu total=%llu prepare=%d copy=%d served=%d",
+                gs_job.id, task, stall_retries, route_version == 7 ? "storage" : "http", (unsigned long long)phase_done,
+                (unsigned long long)phase_length, p.preparing, p.copy, gs_served);
+            /* An idle task at 100/100 whose installed base matches the source has
+             * finished; only its counters stopped short. Confirm it, not a stall. */
+            if (kind == 6 && p.preparing >= 100 && p.copy >= 100 && !app_exists(gs_job.title, &exists) && exists &&
+                gs_installed_base_matches(gs_job.destination, 0)) {
+                gs_log_write("resident", "bgft-stall-installed job=%s task=%d evidence=installed-package", gs_job.id, task);
+                snprintf(record, sizeof(record), "%s %d 1 0 %d %d", gs_job.content, task, route_version, kind);
+                int saved = write_atomic(journal, record);
+                if (!saved) { gs_archive_task = -1; gs_done = gs_job.total; }
+                return saved;
+            }
             int (*stop_task)(int);
             if (stall_retries < 1 && !gs_bind(bgft, "sceBgftServiceDownloadStopTask", &stop_task) && !stop_task(task)) {
-                stall_retries++; stable = 0; storage_copy_progress = 0; memset(&watch, 0, sizeof(watch));
+                stall_retries++; stall_bytes = phase_done; stable = 0; storage_copy_progress = 0; memset(&watch, 0, sizeof(watch));
                 gs_write_status("installing", "PS4 download stopped advancing; resuming the same task with progress retained");
                 for (int wait = 0; wait < 30 && !g_stop && !gs_canceled; wait++) sceKernelUsleep(100000);
                 if (g_stop || gs_canceled) return -1;
                 if (!gs_start_owned_bgft(bgft, task)) continue;
             }
             int parked = gs_park_task();
-            char error[384]; snprintf(error, sizeof(error), "PS4 task stalled (task=%d prepare=%d copy=%d). %s; inspect PS4 Notifications and retry. Progress and task journal retained.",
-                task, p.preparing, p.copy, parked ? "Stop unconfirmed" : "Task stopped safely");
+            /* The byte counts show whether the PS4 received anything before it stopped. */
+            char error[384]; snprintf(error, sizeof(error), "PS4 task stalled (task=%d prepare=%d copy=%d received=%llu/%llu MiB). %s; inspect PS4 Notifications and retry. Progress and task journal retained.",
+                task, p.preparing, p.copy, (unsigned long long)(phase_done >> 20), (unsigned long long)(phase_length >> 20),
+                parked ? "Stop unconfirmed" : "Task stopped safely");
             gs_write_status("failed", error); return -1;
         }
         if (gs_paused) { sceKernelUsleep(100000); continue; }

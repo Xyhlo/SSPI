@@ -612,9 +612,27 @@ static void gs_stage_install_poll(void)
                 else status = fopen(path, "rb");
                 if (status) { int j; for (j = 0; j < 6 && !gs_line(status, line, sizeof(line)); j++) { }
                     if (j == 6) gs_encoded_line(status, message, sizeof(message)); fclose(status); }
+                /* The installer already removed a native task that its remote source
+                 * refused; SSPI's own client passed that source's range probe. Requeue
+                 * the slot as a normal staged download. Order keeps a restart safe:
+                 * queued status, then this generation's native install record is
+                 * retired, then the fallback is bound to the generation. */
+                if (!strcmp(gs_state, "failed") && gs_job.native_bgft && !stage->canceled && !strncmp(message, "BGFT_SOURCE:", 12)) {
+                    if (g_client_count) continue;
+                    char fallback[1150], job_path[128]; static GsJob record; /* main loop only; keeps the frame small */
+                    stage->done = stage->wire_bytes = 0;
+                    gs_stage_status(stage, "queued", "PS4 download was refused by the package source; using SSPI download for this package");
+                    if (!gs_read_job(&record) && !strcmp(record.id, gs_job.id) && !strcmp(record.generation, gs_job.generation) &&
+                        !gs_ipc_path(job_path, sizeof(job_path), "/job.txt")) unlink(job_path);
+                    snprintf(fallback, sizeof(fallback), "%s.bgft-fallback", stage->job.destination);
+                    if (write_atomic(fallback, stage->job.generation)) gs_stage_status(stage, "failed", "Could not save the download fallback; retry safely");
+                    else { stage->job.native_bgft = 0; stage->pending = 1; }
+                    gs_release = 1; gs_stage_install_after = sceKernelGetProcessTime() + 3000000; continue;
+                }
                 int addon_rejected = strstr(message, "ADDCONT_BROKEN") || strstr(message, "DRM type") ||
                     strstr(message, "not yet confirmed") || strstr(message, "Close the running game") ||
-                    strstr(message, "Not enough PS4 installation space") || strstr(message, "0x80990004") ||
+                    /* Registration and start keep 0x80990004 final; a task-state error= retries anew. */
+                    strstr(message, "Not enough PS4 installation space") || (strstr(message, "0x80990004") && !strstr(message, "error=0x80990004")) ||
                     strstr(message, "PS4 task stalled") || strstr(message, "BGFT_UNRESOLVED:") ||
                     /* Deterministic platform rejections never change on retry. The
                      * installer already parked the task and kept the package, so a

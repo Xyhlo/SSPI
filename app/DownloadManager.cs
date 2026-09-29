@@ -4628,7 +4628,7 @@ namespace Orbis
             if (header.Data.Length != LoopbackPkgFeeder.HeaderBytes || header.Total <= header.Data.Length ||
                 !PkgValidator.TryGetContentIdFromHeader(header.Data, out contentId) ||
                 !PkgValidator.TryGetContentKindFromHeader(header.Data, out actualKind, out kindDetail) ||
-                !PkgValidator.TryGetPackageSizeFromHeader(header.Data, out packageSize) ||
+                !PkgValidator.TryGetTransferPackageSize(header.Data, header.Total, out packageSize) ||
                 packageSize != header.Total)
             {
                 SetFeederForegroundFallback(job, attempt, "PKG preflight was incomplete");
@@ -4963,7 +4963,7 @@ namespace Orbis
             string content, error, title = job.TitleId; long declared; PkgContentKind kind;
             if (!PkgValidator.TryGetContentIdFromHeader(header, out content) ||
                 !PkgValidator.TryGetContentKindFromHeader(header, out kind, out error) ||
-                !PkgValidator.TryGetPackageSizeFromHeader(header, out declared) || declared != size ||
+                !PkgValidator.TryGetTransferPackageSize(header, size, out declared) || declared != size ||
                 !PkgValidator.CheckRequestedIdentity(job.Kind, kind, job.TitleId, content, out error) ||
                 (!string.IsNullOrEmpty(job.ExpectedContentId) && job.ExpectedContentId != content) ||
                 (job.ExpectedByteSize > 0 && job.ExpectedByteSize != size))
@@ -7134,6 +7134,10 @@ namespace Orbis
                 if (taskId < 0)
                 {
                     MarkInstallAccepted(job.Id, "Sent to PS4 — verification pending · PKG kept", -1, attempt);
+                    // A license has nothing left to copy once AppInstUtil returns, so later
+                    // packages need not wait while its registration is being confirmed.
+                    if (actualKind == PkgContentKind.AddOn && PkgIntegrity.IsNoDataLicense(job.DestPath))
+                        lock (_lock) { if (AcceptInstallCallback(job, attempt) && job.State == DlState.Submitted) job.InstallOrderReady = true; }
                     return;
                 }
                 TrackLocalInstallTask(job.Id, attempt, taskId);
@@ -8996,7 +9000,8 @@ namespace Orbis
                 // or registering a second installation of the same input.
                 item.State = DlState.Submitted;
                 item.Background = false;
-                item.InstallOrderReady = item.Kind == "theme-license" && item.InstallOrderReady;
+                item.InstallOrderReady = item.InstallOrderReady &&
+                    (item.Kind == "theme-license" || PkgIntegrity.IsNoDataLicense(item.DestPath));
                 item.Error = null;
                 item.StatusText = "Checking previous PS4 installation; local PKG retained";
                 return;
