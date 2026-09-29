@@ -21,6 +21,10 @@ static int (*user_initial)(int*);
 static int (*user_foreground)(int*);
 static int (*system_hide_splash)(void);
 static int (*system_load_exec)(const char*, const char* const*);
+static const char* (*mono_check_corlib_version)(void);
+// Set only below firmware 6.72, when the console's own system Mono replaced a
+// rejected packaged runtime (see load_firmware_mono_runtime).
+static int system_mono_runtime;
 
 static int boot_failure(const char* stage, int code)
 {
@@ -117,6 +121,83 @@ static int load_mono_runtime(const char* path)
     gs_log_write("startup", "mono load_result=0x%08x start_result=0x%08x",
         (unsigned)module, (unsigned)startResult);
     return module;
+}
+
+// Records whether the kernel loader itself refuses a rejected runtime (errno
+// 22 here) or accepts it, which moves the failure to libkernel's start steps.
+// The module is loaded without running any of its code and then unloaded.
+static void probe_rejected_runtime(const char* path)
+{
+    int handle = -1;
+    int loadError = dynlib_load_only(path, &handle);
+    int unloadError = -1;
+    if (!loadError && handle >= 0) unloadError = dynlib_unload(handle);
+    gs_log_write("startup", "mono diagnostic kernel_load_errno=%d handle=0x%08x unload_errno=%d",
+        loadError, (unsigned)handle, unloadError);
+}
+
+static int load_system_mono_runtime(void)
+{
+    static const char runtime[] = "libmonosgen-2.0.sprx";
+    const char* sandbox = sceKernelGetFsSandboxRandomWord();
+    int module = -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        char path[256];
+        if (attempt == 0) {
+            if (!sandbox || !*sandbox) continue;
+            snprintf(path, sizeof(path), "/%s/common/lib/%s", sandbox, runtime);
+        } else {
+            snprintf(path, sizeof(path), "/system/common/lib/%s", runtime);
+        }
+        int startResult = 0;
+        module = sceKernelLoadStartModule(path, 0, NULL, 0, NULL, &startResult);
+        gs_log_write("startup", "mono runtime variant=system source=%s load_result=0x%08x start_result=0x%08x",
+            attempt == 0 ? "sandbox" : "system", (unsigned)module, (unsigned)startResult);
+        if (module >= 0) return module;
+    }
+    return module;
+}
+
+// The packaged runtime is the firmware 6.72 system Mono: it declares SDK
+// 0x06720001 (the 6.72 system software version) and imports internal system
+// libraries (libSceLibcInternal, libSceRegMgr, sceSysmoduleLoadModuleInternal).
+// Firmware 6.72 and newer only ever use it. Below 6.72 it is tried first (the
+// compat copy), and when it is rejected the console's own system Mono, which
+// matches that firmware's loader and libraries, is used instead.
+static int load_firmware_mono_runtime(const char* path, int belowFirmware672)
+{
+    int module = load_mono_runtime(path);
+    if (module >= 0 || !belowFirmware672) return module;
+    probe_rejected_runtime(path);
+    int systemModule = load_system_mono_runtime();
+    if (systemModule < 0) return module;
+    system_mono_runtime = 1;
+    return systemModule;
+}
+
+static int install_runtime_hooks(int module)
+{
+    if (!system_mono_runtime) return InstallHooks();
+    uint64_t text = 0, size = 0, offset = 0;
+    int matches = 0;
+    int result = InstallSystemRuntimeHooks(module, &text, &size, &offset, &matches);
+    gs_log_write("startup", "mono hook variant=system result=%d matches=%d offset=0x%llx text_size=0x%llx",
+        result, matches, (unsigned long long)offset, (unsigned long long)size);
+    if (result == 0) {
+        // Record the loader candidates so a firmware-specific entry can be reviewed.
+        uint64_t functions[4], references[4];
+        int count = FindSprxLoaderCandidates((const uint8_t*)(uintptr_t)text, size, functions, references, 4);
+        for (int i = 0; i < count && i < 4; i++) {
+            char bytes[97] = "unknown";
+            if (functions[i] != UINT64_MAX && functions[i] + 48 <= size)
+                for (int b = 0; b < 48; b++)
+                    snprintf(bytes + b * 2, 3, "%02x", ((const uint8_t*)(uintptr_t)text)[functions[i] + b]);
+            gs_log_write("startup", "mono hook candidate function=0x%llx reference=0x%llx bytes=%s",
+                (unsigned long long)functions[i], (unsigned long long)references[i], bytes);
+        }
+        gs_log_write("startup", "mono hook candidates=%d", count);
+    }
+    return result > 0;
 }
 
 static int require_export(int module, const char* name, void** pointer)
@@ -302,6 +383,10 @@ void addInternalCalls(){
 
 void MonoLogCallback(const char *log_domain, const char *log_level, const char *message, int fatal, void *user_data){
 	klogf("[%s] %s", log_level, message);
+    // The system runtime fallback is unproven on console; keep its errors.
+    if (system_mono_runtime && (fatal || (log_level && (!strcmp(log_level, "error") || !strcmp(log_level, "critical")))))
+        gs_log_write("startup", "mono runtime variant=system level=%s fatal=%d message=%s",
+            log_level ? log_level : "?", fatal, message ? message : "");
 }
 
 
@@ -341,6 +426,16 @@ void* startMono()
     if (!domain) {
         boot_failure("mono-domain", -1);
         return 0;
+    }
+    if (system_mono_runtime) {
+        // The packaged class libraries were built for the 6.72 runtime.
+        const char* mismatch = mono_check_corlib_version ? mono_check_corlib_version() : NULL;
+        gs_log_write("startup", "mono runtime variant=system corlib=%s",
+            !mono_check_corlib_version ? "unchecked" : mismatch ? mismatch : "match");
+        if (mismatch) {
+            boot_failure("mono-corlib-mismatch", -1);
+            return 0;
+        }
     }
 
     // The embedded entry uses runtime_invoke rather than exec_main, so Mono
@@ -490,17 +585,22 @@ int main()
     boot_stage("application-mount-ready", 0);
     log_package_build();
     char pkgLib[0x100] = "\x0";
+    int belowFirmware672 = 0;
     sprintf(&pkgLib, "%s/sce_module/libmonosgen-2.0.prx", baseDir);
-    // Firmware older than the runtime's 6.72 SDK rejects the original module
-    // (0x80020016 at module-mono). The package also carries a copy whose module
-    // parameter declares the 4.50 SDK; only those consoles load it, so every
-    // newer firmware keeps loading the original file unchanged.
+    // Firmware older than 6.72 rejects the original module (0x80020016 at
+    // module-mono). The package also carries a copy whose module parameter
+    // declares the 4.50 SDK; only those consoles load it, so every newer
+    // firmware keeps loading the original file unchanged. On 5.05 the copy is
+    // rejected the same way, so load_firmware_mono_runtime continues there.
     if (versionResult == 0 && systemVersion.Version != 0 && systemVersion.Version < 0x06720000) {
+        belowFirmware672 = 1;
         char compatLib[0x100];
         snprintf(compatLib, sizeof(compatLib), "%s/compat/libmonosgen-2.0.prx", baseDir);
         int compat = file_exists(compatLib);
         gs_log_write("startup", "mono runtime variant=%s firmware=0x%08x",
             compat ? "sdk-4.50" : "original-compat-missing", (unsigned)systemVersion.Version);
+        gs_log_write("startup", "mono runtime path=%s original=%d compat=%d",
+            compat ? compatLib : pkgLib, file_exists(pkgLib), compat);
         if (compat) snprintf(pkgLib, sizeof(pkgLib), "%s", compatLib);
     }
 
@@ -508,7 +608,7 @@ int main()
 	int libSceNet = load_system_module("libSceNet");
 	int libSceSystemService = load_system_module("libSceSystemService");
     int libSceUserService = load_system_module("libSceUserService");
-	int mono_framework = load_mono_runtime(pkgLib);
+	int mono_framework = load_firmware_mono_runtime(pkgLib, belowFirmware672);
 
 #ifdef RESIDENT_DAEMON
     if (!(libSceSystemService & 0x80000000))
@@ -553,6 +653,8 @@ int main()
     sceKernelDlsym(mono_framework, "mono_dl_fallback_unregister", (void**)&mono_dl_fallback_unregister);
     sceKernelDlsym(mono_framework, "mono_trace_set_log_handler", (void**)&mono_trace_set_log_handler);
     sceKernelDlsym(mono_framework, "mono_domain_create", (void**)&mono_domain_create);
+    if (system_mono_runtime)
+        sceKernelDlsym(mono_framework, "mono_check_corlib_version", (void**)&mono_check_corlib_version);
 
     sceKernelDlsym(libKernel, "sceKernelJitCreateSharedMemory", (void**)&JitCreateSharedMemory);
     sceKernelDlsym(libKernel, "sceKernelJitCreateAliasOfSharedMemory", (void**)&JitCreateAliasOfSharedMemory);
@@ -588,7 +690,7 @@ int main()
     REQUIRE_EXPORT(mono_framework, mono_dl_fallback_register);
     REQUIRE_EXPORT(mono_framework, mono_trace_set_log_handler);
     boot_stage("exports-ready", 0);
-    if (!InstallHooks()) return boot_failure("mono-hook-mismatch", -1);
+    if (!install_runtime_hooks(mono_framework)) return boot_failure("mono-hook-mismatch", -1);
     boot_stage("mono-hook-ready", 0);
 
     run();
