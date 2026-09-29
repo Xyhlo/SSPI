@@ -459,8 +459,8 @@ namespace Orbis
                         continue;
                     }
                     if (status != 200) throw new IOException("Source HTTP " + status);
-                    const long limit = 4L * 1024 * 1024;
-                    if (response.ContentLength > limit) throw new IOException("Source exceeds 4 MiB");
+                    const long limit = 8L * 1024 * 1024; // PackageSourcePackage.MaximumCompressedBytes
+                    if (response.ContentLength > limit) throw new IOException("Source exceeds 8 MiB");
                     long done = 0;
                     using (var input = response.GetResponseStream())
                     using (var output = new FileStream(path, FileMode.Create, FileAccess.Write))
@@ -470,7 +470,7 @@ namespace Orbis
                         {
                             if (cancel != null && cancel()) throw new OperationCanceledException();
                             done += count;
-                            if (done > limit) throw new IOException("Source exceeds 4 MiB");
+                            if (done > limit) throw new IOException("Source exceeds 8 MiB");
                             output.Write(buffer, 0, count);
                             if (progress != null) progress(done, response.ContentLength);
                         }

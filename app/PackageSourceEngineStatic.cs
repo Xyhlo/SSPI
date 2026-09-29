@@ -18,7 +18,7 @@ namespace Orbis
         internal const int MaxTitles = 30000;
         const int MaxJsonBytes = 2 * 1024 * 1024;
         const int MaxShardBytes = 1500000;
-        const int MaxIndexBytes = 4 * 1024 * 1024;
+        const int MaxIndexBytes = 8 * 1024 * 1024;
         static readonly Regex TitlePattern = new Regex(@"\A(?:CUSA|SLUS|SCUS|SLES|SCES|SLPS|SLPM|SCPS)[0-9]{5}\z");
         static readonly object Gate = new object();
         static readonly Dictionary<string, Catalog> Catalogs = new Dictionary<string, Catalog>(StringComparer.Ordinal);

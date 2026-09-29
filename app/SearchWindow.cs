@@ -1396,13 +1396,13 @@ namespace Orbis
                     NetHttp.DownloadSourceFile(uri.AbsoluteUri, temp,
                         (done, total) =>
                         {
-                            if (done > 4L * 1024 * 1024 || total > 4L * 1024 * 1024) tooLarge = true;
+                            if (done > PackageSourcePackage.MaximumCompressedBytes || total > PackageSourcePackage.MaximumCompressedBytes) tooLarge = true;
                             UpdateSourceInstall(SourceInstallStage.Downloading, done, total,
                                 total > 0 ? "Receiving source package" : "Receiving source package · size unknown");
                         },
                         () => tooLarge, timeoutMs);
-                    if (tooLarge || !File.Exists(temp) || new FileInfo(temp).Length > 4L * 1024 * 1024)
-                        throw new Exception("source package exceeds 4 MiB");
+                    if (tooLarge || !File.Exists(temp) || new FileInfo(temp).Length > PackageSourcePackage.MaximumCompressedBytes)
+                        throw new Exception("source package exceeds 8 MiB");
                     long sourceBytes = new FileInfo(temp).Length;
                     UpdateSourceInstall(SourceInstallStage.Validating, sourceBytes, sourceBytes,
                         "Checking package structure, manifest, and limits");
@@ -1419,7 +1419,7 @@ namespace Orbis
                 catch (OperationCanceledException)
                 {
                     string detail = tooLarge
-                        ? "Package exceeds the 4 MiB safety limit"
+                        ? "Package exceeds the 8 MiB safety limit"
                         : "Package download was canceled";
                     UpdateSourceInstall(SourceInstallStage.Failed, 0, 0, detail);
                     SetStatus(detail);

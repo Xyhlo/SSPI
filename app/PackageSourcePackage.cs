@@ -18,13 +18,13 @@ namespace Orbis
 
     /// <summary>
     /// A completely materialized and validated .gssource archive. Materializing is intentional:
-    /// the expanded archive is capped at 32 MiB, so extraction never depends on a mutable input.
+    /// the expanded archive is capped at 64 MiB, so extraction never depends on a mutable input.
     /// This class only reads declarative data; it never loads an assembly or executes package data.
     /// </summary>
     internal sealed class PackageSourcePackage
     {
-        public const int MaximumCompressedBytes = 4 * 1024 * 1024;
-        public const int MaximumExpandedBytes = 32 * 1024 * 1024;
+        public const int MaximumCompressedBytes = 8 * 1024 * 1024;
+        public const int MaximumExpandedBytes = 64 * 1024 * 1024;
         const int MaximumNonCatalogExpandedBytes = 16 * 1024 * 1024;
         public const int MaximumEntryBytes = 4 * 1024 * 1024;
         public const int MaximumEntries = 64;
@@ -47,7 +47,7 @@ namespace Orbis
             var info = new FileInfo(path);
             if (!info.Exists) throw new FileNotFoundException("Package source not found", path);
             if (info.Length <= 0 || info.Length > MaximumCompressedBytes)
-                throw new InvalidDataException("Package source must be between 1 byte and 4 MiB");
+                throw new InvalidDataException("Package source must be between 1 byte and 8 MiB");
             byte[] bytes = new byte[checked((int)info.Length)];
             using (var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
                 ReadExactly(input, bytes);
@@ -57,7 +57,7 @@ namespace Orbis
         public static PackageSourcePackage Open(byte[] bytes)
         {
             if (bytes == null || bytes.Length == 0 || bytes.Length > MaximumCompressedBytes)
-                throw new InvalidDataException("Package source must be between 1 byte and 4 MiB");
+                throw new InvalidDataException("Package source must be between 1 byte and 8 MiB");
 
             var package = new PackageSourcePackage();
             package.PackageSha256 = Hash(bytes);
@@ -140,7 +140,7 @@ namespace Orbis
                                 throw new InvalidDataException("Entry compressed size is invalid: " + path);
                             expanded += entry.Size;
                             if (expanded > MaximumExpandedBytes)
-                                throw new InvalidDataException("Expanded package exceeds 32 MiB");
+                                throw new InvalidDataException("Expanded package exceeds 64 MiB");
                             if (entry.CompressedSize == 0 && entry.Size > 0)
                                 throw new InvalidDataException("Invalid compression ratio: " + path);
                             if (entry.CompressedSize > 0 && entry.Size > entry.CompressedSize * 20L)
