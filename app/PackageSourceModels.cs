@@ -135,6 +135,19 @@ namespace Orbis
             if (value == "JPN" || value == "JAP") return "JP";
             return value;
         }
+
+        // Download pages stamp labels and file names with "[site.com]" tags. Screens
+        // show them without the tag; stored names keep it because transfers use them.
+        static readonly Regex SiteTag = new Regex(@"[\s_.+-]*[\[({][\s+]*(?:https?://)?(?:www\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*" +
+            @"\.(?:com|net|org|info|io|to|co|cc|me|xyz|ru|club|site|online|vip|top|gg|ws|biz|us|eu)[\s+]*[\])}]" +
+            @"|[\s_+-]+(?:www\.)?[A-Za-z0-9]+\.(?:com|net|org)(?=[.\s_+-]|$)", RegexOptions.IgnoreCase);
+        internal static string WithoutSiteTags(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.IndexOf('.') < 0) return text ?? "";
+            string clean = SiteTag.Replace(text, "").TrimStart(' ', '-', '_', '+').Trim();
+            if (clean.StartsWith(".", StringComparison.Ordinal) && clean.IndexOf('.', 1) > 0) clean = clean.TrimStart('.');
+            return clean.Length == 0 || clean[0] == '.' ? "Download" + clean : clean;
+        }
     }
 
     internal sealed class SourceResolveRequest

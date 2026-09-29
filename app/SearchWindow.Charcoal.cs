@@ -298,6 +298,7 @@ namespace Orbis
         static string PackageDisplayTitle(string kind, string label, string gameName, string host, string version)
         {
             string title = PackageTitle(kind);
+            label = PackageSourceIdentity.WithoutSiteTags(label);
             if (SamePackageKind(kind, "dlc") && !string.IsNullOrWhiteSpace(label) &&
                 !string.Equals(label, gameName, StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(label, host, StringComparison.OrdinalIgnoreCase)) title = label;
@@ -627,7 +628,7 @@ namespace Orbis
             bool failed = !string.IsNullOrEmpty(note);
             if (!failed && candidate != null)
             {
-                string label = (candidate.Label ?? "").Trim();
+                string label = PackageSourceIdentity.WithoutSiteTags((candidate.Label ?? "").Trim());
                 if (!string.IsNullOrEmpty(label) && !string.Equals(label, meta.PackageTitle, StringComparison.OrdinalIgnoreCase)) note = label;
             }
             if (!string.IsNullOrEmpty(note))

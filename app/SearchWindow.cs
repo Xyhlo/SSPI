@@ -5032,7 +5032,7 @@ namespace Orbis
         static string DownloadPackageMetadata(DlItem item)
         {
             var parts = new List<string>();
-            parts.Add(string.IsNullOrEmpty(item.Label) ? "Package" : item.Label);
+            parts.Add(string.IsNullOrEmpty(item.Label) ? "Package" : PackageSourceIdentity.WithoutSiteTags(item.Label));
             string source = !string.IsNullOrEmpty(item.SourceAttribution)
                 ? item.SourceAttribution : item.SourceId;
             if (!string.IsNullOrEmpty(source))

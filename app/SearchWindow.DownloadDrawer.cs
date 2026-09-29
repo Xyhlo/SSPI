@@ -75,7 +75,7 @@ namespace Orbis
         readonly List<DrawerRow> _drawerRows = new List<DrawerRow>();
         static string IncomingFileName(DlItem item, string name)
         {
-            return DownloadManager.IncomingContainerFileName(item, name);
+            return PackageSourceIdentity.WithoutSiteTags(DownloadManager.IncomingContainerFileName(item, name));
         }
         void OpenDownloadDrawer(DownloadGroup group)
         {
@@ -173,7 +173,7 @@ namespace Orbis
                     offset += volume.Size;
                 }
                 foreach (var output in outputs)
-                    _drawerRows.Add(new DrawerRow { Name = output.Name, Detail = output.State, Size = FileBytes(output.Size),
+                    _drawerRows.Add(new DrawerRow { Name = PackageSourceIdentity.WithoutSiteTags(output.Name), Detail = output.State, Size = FileBytes(output.Size),
                         Key = "output\n" + selected.Id + "\n" + output.Name,
                         ItemId = selected.Id, Error = output.State.StartsWith("Failed", StringComparison.Ordinal),
                         Installed = output.State == "Installed",
