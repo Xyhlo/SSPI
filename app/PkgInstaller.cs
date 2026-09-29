@@ -1262,7 +1262,10 @@ namespace Orbis
                 () => { int found; return TryFindBackgroundTask(contentId, subType, out found) ? found : -1; },
                 id => IsOwnedBackgroundTask(id, contentId, subType),
                 id => { BgftTaskProgress state; int rc = sceBgftServiceDownloadGetProgress(id, out state);
-                    return new PkgInstallPolicy.BgftStartProgress { Readable = rc == 0, Error = state.ErrorResult }; },
+                    return new PkgInstallPolicy.BgftStartProgress { Readable = rc == 0, Error = state.ErrorResult,
+                        Preparing = state.PreparingPercent, Copy = state.LocalCopyPercent,
+                        Total = state.LengthTotal != 0 ? state.LengthTotal : state.Length,
+                        Done = state.TransferredTotal != 0 ? state.TransferredTotal : state.Transferred }; },
                 sceBgftServiceDownloadStopTask, sceBgftServiceIntDownloadUnregisterTask, ReleaseWebTask, out detail);
             LogInstall("BGFT duplicate recovery content=" + contentId + " subtype=" + subType + " " + detail);
             return recovered;

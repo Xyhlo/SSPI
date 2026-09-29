@@ -5,6 +5,15 @@ namespace Orbis
     internal static class BgftCancellation
     {
         internal const int TaskNotFound = unchecked((int)0x80990019);
+        const string NotOwned = " is not owned by SSPI; operation refused";
+
+        /// <summary>True when an operation was refused because the PS4 task belongs to
+        /// something other than SSPI (it is not in the ownership journal).</summary>
+        internal static bool IsForeignRefusal(string error)
+        {
+            return error != null && error.StartsWith("BGFT task ", StringComparison.Ordinal) &&
+                error.EndsWith(NotOwned, StringComparison.Ordinal);
+        }
         internal delegate int FindTask(string content, int subtype, out int task);
 
         internal static bool ResolveOwned(string content, int subtype, FindTask find,
@@ -22,7 +31,7 @@ namespace Orbis
             if (rc != 0)
             { activeTask = -1; error = "BGFT find 0x" + unchecked((uint)rc).ToString("X8"); return false; }
             if (!owned(activeTask))
-            { error = "BGFT task " + activeTask + " is not owned by SSPI; operation refused"; return false; }
+            { error = "BGFT task " + activeTask + NotOwned; return false; }
             return true;
         }
 

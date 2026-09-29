@@ -683,8 +683,7 @@ namespace Orbis
                             {
                                 int activeTask;
                                 string cancelError;
-                                if (!PkgInstaller.CancelBackground(existing.BgftTaskId, existing.BgftContentId,
-                                    existing.BgftSubType, out activeTask, out cancelError))
+                                if (!CancelRowBackground(existing, out activeTask, out cancelError))
                                 {
                                     existing.BgftTaskId = activeTask;
                                     existing.StatusText = cancelError;
@@ -1434,8 +1433,7 @@ namespace Orbis
                     }
                     else if (it.State == DlState.Failed)
                     {
-                        if (PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
-                            out activeTask, out error))
+                        if (CancelRowBackground(it, out activeTask, out error))
                         {
                             RetireCanceledBgftSubmission(it);
                             ClearBackground(it);
@@ -1630,8 +1628,7 @@ namespace Orbis
                     { it.CancelRequested = previous; error = "Could not save the cancellation request"; return false; }
                     int activeTask;
                     string cancelError;
-                    if (PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
-                        out activeTask, out cancelError))
+                    if (CancelRowBackground(it, out activeTask, out cancelError))
                     {
                         RetireCanceledBgftSubmission(it);
                         ClearBackground(it);
@@ -1798,8 +1795,7 @@ namespace Orbis
                         if (!SaveManifest())
                         { it.RemoveRequested = requested; it.CancelRequested = canceled; error = "Could not save the removal request"; return false; }
                         int activeTask;
-                        if (!PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
-                            out activeTask, out error))
+                        if (!CancelRowBackground(it, out activeTask, out error))
                         {
                             it.BgftTaskId = activeTask;
                             it.StatusText = "Removal saved; waiting for PS4 acknowledgement";
@@ -1864,8 +1860,7 @@ namespace Orbis
                         {
                             int activeTask;
                             string cancelError;
-                            if (!PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
-                                    out activeTask, out cancelError))
+                            if (!CancelRowBackground(it, out activeTask, out cancelError))
                             {
                                 it.BgftTaskId = activeTask;
                                 error = cancelError ?? "BGFT cancel failed";
@@ -1891,8 +1886,7 @@ namespace Orbis
                     {
                         int activeTask;
                         string cancelError;
-                        if (!PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType,
-                                out activeTask, out cancelError))
+                        if (!CancelRowBackground(it, out activeTask, out cancelError))
                         {
                             it.BgftTaskId = activeTask;
                             error = cancelError ?? "Cancel background first";
@@ -5148,8 +5142,10 @@ namespace Orbis
 
         string FeederLastError(DlItem item)
         {
-            return item != null && item.BgftResident
-                ? ResidentDownloadService.GetError(item.Id) : _loopback.LastError;
+            if (item == null) return null;
+            string error = item.BgftResident ? ResidentDownloadService.GetError(item.Id) : _loopback.LastError;
+            // The loopback server's LastError is process-wide ("ok" once it starts), never a row failure.
+            return string.IsNullOrWhiteSpace(error) || error == "ok" || error == "stopped" ? null : error;
         }
 
         void FeederMarkFailed(DlItem item)
@@ -6906,6 +6902,7 @@ namespace Orbis
                 bool baseReady = !PkgInstallPolicy.RequiresInstalledBase(actualKind) ||
                     (!string.IsNullOrEmpty(actualTitleId) && PkgInstaller.IsTitleInstalled(actualTitleId));
                 string fallbackReason = null;
+                bool foreignConflict = false;
                 if (useLoopback && baseReady)
                 {
                     string url;
@@ -7043,7 +7040,7 @@ namespace Orbis
                             if (taskId >= 0)
                                 lock (_lock) job.BgftTaskId = taskId;
                             if (!TryCancelBackgroundIdentity(job, contentId, subType,
-                                registrationError))
+                                registrationError, true, taskId < 0, out foreignConflict))
                             {
                                 SaveManifest();
                                 return;
@@ -7064,7 +7061,8 @@ namespace Orbis
                 if (useLoopback)
                 {
                     string error = fallbackReason ?? "BGFT package registration failed; PKG retained";
-                    if (!RetryLocalInstall(job, attempt, error)) MarkInstallFailed(job.Id, error, attempt);
+                    // Another PS4 download holds this content; a local retry would meet the same conflict.
+                    if (foreignConflict || !RetryLocalInstall(job, attempt, error)) MarkInstallFailed(job.Id, error, attempt);
                     return;
                 }
                 lock (_lock)
@@ -7254,7 +7252,7 @@ namespace Orbis
                 if (!stop && InstallDependencyReady(item)) return false;
                 if (string.IsNullOrEmpty(item.BgftContentId) || item.BgftSubType <= 0) return false;
                 int activeTask; string error;
-                if (!PkgInstaller.CancelBackground(item.BgftTaskId, item.BgftContentId, item.BgftSubType, out activeTask, out error))
+                if (!CancelRowBackground(item, out activeTask, out error))
                 {
                     item.BgftTaskId = activeTask;
                     item.StatusText = (stop ? "Stopping installation; " : "Yielding to required package; ") + error;
@@ -7902,8 +7900,7 @@ namespace Orbis
                         if (!object.ReferenceEquals(Find(item.Id), item) || !item.CancelRequested) continue;
                         int activeTask;
                         string cancelError;
-                        if (PkgInstaller.CancelBackground(item.BgftTaskId, item.BgftContentId, item.BgftSubType,
-                            out activeTask, out cancelError))
+                        if (CancelRowBackground(item, out activeTask, out cancelError))
                         {
                             RetireCanceledBgftSubmission(item);
                             ClearBackground(item);
@@ -7979,8 +7976,8 @@ namespace Orbis
                                 cur.BgftFeederMisses++;
                                 if (cur.BgftFeederMisses >= 6)
                                 {
-                                    FallbackBgftToLocal(cur,
-                                        FeederLastError(cur) ?? "loopback server stopped");
+                                    FallbackBgftToLocal(cur, FeederLastError(cur) ??
+                                        (string.IsNullOrEmpty(cur.Error) ? "loopback server stopped" : cur.Error));
                                     feederDead = true;
                                 }
                             }
@@ -8360,16 +8357,43 @@ namespace Orbis
                 (item.BgftDirect || item.BgftLoopbackServed));
         }
 
+        /// <summary>Cancels the PS4 task a row tracks. A row of this app's own install path
+        /// whose task is not SSPI's lets go of it instead of retrying forever (earlier
+        /// builds adopted a conflicting download after a failed registration). SSPI claims
+        /// every task it registers inside the journal gate, so that task was never the
+        /// row's; it is left untouched on the PS4.</summary>
+        static bool CancelRowBackground(DlItem it, out int activeTask, out string error)
+        {
+            if (PkgInstaller.CancelBackground(it.BgftTaskId, it.BgftContentId, it.BgftSubType, out activeTask, out error)) return true;
+            if (it.BgftResident || it.ResidentStaged || it.ResidentArchive || !BgftCancellation.IsForeignRefusal(error)) return false;
+            LogBgftEvent("foreign-task-detached", it, error);
+            activeTask = -1; error = null;
+            return true;
+        }
+
         bool TryCancelBackgroundIdentity(DlItem item, string contentId, int subType, string reason,
             bool failLoopback = true)
+        { bool foreign; return TryCancelBackgroundIdentity(item, contentId, subType, reason, failLoopback, false, out foreign); }
+
+        /// <param name="detachForeign">The row never registered a task (its registration
+        /// failed), so a task SSPI does not own is left alone instead of being adopted:
+        /// adopting it made the row wait on someone else's download forever.</param>
+        bool TryCancelBackgroundIdentity(DlItem item, string contentId, int subType, string reason,
+            bool failLoopback, bool detachForeign, out bool foreign)
         {
             int activeTask = -1;
             string cancelError = null;
             bool canceled = PkgInstaller.CancelBackground(item != null ? item.BgftTaskId : -1,
                     contentId, subType,
                     out activeTask, out cancelError);
+            foreign = !canceled && BgftCancellation.IsForeignRefusal(cancelError);
             if (canceled) return true;
             if (item == null) return false;
+            if (foreign && detachForeign)
+            {
+                LogBgftEvent("foreign-conflict", item, reason + " | " + cancelError);
+                return true;
+            }
             lock (_lock)
             {
                 item.Background = true;

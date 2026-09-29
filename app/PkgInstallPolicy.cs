@@ -190,7 +190,11 @@ namespace Orbis
             if (task < 0 || !owned(task))
             { detail = "Existing PS4 download is not owned by this installation"; return false; }
             BgftStartProgress state = progress(task);
-            if (!state.Readable || state.Error == 0)
+            // A finished task SSPI registered can stay on the PS4 after its install;
+            // unregistering it leaves the installed content untouched.
+            bool finished = state.Readable && state.Error == 0 && state.Total > 0 && state.Done >= state.Total &&
+                state.Preparing >= 100 && state.Copy >= 100;
+            if (!state.Readable || (state.Error == 0 && !finished))
             { detail = "Existing PS4 download is active or its state is unconfirmed"; return false; }
             if (find() != task || !owned(task))
             { detail = "Existing PS4 download changed during recovery"; return false; }
@@ -202,7 +206,7 @@ namespace Orbis
                 return false;
             }
             release(task);
-            detail = "Retired failed owned task " + task;
+            detail = "Retired " + (finished ? "completed" : "failed") + " owned task " + task;
             return true;
         }
 
