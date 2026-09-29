@@ -752,13 +752,33 @@ static void gs_stage_download_poll(void)
     } else stage->created = 1;
 }
 
+/* 1: this stage's record is still on disk; 0: it was removed or replaced (the app
+ * retires the record of a job whose worker stopped answering); -1: unreadable. */
+static int gs_stage_record_owned(int slot, const GsStage *stage)
+{
+    static GsJob disk; char path[1100];
+    gs_stage_path(slot, "job", path, sizeof(path));
+    if (access(path, F_OK)) return errno == ENOENT ? 0 : -1;
+    if (gs_stage_read_job(slot, &disk)) return -1;
+    return !strcmp(disk.id, stage->job.id) && !strcmp(disk.generation, stage->job.generation);
+}
+
 static void gs_stage_poll(void)
 {
-    static uint64_t intake_log_at[GS_STAGE_COUNT];
+    static uint64_t intake_log_at[GS_STAGE_COUNT], owner_checked_at[GS_STAGE_COUNT];
     for (int i = 0; i < GS_STAGE_COUNT; i++) {
         GsStage *stage = &gs_stages[i]; stage->slot = i;
         if (stage->job.id[0]) {
             gs_stage_control(stage);
+            /* Never keep transferring a job the app has already retired. */
+            uint64_t checked = sceKernelGetProcessTime();
+            if (!stage->canceled && !stage->install_owned && checked - owner_checked_at[i] >= 5000000) {
+                owner_checked_at[i] = checked;
+                if (!gs_stage_record_owned(i, stage)) {
+                    gs_log_write("resident", "stage-orphaned slot=%d job=%s", i, stage->job.id);
+                    stage->canceled = stage->release = 1;
+                }
+            }
             if (stage->pending && !stage->canceled) {
                 if (stage->paused && strcmp(stage->state, "paused")) gs_stage_status(stage, "paused", NULL);
                 else if (!stage->paused && !strcmp(stage->state, "paused"))
@@ -773,7 +793,7 @@ static void gs_stage_poll(void)
             }
             if (stage->canceled && !stage->created && strcmp(gs_job.id, stage->job.id)) {
                 if (gs_archive_cancel_before_start(&stage->job) ||
-                    (stage->job.expected_kind && gs_retire_parked_package(stage->job.id, stage->job.content, stage->job.expected_kind))) {
+                    (stage->job.expected_kind && gs_retire_parked_package(stage->job.id, stage->job.content, stage->job.expected_kind, stage->release))) {
                     gs_stage_status(stage, "failed", "Stopping the retained PS4 task is unconfirmed; job and files kept");
                     continue;
                 }
@@ -781,7 +801,8 @@ static void gs_stage_poll(void)
             }
             if (stage->release && !stage->created && strcmp(gs_job.id, stage->job.id)) {
                 char path[1100]; gs_stage_path(i, "job", path, sizeof(path));
-                if (!unlink(path) || errno == ENOENT) {
+                /* A record the app already reused for another job is not ours to remove. */
+                if (!gs_stage_record_owned(i, stage) || !unlink(path) || errno == ENOENT) {
                     gs_stage_status(stage, "released", NULL); memset(stage, 0, sizeof(*stage)); stage->slot = i;
                 }
             }

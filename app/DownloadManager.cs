@@ -127,6 +127,8 @@ namespace Orbis
         public bool ResidentArchive;
         public bool ResidentStaged;
         public bool ResidentRemovePending;
+        // Transient (not saved): when this removal started, and since when no worker heartbeat was seen.
+        public long ResidentRemoveStarted, ResidentRemoveSilentSince;
         public bool RemoveRequested;
         public bool ResidentAutoInstall;
         public string ResidentGeneration;
@@ -1352,7 +1354,9 @@ namespace Orbis
                         it.ResidentLinkRenewals = 0; it.ResidentLastRenewalBytes = 0;
                         it.CancelRequested = it.PauseRequested = false;
                         it.State = DlState.Resolving;
-                        it.StatusText = "Stopping previous attempt; verified files retained for retry";
+                        // Releasing a native job unregisters its PS4 task and the bytes BGFT held.
+                        it.StatusText = IsNativeBgftRow(it) ? "Stopping previous attempt; the PS4 download will restart from the beginning"
+                            : "Stopping previous attempt; verified files retained for retry";
                         if (SaveManifest())
                         {
                             residentCommandId = it.Id; residentRelease = true;
@@ -1778,12 +1782,12 @@ namespace Orbis
                         it.ResidentGeneration = wasGeneration;
                         it.StatusText = previousStatus; error = "Could not save the removal request"; return false;
                     }
+                    // ReleaseResidentJob adopts the owner of this ID when the saved
+                    // generation or destination is stale; skipping here left it unreleased.
                     residentReleaseId = it.Id;
                     residentReleaseItem = it;
                     residentReleaseAttempt = it.AttemptId;
                     residentReleaseGeneration = it.ResidentGeneration;
-                    if (!ownedJobFound || !string.Equals(ownedGeneration ?? "", residentReleaseGeneration ?? "", StringComparison.Ordinal))
-                        residentReleaseId = null;
                 }
                 else
                 {
@@ -2857,8 +2861,9 @@ namespace Orbis
                         bool dependencyAllowed = publishOnly ? !HasUnstartedPrerequisite(i) : InstallDependencyReady(i);
                         // One pure policy call, shared with the host regression, so a
                         // parked TorBox preparation is never claimed a second time and
-                        // never blocks an independent game behind it.
-                        if (QueueScheduler.CanClaim(i.ParkedForProvider, i.State == DlState.Queued, i.Background,
+                        // never blocks an independent game behind it. A row waiting for
+                        // its resident removal must never restart: claiming clears its stop.
+                        if (!i.ResidentRemovePending && QueueScheduler.CanClaim(i.ParkedForProvider, i.State == DlState.Queued, i.Background,
                             backgroundBusy, residentBusy, publishOnly, localPending, local, dependencyAllowed,
                             DateTime.UtcNow.Ticks, i.RetryAfterUtcTicks, TransferClockMs(), _nextJobStartAt,
                             _activeIds.Count, WorkerCount, _activePaths.Contains(pathKey)))
@@ -4985,6 +4990,15 @@ namespace Orbis
         static string NativeBgftDestination(string id)
         { return Path.Combine(AppSettings.StagingRoot("ps4"), "bgft-" + id + ".pkg").Replace('\\', '/'); }
 
+        // BGFT, not SSPI, holds a native job's payload and a release unregisters it.
+        // A fallback downloads to the same path with an SSPI map; that one resumes.
+        internal static bool IsNativeBgftRow(DlItem item)
+        {
+            return item != null && !string.IsNullOrEmpty(item.Id) &&
+                string.Equals(item.DestPath, NativeBgftDestination(item.Id), StringComparison.Ordinal) &&
+                !File.Exists(item.DestPath) && !File.Exists(item.DestPath + ".map");
+        }
+
         bool HandoffStagedPackage(DlItem job, int attempt, string url, string titleId,
             string kind, string contentId, long size, bool archive = false, bool nativeBgft = false, bool localSource = false)
         {
@@ -5243,16 +5257,20 @@ namespace Orbis
         {
             if (item == null) return;
             string id = item.Id;
-            if (!EnsureResidentGeneration(item, attempt, out generation))
+            string ownerGeneration;
+            bool owned = EnsureResidentGeneration(item, attempt, out generation) &&
+                ResidentDownloadService.TryGetJobIdentity(id, item.DestPath, out ownerGeneration) &&
+                string.Equals(ownerGeneration ?? "", generation ?? "", StringComparison.Ordinal);
+            // A removal ends the row, so it must reach whichever record still owns this
+            // queue ID even when the saved generation or path is stale; otherwise no
+            // release is ever written and the removal waits forever.
+            if (!owned && !(requireRemovePending && AdoptResidentOwnerForRemoval(item, attempt, out generation)))
             {
                 lock (_lock)
                     if (object.ReferenceEquals(Find(id), item) && item.AttemptId == attempt && item.ResidentRemovePending)
                         item.StatusText = "Waiting for resident job ownership before removal";
                 return;
             }
-            string ownerGeneration;
-            if (!ResidentDownloadService.TryGetJobIdentity(id, item.DestPath, out ownerGeneration) ||
-                !string.Equals(ownerGeneration ?? "", generation ?? "", StringComparison.Ordinal)) return;
             Func<Action, bool> publishIfCurrent = publish =>
             {
                 lock (_lock)
@@ -5269,6 +5287,30 @@ namespace Orbis
             Action release = () => ResidentDownloadService.Release(id, generation, publishIfCurrent);
             if (System.Threading.Monitor.IsEntered(_lock)) ThreadPool.QueueUserWorkItem(_ => release());
             else release();
+        }
+
+        // Queue IDs are unique per row and a pending removal blocks any new attempt, so
+        // the record still owning this ID is the one to stop. Persist its generation
+        // first; the generation-bound release and its publish check then agree.
+        bool AdoptResidentOwnerForRemoval(DlItem item, int attempt, out string generation)
+        {
+            generation = null;
+            string owner;
+            if (!ResidentDownloadService.TryGetOwnerGeneration(item.Id, out owner)) return false;
+            lock (_lock)
+            {
+                if (!object.ReferenceEquals(Find(item.Id), item) || item.AttemptId != attempt || !item.ResidentRemovePending) return false;
+                string previous = item.ResidentGeneration;
+                if (!string.Equals(previous ?? "", owner ?? "", StringComparison.Ordinal))
+                {
+                    item.ResidentGeneration = owner;
+                    if (!SaveManifest()) { item.ResidentGeneration = previous; return false; }
+                    SspiLog.Write("resident", "event=remove-owner-adopted job=" + item.Id +
+                        " saved=" + (string.IsNullOrEmpty(previous) ? "none" : previous) + " owner=" + (owner ?? "legacy"));
+                }
+                generation = owner;
+                return true;
+            }
         }
 
         bool FeederTryMarkComplete(DlItem item, out string error)
@@ -7557,13 +7599,38 @@ namespace Orbis
             };
             if (item.ResidentRemovePending)
             {
+                // Read outside _lock (a status read may retry briefly). A worker that cannot
+                // stop the job reports why; show that instead of an endless generic wait.
+                ResidentDownloadStatus removal;
+                string blocked = ResidentDownloadService.TryGetStatus(item.Id, out removal) &&
+                    removal.State == "failed" && !string.IsNullOrEmpty(removal.Error) ? removal.Error : null;
+                // A worker that is not running can never acknowledge. After a minute with
+                // no heartbeat at all, retire its pre-install record here so the removal
+                // finishes like any other.
+                bool workerSeen = ResidentDownloadService.WorkerHeartbeatSeen;
+                long now = DateTime.UtcNow.Ticks;
+                bool retireOrphan;
+                lock (_lock)
+                {
+                    if (!object.ReferenceEquals(Find(item.Id), item)) return;
+                    if (item.ResidentRemoveStarted == 0) item.ResidentRemoveStarted = now;
+                    if (workerSeen) item.ResidentRemoveSilentSince = 0;
+                    else if (item.ResidentRemoveSilentSince == 0) item.ResidentRemoveSilentSince = now;
+                    retireOrphan = !workerSeen && now - item.ResidentRemoveSilentSince >= TimeSpan.TicksPerMinute &&
+                        !_activeIds.Contains(item.Id) && !item.InstallSubmitted && item.BgftTaskId < 0;
+                }
+                if (retireOrphan) ResidentDownloadService.TryRetireOrphanedStagedJob(item.Id, generation);
                 lock (_lock)
                 {
                     if (!object.ReferenceEquals(Find(item.Id), item)) return;
                     if (_activeIds.Contains(item.Id) || ResidentDownloadService.HasJob(item.Id))
                     {
                         ReleaseResidentJob(item, attempt, generation, true);
-                        item.StatusText = "Removing background job; waiting for worker acknowledgement";
+                        item.StatusText = blocked != null ? "Removal waiting for the background worker: " + blocked
+                            : !workerSeen ? "Background worker is not running; removal finishes within a minute"
+                            : now - item.ResidentRemoveStarted > TimeSpan.TicksPerMinute * 3
+                                ? "Background worker has not stopped this download yet; restart the PS4 to finish removing it"
+                                : "Removing background job; waiting for worker acknowledgement";
                         return;
                     }
                     // The native owner removes its durable job only after readers, transfer
@@ -7603,12 +7670,16 @@ namespace Orbis
                         item.StatusText = "Waiting for background transfer to stop before retry";
                         return;
                     }
+                    bool nativeRestart = IsNativeBgftRow(item);
                     ClearBackground(item);
                     item.ResidentArchive = false;
                     item.ResidentRetryPending = false;
                     item.State = item.CancelRequested ? DlState.Canceled : item.PauseRequested ? DlState.Paused : DlState.Queued;
+                    // The released native task took its received bytes with it.
+                    if (nativeRestart) item.Done = 0;
                     item.StatusText = item.CancelRequested ? "Canceled; partial download retained" :
-                        item.PauseRequested ? "Paused; partial download retained" : "Preparing retry; verified files retained";
+                        item.PauseRequested ? "Paused; partial download retained" :
+                        nativeRestart ? "Preparing retry; the PS4 download restarts from the beginning" : "Preparing retry; verified files retained";
                     item.CancelRequested = item.PauseRequested = false;
                     item.Error = null; item.BytesPerSec = 0; item.EtaSeconds = 0;
                     item.StatsInitialized = false;

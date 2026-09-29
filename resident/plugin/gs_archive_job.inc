@@ -1452,7 +1452,7 @@ static int gs_park_task(void)
     return 0;
 }
 
-static int gs_retire_parked_package(const char *job_id, const char *content, int kind)
+static int gs_retire_parked_package(const char *job_id, const char *content, int kind, int release)
 {
     char path[1200], leaf[300], id[49], record[128], extra; int task, complete, pending, version, saved_kind = kind;
     snprintf(leaf, sizeof(leaf), "/packages/%s/install-001.txt", job_id);
@@ -1479,7 +1479,22 @@ static int gs_retire_parked_package(const char *job_id, const char *content, int
         snprintf(record, sizeof(record), "%s -1 0 0 6", id);
         return write_atomic(path, record);
     }
-    if (lookup || current != task || task < 0) return -1;
+    if (!lookup && current != task) {
+        /* BGFT keeps one task per content, and another task owns it now. The saved
+         * task is gone once BGFT no longer knows its ID. Intent without an ID, or a
+         * readable (possibly recycled) ID, cannot prove ownership, so only a release
+         * drops SSPI tracking; waiting would hold the job forever. The current task
+         * is never stopped: it may belong to another row or to the PS4 itself. */
+        int (*progress)(int, GsBgftProgress *); GsBgftProgress state = {0};
+        int gone = task >= 0 && !gs_bind(module, "sceBgftServiceDownloadGetProgress", &progress) &&
+            (uint32_t)progress(task, &state) == 0x80990019u;
+        if (!gone && !release) return -1;
+        gs_log_write("resident", "bgft-retire-parked job=%s task=%d current=%d outcome=%s",
+            job_id, task, current, gone ? "superseded" : "tracking-released");
+        snprintf(record, sizeof(record), "%s -1 0 0 6", id);
+        return write_atomic(path, record);
+    }
+    if (lookup || task < 0) return -1;
     if (gs_bind(module, "sceBgftServiceDownloadStopTask", &stop) ||
         gs_bind(module, "sceBgftServiceIntDownloadUnregisterTask", &remove)) return -1;
     stop(task);

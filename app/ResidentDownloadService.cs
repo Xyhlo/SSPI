@@ -483,6 +483,24 @@ namespace Orbis
             catch { return false; }
         }
 
+        /// <summary>Finds the resident record owned by a queue ID regardless of its
+        /// destination: a staged slot first, then the singleton install record (a native
+        /// install names its .bgft-meta input there). Generation is null for legacy records.</summary>
+        internal static bool TryGetOwnerGeneration(string id, out string generation)
+        {
+            generation = null;
+            int slot = FindStagedSlot(id);
+            if (slot >= 0) { generation = StagedGeneration(slot); return true; }
+            try
+            {
+                string[] record = File.ReadAllLines(JobPath);
+                if (record.Length < 2 || Decode(record[1]) != id) return false;
+                generation = ActiveGeneration(id);
+                return true;
+            }
+            catch { return false; }
+        }
+
         static string ReadStagedGeneration(string jobPath)
         {
             try
@@ -2054,6 +2072,63 @@ namespace Orbis
         }
 
         public static bool HasDownloader { get { return FreshHeartbeat(); } }
+
+        /// <summary>Any recent heartbeat from any worker build, ready or not, or one that
+        /// exists but cannot be read, counts as a running worker.</summary>
+        internal static bool WorkerHeartbeatSeen
+        {
+            get
+            {
+                if (!AppSettings.DataDirWritable || AppSettings.DataMigrationPending) return true;
+                WorkerHeartbeat heartbeat;
+                return TryReadHeartbeat(out heartbeat) || _heartbeatReadError != null;
+            }
+        }
+
+        /// <summary>Retires the transfer record of a job whose worker is not running, so a
+        /// removal that can never be acknowledged still completes. Only a pre-install
+        /// transfer qualifies: never a native BGFT record, the singleton worker's job, or
+        /// a job with an install receipt. The control file (with its release) stays, and
+        /// a worker that returns stops any transfer whose record it no longer finds.</summary>
+        internal static bool TryRetireOrphanedStagedJob(string id, string generation)
+        {
+            lock (Gate)
+            {
+                if (WorkerHeartbeatSeen) return false;
+                int slot = FindStagedSlot(id);
+                if (slot < 0) return false;
+                try
+                {
+                    string[] record = File.ReadAllLines(StagedPath(slot, "job"));
+                    if (!IsStagedRecord(record) || Decode(record[1]) != id || record[0] == "16" ||
+                        !string.Equals(StagedGeneration(slot) ?? "", generation ?? "", StringComparison.Ordinal)) return false;
+                    if (File.Exists(JobPath))
+                    {
+                        string[] active = File.ReadAllLines(JobPath);
+                        if (active.Length > 1 && Decode(active[1]) == id) return false;
+                    }
+                    foreach (string root in new[] { CanonicalIpcRoot, SharedIpcRoot })
+                        foreach (string area in new[] { "packages", "archives" })
+                        {
+                            string receipts = Path.Combine(root, area, id);
+                            if (Directory.Exists(receipts) && Directory.GetFiles(receipts, "install-*.txt").Length > 0) return false;
+                        }
+                    ResidentDownloadStatus status;
+                    if (TryGetStagedStatus(id, out status) && Array.IndexOf(new[] { "queued", "ready", "feeding", "paused",
+                        "storage-wait", "validating", "staged", "failed", "canceled" }, status.State) < 0) return false;
+                    foreach (string kind in new[] { "job", "status", "metrics" })
+                    {
+                        string path = StagedPath(slot, kind);
+                        File.Delete(path);
+                        string shared = MapToSharedIpcRoot(path);
+                        if (shared != null && shared != path) File.Delete(shared);
+                    }
+                    SspiLog.Write("resident", "event=remove-orphan-retired job=" + id + " slot=" + slot);
+                    return true;
+                }
+                catch (Exception ex) { _lastError = ex.Message; return false; }
+            }
+        }
 
         internal static bool SupportsSevenZipArchive
         {

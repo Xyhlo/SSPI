@@ -1107,7 +1107,7 @@ static void gs_worker_poll(void)
     if (gs_canceled && !gs_worker_running && gs_job.id[0]) {
         if ((!gs_worker_created && !gs_archive_journal[0] &&
                 (gs_archive_cancel_before_start(&gs_job) || (gs_job.archive != 1 && gs_job.expected_kind &&
-                    gs_retire_parked_package(gs_job.id, gs_job.content, gs_job.expected_kind)))) || gs_cancel_task()) {
+                    gs_retire_parked_package(gs_job.id, gs_job.content, gs_job.expected_kind, gs_release)))) || gs_cancel_task()) {
             gs_release = 0; gs_write_status("failed", "BGFT cancellation unconfirmed; ownership retained");
         } else gs_write_status("canceled", NULL);
     }
