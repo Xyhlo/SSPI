@@ -26,6 +26,28 @@ namespace Orbis
             return string.Join(",", encoded.ToArray());
         }
 
+        /// <summary>Source data version of Encode: a malformed or surplus password is
+        /// skipped instead of rejecting the row, title or whole catalog.</summary>
+        internal static string EncodeLenient(IList values)
+        {
+            var usable = new List<string>();
+            if (values != null)
+                foreach (object entry in values)
+                {
+                    string value = UsablePassword(entry);
+                    if (value.Length > 0 && !usable.Contains(value) && usable.Count < 4) usable.Add(value);
+                }
+            return Encode(usable);
+        }
+
+        internal static string UsablePassword(object entry)
+        {
+            string value = entry as string;
+            if (value == null || value.IndexOf('\0') >= 0 || Utf8.GetByteCount(value) > 256) return "";
+            foreach (char c in value) if (char.IsControl(c)) return "";
+            return value;
+        }
+
         internal static string[] Decode(string encoded)
         {
             if (string.IsNullOrEmpty(encoded)) return new string[0];

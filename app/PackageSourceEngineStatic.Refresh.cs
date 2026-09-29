@@ -115,8 +115,9 @@ namespace Orbis
                     hostUri.Host != hostname || hostUri.AbsolutePath != "/" || hostUri.Query.Length != 0 || hostUri.UserInfo.Length != 0) throw Bad("Invalid refresh file host");
                 config.FileHosts.Add(hostname);
             }
-            foreach (object value in Array(data, "archivePasswords", 4, true)) config.Passwords.Add(value);
-            ArchivePasswordDefaults.Encode(config.Passwords);
+            // Optional: a catalog without source passwords still refreshes.
+            foreach (string value in ArchivePasswordDefaults.Decode(ArchivePasswordDefaults.EncodeLenient(Value(data, "archivePasswords", false) as IList)))
+                config.Passwords.Add(value);
             return config;
         }
         static int RefreshInt(Dictionary<string, object> data, string name, int minimum, int maximum)

@@ -1310,10 +1310,21 @@ namespace Orbis
                 if (!rar) { error = "This download is not a failed RAR archive"; return false; }
                 // Commit the explicit password before any worker receives a retry. Source
                 // defaults only fill empty passwords, so retained parts use this value.
-                string previous = item.ArchivePassword;
+                string previous = item.ArchivePassword, previousList = item.ArchivePasswords;
+                // The source's own password stays a fallback: an outer and an inner
+                // archive can each need a different one.
+                if (!string.IsNullOrEmpty(previous) && previous != password)
+                {
+                    var kept = new List<string>(ArchivePasswordDefaults.Decode(item.ArchivePasswords));
+                    kept.Remove(previous); kept.Insert(0, previous);
+                    item.ArchivePasswords = ArchivePasswordDefaults.EncodeLenient(kept);
+                }
                 item.ArchivePassword = password;
                 if (!SaveManifest())
-                { item.ArchivePassword = previous; error = "Could not save the archive password"; return false; }
+                {
+                    item.ArchivePassword = previous; item.ArchivePasswords = previousList;
+                    error = "Could not save the archive password"; return false;
+                }
                 TogglePause(id);
                 return true;
             }
@@ -4841,19 +4852,16 @@ namespace Orbis
 
         internal static string ResidentArchivePasswordError(byte[] header, string password)
         {
+            // Only RAR uses a password. Sources give every link on a page the same
+            // passwords, so one on a ZIP or 7z row is no sign of encryption; the
+            // extractors report real encryption themselves and keep the archive.
             if (PackageArchive.IsSevenZipHeader(header))
-            {
-                if (!string.IsNullOrEmpty(password)) return "Encrypted 7z archives are not supported; the archive is kept.";
-                if (!ResidentDownloadService.SupportsSevenZipArchive)
-                    return "Restart the PS4 and enable GoldHEN to load this build's 7z extractor; files are kept.";
-                return null;
-            }
-            if (string.IsNullOrEmpty(password)) return null;
-            if (!ResidentDownloadService.ValidArchivePassword(password))
-                return "Archive password exceeds 256 UTF-8 bytes or is invalid";
-            if (header != null && header.Length >= 4 && header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21)
-                return null;
-            return "Encrypted ZIP archives are not supported; the archive is kept. Choose an unencrypted ZIP or a supported RAR archive.";
+                return ResidentDownloadService.SupportsSevenZipArchive ? null
+                    : "Restart the PS4 and enable GoldHEN to load this build's 7z extractor; files are kept.";
+            bool rar = header != null && header.Length >= 4 && header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21;
+            if (!rar || string.IsNullOrEmpty(password)) return null;
+            return ResidentDownloadService.ValidArchivePassword(password) ? null
+                : "Archive password exceeds 256 UTF-8 bytes or is invalid";
         }
 
         void RunLocalSource(DlItem job, int attempt)

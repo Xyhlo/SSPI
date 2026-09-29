@@ -154,7 +154,7 @@ namespace Orbis
                     CandidateId = candidateId,
                     ArchiveVolumes = ReadVolumes(row, access),
                     ArchivePassword = Value(row, "archivePassword", "archivePassword") ?? "",
-                    ArchivePasswords = ArchivePasswordDefaults.Encode(ArrayAt(row, "archivePasswords")),
+                    ArchivePasswords = ArchivePasswordDefaults.EncodeLenient(ArrayAt(row, "archivePasswords")),
                     ResolutionError = Value(row, "resolutionError", "resolutionError") ?? "",
                     TitleId = Value(row, Field(fields, "titleId", "titleid"), "titleId", "titleid") ?? titleId ?? "",
                     DisplayName = Value(row, Field(fields, "name", "name"), "name", "displayName") ?? name ?? "",

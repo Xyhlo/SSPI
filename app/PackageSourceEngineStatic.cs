@@ -299,7 +299,7 @@ namespace Orbis
                         Label = Text(row, "label", 512, false), HosterName = Text(row, "hoster", 256, false),
                         PackageVersion = Text(row, "version", 64, false), RequiredFirmware = Text(row, "requiredFirmware", 64, false),
                         PackageGroupId = Text(row, "groupId", 256, false), SourcePageUrl = Url(Text(row, "sourcePageUrl", 2048, false), false),
-                        ArchivePassword = Text(row, "archivePassword", 256, false),
+                        ArchivePassword = ArchivePasswordDefaults.UsablePassword(Value(row, "archivePassword", false)),
                         ArchivePasswords = PasswordDefaults(row),
                         ExpectedSha256 = Sha(Text(row, "sha256", 64, false)),
                         ExpectedContentId = Text(row, "contentId", 128, false), AccessType = Access(Text(row, "accessType", 32, true)) };
@@ -406,13 +406,9 @@ namespace Orbis
             return value;
         }
         static string Hash(byte[] value) { using (var sha = SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(value)).Replace("-", "").ToLowerInvariant(); }
+        // Passwords are hints: an unusable entry is skipped, never a reason to drop the title.
         static string PasswordDefaults(Dictionary<string, object> row)
-        {
-            object value = Value(row, "archivePasswords", false);
-            if (value != null && !(value is IList)) throw Bad("archivePasswords must be an array");
-            try { return ArchivePasswordDefaults.Encode(value as IList); }
-            catch (FormatException ex) { throw Bad(ex.Message); }
-        }
+        { return ArchivePasswordDefaults.EncodeLenient(Value(row, "archivePasswords", false) as IList); }
         static InvalidDataException Bad(string message) { return new InvalidDataException("Static catalog: " + message); }
         static void CheckCanceled(Func<bool> cancel) { if (cancel != null && cancel()) throw new OperationCanceledException(); }
         internal static int CompareTitle(SourceTitleResult a, SourceTitleResult b)

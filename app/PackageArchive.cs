@@ -245,8 +245,7 @@ namespace Orbis
         static List<PackageArchiveEntry> ReadSevenZip(string input, string destination,
             Func<bool> cancel = null, Action<long, long> progress = null, string password = null)
         {
-            if (!string.IsNullOrEmpty(password))
-                throw new NotSupportedException("Encrypted 7z archives are not supported; the archive is kept.");
+            // A source password is for RAR; the 7z reader reports real encryption itself.
             CheckCancel(cancel);
             const int stride = 1032;
             IntPtr entries = Marshal.AllocHGlobal(MaximumPackageEntries * stride);
