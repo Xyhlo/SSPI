@@ -89,8 +89,9 @@ typedef struct {
     unsigned failed_lanes;
     // Adaptive lane governor: the most lanes that held without a reset burst or
     // a wasted raise (0 until either happens), when probing above it resumes,
-    // and the real-time speed window a raise is judged by.
-    int ceiling, probe_from;
+    // and the real-time speed window a raise is judged by. restore_to: the lanes
+    // held before a cooldown, stalled-read or network-outage cut (0 when none).
+    int ceiling, probe_from, restore_to;
     unsigned ceiling_hold;
     uint64_t ceiling_until, probe_rate, rate_at, rate_bytes;
     uint64_t useful_bytes, useful_progress_at, tls_failure_started, recovery_deadline;

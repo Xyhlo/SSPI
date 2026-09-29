@@ -280,6 +280,10 @@ static void *gs_stage_worker(void *opaque)
         goto done;
     }
     if (sspi_xfer_init(gs_http)) { snprintf(stage->error, sizeof(stage->error), "Firmware transfer pool initialization failed"); goto done; }
+    /* A restarted engine (resume after a park, retry, reconnect) re-hashes its
+     * retained chunks from zero before any network read. Publish the bytes its
+     * map already holds meanwhile; display only, the engine is unchanged. */
+    int64_t retained = sspi_xfer_durable(stage->job.destination), resumed = stage->done > 0 ? retained : 0;
     handle = sspi_xfer_start(stage->job.url, NULL, stage->job.destination,
         stage->job.expected_kind ? stage->job.title : "", stage->job.content, stage->job.sha, stage->job.ranges);
     if (handle < 0) { snprintf(stage->error, sizeof(stage->error), "Native transfer could not start: %d", handle); goto done; }
@@ -287,7 +291,9 @@ static void *gs_stage_worker(void *opaque)
     for (;;) {
         GsXferStatus status;
         if (sspi_xfer_poll(handle, &status)) break;
-        stage->done = status.done; stage->active = status.lanes; stage->wire_bytes = status.network_bytes;
+        /* Verification output (done > 0) proves the engine kept this map. */
+        int64_t hold = status.state != GS_QUEUED ? 0 : status.done > 0 ? retained : resumed;
+        stage->done = status.done < hold ? hold : status.done; stage->active = status.lanes; stage->wire_bytes = status.network_bytes;
         if (!stage->notified && status.network_bytes > 0) {
             stage->notified = 1;
             gs_download_notification(stage->job.title[0] ? stage->job.title : "Package",
@@ -330,9 +336,15 @@ static void *gs_stage_worker(void *opaque)
         /* GS_QUEUED is the engine's preparation phase: admission, source probe
          * and staging-file open. Forward its detail every poll so an uncached
          * provider preparation is visible instead of a silent 0% transfer. */
-        const char *detail = NULL;
+        const char *detail = NULL; char resume_detail[180];
         if (!stage->paused && status.state == GS_QUEUED) detail = status.error[0] ? status.error : bgft_detail;
         else if (!stage->paused && status.state != GS_VALIDATING && bgft_detail[0]) detail = bgft_detail;
+        /* Name retained-data verification instead of the generic new-download text. */
+        if (hold > 0 && detail && !strncmp(detail, "Preparing ", 10)) {
+            snprintf(resume_detail, sizeof(resume_detail), "Resuming: checking %lld MiB already downloaded (%lld MiB verified)",
+                (long long)(hold >> 20), (long long)(status.done >> 20));
+            detail = resume_detail;
+        }
         gs_stage_status(stage, stage->paused ? "paused" : status.state == GS_VALIDATING ? "validating" : "feeding", detail);
         sceKernelUsleep(250000);
     }

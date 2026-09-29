@@ -53,6 +53,10 @@ typedef struct {
     // Start of the current blocking open/read (0 when idle). The poll-driven
     // watchdog aborts a call that stalls; `stalled` marks that abort as retryable.
     uint64_t io_since; int io_kind, stalled;
+    // accepted: the current connection was answered with its range. data_at:
+    // when this lane last received body bytes. refused: the provider turned
+    // this connection away at its connection limit (see connection_refused).
+    int accepted, refused; uint64_t data_at;
 #if SSPI_OWNER_DEBUG
     uint64_t owner_filling, owner_wait_started;
 #endif
@@ -90,6 +94,13 @@ static uint64_t origin_cooldown_locked(const char *origin)
         if(origin_cooldowns[i].origin[0]&&!strcmp(origin_cooldowns[i].origin,origin))return origin_cooldowns[i].until;
     return 0;
 }
+// A cooldown, a stalled read or a network outage says nothing about how many
+// connections the server holds. Remember the lanes held before the cut; the
+// job returns to them once the interruption clears (see govern).
+static void note_restorable_cut(GsJobState *j,int before)
+{
+    if(before>j->restore_to)j->restore_to=before;
+}
 static void origin_backoff_locked(const char *origin,uint64_t until)
 {
     if(!origin||!*origin||until<=gs_clock())return;
@@ -109,7 +120,7 @@ static void origin_backoff_locked(const char *origin,uint64_t until)
     }
     if(origin_cooldowns[slot].until<until)origin_cooldowns[slot].until=until;
     for(int i=0;i<GS_XFER_JOBS;i++)if(jobs[i].handle&&!strcmp(jobs[i].origin,origin)) {
-        if(jobs[i].limit>2)jobs[i].limit=2;
+        if(jobs[i].limit>2){note_restorable_cut(&jobs[i],jobs[i].limit);jobs[i].limit=2;}
         jobs[i].clean_chunks=0;jobs[i].recovery_at=origin_cooldowns[slot].until+10000;
     }
 }
@@ -317,6 +328,20 @@ static int immutable_debrid_link(const char *url)
 {
     static const char *const suffixes[]={".download.real-debrid.com",".debrid.it",".alldebrid.com",".tb-cdn.st",".tb-cdn.io",".torbox.app"};
     const char *host=url?strstr(url,"://"):NULL;if(!host)return 0;host+=3;
+    size_t n=strcspn(host,":/?#");
+    for(unsigned i=0;i<sizeof(suffixes)/sizeof(suffixes[0]);i++) {
+        size_t m=strlen(suffixes[i]);
+        if(n>m&&!strncasecmp(host+n-m,suffixes[i],m))return 1;
+    }
+    return 0;
+}
+// AllDebrid serves each link to a limited number of connections. The rest are
+// turned away (HTTP 403, 429 or 503, a reset, or a connection left silent)
+// while the accepted ones keep streaming at about 1 MB/s each.
+static int connection_limited(const GsJobState *j)
+{
+    static const char *const suffixes[]={".debrid.it",".alldebrid.com"};
+    const char *url=j->effective[0]?j->effective:j->url,*host=strstr(url,"://");if(!host)return 0;host+=3;
     size_t n=strcspn(host,":/?#");
     for(unsigned i=0;i<sizeof(suffixes)/sizeof(suffixes[0]);i++) {
         size_t m=strlen(suffixes[i]);
@@ -545,6 +570,23 @@ static OriginLanes *origin_lanes_locked(const char *origin,int create)
     memset(slot,0,sizeof(*slot));snprintf(slot->origin,sizeof(slot->origin),"%s",origin);
     return slot;
 }
+// AllDebrid hands out a different download server for each file, but its
+// connection limit is the service's: every AllDebrid link shares one record.
+static OriginLanes *job_lanes_locked(const GsJobState *j,int create)
+{
+    return origin_lanes_locked(connection_limited(j)?"alldebrid":j->origin,create);
+}
+// Whether another lane of this job still holds an answered connection that
+// received body bytes in the last 3 s. Lanes failing together while none is
+// receiving is the console's network dropping (Wi-Fi, router, ISP), not the
+// server turning connections away.
+static int job_receiving_locked(const GsJobState *j,unsigned except,uint64_t now)
+{
+    int slot=(int)(j-jobs);
+    for(unsigned i=0;i<GS_XFER_LANES;i++)
+        if(i!=except&&lanes[i].job==slot&&lanes[i].accepted&&lanes[i].data_at&&now-lanes[i].data_at<3000)return 1;
+    return 0;
+}
 // Hold the job at `level` before one lane is probed above it again. Reset
 // bursts describe the server and are kept for its next file; a raise that
 // added no speed describes this console's drive or line and stays with the job.
@@ -555,7 +597,7 @@ static void hold_at(GsJobState *j,int level,uint64_t now,int server)
     hold=!hold?LANE_HOLD_MIN_MS:hold>=LANE_HOLD_MAX_MS/2?LANE_HOLD_MAX_MS:hold*2;
     j->ceiling=level;j->ceiling_hold=hold;j->ceiling_until=add_deadline(now,hold);j->probe_from=0;
     if(server) {
-        OriginLanes *o=origin_lanes_locked(j->origin,1);
+        OriginLanes *o=job_lanes_locked(j,1);
         if(o){o->ceiling=level;o->hold=hold;o->until=j->ceiling_until;o->seen=now;}
     }
 }
@@ -582,7 +624,7 @@ static void govern(GsJobState *j,uint64_t now)
             else {
                 // The raise paid off: the next file from this server starts here.
                 if(j->ceiling&&j->limit>j->ceiling)j->ceiling=j->limit;
-                OriginLanes *o=origin_lanes_locked(j->origin,1);
+                OriginLanes *o=job_lanes_locked(j,1);
                 if(o&&o->ceiling<j->limit){o->ceiling=j->limit;o->seen=now;}
             }
         }
@@ -595,9 +637,17 @@ static void govern(GsJobState *j,uint64_t now)
     }
     if(j->limit<cap) {
         int step=j->limit/2;if(step<1)step=1;
-        j->probe_from=j->limit;j->probe_rate=measured?rate:0;
-        j->limit=j->limit>cap-step?cap:j->limit+step;
+        // Returning to the lanes held before a cooldown, stall or outage cut is
+        // not a probe: lanes still draining their spans from before the cut
+        // inflate the old speed, and a misjudged step would hold the job at one
+        // lane for up to ten minutes.
+        int restoring=j->restore_to>j->limit;
+        int next=j->limit>cap-step?cap:j->limit+step;
+        if(restoring&&next>j->restore_to)next=j->restore_to;
+        j->probe_from=restoring?0:j->limit;j->probe_rate=measured?rate:0;
+        j->limit=next;
     }
+    if(j->restore_to&&j->limit>=j->restore_to)j->restore_to=0;
     j->rate_at=real;j->rate_bytes=j->useful_bytes;
     j->clean_chunks=0;j->recovery_at=add_deadline(now,10000);
 }
@@ -684,11 +734,15 @@ static const char *retry_chunk(GsJobState *j,uint32_t chunk,unsigned lane,int rc
     if(server || burst) {
         // Simultaneous failures must not repeatedly halve the same allowance.
         if(now>=j->backoff_until) {
+            int before=j->limit;
             j->limit=server?j->limit/2:j->limit-(j->limit+3)/4;
             if(j->limit<1)j->limit=1;
-            // A throttling reply has its own cooldown and a stalled read is not a
-            // refusal; a burst of resets marks the most connections this server holds.
-            if(!server&&rc!=-16)hold_at(j,j->limit,now,1);
+            // A throttling reply has its own cooldown, a stalled read is not a
+            // refusal and a network outage fails every lane at once; those return
+            // to the earlier level. A burst of resets while other lanes still
+            // receive marks the most connections this server holds.
+            if(!server&&rc!=-16&&job_receiving_locked(j,lane,now)){hold_at(j,j->limit,now,1);j->restore_to=0;}
+            else note_restorable_cut(j,before);
             j->clean_chunks=0;j->recovery_at=j->backoff_until=now+10000;
             j->failed_lanes=0;j->failure_window=now;
         }
@@ -697,9 +751,60 @@ static const char *retry_chunk(GsJobState *j,uint32_t chunk,unsigned lane,int rc
     }
     return scope;
 }
+static int refusal_code(int rc)
+{
+    if(rc==401||rc==403||rc==410||rc==429||rc==503)return 1;
+    return rc<0&&rc!=-3&&rc!=-10&&rc!=-11&&rc!=-12&&rc!=-13&&rc!=-15&&rc!=-17;
+}
+// A new connection to a connection-limited host that fails before any body
+// byte, while another lane of the same job holds an accepted connection, was
+// turned away at the link's connection limit. That is not a dead link or an
+// account cooldown: the job holds at the lanes still accepted, this lane
+// returns its span to them, and the governor probes one lane above the hold
+// once it expires (the hold doubles while probes are refused). Lanes still
+// opening are waited for briefly, so a burst of simultaneous opens is judged
+// by the ones that succeed. Other providers keep the existing handling.
+static int connection_refused(Lane *lane,GsJobState *j,int rc,int streamed)
+{
+    if(streamed||!refusal_code(rc))return 0;
+    gs_lock(&gate);int limited=!j->single&&connection_limited(j);gs_unlock(&gate);
+    if(!limited)return 0;
+    uint64_t deadline=add_deadline(gs_clock(),3000);char line[320];
+    for(;;) {
+        if(__atomic_load_n(&j->stop,__ATOMIC_ACQUIRE))return 0;
+        gs_lock(&gate);
+        uint64_t now=gs_clock();int slot=(int)(j-jobs),live=0,opening=0;
+        for(int i=0;i<GS_XFER_LANES;i++) {
+            Lane *other=&lanes[i];
+            if(other==lane||other->job!=slot)continue;
+            if(other->accepted||(other->data_at&&now-other->data_at<3000))live++;
+            else if(other->io_since&&other->io_kind==GS_IO_OPEN)opening++;
+        }
+        // Count only once simultaneous opens have been answered (bounded wait).
+        if(opening&&now<deadline){gs_unlock(&gate);gs_sleep(25);continue;}
+        if(live) {
+            int before=j->limit,level=live<j->limit?live:j->limit;if(level<1)level=1;
+            j->limit=level;
+            // Refusals that arrive together are one event: do not keep doubling the hold.
+            if(now>=j->backoff_until){hold_at(j,level,now,1);j->backoff_until=add_deadline(now,10000);}
+            else if(level<j->ceiling) {
+                // A lane that had just finished can be counted once; a lower count in
+                // the same burst is the limit, without doubling the hold again.
+                j->ceiling=level;OriginLanes *o=job_lanes_locked(j,1);if(o&&o->ceiling>level)o->ceiling=level;
+            }
+            j->restore_to=0;
+            j->clean_chunks=0;j->recovery_at=add_deadline(now,10000);lane->refused=1;
+            snprintf(line,sizeof(line),"ms=%llu event=connection-limit handle=%d lane=%u hex=0x%08X live=%d before=%d after=%d ceiling=%d hold_ms=%u\n",
+                (unsigned long long)now,j->handle,(unsigned)(lane-lanes),(unsigned)rc,live,before,j->limit,j->ceiling,j->ceiling_hold);
+            gs_unlock(&gate);log_line(j->dest,line);return 1;
+        }
+        gs_unlock(&gate);return 0;
+    }
+}
 static int recover_stream(Lane *lane,GsJobState *j,int rc,unsigned attempt,uint64_t offset,int streamed)
 {
     GsHttp *h=&lane->http;
+    if(connection_refused(lane,j,rc,streamed)){gs_http_close(h);return 0;}
     if(rc==429||rc==503) {
         uint64_t now=gs_clock();unsigned seconds=h->retry_after>0?(unsigned)h->retry_after:15U;
         if(seconds>GS_RETRY_AFTER_MAX_SECONDS)seconds=GS_RETRY_AFTER_MAX_SECONDS;
@@ -745,25 +850,28 @@ static int recover_stream(Lane *lane,GsJobState *j,int rc,unsigned attempt,uint6
     // threshold scales with the current allowance (3 lanes at ten, 7 at 25).
     unsigned burst_threshold=(unsigned)(j->limit+3)/4;if(burst_threshold<3)burst_threshold=3;
     if(provider_failure && failed>=burst_threshold && now>=j->backoff_until) {
+        int before=j->limit;
         burst=1;if(j->limit>2)j->limit--;
-        // Several connections reset together: the server will not hold that
-        // many. Hold the reduced level for this server instead of climbing
-        // straight back into the same resets 10 s later. A stalled read is not
-        // a refusal and keeps the plain reduction.
-        if(rc!=-16)hold_at(j,j->limit,now,1);
+        // Several connections reset together while others still receive: the
+        // server will not hold that many. Hold the reduced level for this server
+        // instead of climbing straight back into the same resets 10 s later. A
+        // stalled read, or an outage with no lane receiving, keeps the plain
+        // reduction and returns to the earlier level.
+        if(rc!=-16&&job_receiving_locked(j,(unsigned)(lane-lanes),now)){hold_at(j,j->limit,now,1);j->restore_to=0;}
+        else note_restorable_cut(j,before);
         j->clean_chunks=0;j->backoff_until=j->recovery_at=now+10000;j->stream_failed_lanes=0;
     }
     // A lane beyond a reduced allowance returns its span instead of waiting out
     // a backoff, so the lanes still streaming claim its unread chunks at once.
     // A body EOF (-11) keeps its bounded retries: the worker fails the job on it.
     int shed=provider_failure&&rc!=-11&&j->active>j->limit;
-    int new_limit=j->limit,ceiling=j->ceiling;unsigned hold=j->ceiling_hold;gs_unlock(&gate);
+    int new_limit=j->limit,ceiling=j->ceiling,restore=j->restore_to;unsigned hold=j->ceiling_hold;gs_unlock(&gate);
     char line[768];
     snprintf(line,sizeof(line),"ms=%llu api=3 revision=supervised-streams-1 event=stream-retry handle=%d lane=%u attempt=%u hex=0x%08X http=%d stage=%s offset=%llu delay_ms=%llu scope=%s ssl=0x%08X verify=0x%X errno=0x%08X host=%s\n",
         (unsigned long long)now,j->handle,(unsigned)(lane-lanes),attempt,(unsigned)rc,h->status,h->stage?h->stage:"open",
         (unsigned long long)offset,(unsigned long long)delay,burst?"burst":"stream",(unsigned)h->ssl_error,h->ssl_verify,(unsigned)h->native_errno,strstr(h->origin,"://")?strstr(h->origin,"://")+3:"unknown");
     log_line(j->dest,line);
-    snprintf(line,sizeof(line),"ms=%llu event=lane-budget handle=%d before=%d after=%d scope=%s ceiling=%d hold_ms=%u shed=%d\n",(unsigned long long)now,j->handle,old_limit,new_limit,burst?"burst":"stream",ceiling,hold,shed);log_line(j->dest,line);
+    snprintf(line,sizeof(line),"ms=%llu event=lane-budget handle=%d before=%d after=%d scope=%s ceiling=%d hold_ms=%u restore=%d shed=%d\n",(unsigned long long)now,j->handle,old_limit,new_limit,burst?"burst":"stream",ceiling,hold,restore,shed);log_line(j->dest,line);
     gs_http_close(h);
     if(shed)return 0;
     uint64_t until=now+delay;
@@ -815,7 +923,7 @@ reopen:
     }
     before=begin_io(lane,GS_IO_OPEN);
     int rc=gs_http_open(h,j->url,j->bearer,j->single?-1:(int64_t)(start+done),(int64_t)(start+length-1),j->single?NULL:j->if_range);
-    gs_lock(&gate);lane->io_since=0;j->request_ms+=gs_clock()-before;gs_unlock(&gate);
+    gs_lock(&gate);lane->io_since=0;j->request_ms+=gs_clock()-before;lane->accepted=!rc&&h->status==206;gs_unlock(&gate);
     if(rc)goto interrupted;
     if(!h->reused) {
         char transport[768];
@@ -859,7 +967,7 @@ reopen:
             int n=gs_http_read(h,buffer+filled,read_size);uint64_t read_ms=gs_clock()-before;
             gs_lock(&gate);lane->io_since=0;j->read_ms+=read_ms;j->read_calls++;j->read_interruptions+=h->interruptions-interruptions;
             if(n>0&&(unsigned)n<=read_size) {
-                j->status.network_bytes+=n;
+                j->status.network_bytes+=n;lane->data_at=before+read_ms;
                 useful_progress(j,start+done+filled,(uint64_t)n);
 #if SSPI_OWNER_DEBUG
                 owner_metrics[j-jobs].network_progress_at=before+read_ms;
@@ -895,8 +1003,10 @@ reopen:
     h->stage="eof";begin_io(lane,GS_IO_EOF);int extra=gs_http_read(h,lane->buffer,1);
     gs_lock(&gate);lane->io_since=0;gs_unlock(&gate);
     if(extra!=0){rc=extra<0?extra:-10;goto interrupted;}
+    __atomic_store_n(&lane->accepted,0,__ATOMIC_RELEASE);
     sha256_final(&lane->hash,digest);return 0;
 interrupted:
+    __atomic_store_n(&lane->accepted,0,__ATOMIC_RELEASE);
     // A watchdog abort is a stalled socket, not a user stop: clear the abort and
     // reconnect the unread tail through the normal stream-recovery backoff.
     if(__atomic_exchange_n(&lane->stalled,0,__ATOMIC_ACQ_REL) && !__atomic_load_n(&j->stop,__ATOMIC_ACQUIRE)) {
@@ -1020,7 +1130,7 @@ static void *worker(void *argument)
     unsigned idle_ms=LANE_IDLE_POLL_MS;
     while(!__atomic_load_n(&shutting_down,__ATOMIC_ACQUIRE)) {
         if(gs_clock()<lane->retry_after){gs_sleep(20);continue;}
-        int slot=-1;uint32_t chunk=0;gs_lock(&gate);int found=claim(&slot,&chunk,&lane->span);if(found==1){lane->job=slot;lane->written=lane->received=0;__atomic_store_n(&lane->stalled,0,__ATOMIC_RELEASE);gs_http_clear_abort(&lane->http);}gs_unlock(&gate);
+        int slot=-1;uint32_t chunk=0;gs_lock(&gate);int found=claim(&slot,&chunk,&lane->span);if(found==1){lane->job=slot;lane->written=lane->received=0;lane->accepted=lane->refused=0;__atomic_store_n(&lane->stalled,0,__ATOMIC_RELEASE);gs_http_clear_abort(&lane->http);}gs_unlock(&gate);
         if(!found) {
             // Lane 0 keeps its buffer so one transfer can always progress.
             if(lane!=lanes&&lane->buffer&&gs_clock()-lane->idle_since>=LANE_IDLE_RELEASE_MS)lane_buffer_release(lane);
@@ -1086,9 +1196,13 @@ static void *worker(void *argument)
             }
             j->dirty++;clean_chunk(j);
         } else if(rc && !j->stop) {
-            j->status.retries++;if(j->attempts[chunk]<255)j->attempts[chunk]++;
+            // A refusal at the link's connection limit is not this chunk's failure:
+            // its span returns to the lanes still streaming without a penalty.
+            int refused=lane->refused;lane->refused=0;
+            j->status.retries++;if(!refused&&j->attempts[chunk]<255)j->attempts[chunk]++;
             int old_limit=j->limit;uint64_t delay=0;const char *scope="fatal";
-            if(rc==401||rc==403||rc==410) {
+            if(refused){delay=500;j->retry_at[chunk]=add_deadline(gs_clock(),delay);scope="connection-limit";}
+            else if(rc==401||rc==403||rc==410) {
                 char message[160];snprintf(message,sizeof(message),"Provider rejected the signed link with HTTP %d; refresh it and resume",rc);fail(j,rc,message);
             }
             else if(rc==-12)fail(j,rc,"Positioned disk write failed; committed chunks retained");
@@ -1318,7 +1432,7 @@ prepared:
         // Start where this server last settled (six lanes without history) and
         // climb while speed rises. A server that reset keeps its learned hold.
         if(!j->single) {
-            OriginLanes *o=origin_lanes_locked(j->origin,0);
+            OriginLanes *o=job_lanes_locked(j,0);
             int start=o&&o->ceiling?o->ceiling:LANE_START;
             if(j->limit>start)j->limit=start;
             if(o&&o->hold){j->ceiling=o->ceiling;j->ceiling_hold=o->hold;j->ceiling_until=o->until;}
@@ -1432,6 +1546,9 @@ int sspi_xfer_poll(int handle,GsXferStatus *status)
 #ifdef GS_HOST_TEST
 __declspec(dllexport) int gs_test_waiting_probes(void){gs_lock(&gate);int waiting=0;for(int i=0;i<GS_XFER_JOBS;i++)if(jobs[i].preparing&&jobs[i].status.state==GS_QUEUED&&!jobs[i].active)waiting++;gs_unlock(&gate);return waiting;}
 __declspec(dllexport) int gs_test_limit(int handle){gs_lock(&gate);GsJobState *j=lookup(handle);int limit=j?j->limit:0;gs_unlock(&gate);return limit;}
+__declspec(dllexport) int gs_test_governor(int handle,int field){gs_lock(&gate);GsJobState *j=lookup(handle);int v=!j?-1:field==0?j->ceiling:field==1?j->restore_to:(int)j->ceiling_hold;gs_unlock(&gate);return v;}
+__declspec(dllexport) void gs_test_forget_lanes(void){gs_lock(&gate);memset(origin_lanes,0,sizeof(origin_lanes));gs_unlock(&gate);}
+__declspec(dllexport) int gs_test_learned_lanes(const char *key){gs_lock(&gate);OriginLanes *o=origin_lanes_locked(key,0);int ceiling=o?o->ceiling:0;gs_unlock(&gate);return ceiling;}
 __declspec(dllexport) unsigned gs_test_lane_buffers(void){return __atomic_load_n(&allocated_lane_buffers,__ATOMIC_RELAXED);}
 __declspec(dllexport) void gs_test_set_limit(int handle,int limit){gs_lock(&gate);GsJobState *j=lookup(handle);if(j)j->limit=limit>j->target_limit?j->target_limit:limit;gs_unlock(&gate);}
 __declspec(dllexport) uint64_t gs_test_io(int handle,int metric){gs_lock(&gate);GsJobState *j=lookup(handle);uint64_t v=!j?0:metric==0?j->read_calls:metric==1?j->write_calls:metric==2?j->write_bytes:metric==4?(uint64_t)j->status.network_bytes-j->write_bytes:j->buffer_wait_ms;gs_unlock(&gate);return v;}
