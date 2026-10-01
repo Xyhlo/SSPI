@@ -123,19 +123,6 @@ static int load_mono_runtime(const char* path)
     return module;
 }
 
-// Records whether the kernel loader itself refuses a rejected runtime (errno
-// 22 here) or accepts it, which moves the failure to libkernel's start steps.
-// The module is loaded without running any of its code and then unloaded.
-static void probe_rejected_runtime(const char* path)
-{
-    int handle = -1;
-    int loadError = dynlib_load_only(path, &handle);
-    int unloadError = -1;
-    if (!loadError && handle >= 0) unloadError = dynlib_unload(handle);
-    gs_log_write("startup", "mono diagnostic kernel_load_errno=%d handle=0x%08x unload_errno=%d",
-        loadError, (unsigned)handle, unloadError);
-}
-
 static int load_system_mono_runtime(void)
 {
     static const char runtime[] = "libmonosgen-2.0.sprx";
@@ -168,7 +155,6 @@ static int load_firmware_mono_runtime(const char* path, int belowFirmware672)
 {
     int module = load_mono_runtime(path);
     if (module >= 0 || !belowFirmware672) return module;
-    probe_rejected_runtime(path);
     int systemModule = load_system_mono_runtime();
     if (systemModule < 0) return module;
     system_mono_runtime = 1;
@@ -594,6 +580,9 @@ int main()
     // rejected the same way, so load_firmware_mono_runtime continues there.
     if (versionResult == 0 && systemVersion.Version != 0 && systemVersion.Version < 0x06720000) {
         belowFirmware672 = 1;
+        // The system runtime fallback is unproven on these consoles: keep every
+        // startup line on disk even if the console stops right after it.
+        gs_log_sync_startup = 1;
         char compatLib[0x100];
         snprintf(compatLib, sizeof(compatLib), "%s/compat/libmonosgen-2.0.prx", baseDir);
         int compat = file_exists(compatLib);

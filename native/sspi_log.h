@@ -26,6 +26,9 @@ extern uint64_t sceKernelGetProcessTime(void);
 #endif
 #endif
 
+/* Set by a caller whose startup lines must survive a console crash (fsync each). */
+static int gs_log_sync_startup, gs_log_durable_now;
+
 #ifndef GS_LOG_ROOT
 #define GS_LOG_ROOT "/data/SSPI/logs"
 #endif
@@ -139,6 +142,7 @@ static int gs_log_append(const char *path, const char *line, size_t length, int6
     if (size > limit) ftruncate(fd, 0);
     /* One append syscall prevents records from interleaving between processes. */
     (void)write(fd, line, length);
+    if (gs_log_durable_now) (void)fsync(fd);
     flock(fd, LOCK_UN); close(fd);
 #endif
     return 0;
@@ -205,7 +209,9 @@ static void gs_log_write(const char *category, const char *format, ...)
     int count = snprintf(line, sizeof(line), "unix=%lld mono_ms=%llu pid=%d category=%s %s\n", (long long)time(NULL), (unsigned long long)monotonic_ms, pid, category, sanitized);
     if (count <= 0 || count >= (int)sizeof(line)) return;
     snprintf(category_leaf, sizeof(category_leaf), "%s.log", category);
+    gs_log_durable_now = gs_log_sync_startup && !strcmp(category, "startup");
     gs_log_append_resilient("combined.log", line, (size_t)count, 16 * 1024 * 1024);
     gs_log_append_resilient(category_leaf, line, (size_t)count, 8 * 1024 * 1024);
+    gs_log_durable_now = 0;
 }
 #endif
