@@ -4524,7 +4524,28 @@ namespace Orbis
         internal static string SelectedModeWaitingReason(bool backgroundSelected, bool workerReady, string reason)
         {
             if (!backgroundSelected || (workerReady && string.IsNullOrEmpty(reason))) return null;
-            return "Background mode waiting: " + (string.IsNullOrWhiteSpace(reason) ? "resident worker is not ready" : reason);
+            return "Background mode waiting: " + (string.IsNullOrWhiteSpace(reason) ? "resident worker is not ready" : DescribeWaitingReason(reason));
+        }
+
+        // NativeHttp reports "sceHttp send 0x8095F00C host=... ssl=0x... verify=0x20 errno=0x...".
+        // The card names the problem and keeps the codes; resident.log keeps the whole line.
+        static readonly System.Text.RegularExpressions.Regex CertificateWait = new System.Text.RegularExpressions.Regex(
+            @"\AsceHttp (?:send|read) 0x(?<rc>[0-9A-Fa-f]{1,8}) host=(?<host>[A-Za-z0-9.-]+) ssl=0x[0-9A-Fa-f]{1,8} verify=0x(?<verify>[0-9A-Fa-f]{1,8})",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        internal static string DescribeWaitingReason(string reason)
+        {
+            var match = CertificateWait.Match(reason ?? "");
+            uint verify;
+            if (!match.Success || !uint.TryParse(match.Groups["verify"].Value, System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out verify) || verify == 0) return reason;
+            // sceHttps verify flags: 0x04 host name, 0x08/0x10 validity dates, 0x20 unknown issuer.
+            string advice = (verify & 0x18u) != 0 ? "Check the PS4's date and time"
+                : (verify & 0x04u) != 0 ? "Check the PS4's DNS setting"
+                : "Check the PS4's date, time and DNS, and turn off any VPN or network filter that inspects secure traffic";
+            return "the PS4 did not trust the certificate from " + match.Groups["host"].Value + " (0x" +
+                match.Groups["rc"].Value.ToUpperInvariant() + ", verify 0x" +
+                verify.ToString("X", System.Globalization.CultureInfo.InvariantCulture) + "). " + advice;
         }
 
         bool WaitForSelectedBackground(DlItem job, int attempt, string reason = null)
