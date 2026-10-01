@@ -210,6 +210,34 @@ static int gs_sfo_string(const unsigned char *data, size_t size, const char *key
     return -1;
 }
 
+/* Sister-edition DLC: an installed game can list another edition's service ID
+ * (region-CUSA_00, the first 19 characters of the DLC's content ID) in
+ * SERVICE_ID_ADDCONT_ADD_1..7 of its param.sfo, and the PS4 links that DLC to it. */
+static int gs_game_accepts_addon(const char *game, const char *content)
+{
+    static const char *formats[] = { "/system_data/priv/appmeta/%s/param.sfo", "/user/appmeta/%s/param.sfo",
+        "/mnt/ext0/user/appmeta/%s/param.sfo" };
+    char path[256], key[40], value[64];
+    if (!game || strlen(game) != 9 || strncmp(game, "CUSA", 4) || strspn(game + 4, "0123456789") != 5 ||
+        !content || strlen(content) < 19) return 0;
+    for (int f = 0; f < 3; f++) {
+        snprintf(path, sizeof(path), formats[f], game);
+        FILE *file = fopen(path, "rb"); if (!file) continue;
+        unsigned char *data = (unsigned char *)malloc(65536);
+        if (!data) { fclose(file); return 0; }
+        size_t size = fread(data, 1, 65536, file); fclose(file);
+        int accepted = 0;
+        for (int n = 1; n <= 7 && !accepted; n++) {
+            snprintf(key, sizeof(key), "SERVICE_ID_ADDCONT_ADD_%d", n);
+            if (!gs_sfo_string(data, size, key, value, sizeof(value)) && strlen(value) >= 19 && !strncmp(value, content, 19))
+                accepted = 1;
+        }
+        free(data);
+        return accepted; /* the first metadata root found belongs to the installed game */
+    }
+    return 0;
+}
+
 static int gs_pkg_sfo(const char *path, const char *key, char *out, size_t cap)
 {
     unsigned char h[32], e[32], *data = NULL; int result = -1;
@@ -656,6 +684,25 @@ static const char *gs_addon_error(int code)
 // Last synchronous AppInstUtil result; ADDCONT_BROKEN selects the BGFT fallback.
 static int gs_addon_last_rc;
 
+/* A sister-edition DLC installs under its own title; its game is whichever installed
+ * title declares that edition (see gs_game_accepts_addon). */
+static int gs_declaring_game_installed(const char *content, int (*app_exists)(const char *, int *))
+{
+    static const char *roots[] = { "/system_data/priv/appmeta", "/user/appmeta", "/mnt/ext0/user/appmeta" };
+    for (int r = 0; r < 3; r++) {
+        DIR *directory = opendir(roots[r]); if (!directory) continue;
+        struct dirent *entry; int count = 0, found = 0;
+        while (!found && ++count <= 4096 && (entry = readdir(directory)) != NULL) {
+            int exists = 0;
+            if (strlen(entry->d_name) != 9 || strncmp(entry->d_name, "CUSA", 4)) continue;
+            if (gs_game_accepts_addon(entry->d_name, content) && !app_exists(entry->d_name, &exists) && exists) found = 1;
+        }
+        closedir(directory);
+        if (found) return 1;
+    }
+    return 0;
+}
+
 static int gs_install_addon(const char *journal, int accepted)
 {
     int module = gs_module("/system/common/lib/libSceAppInstUtil.sprx"), exists = 0;
@@ -664,7 +711,7 @@ static int gs_install_addon(const char *journal, int accepted)
         gs_bind(module, "sceAppInstUtilAppExists", &app_exists)) {
         gs_write_status("failed", "PS4 add-on installer API is unavailable. PKG retained."); return -1;
     }
-    if (app_exists(gs_job.title, &exists) || !exists) {
+    if ((app_exists(gs_job.title, &exists) || !exists) && !gs_declaring_game_installed(gs_job.content, app_exists)) {
         gs_write_status("failed", "DLC requires its base game to finish installation. PKG retained."); return -1;
     }
     // AppInstUtil may consume the source. Persist its identity before handing it over.
@@ -1589,6 +1636,13 @@ static int gs_prepare_pkg(GsExtractedPkg *pkg)
     fclose(file);
     memcpy(gs_job.content, header + 0x40, 36); gs_job.content[36] = 0;
     if (!gs_job.title[0] || (gs_job.borrowed_source && gs_job.archive == 1)) { memcpy(gs_job.title, header + 0x47, 9); gs_job.title[9] = 0; }
+    /* A DLC of a sister edition the selected game declares is checked and installed
+     * under its own title, like a DLC the app handed over directly. */
+    else if ((gs_pkg_be32(header + 0x74) == 0x1b || gs_pkg_be32(header + 0x74) == 0x1c) &&
+             memcmp(gs_job.title, header + 0x47, 9) && gs_game_accepts_addon(gs_job.title, gs_job.content)) {
+        gs_log_write("resident", "sister-addon job=%s game=%s content=%s", gs_job.id, gs_job.title, gs_job.content);
+        memcpy(gs_job.title, header + 0x47, 9); gs_job.title[9] = 0;
+    }
     snprintf(gs_job.destination, sizeof(gs_job.destination), "%s", pkg->path);
     gs_job.total = pkg->size; gs_job.sha[0] = 0;
     return gs_validate(pkg->path);

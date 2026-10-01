@@ -310,7 +310,8 @@ namespace Orbis
                     if (uninstallFirst && !UninstallAndWait(titleId, out error))
                         return InstallOutcome.UninstallFailed;
                 }
-                else if (PkgInstallPolicy.RequiresInstalledBase(contentKind) && exists == 0)
+                else if (PkgInstallPolicy.RequiresInstalledBase(contentKind) && exists == 0 &&
+                    !(contentKind == PkgContentKind.AddOn && InstalledGameAcceptingAddon(packageContentId, expectedTitleId) != null))
                 {
                     error = (contentKind == PkgContentKind.Patch ? "Update" : "DLC") +
                             " requires installed base game " + titleId;
@@ -676,6 +677,30 @@ namespace Orbis
                 error = "BGFT unregister " + ex.GetType().Name;
                 return false;
             }
+        }
+
+        /// <summary>The installed game that takes this DLC: the selected title when it declares
+        /// the DLC's edition, otherwise any installed game whose param.sfo declares it
+        /// (SERVICE_ID_ADDCONT_ADD_1 to _7). Null when none is installed.</summary>
+        internal static string InstalledGameAcceptingAddon(string contentId, string preferredTitleId)
+        {
+            if (string.IsNullOrEmpty(contentId) || contentId.Length < 19) return null;
+            if (!string.IsNullOrEmpty(preferredTitleId) && PkgValidator.GameAcceptsAddon(preferredTitleId, contentId) &&
+                IsTitleInstalled(preferredTitleId)) return preferredTitleId;
+            var checkedTitles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string root in PkgValidator.AppMetaRoots)
+            {
+                string[] directories;
+                try { directories = Directory.GetDirectories(root, "CUSA*"); }
+                catch (Exception) { continue; }
+                foreach (string directory in directories)
+                {
+                    string title = Path.GetFileName(directory);
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(title, "^CUSA[0-9]{5}$") || !checkedTitles.Add(title)) continue;
+                    if (PkgValidator.GameAcceptsAddon(title, contentId) && IsTitleInstalled(title)) return title;
+                }
+            }
+            return null;
         }
 
         public static bool IsTitleInstalled(string titleId)
@@ -1322,6 +1347,9 @@ namespace Orbis
                     {
                         int exists = 0;
                         int existsRc = sceAppInstUtilAppExists(titleId, out exists);
+                        // Sister-edition DLC installs under its own title for a game that declares it.
+                        if (existsRc == 0 && exists == 0 && subType == 7 && InstalledGameAcceptingAddon(contentId, null) != null)
+                            exists = 1;
                         if (existsRc == 0 && exists == 0)
                         {
                             error = (subType == 7 ? "DLC" : "Update") +

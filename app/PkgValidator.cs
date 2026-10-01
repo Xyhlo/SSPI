@@ -62,7 +62,7 @@ namespace Orbis
                     {
                         string contentId;
                         if (!TryGetContentId(path, out contentId) ||
-                            !ContentIdMatchesTitleId(contentId, exp))
+                            !(ContentIdMatchesTitleId(contentId, exp) || IsDeclaredSisterAddon(path, contentId, exp)))
                         {
                             result = PkgValResult.TitleMismatch;
                             detail = "expected " + exp + " got " + got;
@@ -115,7 +115,7 @@ namespace Orbis
                 string expected = (expectedTitleId ?? "").Trim();
                 if (!string.IsNullOrEmpty(expected) &&
                     (!TryGetContentId(path, out contentId) ||
-                     !ContentIdMatchesTitleId(contentId, expected)))
+                     !(ContentIdMatchesTitleId(contentId, expected) || IsDeclaredSisterAddon(path, contentId, expected))))
                 {
                     result = PkgValResult.TitleMismatch;
                     detail = "could not confirm expected title " + expected + " from PKG content ID";
@@ -427,8 +427,15 @@ namespace Orbis
                     ", but the file is " + KindPhrase(actualKind) + ". Choose another mirror; the file was kept";
                 return false;
             }
-            if (!string.IsNullOrEmpty(titleId) && !ContentIdMatchesTitleId(contentId, titleId))
-            { error = "Package does not belong to " + titleId; return false; }
+            if (!string.IsNullOrEmpty(titleId) && !ContentIdMatchesTitleId(contentId, titleId) &&
+                !(actualKind == PkgContentKind.AddOn && GameAcceptsAddon(titleId, contentId)))
+            {
+                string other;
+                error = actualKind == PkgContentKind.AddOn && TryGetTitleIdFromContentId(contentId, out other)
+                    ? "This DLC belongs to " + other + ", which the installed " + titleId + " does not list as a DLC edition"
+                    : "Package does not belong to " + titleId;
+                return false;
+            }
             if (actualKind != PkgContentKind.Patch) return true;
             string installed = InstalledContentId(titleId);
             if (installed.Length > 0 && !string.Equals(installed, contentId, StringComparison.OrdinalIgnoreCase))
@@ -438,30 +445,71 @@ namespace Orbis
 
         static string InstalledContentId(string titleId)
         {
-            if (string.IsNullOrEmpty(titleId) || !System.Text.RegularExpressions.Regex.IsMatch(titleId, @"^CUSA[0-9]{5}$")) return "";
-            foreach (string root in new[] { "/system_data/priv/appmeta", "/user/appmeta", "/mnt/ext0/user/appmeta" })
+            string value;
+            return InstalledParams(titleId).TryGetValue("CONTENT_ID", out value) ? value : "";
+        }
+
+        /// <summary>A game can take DLC published under a sister edition's title. Its installed
+        /// param.sfo (the update's, once one is installed) lists that edition's service ID,
+        /// the first 19 characters of the DLC's content ID such as EP1003-CUSA02961_00, in
+        /// SERVICE_ID_ADDCONT_ADD_1 to _7, and the PS4 links that DLC to the game.</summary>
+        internal static bool GameAcceptsAddon(string gameTitleId, string addonContentId)
+        {
+            if (string.IsNullOrEmpty(addonContentId) || addonContentId.Length < 19) return false;
+            string service = addonContentId.Substring(0, 19);
+            foreach (var entry in InstalledParams(gameTitleId))
+                if (entry.Key.StartsWith("SERVICE_ID_ADDCONT_ADD_", StringComparison.Ordinal) && entry.Value.Length >= 19 &&
+                    string.Equals(entry.Value.Substring(0, 19), service, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        static bool IsDeclaredSisterAddon(string path, string contentId, string gameTitleId)
+        {
+            PkgContentKind kind; string detail;
+            return TryGetContentKind(path, out kind, out detail) && kind == PkgContentKind.AddOn &&
+                GameAcceptsAddon(gameTitleId, contentId);
+        }
+
+        /// <summary>Installed title metadata roots, most current first; host tests use fixtures.</summary>
+        internal static string[] AppMetaRoots = { "/system_data/priv/appmeta", "/user/appmeta", "/mnt/ext0/user/appmeta" };
+
+        /// <summary>String values of the installed title's param.sfo (first metadata root found).</summary>
+        internal static System.Collections.Generic.Dictionary<string, string> InstalledParams(string titleId)
+        {
+            var values = new System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal);
+            if (string.IsNullOrEmpty(titleId) || !System.Text.RegularExpressions.Regex.IsMatch(titleId, @"^CUSA[0-9]{5}$")) return values;
+            foreach (string root in AppMetaRoots)
             {
                 try
                 {
                     string path = Path.Combine(Path.Combine(root, titleId), "param.sfo");
                     if (!File.Exists(path) || new FileInfo(path).Length > 1024 * 1024) continue;
-                    byte[] b = File.ReadAllBytes(path);
-                    if (b.Length < 20 || b[0] != 0 || b[1] != 80 || b[2] != 83 || b[3] != 70) continue;
-                    uint ko = BitConverter.ToUInt32(b, 8), vo = BitConverter.ToUInt32(b, 12), count = BitConverter.ToUInt32(b, 16);
-                    if (count > 128) continue;
-                    for (int i = 0; i < count && 20 + i * 16 + 16 <= b.Length; i++)
-                    {
-                        int e = 20 + i * 16;
-                        long k = (long)ko + BitConverter.ToUInt16(b, e), v = (long)vo + BitConverter.ToUInt32(b, e + 12);
-                        uint n = BitConverter.ToUInt32(b, e + 4);
-                        if (k < 0 || k + 11 > b.Length || v < 0 || n > 128 || v + n > b.Length) continue;
-                        if (Encoding.ASCII.GetString(b, (int)k, 11) == "CONTENT_ID\0")
-                            return Encoding.ASCII.GetString(b, (int)v, (int)n).TrimEnd('\0').Trim();
-                    }
+                    if (ParseSfoStrings(File.ReadAllBytes(path), values)) return values;
                 }
                 catch { }
             }
-            return "";
+            return values;
+        }
+
+        internal static bool ParseSfoStrings(byte[] b, System.Collections.Generic.Dictionary<string, string> values)
+        {
+            if (b == null || b.Length < 20 || b[0] != 0 || b[1] != 80 || b[2] != 83 || b[3] != 70) return false;
+            uint ko = BitConverter.ToUInt32(b, 8), vo = BitConverter.ToUInt32(b, 12), count = BitConverter.ToUInt32(b, 16);
+            if (count > 256) return false;
+            for (int i = 0; i < count && 20 + i * 16 + 16 <= b.Length; i++)
+            {
+                int e = 20 + i * 16;
+                long k = (long)ko + BitConverter.ToUInt16(b, e), v = (long)vo + BitConverter.ToUInt32(b, e + 12);
+                ushort format = BitConverter.ToUInt16(b, e + 2);
+                uint n = BitConverter.ToUInt32(b, e + 4);
+                if (format == 0x0404 || k < 0 || k >= b.Length || v < 0 || n > 1024 || v + n > b.Length) continue;
+                int end = (int)k;
+                while (end < b.Length && end - k < 64 && b[end] != 0) end++;
+                if (end >= b.Length || b[end] != 0 || end == k) continue;
+                string key = Encoding.ASCII.GetString(b, (int)k, end - (int)k);
+                if (!values.ContainsKey(key)) values[key] = Encoding.UTF8.GetString(b, (int)v, (int)n).TrimEnd('\0').Trim();
+            }
+            return true;
         }
 
         internal static int BgftSubTypeForKind(string kind)

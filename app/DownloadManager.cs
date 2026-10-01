@@ -4693,7 +4693,8 @@ namespace Orbis
                 return true;
             }
             if (!string.IsNullOrWhiteSpace(job.TitleId) &&
-                !PkgValidator.ContentIdMatchesTitleId(contentId, job.TitleId))
+                !PkgValidator.ContentIdMatchesTitleId(contentId, job.TitleId) &&
+                !(actualKind == PkgContentKind.AddOn && PkgValidator.GameAcceptsAddon(job.TitleId, contentId)))
             {
                 SetFailureIfCurrent(job, attempt, "PKG title ID mismatch");
                 return true;
@@ -5054,12 +5055,18 @@ namespace Orbis
             string dependencyId;
             bool autoInstall;
             string previousGeneration;
+            // A sister-edition DLC keeps its row, and its install order, under the game that
+            // declares it; the resident still gets the package's own title for its header check.
+            string rowTitle = job.TitleId;
+            bool sisterAddon = PkgValidator.BgftSubTypeForKind(kind) == 7 && !string.IsNullOrEmpty(rowTitle) &&
+                !string.IsNullOrEmpty(contentId) && !PkgValidator.ContentIdMatchesTitleId(contentId, rowTitle) &&
+                PkgValidator.GameAcceptsAddon(rowTitle, contentId);
             lock (_lock)
             {
                 if (!AcceptInstallCallback(job, attempt) || job.CancelRequested || job.PauseRequested)
                 { CommitRequestedStop(job, attempt); return true; }
                 if (nativeBgft) job.DestPath = NativeBgftDestination(job.Id);
-                job.Kind = kind; job.TitleId = titleId;
+                job.Kind = kind; job.TitleId = sisterAddon ? rowTitle : titleId;
                 if (!archive) job.ContainerFormat = "pkg";
                 else if (string.IsNullOrEmpty(job.ContainerFormat)) job.ContainerFormat = "archive";
                 dependencyId = ResidentDependencyId(job);
@@ -6988,7 +6995,10 @@ namespace Orbis
                 {
                     if (job.AttemptId != attempt) return;
                     job.Kind = actualKindName;
-                    if (!string.IsNullOrEmpty(actualTitleId)) job.TitleId = actualTitleId;
+                    // A sister-edition DLC keeps the row under the game that declares it.
+                    bool sisterAddon = actualKind == PkgContentKind.AddOn && !string.IsNullOrEmpty(job.TitleId) &&
+                        !PkgValidator.ContentIdMatchesTitleId(contentId, job.TitleId);
+                    if (!string.IsNullOrEmpty(actualTitleId) && !sisterAddon) job.TitleId = actualTitleId;
                     job.Done = job.Total = size;
                     job.BytesPerSec = 0;
                     job.EtaSeconds = 0;
@@ -7042,7 +7052,8 @@ namespace Orbis
                 }
                 if (WaitForSelectedBackground(job, attempt, "Background selected; validated package is waiting for resident installation")) return;
                 bool baseReady = !PkgInstallPolicy.RequiresInstalledBase(actualKind) ||
-                    (!string.IsNullOrEmpty(actualTitleId) && PkgInstaller.IsTitleInstalled(actualTitleId));
+                    (!string.IsNullOrEmpty(actualTitleId) && PkgInstaller.IsTitleInstalled(actualTitleId)) ||
+                    (actualKind == PkgContentKind.AddOn && PkgInstaller.InstalledGameAcceptingAddon(contentId, job.TitleId) != null);
                 string fallbackReason = null;
                 bool foreignConflict = false;
                 if (useLoopback && baseReady)
