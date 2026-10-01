@@ -710,19 +710,44 @@ static void gs_stage_install_poll(void)
     }
 }
 
+/* Queued stages say what holds the queue: a job the user cannot see (a leftover
+ * record, an upload, an install still pending) otherwise looked like no reason at all. */
+static void gs_stage_queue_reason(const char *reason)
+{
+    for (int i = 0; i < GS_STAGE_COUNT; i++) {
+        GsStage *stage = &gs_stages[i];
+        if (stage->job.id[0] && stage->pending && !stage->canceled && !stage->paused && !strcmp(stage->state, "queued"))
+            gs_stage_idle_status(stage, "queued", reason);
+    }
+}
+
 static void gs_stage_download_poll(void)
 {
-    if (gs_job.id[0] || gs_worker_running || gs_worker_created || g_client_count ||
-        gs_stage_transfer_active() || sceKernelGetProcessTime() < gs_stage_install_after) return;
+    char reason[200];
+    if (gs_job.id[0] || gs_worker_running || gs_worker_created) {
+        snprintf(reason, sizeof(reason), "Queued; waiting for another background job (%s) to finish",
+            gs_job.title[0] ? gs_job.title : "in progress");
+        gs_stage_queue_reason(reason); return;
+    }
+    if (g_client_count) { gs_stage_queue_reason("Queued; waiting for the PS4 installer to finish reading a package"); return; }
+    if (gs_stage_transfer_active()) { gs_stage_queue_reason("Queued; waiting for the current download to finish"); return; }
+    if (sceKernelGetProcessTime() < gs_stage_install_after) return;
     GsJob existing;
-    if (!gs_read_job(&existing)) return;
+    if (!gs_read_job(&existing)) {
+        snprintf(reason, sizeof(reason), "Queued; waiting for another background job (%s) to finish",
+            existing.title[0] ? existing.title : "saved");
+        gs_stage_queue_reason(reason); return;
+    }
     /* A completed package keeps the I/O lease through install retries. A
      * retained update waiting for its base must still let that base download. */
     for (int i = 0; i < GS_STAGE_COUNT; i++) {
         GsStage *stage = &gs_stages[i];
         if (stage->job.auto_install && !stage->pending && !stage->canceled && !stage->paused &&
             (!strcmp(stage->state, "staged") || !strcmp(stage->state, "waiting") || !strcmp(stage->state, "installing")) &&
-            gs_stage_dependency_ready(stage)) return;
+            gs_stage_dependency_ready(stage)) {
+            snprintf(reason, sizeof(reason), "Queued; waiting for %s to finish installing", stage->job.title[0] ? stage->job.title : "a downloaded package");
+            gs_stage_queue_reason(reason); return;
+        }
     }
     int chosen = -1, chosen_rank = 4;
     for (int i = 0; i < GS_STAGE_COUNT; i++) {
