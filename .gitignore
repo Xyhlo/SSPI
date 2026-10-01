@@ -94,8 +94,6 @@
 !/app/UnlockProviders.cs
 !/app/User.cs
 !/app/Util.cs
-!/app/main.csproj
-!/app/packages.config
 !/docs/banner.png
 # Public documentation site and approved PS4 branding.
 !/docs/.nojekyll
@@ -178,28 +176,13 @@
 !/native/main.c
 !/native/cover_jpeg.c
 !/native/cover_jpeg.h
-!/native/main.h
-!/native/module.c
-!/native/module.h
-!/native/module_loader.c
-!/native/module_loader.h
-!/native/mono.h
-!/product.json
 !/resident/native/appdb.c
-!/resident/native/goldhen_process.h
 !/resident/native/filesystem_context.h
-!/resident/native/module_inventory.h
-!/resident/native/resident_bridge.c
-!/resident/native/resident_crt.c
 !/resident/native/storage_space.h
 !/resident/plugin/crypto/sha256.c
 !/resident/plugin/crypto/sha256.h
 !/resident/plugin/gs_archive_job.inc
-!/resident/plugin/gs_plugin_crt.c
-!/resident/plugin/gs_resident_bootstrap.c
-!/resident/plugin/gs_resident_plugin.c
 !/resident/plugin/gs_resident_probe.c
-!/resident/native/shared_module_path.h
 !/resident/plugin/gs_resident_worker.inc
 !/resident/plugin/gs_unrar.cpp
 !/resident/plugin/gs_unrar.h
@@ -209,7 +192,6 @@
 !/resident/plugin/gs_7z_allocator.h
 !/resident/worker/WorkerProgram.cs
 !/resident/worker/WorkerSupport.cs
-!/resident/worker/worker.csproj
 
 /SDK/
 /Build-Output/
@@ -248,7 +230,6 @@
 !/native/sdl/WindowLoop.inc
 !/native/sspi_data_fs.h
 !/native/sspi_log.h
-!/resident/native/shell_loader.h
 !/resident/native/worker_presence.h
 !/resident/plugin/gs_native_bgft.inc
 !/resident/plugin/gs_pkg_validation.h

@@ -4,6 +4,8 @@
 
 Super Simple Package Installer is a package manager for homebrew-enabled PlayStation 4 consoles. It searches package sources, manages downloads and installs content from a controller-friendly interface.
 
+This repository is a source overview, so you can see what SSPI does on your console. It isn't complete enough to compile: builds from source are reserved for close collaborators. To use SSPI, install the PKG from the releases page.
+
 Current release: [5.11.4 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.4), build `46d30f6a8d0a`.
 
 [Releases](https://github.com/Xyhlo/SSPI/releases) · [Guide](https://xyhlo.github.io/SSPI/) · [Discord](https://discord.gg/hF2vw7ybRs) · [Issues](https://github.com/Xyhlo/SSPI/issues)
@@ -79,16 +81,17 @@ Remove service keys, pairing tokens and signed download URLs before sharing logs
 
 ## Source
 
-This repository is a production-source export. SDKs, build tooling, runtime assets, tests and source descriptors are not included, so a plain clone is not a complete build environment.
+This repository is a source overview, not a buildable project. It shows how SSPI searches sources, works with link services, and downloads, extracts and installs packages, so you can review what runs on your console.
+
+Some parts are deliberately left out so that SSPI can't be compiled or repackaged from this repository: the project files, the application identity, the native runtime loader and the background service's loader code. SDKs, build tooling, runtime assets and tests are not included either. Builds from source are reserved for close collaborators, so install SSPI from the releases page.
 
 | Path | Contents |
 | --- | --- |
 | `app/` | Application, interface, sources, services and pairing |
-| `native/` | Startup, module loading, cover decoding and video |
+| `native/` | Startup, cover decoding and video |
 | `transfer/` | Native download engine |
 | `https/` | HTTP range helpers |
 | `resident/` | Background queue, archive and installation code |
-| `product.json` | Version and application identity |
 
 ## License
 
