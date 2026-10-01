@@ -299,7 +299,7 @@ namespace Orbis
                         if (_cfg.DownloadStatsMode != 1)
                         {
                             string rate = item.State == DlState.Failed ? "Files kept for retry" : TransferRateLine(item, _cfg.DownloadStatsMode);
-                            if (item.ParkedForProvider) rate = "Preparing in TorBox";
+                            if (item.ParkedForProvider) rate = "Preparing in " + ParkedService(item);
                             int rateRight = counterX - 32;
                             int rateWidth = Math.Max(0, rateRight - (tx + 478));
                             int rateX = Math.Max(tx + 478, rateRight - UiFont.MeasurePx(21, rate));

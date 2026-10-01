@@ -281,7 +281,7 @@ namespace Orbis
             if (item.RemoveRequested || item.ResidentRemovePending) return item.StatusText ?? "Removing";
             if (item.CancelRequested) return item.StatusText ?? "Canceling";
             if (Extracting(item)) return "Extracting";
-            if (item.ParkedForProvider) return "Preparing in TorBox";
+            if (item.ParkedForProvider) return "Preparing in " + ParkedService(item);
             if (item.State == DlState.Submitted && !item.Background && PkgValidator.BgftSubTypeForKind(item.Kind) == 7) return "Installing";
             if ((item.StatusText ?? "").StartsWith("Installing packages", StringComparison.OrdinalIgnoreCase)) return "Installing in order";
             if (item.State == DlState.Queued && !item.InstallAfterConfirmed && !string.IsNullOrEmpty(item.InstallAfterId)) return "Waiting for dependency";
@@ -293,6 +293,13 @@ namespace Orbis
             if (hit == null) return "Unknown title";
             return string.IsNullOrWhiteSpace(hit.Name) || string.Equals(hit.Name, hit.TitleId, StringComparison.OrdinalIgnoreCase)
                 ? "Title name unavailable" : hit.Name;
+        }
+
+        // TorBox, AllDebrid and Premiumize all park a download while they prepare it.
+        internal static string ParkedService(DlItem item)
+        {
+            string id = item == null ? "" : item.ParkProviderId;
+            return string.IsNullOrEmpty(id) ? "the link service" : UnlockProviders.DisplayName(id);
         }
 
         static string PackageDisplayTitle(string kind, string label, string gameName, string host, string version)
@@ -655,7 +662,7 @@ namespace Orbis
             if (item.State == DlState.Paused) return "Paused";
             // A parked TorBox preparation is progress of its own; the provider's
             // own metric must not be replaced by a "Measuring speed." placeholder.
-            if (item.ParkedForProvider) return !string.IsNullOrEmpty(item.StatusText) ? item.StatusText : "Preparing in TorBox · other downloads continue";
+            if (item.ParkedForProvider) return !string.IsNullOrEmpty(item.StatusText) ? item.StatusText : "Preparing in " + ParkedService(item) + " · other downloads continue";
             // A resolving row is not transferring bytes yet, so a rate line would
             // read "Measuring speed." forever. Show the resolver's own progress
             // instead: an uncached provider preparing the file reports continuously.

@@ -3679,7 +3679,7 @@ namespace Orbis
         static string ActiveTransferOwnerText(DlItem item)
         {
             if (item == null) return "Queued";
-            if (item.ParkedForProvider) return item.StatusText ?? "Preparing in TorBox · other downloads continue";
+            if (item.ParkedForProvider) return item.StatusText ?? "Preparing in " + ParkedService(item) + " · other downloads continue";
             if (item.State == DlState.Queued && (item.StatusText ?? "").StartsWith("Background mode waiting:", StringComparison.Ordinal))
                 return item.StatusText;
             if (item.State != DlState.Downloading && item.State != DlState.Finalizing &&
@@ -5053,7 +5053,7 @@ namespace Orbis
                 if (item.State == DlState.Installing || (item.StatusText ?? "").StartsWith("Installing packages")) return "Installing in order";
                 if (item.State == DlState.Downloading) return "Downloading";
                 if (item.State == DlState.Finalizing) return "Waiting to install";
-                if (item.ParkedForProvider) return "Waiting for TorBox preparation";
+                if (item.ParkedForProvider) return "Waiting for " + ParkedService(item) + " preparation";
                 if (item.State == DlState.Resolving) return "Resolving links";
                 if (item.State == DlState.Installed) installed++;
                 if (item.State == DlState.Submitted) submitted++;
@@ -5595,7 +5595,7 @@ namespace Orbis
 
         static string StateLabel(DlItem item)
         {
-            if (item != null && item.ParkedForProvider) return "Preparing in TorBox";
+            if (item != null && item.ParkedForProvider) return "Preparing in " + ParkedService(item);
             if (item != null && item.State == DlState.Completed && !string.IsNullOrEmpty(item.Error))
                 return "Install failed";
             return StateLabel(item == null ? DlState.Finalizing : item.State);
