@@ -2049,6 +2049,11 @@ namespace Orbis
                             if (SamePath(otherPath, path)) { claimed = true; break; }
                         if (claimed) break;
                     }
+                    if (!claimed && OnDisconnectedUsb(path))
+                    {
+                        SspiLog.Write("download", "event=remove-drive-absent job=" + item.Id + " files-left-for-stored-files=1");
+                        continue;
+                    }
                     if (!claimed && !DeleteDownloadFiles(path))
                     {
                         error = "Downloaded files could not be removed; reconnect storage and retry";
@@ -2056,12 +2061,21 @@ namespace Orbis
                     }
                 }
             }
-            if (item.ResidentArchive && !TryDeleteResidentExtractionDirectory(item))
+            if (item.ResidentArchive && !OnDisconnectedUsb(ResidentExtractionRoot(item)) && !TryDeleteResidentExtractionDirectory(item))
             {
                 error = "Extracted package cleanup pending; reconnect storage and retry";
                 return false;
             }
             return true;
+        }
+
+        // A USB drive that is not connected holds nothing SSPI can reach, so removing a
+        // row never waits for it; anything left there shows in Stored files once it is back.
+        static bool OnDisconnectedUsb(string path)
+        {
+            string normalized = (path ?? "").Replace('\\', '/');
+            return normalized.Length >= 9 && normalized.StartsWith("/mnt/usb", StringComparison.Ordinal) &&
+                !UsbVolumeLabel.IsConnected(normalized.Substring(0, 9));
         }
 
         static bool TryDeleteResidentExtractionDirectory(DlItem item)
