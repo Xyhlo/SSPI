@@ -4,23 +4,25 @@
 
 Super Simple Package Installer is a package manager for homebrew-enabled PlayStation 4 consoles. It searches package sources, manages downloads and installs content from a controller-friendly interface.
 
-Current release: [5.11.3 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3), build `07dac5e85610`.
+Current release: [5.11.4 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.4), build `46d30f6a8d0a`.
 
 [Releases](https://github.com/Xyhlo/SSPI/releases) · [Guide](https://xyhlo.github.io/SSPI/) · [Discord](https://discord.gg/hF2vw7ybRs) · [Issues](https://github.com/Xyhlo/SSPI/issues)
 
 ## Features
 
 - Search installed package sources by title or CUSA ID, with grouped regions and source variants.
+- Install shared sources from the community directory. Installed community sources update themselves in the background.
 - Real-Debrid, TorBox, AllDebrid and Premiumize support. Each service requires your own account.
 - Queue direct links, stored debrid files and packages or archives from USB.
 - Background download, extraction and installation through a resident worker.
-- RAR, ZIP and 7z extraction, including multipart and password-protected RAR archives.
+- RAR, ZIP and 7z extraction, including multipart and password-protected RAR archives and archives packed inside a RAR.
 - FTP inbox installs, RAR sets from USB and multi-part RAR links from your phone.
+- A phone page that follows the download queue, including extraction, and can pause, resume, retry, install or remove downloads.
 - An installed-game library with custom case covers and home-screen icons, plus photo and pixel backgrounds for SSPI.
 - PS4 system theme installs (needs a PS4 test).
 - Adaptive download connections and in-app recovery for unresponsive download links.
 - Staging on internal storage or an exFAT USB drive.
-- Base, update and DLC ordering, with update detection for installed games.
+- Base, update and DLC ordering, with update detection for installed games. DLC published under a sister edition is accepted when the installed game lists that edition (needs a PS4 test).
 
 See the [guide](https://xyhlo.github.io/SSPI/) for setup, storage and download details.
 
@@ -32,15 +34,16 @@ See the [guide](https://xyhlo.github.io/SSPI/) for setup, storage and download d
 
 ## Installation
 
-1. Download [`sspi5.11.3.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3) from the 5.11.3 beta release. GitHub source archives are not installable packages.
-2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.3.pkg SHA256` and compare the result with `3fe15c485a71dcfe64c3d0c667ca0ceff5e0d665051715bccc4a7dfd0d9f54af`.
-3. Install it over the existing app; your settings and queue are kept. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI.
-4. The footer should read `BETA 5.11 / 07dac5e85610`. There is no in-app updater, so install updates manually from the release page.
+1. Download [`sspi5.11.4.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.4) from the 5.11.4 beta release. GitHub source archives are not installable packages.
+2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.4.pkg SHA256` and compare the result with `5b6acbb0db14ecfcfd3aa8804b23f2c36ae74344ccf024b6b22968879d69c1f7`.
+3. Install it over the existing app. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI.
+4. The footer should read `BETA 5.11 / 46d30f6a8d0a`. Every 5.11 beta has the same app version, so if the footer still shows an earlier build, delete SSPI from the home screen and install the package again. Settings, service keys and the download queue are stored under `/data/SSPI` and are kept.
+5. There is no in-app updater, so install updates manually from the release page.
 
 ## Setup
 
 1. Open **Settings → Connections** and scan the pairing QR code with a phone on the same network. Save your service keys and enable the services you want to use.
-2. Open **Manage sources** and enable your installed package sources.
+2. Open **Settings → Connections → Manage sources**. Choose **Browse community sources** to install a shared source, then enable the sources you want to use.
 3. Use **PS4 Settings** to choose where games install. In SSPI, use **Settings → Storage → Staging location** for temporary download and extraction files. Keep a selected USB drive connected until installation finishes.
 
 Runtime data is stored under `/data/SSPI`. Settings and service keys stay on the console.
