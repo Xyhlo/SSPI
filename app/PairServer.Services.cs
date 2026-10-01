@@ -155,6 +155,8 @@ namespace Orbis
             { state = "limited"; message = "Key validated · account plan restricts downloads"; }
             else if (status.StartsWith("REJECTED:", StringComparison.OrdinalIgnoreCase))
             { state = "rejected"; message = "Key saved · provider rejected this key; check Connections"; }
+            else if (status.StartsWith("UNVERIFIED:", StringComparison.OrdinalIgnoreCase))
+            { state = "rejected"; message = "Key saved · TorBox could not verify this key; re-enter it or reset it at TorBox"; }
             else if (status.StartsWith("RATE_LIMITED:", StringComparison.OrdinalIgnoreCase))
             { state = "unavailable"; message = "Key saved · service busy; wait before retrying"; }
             else if (status.StartsWith("LIMITED:", StringComparison.OrdinalIgnoreCase))

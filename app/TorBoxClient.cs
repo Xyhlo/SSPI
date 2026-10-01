@@ -472,7 +472,7 @@ namespace Orbis
                     {
                         result.Kind = PreparedPollKind.Rejected;
                         result.NeedsAction = true;
-                        result.Error = "TorBox could not confirm whether this download was created. Automatic resubmission was stopped to avoid a duplicate. Check the TorBox account before retrying.";
+                        result.Error = "TorBox could not confirm whether this download was created, so SSPI stopped instead of risking a duplicate. Retry sends it again; check the TorBox account first if you want to avoid a duplicate.";
                     }
                     else result.Kind = PreparedPollKind.Preparing;
                     return result;
@@ -972,6 +972,19 @@ namespace Orbis
             }
             catch { return ""; }
         }
+        /// <summary>The player chose Retry after an uncertain create: forget that create so
+        /// the next attempt sends the link again. A create TorBox confirmed (with an ID) is
+        /// kept; without this, every retry met the same unconfirmed record.</summary>
+        internal static void ForgetUnconfirmedCreate(string token, string hostUrl)
+        {
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrEmpty(hostUrl)) return;
+            string key = PendingKey(token, hostUrl);
+            Pending pending = LookupPending(key);
+            if (pending == null || !string.IsNullOrEmpty(pending.Id)) return;
+            ForgetPending(key);
+            SspiLog.Write("download", "event=torbox-unconfirmed-create-cleared");
+        }
+
         static void ForgetPending(string key)
         {
             File.Delete(PendingPath(key));
@@ -1007,6 +1020,11 @@ namespace Orbis
                     { Wait(1500, null); continue; }
                     if (ex.ProviderCode == "BAD_TOKEN" || ex.ProviderCode == "INVALID_TOKEN" || ex.ProviderCode == "NO_AUTH")
                         return "REJECTED: TorBox did not accept the saved API key";
+                    // TorBox answers AUTH_ERROR for any well-formed key it does not know, so a
+                    // second AUTH_ERROR usually means a mistyped, reset or revoked key. A server
+                    // error (5xx) with that code is an outage and stays a retry.
+                    if (ex.ProviderCode == "AUTH_ERROR" && !ex.IsRateLimited && ex.HttpStatusCode < 500)
+                        return "UNVERIFIED: TorBox could not verify the saved API key";
                     if (ex.IsRateLimited) return "RATE_LIMITED: TorBox is busy; wait before retrying";
                     if (ex.ProviderCode == "PLAN_RESTRICTED_FEATURE" || ex.ProviderCode == "PLAN_RESTRICTED" || ex.ProviderCode == "NO_PREMIUM")
                         return "LIMITED: TorBox reports a plan restriction";

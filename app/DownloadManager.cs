@@ -1487,6 +1487,7 @@ namespace Orbis
                 else if (it.PauseRequested || it.State == DlState.Paused || it.State == DlState.Failed ||
                          it.State == DlState.Canceled)
                 {
+                    if (it.State == DlState.Failed) ForgetUnconfirmedTorBoxCreates(it);
                     bool restartRequired = it.State == DlState.Failed &&
                         !File.Exists(it.DestPath) && DownloadResumeInfo.IsRestartRequired(it.Error) &&
                         !TransferClient.HasCompletedJournal(it.DestPath);
@@ -5790,6 +5791,20 @@ namespace Orbis
             if (cancel()) throw new OperationCanceledException();
             if (!SaveManifest()) throw new IOException("Could not save the renewed provider lease for archive part " + (index + 1));
             return fresh;
+        }
+
+        /// <summary>Retrying a failed row after "TorBox could not confirm whether this
+        /// download was created" sends the link again for this row and its archive parts.</summary>
+        void ForgetUnconfirmedTorBoxCreates(DlItem it)
+        {
+            string token = _cfg.TorBoxApiKey;
+            if (it == null || string.IsNullOrWhiteSpace(token)) return;
+            var urls = new List<string> { it.HosterUrl };
+            try { if (!string.IsNullOrEmpty(it.ArchiveVolumes)) foreach (var volume in ArchiveVolumeSet.Decode(it.ArchiveVolumes)) urls.Add(volume.Url); }
+            catch (Exception) { }
+            foreach (string url in urls)
+                try { TorBoxClient.ForgetUnconfirmedCreate(token, url); }
+                catch (Exception ex) { SspiLog.Write("download", "event=torbox-unconfirmed-create-clear-failed exception=" + ex.GetType().Name); }
         }
 
         /// <summary>Free path. When the chosen mirror's host cannot be used without a link

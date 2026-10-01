@@ -143,7 +143,7 @@ namespace Orbis
             else if (code == "DOWNLOAD_SERVER_ERROR")
                 message = "TorBox's download server reported DOWNLOAD_SERVER_ERROR. Wait before retrying.";
             else if (code == "AUTH_ERROR")
-                message = "Token verification is temporarily unavailable at TorBox (AUTH_ERROR). Your saved key was kept; retry shortly.";
+                message = "TorBox could not verify your API key (AUTH_ERROR). If this repeats, re-enter the key in Connections or reset it at TorBox.";
             else if (code == "BAD_TOKEN" || code == "INVALID_TOKEN")
                 message = "Your API key was rejected. Reconnect in Connections.";
             else if (code == "NO_AUTH")
