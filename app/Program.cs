@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using Orbis.Internals;
@@ -11,6 +12,7 @@ namespace Orbis
     {
         private static SearchWindow Window;
         private static readonly NavigationRepeat Navigation = new NavigationRepeat();
+        private static readonly KeyboardTyping Typing = new KeyboardTyping();
 
         public static void Main()
         {
@@ -182,7 +184,10 @@ namespace Orbis
                     return;
                 }
                 Navigation.Clear();
-                if (e.ButtonState == JoyButtonEvent.Type.Up) Window.HandleButton(e.Button);
+                bool dispatch = e.ButtonState == JoyButtonEvent.Type.Down
+                    ? Typing.Press((int)e.Button, Window.SoftKeyboardOpen)
+                    : Typing.Release((int)e.Button);
+                if (dispatch) Window.HandleButton(e.Button);
             }
             catch (Exception ex) { RecordFailure(ex); }
         }
@@ -208,6 +213,33 @@ namespace Orbis
                 catch { }
             }
             return null;
+        }
+    }
+
+    /// <summary>Other buttons act on release, but the on-screen keyboard types on press:
+    /// typing on release entered whichever key the cursor had moved to while the button
+    /// was still held. The release of a key typed on press is then ignored.</summary>
+    internal sealed class KeyboardTyping
+    {
+        readonly List<int> typed = new List<int>();
+        static bool TypingButton(int button)
+        {
+            return button == (int)DS4Button.SCE_PAD_BUTTON_CROSS || button == (int)DS4Button.SCE_PAD_BUTTON_SQUARE ||
+                button == (int)DS4Button.SCE_PAD_BUTTON_TRIANGLE;
+        }
+        /// <returns>True when the press itself is dispatched.</returns>
+        internal bool Press(int button, bool keyboardOpen)
+        {
+            // A release lost to a disconnect must not swallow a later menu press.
+            if (!keyboardOpen) { typed.Clear(); return false; }
+            if (!TypingButton(button)) return false;
+            if (!typed.Contains(button)) typed.Add(button);
+            return true;
+        }
+        /// <returns>True when the release is dispatched (it was not typed on press).</returns>
+        internal bool Release(int button)
+        {
+            return !typed.Remove(button);
         }
     }
 

@@ -817,6 +817,8 @@ namespace Orbis
             TextPx(r, x, y + 466, 18, "Music stays beneath the interface sounds.", Dim);
         }
 
+        internal bool SoftKeyboardOpen { get { lock (_lock) return _softKbOpen; } }
+
         public void HandleButton(DS4Button button)
         {
             MarkUiProgress("input-wait");
