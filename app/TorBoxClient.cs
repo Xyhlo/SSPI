@@ -206,13 +206,21 @@ namespace Orbis
 
         static bool SourceMatches(Dictionary<string, object> job, string sourceUrl)
         {
-            string[] names = { "link", "url", "source", "source_url", "sourceUrl", "src_url", "web_url", "webUrl",
-                "webdownload_url", "webdownload_link", "download_link", "input_link", "original_link", "originalLink" };
+            // TorBox's web download list reports the submitted link as original_url.
+            string[] names = { "original_url", "originalUrl", "link", "url", "source", "source_url", "sourceUrl", "src_url",
+                "web_url", "webUrl", "webdownload_url", "webdownload_link", "download_link", "input_link", "original_link", "originalLink" };
             foreach (string name in names)
             {
                 string value = Text(job, name);
                 if (string.Equals(value, sourceUrl, StringComparison.Ordinal)) return true;
             }
+            // TorBox also identifies a link by the MD5 of the exact URL.
+            string wanted = LinkHash(sourceUrl);
+            if (string.Equals(Text(job, "hash"), wanted, StringComparison.OrdinalIgnoreCase)) return true;
+            var alternatives = Value(job, "alternative_hashes") as List<object>;
+            if (alternatives != null)
+                foreach (object value in alternatives)
+                    if (value is string && string.Equals((string)value, wanted, StringComparison.OrdinalIgnoreCase)) return true;
             return false;
         }
 
@@ -636,7 +644,18 @@ namespace Orbis
                         // the create, so only their intent is safe to clear.
                         if (ex.HttpStatusCode == 401 || ex.HttpStatusCode == 403 || ex.HttpStatusCode == 429 ||
                             ex.ProviderCode == "DOWNLOAD_SERVER_ERROR")
+                        {
                             ForgetPending(key);
+                            throw;
+                        }
+                        // A lost response or server error leaves the create unknown. The saved
+                        // intent goes to list reconciliation, which adopts the download if
+                        // TorBox made it; nothing here sends the create again.
+                        if (ex.HttpStatusCode == 0 || ex.HttpStatusCode == 408 || ex.HttpStatusCode >= 500)
+                        {
+                            if (progress != null) progress("TorBox checking the submitted download");
+                            return pending;
+                        }
                         throw;
                     }
                     finally { NextCreation = CreationClock.ElapsedMilliseconds + 1000; }

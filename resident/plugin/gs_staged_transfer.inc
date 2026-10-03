@@ -593,7 +593,10 @@ static void gs_stage_install_poll(void)
                 if (write_atomic(path, body)) { gs_stage_status(stage, "failed", "Installed package receipt could not be saved; dependency queue remains held"); return; }
                 stage->done = stage->job.total; gs_stage_status(stage, "installed", NULL);
                 gs_stage_install_after = sceKernelGetProcessTime() + 3000000;
-                if (!stage->job.borrowed_source && !g_client_count && gs_storage_matches(stage->job.storage_root, stage->job.storage_token)) {
+                /* An install confirmed only from the installed image keeps its source. */
+                int retain = __atomic_exchange_n(&gs_install_retain_source, 0, __ATOMIC_ACQ_REL);
+                if (retain) gs_log_write("resident", "installed-source-retained job=%s reason=installed-image-evidence", stage->job.id);
+                if (!retain && !stage->job.borrowed_source && !g_client_count && gs_storage_matches(stage->job.storage_root, stage->job.storage_token)) {
                     /* All extracted children have committed install receipts at this point. */
                     unlink(stage->job.destination);
                     char map[1150]; snprintf(map, sizeof(map), "%s.map", stage->job.destination); unlink(map);
@@ -603,6 +606,8 @@ static void gs_stage_install_poll(void)
                     snprintf(map, sizeof(map), "%s.bgft-meta.tail", stage->job.destination); unlink(map);
                     snprintf(map, sizeof(map), "%s.bgft-meta.tmp", stage->job.destination); unlink(map);
                     snprintf(map, sizeof(map), "%s.bgft-fallback", stage->job.destination); unlink(map);
+                    snprintf(map, sizeof(map), "%s.bgft-debug", stage->job.destination); unlink(map);
+                    snprintf(map, sizeof(map), "%s.bgft-http", stage->job.destination); unlink(map);
                 }
                 gs_release = 1;
             } else if (!gs_worker_running && (!strcmp(gs_state, "failed") || !strcmp(gs_state, "canceled"))) {

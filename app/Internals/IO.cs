@@ -14,5 +14,14 @@ namespace Orbis.Internals
         
         [MethodImpl(MethodImplOptions.InternalCall)]
         static extern IntPtr GetBaseDirectory();
+
+        /// <summary>The launcher's record of this start, one "key=value" per line.</summary>
+        public static string GetLaunchRecord()
+        {
+            return (CString)GetLaunchInfo();
+        }
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        static extern IntPtr GetLaunchInfo();
     }
 }

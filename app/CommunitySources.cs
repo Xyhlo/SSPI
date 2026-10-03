@@ -140,10 +140,23 @@ namespace Orbis
             if (rows == null || rows.Count > 30) throw new InvalidDataException("Invalid directory entries");
             var result = new List<CommunitySourceEntry>();
             foreach (object row in rows) {
-                try { var entry = ParseEntry(row as Dictionary<string, object>); if (entry != null) result.Add(entry); }
+                try { var entry = ParseEntry(row as Dictionary<string, object>); if (entry != null && !OnlyForPs5(entry)) result.Add(entry); }
                 catch { /* An invalid submission must not break the whole page. */ }
             }
             return result;
+        }
+        /// <summary>The directory also lists PS5 sources, which this app cannot install
+        /// ("Unsupported catalog title identifier"). A source tagged PS5 and not PS4 is hidden.</summary>
+        internal static bool OnlyForPs5(CommunitySourceEntry entry)
+        {
+            bool ps4 = false, ps5 = false;
+            foreach (string tag in (entry.Tags ?? "").Split(new[] { " · " }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string t = tag.Trim();
+                if (string.Equals(t, "PS4", StringComparison.OrdinalIgnoreCase)) ps4 = true;
+                else if (string.Equals(t, "PS5", StringComparison.OrdinalIgnoreCase)) ps5 = true;
+            }
+            return ps5 && !ps4;
         }
         /// <summary>One authenticated directory row, or null. The encrypted metadata must
         /// name the same file hash as the row, as published clients also require.</summary>

@@ -26,6 +26,170 @@ static const char* (*mono_check_corlib_version)(void);
 // rejected packaged runtime (see load_firmware_mono_runtime).
 static int system_mono_runtime;
 
+// The installed package: Mono, its class libraries, the native modules and this
+// launcher always load from here. baseDir names SSPI's own files, which an app
+// update can replace (see select_installed_update).
+char packageDir[0x100];
+// Set while baseDir points at an installed update; module_loader.c then prefers
+// the update's copies of SSPI's own assemblies.
+int update_active;
+// This start as "key=value" lines (abi, source, revision, root, package, skipped) for
+// AppFiles in AppUpdate.cs, through the Orbis.Internals.IO::GetLaunchInfo internal call.
+// Mono on the console does not see variables set here with setenv (24ef860fb9b6 test).
+// The resident daemon has no app updates and returns an empty record.
+static char launchRecord[0x300];
+static char* getLaunchRecord(void) { return launchRecord; }
+
+#ifndef RESIDENT_DAEMON
+// AppUpdate.cs installs SSPI's own files in /data/SSPI/app/<revision>. The newest
+// one made for this package (same base, same or older launcher ABI, newer than the
+// package) runs instead of the package's own files. Each start before the safe
+// start screen counts as an attempt; three attempts without reaching it mark the
+// update bad and the package's own files run, so a broken update cannot lock SSPI.
+#define SSPI_LOADER_ABI 1
+static const char* update_root = "/data/SSPI/app";
+static char appSource[16] = "package";
+static char appRevision[24] = "0";
+static char updateSkipped[160] = "";
+
+static int read_small_text(const char* path, char* out, size_t size)
+{
+    FILE* file = fopen(path, "rb");
+    if (!file) return -1;
+    size_t length = fread(out, 1, size - 1, file);
+    fclose(file);
+    out[length] = 0;
+    return length ? 0 : -1;
+}
+
+/* Value of a "key=value" line in a small sspi-build.txt. */
+static int build_value(const char* text, const char* key, char* out, size_t size)
+{
+    size_t key_length = strlen(key);
+    const char* line = text;
+    while (*line) {
+        const char* end = strchr(line, '\n');
+        size_t length = end ? (size_t)(end - line) : strlen(line);
+        while (length && (line[length - 1] == '\r' || line[length - 1] == ' ')) length--;
+        if (length > key_length && line[key_length] == '=' && !strncmp(line, key, key_length)) {
+            length -= key_length + 1;
+            if (length >= size) return -1;
+            memcpy(out, line + key_length + 1, length);
+            out[length] = 0;
+            return 0;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    return -1;
+}
+
+/* Revisions are UTC build times (yyyymmddHHMMSS); anything else reads as 0. */
+static unsigned long long parse_revision(const char* text)
+{
+    unsigned long long value = 0;
+    size_t digits = 0;
+    for (; *text >= '0' && *text <= '9'; text++) {
+        if (++digits > 19) return 0;
+        value = value * 10 + (unsigned)(*text - '0');
+    }
+    while (*text == '\r' || *text == '\n' || *text == ' ') text++;
+    return *text || !digits ? 0 : value;
+}
+
+static int write_small_text(const char* path, const char* text)
+{
+    FILE* file = fopen(path, "wb");
+    if (!file) return -1;
+    size_t length = strlen(text);
+    int written = fwrite(text, 1, length, file) == length;
+    return fclose(file) == 0 && written ? 0 : -1;
+}
+
+static void select_installed_update(void)
+{
+    char text[1024], value[128], package_base[80] = "", path[0x180], directory[0x100];
+    unsigned long long package_revision = 0, revision = 0;
+    const char* skip = NULL;
+    snprintf(path, sizeof(path), "%s/sspi-build.txt", packageDir);
+    if (!read_small_text(path, text, sizeof(text))) {
+        if (!build_value(text, "revision", value, sizeof(value))) package_revision = parse_revision(value);
+        if (build_value(text, "base", package_base, sizeof(package_base))) package_base[0] = 0;
+    }
+    snprintf(appRevision, sizeof(appRevision), "%llu", package_revision);
+    snprintf(path, sizeof(path), "%s/active", update_root);
+    if (read_small_text(path, value, sizeof(value))) goto done; /* no installed update */
+    revision = parse_revision(value);
+    if (!revision) { skip = "unreadable-active-record"; goto done; }
+    if (revision <= package_revision) { skip = "package-is-newer"; goto done; }
+    snprintf(directory, sizeof(directory), "%s/%llu", update_root, revision);
+    snprintf(path, sizeof(path), "%s/%llu.bad", update_root, revision);
+    if (file_exists(path)) { skip = "failed-to-start"; goto done; }
+    snprintf(path, sizeof(path), "%s/sspi-build.txt", directory);
+    if (read_small_text(path, text, sizeof(text)) || build_value(text, "revision", value, sizeof(value)) ||
+        parse_revision(value) != revision) { skip = "identity-missing"; goto done; }
+    if (!package_base[0] || build_value(text, "base", value, sizeof(value)) || strcmp(value, package_base)) {
+        skip = "made-for-another-package"; goto done;
+    }
+    if (build_value(text, "abi", value, sizeof(value)) || !parse_revision(value) ||
+        parse_revision(value) > SSPI_LOADER_ABI) { skip = "needs-newer-launcher"; goto done; }
+    snprintf(path, sizeof(path), "%s/main.exe", directory);
+    if (!file_exists(path)) { skip = "files-missing"; goto done; }
+    snprintf(path, sizeof(path), "%s/main.exe.config", directory);
+    if (!file_exists(path)) { skip = "files-missing"; goto done; }
+    {
+        char attempts_path[0x180], count[16];
+        int attempts = 0;
+        snprintf(attempts_path, sizeof(attempts_path), "%s/%llu.boot", update_root, revision);
+        if (!read_small_text(attempts_path, count, sizeof(count))) attempts = (int)parse_revision(count);
+        if (attempts >= 3) {
+            snprintf(path, sizeof(path), "%s/%llu.bad", update_root, revision);
+            write_small_text(path, "did not reach safe start in 3 attempts\n");
+            skip = "failed-to-start"; goto done;
+        }
+        snprintf(count, sizeof(count), "%d\n", attempts + 1);
+        /* Without a durable attempt count a crashing update could repeat forever. */
+        if (write_small_text(attempts_path, count)) { skip = "attempt-count-unwritable"; goto done; }
+    }
+    snprintf(baseDir, sizeof(baseDir), "%s", directory);
+    snprintf(mainExe, sizeof(mainExe), "%s/main.exe", directory);
+    snprintf(appSource, sizeof(appSource), "update");
+    snprintf(appRevision, sizeof(appRevision), "%llu", revision);
+    update_active = 1;
+done:
+    if (skip) snprintf(updateSkipped, sizeof(updateSkipped), "%llu:%s", revision, skip);
+    gs_log_write("startup", "app-files source=%s revision=%s root=%s package=%s skipped=%s",
+        appSource, appRevision, baseDir, packageDir, skip ? updateSkipped : "none");
+    snprintf(launchRecord, sizeof(launchRecord), "abi=%d\nsource=%s\nrevision=%s\nroot=%s\npackage=%s\nskipped=%s\n",
+        SSPI_LOADER_ABI, appSource, appRevision, baseDir, packageDir, updateSkipped);
+}
+
+/* The update's managed code failed before the safe start screen reset its attempt
+   count: mark it bad and start again on the package's own files at once, rather than
+   after two more failed starts. Returns nonzero while the console restarts SSPI. */
+static int restart_without_failed_update(void)
+{
+    char path[0x180];
+    if (!update_active) return 0;
+    snprintf(path, sizeof(path), "%s/%s.boot", update_root, appRevision);
+    if (!file_exists(path)) return 0; /* it reached safe start, where a newer update can install */
+    snprintf(path, sizeof(path), "%s/%s.bad", update_root, appRevision);
+    write_small_text(path, "managed start failed before safe start\n");
+    boot_stage("update-start-failed", -1);
+    gs_log_write("startup", "app-files update %s failed before safe start; restarting with the package files", appRevision);
+    snprintf(path, sizeof(path), "%s/eboot.bin", packageDir);
+    const char* launchers[] = { "/app0/eboot.bin", path };
+    for (int i = 0; i < 2; i++) {
+        int result = system_load_exec ? system_load_exec(launchers[i], NULL) : -1;
+        gs_log_write("startup", "app-files restart path=%s result=0x%08x", launchers[i], (unsigned int)result);
+        if (result != 0) continue;
+        for (int wait = 0; wait < 100; wait++) sceKernelUsleep(100000); /* the system replaces this process */
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static int boot_failure(const char* stage, int code)
 {
     boot_stage(stage, code);
@@ -167,8 +331,8 @@ static int install_runtime_hooks(int module)
     uint64_t text = 0, size = 0, offset = 0;
     int matches = 0;
     int result = InstallSystemRuntimeHooks(module, &text, &size, &offset, &matches);
-    gs_log_write("startup", "mono hook variant=system result=%d matches=%d offset=0x%llx text_size=0x%llx",
-        result, matches, (unsigned long long)offset, (unsigned long long)size);
+    gs_log_write("startup", "mono hook variant=system result=%d matches=%d offset=0x%llx text_size=0x%llx abi=%d",
+        result, matches, (unsigned long long)offset, (unsigned long long)size, SystemRuntimeHookAbi);
     if (result == 0) {
         // Record the loader candidates so a firmware-specific entry can be reviewed.
         uint64_t functions[4], references[4];
@@ -357,6 +521,7 @@ void addInternalCalls(){
 	addInternalCall("Orbis.Internals.Kernel::GetMethodPointer", mono_method_get_unmanaged_thunk);
     klog("Adding IO internal calls...");
     addInternalCall("Orbis.Internals.IO::GetBaseDirectory", getBaseDirectory);
+    addInternalCall("Orbis.Internals.IO::GetLaunchInfo", getLaunchRecord);
     klog("Adding User Service internal calls...");
     addInternalCall("Orbis.Internals.UserService::Initialize", user_initialize);
     addInternalCall("Orbis.Internals.UserService::Terminate", user_terminate);
@@ -402,7 +567,8 @@ void* startMono()
     void* domain = mono_get_root_domain();
 
     if (!domain) {
-        mono_set_dirs(baseDir, baseCon);
+        // Class libraries always come from the package, even when an update runs.
+        mono_set_dirs(packageDir, baseCon);
         domain = mono_jit_init("main");
     }
 
@@ -486,6 +652,9 @@ void runMain()
     void* exception = NULL;
     boot_stage("managed-invoke", 0);
     mono_runtime_invoke(methodMain, 0, (void**)argv, &exception);
+#ifndef RESIDENT_DAEMON
+    if (exception && restart_without_failed_update()) return;
+#endif
     if (exception) boot_failure("managed-unhandled", -1);
     else boot_stage("managed-return", 0);
 }
@@ -566,13 +735,17 @@ int main()
     sprintf(&mainExe, "%s/main.exe", baseDir);
     sprintf(&baseCon, "%s/mono", baseDir);
 #endif
-	
+    snprintf(packageDir, sizeof(packageDir), "%s", baseDir);
+
     if (!file_exists(mainExe)) return boot_failure("application-mount", -1);
     boot_stage("application-mount-ready", 0);
+#ifndef RESIDENT_DAEMON
+    select_installed_update();
+#endif
     log_package_build();
     char pkgLib[0x100] = "\x0";
     int belowFirmware672 = 0;
-    sprintf(&pkgLib, "%s/sce_module/libmonosgen-2.0.prx", baseDir);
+    sprintf(&pkgLib, "%s/sce_module/libmonosgen-2.0.prx", packageDir);
     // Firmware older than 6.72 rejects the original module (0x80020016 at
     // module-mono). The package also carries a copy whose module parameter
     // declares the 4.50 SDK; only those consoles load it, so every newer
@@ -584,7 +757,7 @@ int main()
         // startup line on disk even if the console stops right after it.
         gs_log_sync_startup = 1;
         char compatLib[0x100];
-        snprintf(compatLib, sizeof(compatLib), "%s/compat/libmonosgen-2.0.prx", baseDir);
+        snprintf(compatLib, sizeof(compatLib), "%s/compat/libmonosgen-2.0.prx", packageDir);
         int compat = file_exists(compatLib);
         gs_log_write("startup", "mono runtime variant=%s firmware=0x%08x",
             compat ? "sdk-4.50" : "original-compat-missing", (unsigned)systemVersion.Version);

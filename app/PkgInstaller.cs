@@ -347,6 +347,12 @@ namespace Orbis
                         error = bgftError.Substring("BGFT_UNRESOLVED:".Length);
                         return InstallOutcome.InstallFailed;
                     }
+                    if (taskId < 0 && !string.IsNullOrEmpty(bgftError) &&
+                        bgftError.StartsWith(PkgInstallPolicy.StorageHttpFallback, StringComparison.Ordinal))
+                    {
+                        error = bgftError;
+                        return InstallOutcome.QueueRequired;
+                    }
 
                     // AppInstUtil only when BGFT never created/owns a live task.
                     // Never fallback on duplicate/unresolved ownership (could double-install).
@@ -1227,6 +1233,15 @@ namespace Orbis
                         LogInstall(error);
                         return false;
                     }
+                    // The PS4 refused the storage route without creating a task: the queue
+                    // retries this base through the local HTTP feed.
+                    if (PkgInstallPolicy.CanFallbackFromStorage(rc, taskId))
+                    {
+                        error = PkgInstallPolicy.StorageHttpFallback + "BGFT storage register " +
+                            PkgInstallPolicy.DescribeBgftError(rc) + " path=" + contentUrl;
+                        LogInstall(error);
+                        return false;
+                    }
                     error = (rc == 0 ? "BGFT register returned no task" : "BGFT register " + PkgInstallPolicy.DescribeBgftError(rc)) + " path=" + contentUrl +
                         " source={path=" + pkgPath + " " + DescribeManagedFile(pkgPath) + "}";
                     LogInstall(error);
@@ -1284,7 +1299,14 @@ namespace Orbis
         static bool TryRetireFailedDuplicate(string contentId, int subType, out string detail)
         {
             bool recovered = PkgInstallPolicy.TryRetireFailedBgftTask(
-                () => { int found; return TryFindBackgroundTask(contentId, subType, out found) ? found : -1; },
+                () =>
+                {
+                    if (string.IsNullOrEmpty(contentId) || subType <= 0) return -1;
+                    int found = -1;
+                    int rc = sceBgftServiceDownloadFindTaskByContentId(contentId, subType, out found);
+                    LogInstall("BGFT duplicate lookup rc=" + Hex(rc) + " task=" + found + " content=" + contentId + " subtype=" + subType);
+                    return rc == 0 ? found : -1;
+                },
                 id => IsOwnedBackgroundTask(id, contentId, subType),
                 id => { BgftTaskProgress state; int rc = sceBgftServiceDownloadGetProgress(id, out state);
                     return new PkgInstallPolicy.BgftStartProgress { Readable = rc == 0, Error = state.ErrorResult,

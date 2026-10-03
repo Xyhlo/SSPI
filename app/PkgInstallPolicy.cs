@@ -46,9 +46,23 @@ namespace Orbis
             string path = (source ?? "").Replace('\\', '/');
             bool internalSource = path.StartsWith("/data/", StringComparison.Ordinal) ||
                 path.StartsWith("/user/data/", StringComparison.Ordinal);
-            // Storage BGFT can reject a source on a different filesystem from the
-            // system-selected destination. HTTP leaves destination selection to PS4.
-            return !internalSource || extendedStoragePresent;
+            // An attached extended storage drive does not say where the PS4 installs.
+            // Two consoles with one stopped every HTTP base install at 0x80F00633, so
+            // an internal base tries storage first; a taskless storage rejection
+            // (CanFallbackFromStorage) moves that job to HTTP.
+            return !internalSource;
+        }
+
+        // Prefix of an install error asking the queue to retry this base over HTTP.
+        internal const string StorageHttpFallback = "BGFT_STORAGE_HTTP:";
+
+        // Only an explicit, taskless storage rejection may move a base to HTTP.
+        // A returned task, however it failed, keeps its owner.
+        internal static bool CanFallbackFromStorage(int code, int taskId)
+        {
+            if (taskId >= 0) return false;
+            uint value = unchecked((uint)code);
+            return value == 0x80990004u || value == 0x80020012u || value == 0x8002004Eu;
         }
 
         internal static bool RequiresWebBase(int subType, PkgContentKind kind)
@@ -155,7 +169,7 @@ namespace Orbis
                 case 0x80990039: reason = "not enough free space on the PS4 installation drive"; break;
                 case 0x80990086: reason = "content already queued"; break;
                 case 0x80990088: reason = "installed content conflict"; break;
-                case 0x80F00633: reason = "NP environment rejected registration; a retry repeats the same system rejection"; break;
+                case 0x80F00633: reason = "PS4 DRM content status check failed"; break;
                 case 0x80991401: reason = "package source rejected authorization (HTTP 401)"; break;
                 case 0x80991403: reason = "package source refused the PS4 download request (403 Forbidden)"; break;
                 case 0x80991404: reason = "package source unavailable"; break;
@@ -187,8 +201,11 @@ namespace Orbis
             Func<int, int> unregister, Action<int> release, out string detail)
         {
             int task = find();
-            if (task < 0 || !owned(task))
-            { detail = "Existing PS4 download is not owned by this installation"; return false; }
+            // A failed lookup and a task SSPI does not own are different findings.
+            if (task < 0)
+            { detail = "Existing PS4 download could not be found by content ID and package type"; return false; }
+            if (!owned(task))
+            { detail = "Existing PS4 download " + task + " has no matching SSPI ownership record"; return false; }
             BgftStartProgress state = progress(task);
             // A finished task SSPI registered can stay on the PS4 after its install;
             // unregistering it leaves the installed content untouched.

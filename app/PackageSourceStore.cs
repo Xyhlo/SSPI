@@ -46,8 +46,36 @@ namespace Orbis
             _registryPath = Path.Combine(_root, "registry.json");
             Directory.CreateDirectory(_installedRoot);
             Directory.CreateDirectory(_stagingRoot);
+            RecoverInterruptedReplacements();
             _entries = LoadRegistry();
             CleanupStaging();
+        }
+
+        /// <summary>A same-version update moves the installed files to staging/retired-*
+        /// and then moves the new files in. If SSPI stopped between the two moves, the
+        /// registry points at a missing folder and staging cleanup would delete both
+        /// copies: put the old files back first.</summary>
+        void RecoverInterruptedReplacements()
+        {
+            string[] retired;
+            try { retired = Directory.GetDirectories(_stagingRoot, "retired-*"); }
+            catch (IOException) { return; }
+            catch (UnauthorizedAccessException) { return; }
+            foreach (string directory in retired)
+            {
+                try
+                {
+                    if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) continue;
+                    var package = PackageSourcePackage.OpenInstalled(directory);
+                    string sourceRoot = OwnedChild(_installedRoot, package.Descriptor.SourceId);
+                    string finalPath = OwnedChild(sourceRoot, package.Descriptor.Version);
+                    if (Directory.Exists(finalPath)) continue;
+                    Directory.CreateDirectory(sourceRoot);
+                    Directory.Move(directory, finalPath);
+                    SspiLog.Write("source-refresh", "event=interrupted-replacement-recovered source=" + package.Descriptor.SourceId);
+                }
+                catch (Exception) { /* Unreadable leftovers are removed with the rest of staging. */ }
+            }
         }
 
         public List<PackageSourceRegistryEntry> GetInstalledSources()

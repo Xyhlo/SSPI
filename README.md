@@ -6,7 +6,7 @@ Super Simple Package Installer is a package manager for homebrew-enabled PlaySta
 
 This repository is a source overview, so you can see what SSPI does on your console. It isn't complete enough to compile: builds from source are reserved for close collaborators. To use SSPI, install the PKG from the releases page.
 
-Current release: [5.11.4 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.4), build `46d30f6a8d0a`.
+Current release: [5.11.5 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.5), build `cd56d53dc0d1`.
 
 [Releases](https://github.com/Xyhlo/SSPI/releases) · [Guide](https://xyhlo.github.io/SSPI/) · [Discord](https://discord.gg/hF2vw7ybRs) · [Issues](https://github.com/Xyhlo/SSPI/issues)
 
@@ -36,10 +36,10 @@ See the [guide](https://xyhlo.github.io/SSPI/) for setup, storage and download d
 
 ## Installation
 
-1. Download [`sspi5.11.4.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.4) from the 5.11.4 beta release. GitHub source archives are not installable packages.
-2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.4.pkg SHA256` and compare the result with `5b6acbb0db14ecfcfd3aa8804b23f2c36ae74344ccf024b6b22968879d69c1f7`.
+1. Download [`sspi5.11.5.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.5) from the 5.11.5 beta release. GitHub source archives are not installable packages.
+2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.5.pkg SHA256` and compare the result with `ab3f0c4a47ac405782449a1cb468ff5f9e468973201b7c69bbfa8f07dc1d47bc`.
 3. Install it over the existing app. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI.
-4. The footer should read `BETA 5.11 / 46d30f6a8d0a`. Every 5.11 beta has the same app version, so if the footer still shows an earlier build, delete SSPI from the home screen and install the package again. Settings, service keys and the download queue are stored under `/data/SSPI` and are kept.
+4. The footer should read `BETA 5.11 / cd56d53dc0d1`. Every 5.11 beta has the same app version, so if the footer still shows an earlier build, delete SSPI from the home screen and install the package again. Settings, service keys and the download queue are stored under `/data/SSPI` and are kept.
 5. There is no in-app updater, so install updates manually from the release page.
 
 ## Setup

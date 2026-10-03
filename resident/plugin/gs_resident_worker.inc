@@ -900,7 +900,7 @@ static const char *gs_bgft_error(int code)
         case 0x80990039u: return "not enough free space on the PS4 installation drive";
         case 0x80990086u: return "content already queued";
         case 0x80990088u: return "installed content conflict";
-        case 0x80F00633u: return "NP environment rejected registration; a retry repeats the same system rejection";
+        case 0x80F00633u: return "PS4 DRM content status check failed";
         case 0x80991401u: return "package source rejected authorization (HTTP 401)";
         case 0x80991403u: return "package source refused the PS4 download request (403 Forbidden)";
         case 0x80991404u: return "package source unavailable";
@@ -920,7 +920,7 @@ static const char *gs_bgft_error(int code)
 static int gs_bgft_error_terminal(int code)
 {
     switch ((uint32_t)code) {
-        case 0x80F00633u: return 1; /* NP environment rejected registration */
+        case 0x80F00633u: return 1; /* DRM content status (CE-36441-8) */
         case 0x80990004u: return 1; /* registration arguments rejected */
         case 0x80990088u: return 1; /* installed content conflict */
         case 0x80020012u: return 1; /* cross-device path rejected */
@@ -932,6 +932,9 @@ static int gs_bgft_error_terminal(int code)
  * 0x80990004 is task state, so registration wording would misreport it. */
 static const char *gs_bgft_progress_error(int code)
 {
+    if ((uint32_t)code == 0x80F00633u) return "PS4 stopped the install with a DRM content status error";
+    /* SCE_NP_DRM_CONTENT_ERROR_ORIGINCHECK (CE-36434-0), seen on 2 Oct for updates. */
+    if ((uint32_t)code == 0x80F00612u) return "PS4 rejected the update: it does not match the installed game's content ID or release";
     return (uint32_t)code == 0x80990004u ? "PS4 download task reported an argument error after registration" : gs_bgft_error(code);
 }
 
@@ -1072,6 +1075,25 @@ done:
     return NULL;
 }
 
+/* 1 for a journal that owns no PS4 task: "<content> -1 0 0 6" after a canceled task,
+ * or the same plus the package kind (6-9) after a registration the PS4 rejected
+ * without creating one. Links and anything longer than a journal are refused. */
+static int gs_stopped_install_journal(const char *path)
+{
+    char body[130];
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return 0;
+    FILE *file = fdopen(fd, "rb"); if (!file) { close(fd); return 0; }
+    size_t length = fread(body, 1, sizeof(body) - 1, file); fclose(file);
+    if (!length || length > 128) return 0;
+    body[length] = 0;
+    while (length && (body[length - 1] == '\n' || body[length - 1] == '\r' || body[length - 1] == ' ')) body[--length] = 0;
+    if ((length != 45 && length != 47) ||
+        strspn(body, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != 36 ||
+        strncmp(body + 36, " -1 0 0 6", 9)) return 0;
+    return length == 45 || (body[45] == ' ' && body[46] >= '6' && body[46] <= '9');
+}
+
 static int gs_archive_cancel_before_start(const GsJob *job)
 {
     if (job->archive != 1) return 0;
@@ -1087,10 +1109,13 @@ static int gs_archive_cancel_before_start(const GsJob *job)
     int directory_kind = gs_nofollow_path(directory, 1);
     if (directory_kind != 1) return directory_kind == 0 ? 0 : -1;
     /* No worker has restored child task IDs yet. Even a completion receipt
-     * must retain ownership until the installer can verify it. */
+     * must retain ownership until the installer can verify it; only a journal
+     * that owns no task releases it. */
     for (int ordinal = 1; ordinal <= 256; ordinal++) {
         snprintf(path, sizeof(path), "%s/install-%03d.txt", directory, ordinal);
-        if (gs_nofollow_path(path, 0) != 0) return -1;
+        int present = gs_nofollow_path(path, 0);
+        if (present == 0) continue;
+        if (present != 1 || !gs_stopped_install_journal(path)) return -1;
     }
     return 0;
 }

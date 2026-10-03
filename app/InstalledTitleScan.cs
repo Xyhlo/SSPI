@@ -54,7 +54,10 @@ namespace Orbis
             if (string.IsNullOrEmpty(titleId) || titleId.Length < 8) return false;
             if (string.Equals(titleId, "SRCH00001", StringComparison.OrdinalIgnoreCase)) return false;
             return titleId.StartsWith("CUSA", StringComparison.OrdinalIgnoreCase) ||
-                   titleId.StartsWith("PPSA", StringComparison.OrdinalIgnoreCase);
+                   titleId.StartsWith("PPSA", StringComparison.OrdinalIgnoreCase) ||
+                   // PS1/PS2 classic packages installed under their disc serial (SLUS00923).
+                   System.Text.RegularExpressions.Regex.IsMatch(titleId, @"\AS[CL][A-Z]{2}[0-9]{5}\z",
+                       System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         }
 
         internal static void ReadMeta(string titleId, out string name, out string version, out string icon)

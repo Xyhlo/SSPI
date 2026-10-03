@@ -2,6 +2,10 @@ extern char appRoot[0x100];
 extern char baseCon[0x100];
 extern char baseDir[0x100];
 extern char mainExe[0x100];
+// Nonzero while baseDir is an installed app update (main.c, select_installed_update).
+extern int update_active;
+// The installed package's files; the same as baseDir unless an update runs.
+extern char packageDir[0x100];
 
 
 void klog(const char* str);

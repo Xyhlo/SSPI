@@ -135,6 +135,8 @@ namespace Orbis
         public string ResolvedProviderId = "";
         internal bool ForegroundTransfer;
         internal string BackgroundWaitLoggedReason;
+        // Silent-feeding watch (not saved): bytes seen and when they last changed.
+        internal long FeedWatchBytes, FeedWatchTicks;
         public bool InstallOrderReady;
         public string ExpectedSha256 = "";
         public long ExpectedByteSize;
@@ -193,6 +195,9 @@ namespace Orbis
         // Set once after AppInstUtil synchronously rejects an add-on (ADDCONT_BROKEN);
         // the next install attempt registers the retained PKG through loopback BGFT.
         public bool AddOnBgftFallback;
+        // Saved once the PS4 refused the storage route for this base without creating
+        // a task; its later install attempts use loopback BGFT.
+        public bool BaseStorageRefused;
         public long RetryAfterUtcTicks;
         public int TransientHttpRetries;
         public long HttpRetryLastDurableBytes;
@@ -1129,6 +1134,7 @@ namespace Orbis
                         BgftLoopback = i.BgftLoopback,
                         BgftResident = i.BgftResident,
                         BgftLoopbackServed = i.BgftLoopbackServed,
+                        BaseStorageRefused = i.BaseStorageRefused,
                         ForceLocalInstall = i.ForceLocalInstall,
                         BgftTaskId = i.BgftTaskId,
                         BgftContentId = i.BgftContentId,
@@ -2110,14 +2116,32 @@ namespace Orbis
             try
             {
                 if (!Directory.Exists(directory)) return true;
-                if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0 ||
-                    Directory.GetDirectories(directory).Length != 0) return false;
+                if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) return false;
+                // An interrupted nested-archive extraction leaves the inner archive in
+                // <directory>/nested. Only that exact, plain folder of plain files is
+                // owned here; any other folder, a link or a deeper level keeps it all.
+                string nested = null;
+                string[] nestedFiles = new string[0];
+                foreach (string subdirectory in Directory.GetDirectories(directory))
+                {
+                    if (nested != null || !string.Equals(Path.GetFileName(subdirectory), "nested", StringComparison.Ordinal) ||
+                        (File.GetAttributes(subdirectory) & FileAttributes.ReparsePoint) != 0 ||
+                        Directory.GetDirectories(subdirectory).Length != 0) return false;
+                    nested = subdirectory;
+                    nestedFiles = Directory.GetFiles(subdirectory);
+                    foreach (string inner in nestedFiles)
+                        if ((File.GetAttributes(inner) & FileAttributes.ReparsePoint) != 0) return false;
+                }
                 string[] files = Directory.GetFiles(directory);
                 foreach (string file in files)
                 {
+                    if ((File.GetAttributes(file) & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0) return false;
                     string leaf = Path.GetFileName(file);
+                    // The resident also keeps BGFT markers beside an extracted package
+                    // (.bgft-debug, .bgft-transfer-size) and a no-data license record
+                    // beside its journal (.license); write_atomic stages each as .tmp.
                     bool known = System.Text.RegularExpressions.Regex.IsMatch(leaf,
-                        @"^(?:packages|complete|extraction-in-progress)\.txt(?:\.tmp)?$|^pkg-\d{3}\.pkg(?:\.part)?$|^install-\d{3}\.txt(?:\.addon|\.tmp|\.addon\.tmp)?$",
+                        @"^(?:packages|complete|extraction-in-progress)\.txt(?:\.tmp)?$|^pkg-\d{3}\.pkg(?:\.part|\.bgft-debug(?:\.tmp)?|\.bgft-transfer-size(?:\.tmp)?)?$|^install-\d{3}\.txt(?:\.addon|\.license)?(?:\.tmp)?$",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     if (!known) return false;
                     // The resident worker rewrites a canceled BGFT journal to
@@ -2127,11 +2151,15 @@ namespace Orbis
                     if (!installConfirmed && leaf.StartsWith("install-", StringComparison.OrdinalIgnoreCase))
                     {
                         if (leaf.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) return false;
-                        string journal = leaf.EndsWith(".addon", StringComparison.OrdinalIgnoreCase)
-                            ? file.Substring(0, file.Length - ".addon".Length) : file;
+                        string journal = file;
+                        foreach (string record in new[] { ".addon", ".license" })
+                            if (leaf.EndsWith(record, StringComparison.OrdinalIgnoreCase))
+                                journal = file.Substring(0, file.Length - record.Length);
                         if (!IsStoppedResidentInstallJournal(journal)) return false;
                     }
                 }
+                foreach (string inner in nestedFiles) File.Delete(inner);
+                if (nested != null) Directory.Delete(nested, false);
                 foreach (string file in files) File.Delete(file);
                 Directory.Delete(directory, false);
                 return !Directory.Exists(directory);
@@ -2146,8 +2174,10 @@ namespace Orbis
             {
                 if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0 ||
                     new FileInfo(path).Length > 128) return false;
+                // A canceled task leaves "<content> -1 0 0 6". A registration the PS4
+                // rejected without creating a task appends the package kind (6-9).
                 return System.Text.RegularExpressions.Regex.IsMatch(File.ReadAllText(path).Trim(),
-                    @"^[A-Za-z0-9_-]{36} -1 0 0 6$");
+                    @"^[A-Za-z0-9_-]{36} -1 0 0 6(?: [6-9])?$");
             }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
@@ -2265,7 +2295,7 @@ namespace Orbis
             SaveManifest();
         }
 
-        public bool QueuePreparedLocalInstall(string id, int attempt)
+        public bool QueuePreparedLocalInstall(string id, int attempt, string installError = null)
         {
             lock (_lock)
             {
@@ -2282,6 +2312,15 @@ namespace Orbis
                     item.BytesPerSec = item.EtaSeconds = 0;
                     SaveManifest();
                     return false;
+                }
+                // The PS4 refused the storage route without a task: later attempts for this
+                // base use loopback BGFT. Losing the flag only repeats that refusal once.
+                if (installError != null && !item.BaseStorageRefused &&
+                    installError.StartsWith(PkgInstallPolicy.StorageHttpFallback, StringComparison.Ordinal))
+                {
+                    item.BaseStorageRefused = true;
+                    SspiLog.Write("download", "event=base-storage-refused job=" + id + " next=loopback detail=" +
+                        installError.Substring(PkgInstallPolicy.StorageHttpFallback.Length));
                 }
                 item.State = DlState.Completed;
                 QueueLocalInstall(id);
@@ -4558,6 +4597,23 @@ namespace Orbis
                 if (ResidentDownloadService.EnsureAvailable(out error)) { job.BackgroundWaitLoggedReason = null; return false; }
                 reason = string.IsNullOrEmpty(error) ? ResidentDownloadService.ReadinessDetail : error;
             }
+            // A dead link (HTTP 404 or 410) never recovers by waiting. Fail the row so the
+            // user can replace the link, instead of requeueing it every 15 seconds.
+            if (reason != null && (reason.Contains("HTTP 404") || reason.Contains("HTTP 410")))
+            {
+                lock (_lock)
+                {
+                    if (job.AttemptId != attempt || job.Background) return true;
+                    job.State = DlState.Failed;
+                    job.Error = "The download link no longer works (" + (reason.Contains("HTTP 410") ? "HTTP 410" : "HTTP 404") + "). Remove this file and add a working link.";
+                    job.StatusText = job.Error;
+                    job.BytesPerSec = 0; job.EtaSeconds = 0;
+                    job.ForegroundTransfer = false; job.ForceLocalInstall = false;
+                }
+                SspiLog.Write("resident", "background job failed: dead link " + ClipMsg(reason, 80));
+                SaveManifest();
+                return true;
+            }
             lock (_lock)
             {
                 if (job.AttemptId != attempt || job.Background) return true;
@@ -4693,7 +4749,7 @@ namespace Orbis
                 return true;
             }
             if (!string.IsNullOrWhiteSpace(job.TitleId) &&
-                !PkgValidator.ContentIdMatchesTitleId(contentId, job.TitleId) &&
+                !PkgValidator.ContentIdMatchesCatalogTitleId(contentId, job.TitleId) &&
                 !(actualKind == PkgContentKind.AddOn && PkgValidator.GameAcceptsAddon(job.TitleId, contentId)))
             {
                 SetFailureIfCurrent(job, attempt, "PKG title ID mismatch");
@@ -6235,21 +6291,31 @@ namespace Orbis
 
         static void AssignArchiveInstallDependencies(List<PendingLocalChild> pending)
         {
+            // Bases and updates chain per title: in an archive holding several games, one
+            // game's unconfirmed or removed base must not hold another game's packages.
+            var lastByTitle = new Dictionary<string, DlItem>(StringComparer.OrdinalIgnoreCase);
             DlItem lastBaseOrPatch = null;
             foreach (PendingLocalChild child in pending)
             {
                 child.Item.InstallAfterId = "";
                 child.Item.InstallAfterConfirmed = false;
+                string title = child.Item.TitleId ?? "";
+                DlItem sameTitle;
+                lastByTitle.TryGetValue(title, out sameTitle);
                 if (child.Priority <= 1)
                 {
-                    if (lastBaseOrPatch != null) child.Item.InstallAfterId = lastBaseOrPatch.Id;
+                    if (sameTitle != null) child.Item.InstallAfterId = sameTitle.Id;
+                    lastByTitle[title] = child.Item;
                     lastBaseOrPatch = child.Item;
                     continue;
                 }
 
                 if (string.Equals(child.Item.Kind, "dlc", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (lastBaseOrPatch != null) child.Item.InstallAfterId = lastBaseOrPatch.Id;
+                    // A DLC follows its own game; with none in the archive (a sister
+                    // edition's DLC) it follows the archive's latest base or update.
+                    DlItem after = sameTitle ?? lastBaseOrPatch;
+                    if (after != null) child.Item.InstallAfterId = after.Id;
                     continue;
                 }
 
@@ -7018,6 +7084,7 @@ namespace Orbis
                     SaveManifest(); return;
                 }
                 bool useLoopback = PkgInstaller.UseLoopbackInstall(actualKind, job.DestPath) ||
+                    (actualKind == PkgContentKind.BaseGame && job.BaseStorageRefused) ||
                     (actualKind == PkgContentKind.AddOn && job.AddOnBgftFallback);
                 if (useLoopback && _loopback.IsOwnedByOther(job.Id))
                 {
@@ -7277,7 +7344,7 @@ namespace Orbis
             }
             if (outcome == InstallOutcome.QueueRequired)
             {
-                QueuePreparedLocalInstall(job.Id, attempt);
+                QueuePreparedLocalInstall(job.Id, attempt, error);
                 return;
             }
             if (outcome == InstallOutcome.Started)
@@ -7424,6 +7491,11 @@ namespace Orbis
 
         bool RetryLocalInstall(DlItem job, int attempt, string reason)
         {
+            // Unresolved ownership and deterministic PS4 rejections do not change on an
+            // automatic retry; registering again only repeats the conflict.
+            if ((reason ?? "").IndexOf("BGFT_UNRESOLVED:", StringComparison.Ordinal) >= 0 ||
+                (reason ?? "").IndexOf("BGFT_TERMINAL:", StringComparison.Ordinal) >= 0)
+                return false;
             lock (_lock)
             {
                 if (job.AttemptId != attempt || job.CancelRequested || job.PauseRequested ||
@@ -7759,9 +7831,25 @@ namespace Orbis
                         SaveManifest();
                         return;
                     }
-                    if (!TryCleanupFanOutPending(item)) { item.StatusText = "Extracted package cleanup pending"; return; }
-                    string cleanupError;
-                    if (!TryCleanupOwnedFiles(item, out cleanupError)) { item.StatusText = cleanupError; return; }
+                    // The worker no longer owns this job, so stop showing it as resident-owned
+                    // while cleanup is retried. Its resident identity stays until cleanup succeeds.
+                    bool normalized = item.Background || item.BgftResident || item.ResidentRetryPending ||
+                        item.ResidentPauseDesired.HasValue || item.PauseRequested || item.State != DlState.Canceled;
+                    item.Background = item.BgftResident = false;
+                    item.ResidentRetryPending = false;
+                    item.ResidentPauseDesired = null;
+                    item.PauseRequested = false;
+                    item.State = DlState.Canceled;
+                    item.BytesPerSec = item.EtaSeconds = 0;
+                    string previousStatus = item.StatusText, cleanupError = null;
+                    if (!TryCleanupFanOutPending(item)) cleanupError = "Extracted package cleanup pending";
+                    else TryCleanupOwnedFiles(item, out cleanupError);
+                    if (cleanupError != null)
+                    {
+                        item.StatusText = cleanupError;
+                        if (normalized || !string.Equals(previousStatus, cleanupError, StringComparison.Ordinal)) SaveManifest();
+                        return;
+                    }
                     PreserveConfirmedDependency(item);
                     _items.Remove(item);
                     SaveManifest();
@@ -7927,6 +8015,16 @@ namespace Orbis
                 ApplyResidentTransferPhase(item, status);
                 if ((status.State == "feeding" || status.State == "installing") && !string.IsNullOrEmpty(status.Error))
                     item.StatusText = status.Error;
+                // Reported 2 Oct: rows sat at "Resident download: feeding" with no progress.
+                // After 5 minutes without new bytes, say so and what to do.
+                if (status.State == "feeding" && string.IsNullOrEmpty(status.Error))
+                {
+                    long now = DateTime.UtcNow.Ticks, seen = status.Done + status.NetworkBytes;
+                    if (item.FeedWatchTicks == 0 || seen != item.FeedWatchBytes) { item.FeedWatchBytes = seen; item.FeedWatchTicks = now; }
+                    else if (now - item.FeedWatchTicks >= TimeSpan.FromMinutes(5).Ticks)
+                        item.StatusText = "No download progress for 5 minutes. Pause and resume it; if it stays stuck, restart the PS4 and enable GoldHEN again.";
+                }
+                else item.FeedWatchTicks = 0;
                 if (item.CancelRequested && status.State != "installed" && status.State != "failed" && status.State != "canceled")
                     item.StatusText = "Canceling background job; waiting for worker acknowledgement";
                 if (status.State == "installed")
@@ -8323,11 +8421,14 @@ namespace Orbis
                                 {
                                     LogBgftEvent("task-stall", cur,
                                         "polls=" + cur.BgftStallPolls + " expected=" + expected, progress);
+                                    // Near the end, neither BGFT's counters nor SSPI's served-range
+                                    // receipt proves a complete read; name the figures, not a cause.
                                     FallbackBgftToLocal(cur,
                                         cur.BgftDirect
                                             ? (nearDone ? "direct transfer size mismatch"
                                                 : "direct transfer stalled at " + Human(progress.Done))
-                                            : (nearDone ? "loopback transfer was not fully served"
+                                            : (nearDone ? "PS4 stopped importing near the end without confirming the whole package (PS4 " +
+                                                Human(progress.Done) + " of " + Human(progress.Total) + ", package " + Human(expected) + ")"
                                                 : "stalled at " + Human(progress.Done)));
                                     stateChanged = true;
                                     // skip rest of state machine this tick
@@ -8733,6 +8834,7 @@ namespace Orbis
                         sb.Append("\"bgft_resident\":").Append(it.BgftResident ? "true" : "false").Append(',');
                         sb.Append("\"bgft_direct\":").Append(it.BgftDirect ? "true" : "false").Append(',');
                         sb.Append("\"bgft_loopback_served\":").Append(it.BgftLoopbackServed ? "true" : "false").Append(',');
+                        sb.Append("\"base_storage_refused\":").Append(it.BaseStorageRefused ? "true" : "false").Append(',');
                         sb.Append("\"force_local_install\":").Append(it.ForceLocalInstall ? "true" : "false").Append(',');
                         sb.Append("\"bgft_task\":").Append(it.BgftTaskId).Append(',');
                         sb.Append("\"bgft_content_id\":\"").Append(JsonLite.Escape(it.BgftContentId)).Append("\",");
@@ -9330,6 +9432,7 @@ namespace Orbis
                         BgftResident = JsonLite.GetBool(obj, "bgft_resident"),
                         BgftDirect = JsonLite.GetBool(obj, "bgft_direct"),
                         BgftLoopbackServed = JsonLite.GetBool(obj, "bgft_loopback_served"),
+                        BaseStorageRefused = JsonLite.GetBool(obj, "base_storage_refused"),
                         ForceLocalInstall = JsonLite.GetBool(obj, "force_local_install"),
                         BgftTaskId = ParseInt(JsonLite.GetString(obj, "bgft_task"), -1),
                         BgftContentId = JsonLite.GetString(obj, "bgft_content_id") ?? "",
@@ -9777,7 +9880,7 @@ namespace Orbis
             ".resident.part", ".resident.map", ".resident.map.tmp", ".resident.xfer-lock",
             ".resident.sha256-ok", ".resident.sha256-ok.tmp",
             ".parallel.part", ".parallel.part.ranges", ".parallel.part.ranges.tmp",
-            ".bgft-meta", ".bgft-meta.tail", ".bgft-meta.tmp", ".bgft-fallback"
+            ".bgft-meta", ".bgft-meta.tail", ".bgft-meta.tmp", ".bgft-fallback", ".bgft-debug"
         };
 
         // The download a stored file belongs to: its own path for a package or

@@ -66,8 +66,12 @@ static int gs_stage_dependency_ready(const GsStage *stage)
     FILE *file = fopen(path, "rb"); if (!file) return 0;
     int good = !gs_line(file, line, sizeof(line)) && !strcmp(line, "1") &&
         !gs_encoded_line(file, id, sizeof(id)) && !strcmp(id, stage->job.after) &&
-        !gs_encoded_line(file, content, sizeof(content)) && strlen(content) == 36 &&
-        (!stage->job.title[0] || !memcmp(content + 7, stage->job.title, 9));
-    fclose(file); return good;
+        !gs_encoded_line(file, content, sizeof(content)) && strlen(content) == 36;
+    fclose(file);
+    if (!good || !stage->job.title[0] || !memcmp(content + 7, stage->job.title, 9)) return good;
+    /* A sister-edition DLC carries its own title but follows the game that
+     * declares it, so that game's receipt names the game's title. */
+    char game[10]; memcpy(game, content + 7, 9); game[9] = 0;
+    return gs_game_accepts_addon(game, stage->job.content);
 }
 #endif

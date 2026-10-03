@@ -598,10 +598,41 @@ namespace Orbis
             if (!_ready) throw new Exception(_initError);
             if (cancel != null && cancel()) throw new OperationCanceledException();
             if (maxBytes <= 0) maxBytes = MaxBodyDefault;
-            int status;
-            string body = Request(MethodGet, url, null, null, referer, bearer, timeoutMs, maxBytes, out status,
-                userAgent, true, cancel, allowOrigin, redirectLimit);
-            return body;
+            // The SSL library can briefly run out of memory (0x809517D5) while other HTTPS
+            // work holds its pool. A GET is safe to repeat; each attempt creates fresh
+            // request objects, within the caller's original time budget.
+            int budget = timeoutMs > 0 ? timeoutMs : 45000;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    int status;
+                    return Request(MethodGet, url, null, null, referer, bearer,
+                        (int)Math.Max(1000, budget - clock.ElapsedMilliseconds), maxBytes, out status,
+                        userAgent, true, cancel, allowOrigin, redirectLimit);
+                }
+                catch (Exception ex)
+                {
+                    int delay = attempt == 0 ? 1000 : 3000;
+                    if (attempt >= 2 || !IsSslMemoryShortage(ex) || (cancel != null && cancel()) ||
+                        clock.ElapsedMilliseconds + delay >= budget) throw;
+                    SspiLog.Write("network", "native_http retry attempt=" + (attempt + 1) + " delay_ms=" + delay +
+                        " reason=ssl-out-of-memory host=" + SafeDiagnosticHost(url));
+                    for (int waited = 0; waited < delay; waited += 100)
+                    {
+                        if (cancel != null && cancel()) throw new OperationCanceledException();
+                        Thread.Sleep(Math.Min(100, delay - waited));
+                    }
+                }
+            }
+        }
+
+        // SCE_SSL_ERROR_OUT_OF_MEMORY while sending; HTTP status replies are never retried here.
+        static bool IsSslMemoryShortage(Exception ex)
+        {
+            return !(ex is OperationCanceledException) && !(ex is ServiceHttpException) &&
+                (ex.Message ?? "").IndexOf("sceHttp send 0x809517D5", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         static string GetStringRaw(string url, int timeoutMs, string referer, string bearer, int maxBytes)

@@ -291,6 +291,11 @@ namespace Orbis
                 }
             }
             catch { }
+            // Before settings, the resident or the UI load (see SearchWindow.SafeStart.cs).
+            try { RunSafeStart(); }
+            catch (Exception ex) { Program.RecordFailure(ex); Program.StartupStage("safe-start-failed"); }
+            // Crash-test update builds only (SSPI_UPDATE_TEST_CRASH): fail here like a startup crash.
+            if (BuildIdentity.UpdateTestCrash.Length != 0) throw new InvalidOperationException(BuildIdentity.UpdateTestCrash);
             Program.StartupStage("settings-load");
             _cfg.Load();
             if (_cfg.UnlockProviderId == UnlockProviders.DeepbridId) { _cfg.UnlockProviderId = _cfg.HasTorBox ? UnlockProviders.TorBoxId : UnlockProviders.RealDebridId; _cfg.DeepbridApiKey = ""; _cfg.Save(); }
@@ -3302,7 +3307,7 @@ namespace Orbis
                     switch (outcome)
                     {
                         case InstallOutcome.QueueRequired:
-                            if (_dlMgr.QueuePreparedLocalInstall(id, installAttempt))
+                            if (_dlMgr.QueuePreparedLocalInstall(id, installAttempt, err))
                                 SetStatus("Queued for verified package installation");
                             break;
                         case InstallOutcome.Started:

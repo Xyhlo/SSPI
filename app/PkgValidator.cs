@@ -62,7 +62,7 @@ namespace Orbis
                     {
                         string contentId;
                         if (!TryGetContentId(path, out contentId) ||
-                            !(ContentIdMatchesTitleId(contentId, exp) || IsDeclaredSisterAddon(path, contentId, exp)))
+                            !(ContentIdMatchesCatalogTitleId(contentId, exp) || IsDeclaredSisterAddon(path, contentId, exp)))
                         {
                             result = PkgValResult.TitleMismatch;
                             detail = "expected " + exp + " got " + got;
@@ -115,7 +115,7 @@ namespace Orbis
                 string expected = (expectedTitleId ?? "").Trim();
                 if (!string.IsNullOrEmpty(expected) &&
                     (!TryGetContentId(path, out contentId) ||
-                     !(ContentIdMatchesTitleId(contentId, expected) || IsDeclaredSisterAddon(path, contentId, expected))))
+                     !(ContentIdMatchesCatalogTitleId(contentId, expected) || IsDeclaredSisterAddon(path, contentId, expected))))
                 {
                     result = PkgValResult.TitleMismatch;
                     detail = "could not confirm expected title " + expected + " from PKG content ID";
@@ -135,6 +135,30 @@ namespace Orbis
             string embeddedTitleId = contentId.Substring(dash + 1, underscore - dash - 1);
             return string.Equals(embeddedTitleId, expectedTitleId.Trim(),
                 StringComparison.OrdinalIgnoreCase);
+        }
+
+        // A PS1/PS2 disc serial (SLUS20946 or SLUS-20946), never a PS4/PS5 title ID.
+        internal static string NormalizeClassicSerial(string value)
+        {
+            string id = (value ?? "").Trim().ToUpperInvariant();
+            return System.Text.RegularExpressions.Regex.IsMatch(id, @"\A(?!CUSA|PPSA)[A-Z]{4}-?[0-9]{5}\z")
+                ? id.Replace("-", "") : "";
+        }
+
+        // Catalogs list classics under their disc serial, while the PKG is a PS4 title whose
+        // content label starts with that serial (SLUS20946 -> UP1004-CUSA03506_00-SLUS209460000001).
+        // Only source-versus-package admission uses this; installs use the PKG's own title.
+        internal static bool ContentIdMatchesCatalogTitleId(string contentId, string catalogTitleId)
+        {
+            if (ContentIdMatchesTitleId(contentId, catalogTitleId)) return true;
+            string serial = NormalizeClassicSerial(catalogTitleId);
+            if (serial.Length == 0) return false;
+            var match = System.Text.RegularExpressions.Regex.Match(contentId ?? "",
+                @"\A[A-Z]{2}[0-9]{4}-(?<title>[A-Z]{4}[0-9]{5})_[0-9]{2}-(?<label>[A-Z0-9_-]{16})\z",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+            return match.Success &&
+                (string.Equals(match.Groups["title"].Value, serial, StringComparison.OrdinalIgnoreCase) ||
+                 match.Groups["label"].Value.StartsWith(serial, StringComparison.OrdinalIgnoreCase));
         }
 
         internal static PkgContentKind RequestedKind(string requestedKind)
@@ -411,7 +435,8 @@ namespace Orbis
             int under = contentId.IndexOf('_', dash + 1);
             if (under < 0) under = contentId.Length;
             titleId = contentId.Substring(dash + 1, under - dash - 1).ToUpperInvariant();
-            return titleId.StartsWith("CUSA", StringComparison.Ordinal) && titleId.Length >= 9;
+            // PS4 titles (CUSA, PLAS, PCJS ...) and serial-titled PS1 packages (SLUS00923).
+            return System.Text.RegularExpressions.Regex.IsMatch(titleId, @"\A[A-Z]{4}[0-9]{5}\z");
         }
 
         internal static bool CheckRequestedIdentity(string requestedKind, PkgContentKind actualKind,
@@ -427,7 +452,7 @@ namespace Orbis
                     ", but the file is " + KindPhrase(actualKind) + ". Choose another mirror; the file was kept";
                 return false;
             }
-            if (!string.IsNullOrEmpty(titleId) && !ContentIdMatchesTitleId(contentId, titleId) &&
+            if (!string.IsNullOrEmpty(titleId) && !ContentIdMatchesCatalogTitleId(contentId, titleId) &&
                 !(actualKind == PkgContentKind.AddOn && GameAcceptsAddon(titleId, contentId)))
             {
                 string other;
@@ -437,7 +462,10 @@ namespace Orbis
                 return false;
             }
             if (actualKind != PkgContentKind.Patch) return true;
-            string installed = InstalledContentId(titleId);
+            // A classic's catalog serial is not its installed title; compare the package's own.
+            string installedTitle;
+            if (!TryGetTitleIdFromContentId(contentId, out installedTitle)) installedTitle = titleId;
+            string installed = InstalledContentId(installedTitle);
             if (installed.Length > 0 && !string.Equals(installed, contentId, StringComparison.OrdinalIgnoreCase))
             { error = "Update content ID differs from the installed base game. Choose the matching release."; return false; }
             return true;

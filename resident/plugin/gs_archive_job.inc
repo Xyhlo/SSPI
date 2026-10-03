@@ -552,6 +552,63 @@ static int gs_installed_base_matches(const char *input_path, int verify)
     fclose(input); return 0;
 }
 
+/* Size, header and tail can match a destination BGFT preallocated but never fully
+ * wrote. Before an install is trusted on that evidence alone, 64 blocks spread
+ * across the file must match the local source too. */
+static int gs_installed_base_sampled(const char *input_path)
+{
+    const char *roots[] = { "/user/app", "/mnt/ext0/user/app" };
+    unsigned char expected[4096], actual[4096]; struct stat source;
+    if (!gs_installed_base_matches(input_path, 0)) return 0;
+    FILE *input = fopen(input_path, "rb"); if (!input) return 0;
+    if (gs_file_stat(input, &source) || source.st_size < (int64_t)(2 * sizeof(expected))) { fclose(input); return 0; }
+    int matched = 0;
+    for (int i = 0; i < 2 && !matched; i++) {
+        char path[256]; snprintf(path, sizeof(path), "%s/%s/app.pkg", roots[i], gs_job.title);
+        FILE *file = fopen(path, "rb"); if (!file) continue;
+        int same = 1;
+        for (int n = 1; same && n <= 64; n++) {
+            long offset = (long)(((int64_t)source.st_size - (int64_t)sizeof(expected)) / 65 * n);
+            offset -= offset % 4096;
+            same = !fseek(input, offset, SEEK_SET) && fread(expected, 1, sizeof(expected), input) == sizeof(expected) &&
+                !fseek(file, offset, SEEK_SET) && fread(actual, 1, sizeof(actual), file) == sizeof(actual) &&
+                !memcmp(expected, actual, sizeof(expected));
+        }
+        fclose(file); matched = same;
+    }
+    fclose(input); return matched;
+}
+
+/* Set when a base install was confirmed from the installed image after BGFT stopped
+ * reporting progress. The staged source is then kept rather than deleted. */
+static int gs_install_retain_source;
+
+/* <package>.bgft-http holds "<content> <bytes> <generation>" once the PS4 refused the
+ * storage route for this package: a taskless StorageEx rejection, or an accepted
+ * storage task that failed with 0x80990004. The same job generation then installs
+ * over local HTTP, across restarts; a new generation tries storage again. */
+static void gs_storage_refusal(char *body, size_t size)
+{
+    snprintf(body, size, "%s %lld %s", gs_job.content, (long long)gs_job.total,
+        gs_job.generation[0] ? gs_job.generation : "-");
+}
+
+static int gs_storage_refused_marked(const char *marker)
+{
+    char body[160] = {0}, expected[160];
+    FILE *file = fopen(marker, "rb"); if (!file) return 0;
+    size_t length = fread(body, 1, sizeof(body) - 1, file); fclose(file);
+    while (length && (body[length - 1] == '\n' || body[length - 1] == '\r')) body[--length] = 0;
+    gs_storage_refusal(expected, sizeof(expected));
+    return !strcmp(body, expected);
+}
+
+static int gs_mark_storage_refused(const char *marker)
+{
+    char body[160]; gs_storage_refusal(body, sizeof(body));
+    return write_atomic(marker, body);
+}
+
 static void gs_download_notification(const char *title, const char *detail)
 {
     OrbisNotificationRequest notice; memset(&notice, 0, sizeof(notice));
@@ -948,6 +1005,7 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     int (*reg)(GsBgftParam *, int *), (*get_progress)(int, GsBgftProgress *);
     GsBgftParam param; struct { void *heap; size_t size; } heap;
     static char storage_refused[49]; /* content whose accepted storage task failed; retry it over HTTP */
+    __atomic_store_n(&gs_install_retain_source, 0, __ATOMIC_RELEASE);
     if (!gs_storage_matches(gs_job.storage_root, gs_job.storage_token)) {
         gs_write_status("failed", "Selected staging drive disconnected; package and installer journal retained"); return -1;
     }
@@ -1000,7 +1058,15 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
             gs_log_write("resident", "bgft-recovery job=%s task=%d reason=unproven-patch-receipt", gs_job.id, task);
         }
         if (complete && kind == 6) {
-            if (gs_stage_stream_finished() == 1 && gs_installed_base_matches(gs_job.destination, 1)) return 0;
+            // The journal cannot say whether the first run trusted sampled image
+            // evidence, so a recovered local base keeps its source like that path.
+            if (gs_stage_stream_finished() == 1 && gs_installed_base_matches(gs_job.destination, 1) &&
+                (gs_job.native_bgft || gs_installed_base_sampled(gs_job.destination))) {
+                __atomic_store_n(&gs_install_retain_source, !gs_job.native_bgft, __ATOMIC_RELEASE);
+                gs_log_write("resident", "bgft-recovery job=%s task=%d reason=completed-base-receipt source=%s",
+                    gs_job.id, task, gs_job.native_bgft ? "released" : "retained");
+                return 0;
+            }
             // Older builds certified a dashboard placeholder. Reattach the saved
             // task, but never promote its receipt without installed-file proof.
             complete = 0;
@@ -1057,9 +1123,11 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
     if (gs_requires_base(kind, theme) && !exists) return -1;
     if (task < 0) {
         if (g_stop || gs_canceled) return -1;
-        // Route 7 registers a completed internal base directly from storage.
-        // HTTP lets BGFT copy to the system-selected install drive when extended
-        // storage is present, without relying on a cross-filesystem local move.
+        // Route 7 has BGFT copy a completed internal base from storage. It is tried
+        // first even with extended storage attached: two consoles with extended
+        // storage stopped every HTTP base install at 0x80F00633. A taskless storage
+        // rejection or an accepted storage task failing with 0x80990004 moves this
+        // job generation to HTTP (<package>.bgft-http).
         struct { GsBgftParam param; uint32_t slot; } storage_param;
         _Static_assert(sizeof(storage_param) == 112, "BGFT storage parameter ABI");
         int (*storage_reg)(void *, int *) = NULL, (*get_slot)(const char *, uint32_t *);
@@ -1088,13 +1156,18 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         // Match IntInit with the internal registration ABI (PS4RPI's 0x80990004 fix).
         const char *api = gs_package_register_api(kind, theme);
         if (gs_bind(bgft, api, &reg)) return -1;
-        int storage_candidate = kind == 6 && !gs_job.native_bgft && gs_stream_slot < 0 && strcmp(storage_refused, gs_job.content) &&
+        char http_marker[1150]; snprintf(http_marker, sizeof(http_marker), "%s.bgft-http", gs_job.destination);
+        int storage_candidate = kind == 6 && !gs_job.native_bgft && gs_stream_slot < 0 &&
             (!strncmp(gs_job.destination, "/data/SSPI/", 11) || !strncmp(gs_job.destination, "/user/data/SSPI/", 16));
-        int extended_storage = storage_candidate ? gs_nofollow_path("/mnt/ext0", 1) : 0;
-        if (storage_candidate && extended_storage != 0)
-            gs_log_write("resident", "bgft-storage-bypassed job=%s extended_storage=%s handoff=http destination=system-default",
-                gs_job.id, extended_storage > 0 ? "present" : "unverified");
-        if (storage_candidate && extended_storage == 0 &&
+        int storage_refused_before = storage_candidate &&
+            (!strcmp(storage_refused, gs_job.content) || gs_storage_refused_marked(http_marker));
+        if (storage_candidate) {
+            int extended_storage = gs_nofollow_path("/mnt/ext0", 1);
+            gs_log_write("resident", "bgft-storage-candidate job=%s extended_storage=%s destination=system-default route=%s",
+                gs_job.id, extended_storage > 0 ? "present" : extended_storage < 0 ? "unverified" : "absent",
+                storage_refused_before ? "http-after-storage-refusal" : "storage");
+        }
+        if (storage_candidate && !storage_refused_before &&
             !gs_bind(bgft, "sceBgftServiceIntDownloadRegisterTaskByStorageEx", &storage_reg) &&
             !gs_bind(app, "sceAppInstUtilGetPrimaryAppSlot", &get_slot)) {
             memset(&storage_param, 0, sizeof(storage_param));
@@ -1123,7 +1196,10 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
         // accepted task, ambiguous success or start failure retains its owner.
         if (route_version == 7 && task < 0 && ((uint32_t)rc == 0x80990004u ||
                 (uint32_t)rc == 0x80020012u || (uint32_t)rc == 0x8002004Eu)) {
-            gs_log_write("resident", "bgft-storage-fallback job=%s rc=0x%08X reason=unsupported-storage-registration", gs_job.id, (unsigned)rc);
+            // Durable for this generation only; an unsaved marker just repeats this refusal.
+            int marked = !gs_mark_storage_refused(http_marker);
+            gs_log_write("resident", "bgft-storage-fallback job=%s rc=0x%08X reason=unsupported-storage-registration marker=%s",
+                gs_job.id, (unsigned)rc, marked ? "saved" : "unsaved");
             route_version = 6; api = "sceBgftServiceIntDownloadRegisterTask";
             snprintf(record, sizeof(record), "%s -1 0 1 6 %d", gs_job.content, kind);
             if (write_atomic(journal, record)) return -1;
@@ -1280,9 +1356,10 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
          * must match the source for 20 polls before normal confirmation runs. */
         if (route_version == 7 && kind == 6 && !phase_length && !storage_copy_progress &&
             p.preparing >= 100 && p.copy >= 100 && gs_installed_base_matches(gs_job.destination, 0)) {
-            if (++storage_installed_polls >= 20) {
+            if (++storage_installed_polls >= 20 && (gs_job.native_bgft || gs_installed_base_sampled(gs_job.destination))) {
                 storage_copy_progress = 1;
-                gs_log_write("resident", "bgft-storage-installed job=%s task=%d evidence=installed-package", gs_job.id, task);
+                __atomic_store_n(&gs_install_retain_source, !gs_job.native_bgft, __ATOMIC_RELEASE);
+                gs_log_write("resident", "bgft-storage-installed job=%s task=%d evidence=installed-package source=retained", gs_job.id, task);
             }
         } else storage_installed_polls = 0;
         int copy_finished = p.copy >= 100 && ((phase_length && phase_done >= phase_length) ||
@@ -1330,10 +1407,35 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
              * the same task would only repeat its stored error. */
             int source = gs_job.native_bgft && ((uint32_t)p.error == 0x80991401u || (uint32_t)p.error == 0x80991403u);
             int removed = (source || (uint32_t)p.error == 0x80990004u) && !gs_cancel_task();
-            if (removed && route_version == 7) snprintf(storage_refused, sizeof(storage_refused), "%s", gs_job.content);
-            gs_log_write("resident", "bgft-task-error job=%s task=%d error=0x%08X mode=%s removed=%d next=%s", gs_job.id, task, (unsigned)p.error,
-                route_version == 7 ? "storage" : "http", removed, !removed ? "retain" : source ? "sspi-download" : route_version == 7 ? "http-registration" : "fresh-registration");
-            char error[384]; snprintf(error, sizeof(error), "%s%s. API=sceBgftServiceDownloadGetProgress rc=0x%08X error=0x%08X task=%d. %s",
+            int marked = 0;
+            if (removed && route_version == 7) {
+                char http_marker[1150]; snprintf(http_marker, sizeof(http_marker), "%s.bgft-http", gs_job.destination);
+                snprintf(storage_refused, sizeof(storage_refused), "%s", gs_job.content);
+                marked = !gs_mark_storage_refused(http_marker);
+            }
+            /* 0x80F00633 (DRM content status) on an HTTP base task. On two consoles with
+             * extended storage every multi-part base game stopped here once the PS4 had
+             * its first part; a debug-API registration stopped at the same byte. The
+             * task and PKG are kept. A first part smaller than the package is logged as
+             * a probable PlayGo boundary (diagnostic only). */
+            uint64_t reported_total = p.length_total ? p.length_total : p.length;
+            uint64_t reported_done = p.length_total ? p.transferred_total : p.transferred;
+            int drm = (uint32_t)p.error == 0x80F00633u && kind == 6 && !theme;
+            int boundary = drm && reported_total && reported_done == reported_total && p.preparing >= 100 && p.copy >= 100 &&
+                gs_job.total > 0 && reported_total < (uint64_t)gs_job.total;
+            int extended = drm ? gs_nofollow_path("/mnt/ext0", 1) > 0 : 0;
+            gs_log_write("resident", "bgft-task-error job=%s task=%d error=0x%08X mode=%s removed=%d next=%s received=%llu/%llu package=%lld playgo_boundary=%d extended_storage=%d marker=%s",
+                gs_job.id, task, (unsigned)p.error, route_version == 7 ? "storage" : "http", removed,
+                !removed ? "retain" : source ? "sspi-download" : route_version == 7 ? "http-registration" : "fresh-registration",
+                (unsigned long long)phase_done, (unsigned long long)phase_length, (long long)gs_job.total, boundary, extended,
+                removed && route_version == 7 ? (marked ? "saved" : "unsaved") : "none");
+            char error[512];
+            if (drm && !removed)
+                snprintf(error, sizeof(error), "BGFT_TERMINAL:%s after receiving %llu of %llu MiB.%s API=sceBgftServiceDownloadGetProgress rc=0x%08X error=0x%08X task=%d. PKG retained.",
+                    gs_bgft_progress_error(p.error), (unsigned long long)(phase_done >> 20), (unsigned long long)(phase_length >> 20),
+                    extended ? " With Extended Storage connected, set Settings > Storage > OPTIONS > Application Install Location to System Storage, then retry; the game can be moved afterwards." : "",
+                    (unsigned)rc, (unsigned)p.error, task);
+            else snprintf(error, sizeof(error), "%s%s. API=sceBgftServiceDownloadGetProgress rc=0x%08X error=0x%08X task=%d. %s",
                 removed && source ? "BGFT_SOURCE:" : !removed && gs_bgft_error_terminal(p.error) ? "BGFT_TERMINAL:" : "", gs_bgft_progress_error(p.error),
                 (unsigned)rc, (unsigned)p.error, task, removed ? "Task removed for a fresh attempt; PKG retained." : "PKG retained.");
             gs_write_status("failed", error); return -1;
@@ -1350,8 +1452,10 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
             /* An idle task at 100/100 whose installed base matches the source has
              * finished; only its counters stopped short. Confirm it, not a stall. */
             if (kind == 6 && p.preparing >= 100 && p.copy >= 100 && !app_exists(gs_job.title, &exists) && exists &&
-                gs_installed_base_matches(gs_job.destination, 0)) {
-                gs_log_write("resident", "bgft-stall-installed job=%s task=%d evidence=installed-package", gs_job.id, task);
+                gs_installed_base_matches(gs_job.destination, 0) &&
+                (gs_job.native_bgft || gs_installed_base_sampled(gs_job.destination))) {
+                __atomic_store_n(&gs_install_retain_source, !gs_job.native_bgft, __ATOMIC_RELEASE);
+                gs_log_write("resident", "bgft-stall-installed job=%s task=%d evidence=installed-package source=retained", gs_job.id, task);
                 snprintf(record, sizeof(record), "%s %d 1 0 %d %d", gs_job.content, task, route_version, kind);
                 int saved = write_atomic(journal, record);
                 if (!saved) { gs_archive_task = -1; gs_done = gs_job.total; }
@@ -1425,7 +1529,8 @@ static int gs_install_archive_pkg(const char *directory, int ordinal, int kind)
                     sceKernelUsleep(500000); continue;
                 }
                 if (stable >= 240) {
-                    gs_write_status("failed", "PS4 finished copying but installed version is unconfirmed. Task and PKG retained; inspect Notifications."); return -1;
+                    /* Retrying cannot confirm it either; the prefix stops automatic retries. */
+                    gs_write_status("failed", "BGFT_UNRESOLVED:PS4 reported copying complete, but the installed package could not be verified. Task and PKG retained. Check Notifications > Downloads before retrying."); return -1;
                 }
                 sceKernelUsleep(500000); continue;
             }
@@ -1628,6 +1733,34 @@ static int gs_pkg_kind(const char *path)
     return type == 0x1a ? 6 : -1;
 }
 
+/* 1 when a catalog's PS1/PS2 disc serial (SLUS20946 or SLUS-20946) names this content
+ * ID: the package title is the serial, or its label starts with it, as in
+ * UP1004-CUSA03506_00-SLUS209460000001. The PKG's own title is then installed. */
+static int gs_classic_catalog_matches(const char *catalog, const char *content)
+{
+    char serial[10]; size_t length = catalog ? strlen(catalog) : 0, n = 0;
+    if (length != 9 && length != 10) return 0;
+    for (size_t i = 0; i < length; i++) {
+        char c = catalog[i];
+        if (length == 10 && i == 4) { if (c != '-') return 0; continue; }
+        if (n < 4) { if (c >= 'a' && c <= 'z') c = (char)(c - 32); if (c < 'A' || c > 'Z') return 0; }
+        else if (c < '0' || c > '9') return 0;
+        serial[n++] = c;
+    }
+    serial[9] = 0;
+    if (n != 9 || !memcmp(serial, "CUSA", 4) || !memcmp(serial, "PPSA", 4)) return 0;
+    if (!content || strlen(content) != 36 || content[6] != '-' || content[16] != '_' || content[19] != '-') return 0;
+    int title = 1, label = 1;
+    for (int i = 0; i < 9; i++) {
+        char t = content[7 + i], l = content[20 + i];
+        if (t >= 'a' && t <= 'z') t = (char)(t - 32);
+        if (l >= 'a' && l <= 'z') l = (char)(l - 32);
+        if (t != serial[i]) title = 0;
+        if (l != serial[i]) label = 0;
+    }
+    return title || label;
+}
+
 static int gs_prepare_pkg(GsExtractedPkg *pkg)
 {
     unsigned char header[0x80]; FILE *file = fopen(pkg->path, "rb");
@@ -1635,7 +1768,11 @@ static int gs_prepare_pkg(GsExtractedPkg *pkg)
     if (fread(header, 1, sizeof(header), file) != sizeof(header)) { fclose(file); return -1; }
     fclose(file);
     memcpy(gs_job.content, header + 0x40, 36); gs_job.content[36] = 0;
-    if (!gs_job.title[0] || (gs_job.borrowed_source && gs_job.archive == 1)) { memcpy(gs_job.title, header + 0x47, 9); gs_job.title[9] = 0; }
+    if (gs_job.title[0] && memcmp(gs_job.title, header + 0x47, 9) && gs_classic_catalog_matches(gs_job.title, gs_job.content)) {
+        gs_log_write("resident", "classic-title job=%s catalog=%s content=%s", gs_job.id, gs_job.title, gs_job.content);
+        memcpy(gs_job.title, header + 0x47, 9); gs_job.title[9] = 0;
+    }
+    else if (!gs_job.title[0] || (gs_job.borrowed_source && gs_job.archive == 1)) { memcpy(gs_job.title, header + 0x47, 9); gs_job.title[9] = 0; }
     /* A DLC of a sister edition the selected game declares is checked and installed
      * under its own title, like a DLC the app handed over directly. */
     else if ((gs_pkg_be32(header + 0x74) == 0x1b || gs_pkg_be32(header + 0x74) == 0x1c) &&
