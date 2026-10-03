@@ -5,13 +5,36 @@ namespace Orbis
     internal static class BackdropPattern
     {
         public const int Width = 640, Height = 360;
-        public static readonly string[] Modes = { "solid", "ripple", "wave", "grid", "halo", "graphite", "obsidian", "slate", "flowers" };
-        public static readonly string[] Names = { "Plain charcoal", "Ripple", "Wave", "Mosaic", "Halo", "Graphite fade", "Obsidian", "Slate glow", "ASCII Flowers" };
+        public static readonly string[] Modes = { "solid", "ripple", "wave", "grid", "halo", "graphite", "obsidian", "slate", "flowers", "silk" };
+        public static readonly string[] Names = { "Plain charcoal", "Ripple", "Wave", "Mosaic", "Halo", "Graphite fade", "Obsidian", "Slate glow", "ASCII Flowers", "Silk" };
         public static int Index(string mode) { return Math.Max(0, Array.FindIndex(Modes, m => string.Equals(m, mode, StringComparison.OrdinalIgnoreCase))); }
         public static bool IsDarkGradient(string mode) { int index = Index(mode); return index >= 5 && index <= 7; }
+        // Silk: soft light strands drifting across charcoal. Rendered once like the
+        // other patterns; no dither and no per-frame work.
+        static byte[] RenderSilk()
+        {
+            var data = new byte[Width * Height * 4];
+            for (int y = 0; y < Height; y++)
+                for (int x = 0; x < Width; x++)
+                {
+                    double u = x / (double)Width, v = y / (double)Height, light = 0;
+                    for (int s = 0; s < 5; s++)
+                    {
+                        double centre = .2 + s * .15 + .075 * Math.Sin(u * 4.6 + s * 1.37) + .03 * Math.Sin(u * 10.5 + s * 2.3);
+                        double d = (v - centre) * Height;
+                        double strength = .55 + .45 * Math.Sin(u * 2.7 + s * .9);
+                        light += strength * (.7 * Math.Exp(-d * d / 8.0) + .3 * Math.Exp(-d * d / 160.0));
+                    }
+                    double shade = 25 + 5 * (1 - v) + 20 * Math.Min(1, light);
+                    int p = (y * Width + x) * 4;
+                    data[p] = (byte)shade; data[p + 1] = (byte)(shade + 1); data[p + 2] = (byte)(shade + 3); data[p + 3] = 255;
+                }
+            return data;
+        }
         public static byte[] Render(int pattern, byte red, byte green, byte blue)
         {
             if (pattern == 8) return RenderFlowers(red, green, blue);
+            if (pattern == 9) return RenderSilk();
             var data = new byte[Width * Height * 4];
             for (int y = 0; y < Height; y++)
                 for (int x = 0; x < Width; x++)
