@@ -33,7 +33,7 @@
       <a class="tab" href="#help" data-panel="help">Help</a>
     </div>
   </nav>
-  <p class="status"><a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3">5.11.3 beta · Download</a></p>
+  <p class="status"><a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.7">5.11.7 (Final) · Download</a></p>
 </header>
 
 <main id="content" tabindex="-1">
@@ -43,9 +43,9 @@
   <div class="panel-head intro">
     <h1 id="start-title" tabindex="-1">SSPI guide</h1>
     <p>SSPI (Super Simple Package Installer) is a homebrew app for the PS4. It searches the package sources you add, downloads through Real-Debrid, TorBox, AllDebrid or Premiumize, and installs the result on the console.</p>
-    <p>This guide covers setup, every setting and how sources work. The current release is the 5.11.3 beta. SSPI is free; service plans are separate.</p>
+    <p>This guide covers setup, every setting and how sources work. The current release is 5.11.7 (Final), the last PKG release: from there SSPI updates itself. SSPI is free; service plans are separate.</p>
     <div class="actions">
-      <a class="button primary" href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3">Download 5.11.3 beta</a>
+      <a class="button primary" href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.7">Download 5.11.7</a>
       <a class="button" href="#setup">Setup steps</a>
     </div>
   </div>
@@ -60,13 +60,13 @@
       </video>
       <ol class="chapters" id="chapters" aria-label="Video chapters"><li><button type="button" data-t="3.6" data-index="1"><time>0:04</time><span>Open SSPI</span></button></li><li><button type="button" data-t="15.0" data-index="2"><time>0:15</time><span>General</span></button></li><li><button type="button" data-t="29.0" data-index="3"><time>0:29</time><span>Connections</span></button></li><li><button type="button" data-t="45.0" data-index="4"><time>0:45</time><span>Package sources</span></button></li><li><button type="button" data-t="64.83" data-index="5"><time>1:05</time><span>Connect your phone</span></button></li><li><button type="button" data-t="73.37" data-index="6"><time>1:13</time><span>Get your Real-Debrid API token</span></button></li><li><button type="button" data-t="99.27" data-index="7"><time>1:39</time><span>Save and validate</span></button></li><li><button type="button" data-t="111.67" data-index="8"><time>1:52</time><span>Sources and appearance</span></button></li><li><button type="button" data-t="127.83" data-index="9"><time>2:08</time><span>Send links and library artwork</span></button></li><li><button type="button" data-t="142.0" data-index="10"><time>2:22</time><span>Appearance</span></button></li><li><button type="button" data-t="159.6" data-index="11"><time>2:40</time><span>Sound and storage</span></button></li><li><button type="button" data-t="171.6" data-index="12"><time>2:52</time><span>Find a game</span></button></li><li><button type="button" data-t="187.6" data-index="13"><time>3:08</time><span>Choose a package</span></button></li><li><button type="button" data-t="207.6" data-index="14"><time>3:28</time><span>Follow the download</span></button></li><li><button type="button" data-t="227.6" data-index="15"><time>3:48</time><span>Add your own files</span></button></li><li><button type="button" data-t="240.57" data-index="16"><time>4:01</time><span>Queue more</span></button></li><li><button type="button" data-t="259.77" data-index="17"><time>4:20</time><span>Your library</span></button></li></ol>
     </div>
-    <div class="note tip"><p>The walkthrough and screenshots were recorded on an earlier 5.11 beta test build (<code>ee19b0a58628</code>), so some screens differ in 5.11.3. For example, settings pages now share one header style with section labels and value chips. Account details, pairing codes, file names and host names are blurred.</p></div>
+    <div class="note tip"><p>The walkthrough and screenshots were recorded on an earlier 5.11 beta test build (<code>ee19b0a58628</code>), so some screens differ in 5.11.7. For example, settings pages now share one header style with section labels and value chips, and every launch now opens on a safe start screen. Account details, pairing codes, file names and host names are blurred.</p></div>
   </div>
 
   <div class="section" id="requirements">
     <h2>What you need</h2>
         <div class="rows">
-      <div class="row"><div><h3>A PS4 that runs homebrew</h3><p>GoldHEN is needed for background downloads. Support across firmware versions is still being tested.</p></div><span class="value">Required</span></div>
+      <div class="row"><div><h3>A PS4 that runs homebrew</h3><p>Firmware 6.72 or later; 5.05 and earlier are not supported. GoldHEN is needed for background downloads.</p></div><span class="value">Required</span></div>
       <div class="row"><div><h3>A phone on the same network</h3><p>Used to enter service keys and add sources. Any browser works, and there's nothing to install.</p></div><span class="value">For setup</span></div>
       <div class="row"><div><h3>A download service account</h3><p>Real-Debrid, TorBox, AllDebrid or Premiumize, with your own plan. Direct links and USB files work without one.</p></div><span class="value muted">Optional</span></div>
       <div class="row"><div><h3>Free storage</h3><p>Leave room for the download, any archive extraction and the installed game. A large RAR set can briefly need about twice the game's size.</p></div><span class="value">Required</span></div>
@@ -95,9 +95,10 @@
   <div class="steps">
     <article class="step" id="install">
       <h3>Install SSPI</h3>
-      <p>Download <code>sspi5.11.3.pkg</code> from the <a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.3">5.11.3 beta release page</a>. GitHub's source ZIP isn't an installable package. SSPI has no in-app updater, so install updates manually.</p>
-      <p>Before installing, check the file's SHA-256. On Windows, run <code>certutil -hashfile sspi5.11.3.pkg SHA256</code> and compare it with <code>3fe15c485a71dcfe64c3d0c667ca0ceff5e0d665051715bccc4a7dfd0d9f54af</code>.</p>
-      <p>Install it over the existing app; your settings and queue are kept. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI. The footer should read <code>BETA 5.11 / 07dac5e85610</code>.</p>
+      <p>Download <code>sspi5.11.7.pkg</code> from the <a href="https://github.com/Xyhlo/SSPI/releases/tag/v5.11.7">5.11.7 (Final) release page</a>. GitHub's source ZIP isn't an installable package. 5.11.7 is the final PKG release: from then on SSPI updates itself, and the GitHub repository only receives source code updates.</p>
+      <p>Before installing, check the file's SHA-256. On Windows, run <code>certutil -hashfile sspi5.11.7.pkg SHA256</code> and compare it with <code>8813e4f8fd3a32e8208efa37f05337b196c787e28a3166fd079a250b9cde0b75</code>.</p>
+      <p>Install it over the existing app; your settings and queue are kept. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI. The footer should read <code>BETA 5.11 / 0eb783eca1f3</code>, or a newer build ID once SSPI has updated itself.</p>
+      <p>Updates: every launch opens on a safe start screen for a few seconds. It saves SSPI's logs and checks for an update; when one is available, SSPI downloads it, verifies it, installs it and restarts. The first launch after an update shows what changed. Your settings, service keys and queue are kept.</p>
       <figure class="media"><div class="shot"><img src="assets/guide/ps4-home.webp" alt="SSPI on the PS4 home screen, labelled Super Simple Package Installer" width="1400" height="331" loading="lazy" decoding="async"></div></figure>
     </article>
     <article class="step" id="open-settings">
@@ -434,7 +435,7 @@
     <p>Start with the error message: open the download's drawer with <strong>R2</strong>, choose Errors and note the exact wording.</p>
   </div>
   <div class="faq">
-    <details><summary>SSPI doesn't start</summary><div><p>Check that the SSPI package installed completely and that your homebrew environment is running. If you report it, include the PS4 model, firmware, GoldHEN version and any system error. Firmware coverage is still being tested. Consoles below firmware 6.72 now load a copy of the runtime made for older firmware; this hasn't been tried on firmware 5.05 yet. <span class="tag">Needs a PS4 test</span></p></div></details>
+    <details><summary>SSPI doesn't start</summary><div><p>Check that the SSPI package installed completely and that your homebrew environment is running. If you report it, include the PS4 model, firmware, GoldHEN version and any system error. SSPI needs firmware 6.72 or later; 5.05 and earlier are not supported.</p></div></details>
     <details><summary>The background worker isn't ready</summary><div><p>In Settings → General, choose Retry on Background worker. After installing an update, fully restart the PS4, enable GoldHEN again and reopen SSPI. Until the worker is ready, use In-app mode and keep SSPI open.</p></div></details>
     <details><summary>The phone page won't open</summary><div><p>Keep SSPI open, rescan the current QR code and make sure the phone and PS4 can reach each other. A guest network, network isolation or a phone VPN can block the page.</p></div></details>
     <details><summary>My key isn't validated</summary><div><p>Copy the whole token again from your service's key page, paste it, tick Enable for downloads and tap Save and validate. A validated key doesn't guarantee that every host is supported or that your plan allows every file.</p></div></details>
@@ -463,7 +464,7 @@
 </main>
 
 <footer class="site-footer">
-  <span>SSPI 5.11.3 beta</span>
+  <span>SSPI 5.11.7</span>
   <a href="https://github.com/Xyhlo/SSPI">GitHub</a>
   <a href="https://github.com/Xyhlo/SSPI/issues/new">Report an issue</a>
   <a href="https://discord.gg/hF2vw7ybRs">Discord</a>
