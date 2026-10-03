@@ -36,7 +36,7 @@ namespace Orbis
                 {_storageMessage="Reconnect the selected USB drive, then open Staging location again.";User.NotifyToast(_storageMessage);return;}
                 string error;
                 if(_cfg.SelectStaging(_stagingChoices[_settingsFocus],out error))
-                {_storageView=0;_settingsFocus=0;_storageLoaded=false;_storageMessage="Staging location saved";User.NotifyToast(_storageMessage);}
+                {DownloadManager.ClearBackgroundUsbBlocks();_storageView=0;_settingsFocus=0;_storageLoaded=false;_storageMessage="Staging location saved";User.NotifyToast(_storageMessage);}
                 else{_storageMessage=error;User.NotifyToast(Clip(error ?? "Staging location unavailable",130));}
                 return;
             }

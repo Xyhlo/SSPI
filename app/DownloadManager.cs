@@ -2076,6 +2076,76 @@ namespace Orbis
             return true;
         }
 
+        // The background service runs inside the PS4's shell process, where opening a USB
+        // drive can keep failing while SSPI itself reads it (storage check -5, reported
+        // 3 Oct on firmware 12.52). Downloads staged on such a drive then run in SSPI
+        // instead of waiting for the service. Choosing a staging location clears the note.
+        static readonly object BlockedUsbGate = new object();
+        static HashSet<string> _backgroundBlockedUsb;
+        static string BlockedUsbPath { get { return Path.Combine(AppSettings.DataDir, "usb-background-blocked"); } }
+
+        static string UsbMountOf(string path)
+        {
+            string normalized = (path ?? "").Replace('\\', '/');
+            return normalized.Length >= 9 && normalized.StartsWith("/mnt/usb", StringComparison.Ordinal) &&
+                normalized[8] >= '0' && normalized[8] <= '7' && (normalized.Length == 9 || normalized[9] == '/')
+                ? normalized.Substring(0, 9) : null;
+        }
+
+        static HashSet<string> BlockedUsb()
+        {
+            if (_backgroundBlockedUsb != null) return _backgroundBlockedUsb;
+            var result = new HashSet<string>(StringComparer.Ordinal);
+            try
+            {
+                if (File.Exists(BlockedUsbPath) && new FileInfo(BlockedUsbPath).Length < 512)
+                    foreach (string line in File.ReadAllLines(BlockedUsbPath))
+                    { string mount = UsbMountOf(line.Trim()); if (mount != null) result.Add(mount); }
+            }
+            catch { }
+            return _backgroundBlockedUsb = result;
+        }
+
+        /// <summary>True when downloads staged at this path must not wait for the background service.</summary>
+        internal static bool BackgroundCannotOpen(string path)
+        {
+            string mount = UsbMountOf(path);
+            if (mount == null) return false;
+            lock (BlockedUsbGate) return BlockedUsb().Contains(mount);
+        }
+
+        /// <summary>Records a drive the service reported it could not open. Only a drive SSPI
+        /// itself can open is recorded; a disconnected drive is a different problem.</summary>
+        internal static bool NoteBackgroundCannotOpen(string path)
+        {
+            string mount = UsbMountOf(path);
+            if (mount == null || !UsbVolumeLabel.IsConnected(mount)) return false;
+            lock (BlockedUsbGate)
+            {
+                var blocked = BlockedUsb();
+                if (!blocked.Add(mount)) return true;
+                try { File.WriteAllText(BlockedUsbPath, string.Join("\n", blocked) + "\n"); } catch { }
+            }
+            SspiLog.Write("download", "usb-storage background service cannot open " + mount + "; downloads staged there run in SSPI");
+            return true;
+        }
+
+        internal static void ClearBackgroundUsbBlocks()
+        {
+            lock (BlockedUsbGate)
+            {
+                _backgroundBlockedUsb = new HashSet<string>(StringComparer.Ordinal);
+                try { if (File.Exists(BlockedUsbPath)) File.Delete(BlockedUsbPath); } catch { }
+            }
+        }
+
+        // The worker's storage-wait detail for check -5 from the shell process.
+        internal static bool ResidentCannotOpenUsb(string error)
+        {
+            return error != null && error.IndexOf("storage check -5", StringComparison.Ordinal) >= 0 &&
+                error.IndexOf("background service", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         // A USB drive that is not connected holds nothing SSPI can reach, so removing a
         // row never waits for it; anything left there shows in Stored files once it is back.
         static bool OnDisconnectedUsb(string path)
@@ -4589,7 +4659,7 @@ namespace Orbis
 
         bool WaitForSelectedBackground(DlItem job, int attempt, string reason = null)
         {
-            if (!BackgroundSelected || UseInAppThemeLicense(job)) return false;
+            if (!BackgroundSelected || UseInAppThemeLicense(job) || BackgroundCannotOpen(job.DestPath)) return false;
             bool logReason;
             if (string.IsNullOrEmpty(reason))
             {
@@ -4708,9 +4778,10 @@ namespace Orbis
                     { SetFailureIfCurrent(job, attempt, passwordError); return true; }
                     if (job.ExpectedByteSize > 0 && job.ExpectedByteSize != header.Total)
                     { SetFailureIfCurrent(job, attempt, "Archive size mismatch"); return true; }
-                    if (ResidentDownloadService.HasStagedDownloader)
+                    if (ResidentDownloadService.HasStagedDownloader && !BackgroundCannotOpen(job.DestPath))
                         return HandoffStagedPackage(job, attempt, direct, job.TitleId, job.Kind, "", header.Total, true);
-                    SetFeederForegroundFallback(job, attempt, "Archive download requires SSPI to remain open");
+                    SetFeederForegroundFallback(job, attempt, BackgroundCannotOpen(job.DestPath)
+                        ? "Background service can't open this USB drive; keep SSPI open" : "Archive download requires SSPI to remain open");
                     return true;
                 }
                 SetFeederForegroundFallback(job, attempt, "Origin did not return a PKG header");
@@ -4774,14 +4845,16 @@ namespace Orbis
                 bool nativeBgft = (actualKind == PkgContentKind.BaseGame || actualKind == PkgContentKind.Patch) &&
                     CanPrepareNativeBgft(job, BackgroundSelected) &&
                     CanInstallWithResidentDependency(ResidentDependencyId(job));
-                return HandoffStagedPackage(job, attempt, direct, actualTitleId, actualKindName, contentId, packageSize, false, nativeBgft);
+                if (nativeBgft || !BackgroundCannotOpen(job.DestPath))
+                    return HandoffStagedPackage(job, attempt, direct, actualTitleId, actualKindName, contentId, packageSize, false, nativeBgft);
             }
             // SSPI owns WAN transfers. BGFT receives a validated local file at install time;
             // a missing resident must not silently revert base games to an opaque single stream.
             if (NetHttp.CanUseParallelDownload(direct, actualTitleId))
                 SelectForegroundParallelDownload(job, attempt);
             else
-                SetFeederForegroundFallback(job, attempt, "Background downloader unavailable; keep SSPI open");
+                SetFeederForegroundFallback(job, attempt, BackgroundCannotOpen(job.DestPath)
+                    ? "Background service can't open this USB drive; keep SSPI open" : "Background downloader unavailable; keep SSPI open");
             return true;
         }
 
@@ -8109,6 +8182,9 @@ namespace Orbis
             }
             if ((status.State == "storage-wait" || status.State == "waiting-storage") && !item.PauseRequested)
             { item.State = DlState.Queued; item.BytesPerSec = 0; item.EtaSeconds = 0; item.StatusText = string.IsNullOrEmpty(status.Error) ? "Reconnect the selected staging drive; background files are retained" : status.Error; }
+            if ((status.State == "storage-wait" || status.State == "waiting-storage") && !item.PauseRequested &&
+                ResidentCannotOpenUsb(status.Error) && (BackgroundCannotOpen(item.DestPath) || NoteBackgroundCannotOpen(item.DestPath)))
+                item.StatusText = "The background service can't open this USB drive. Remove this download and add it again to download it in SSPI to the same drive (keep SSPI open), or set Staging location to PS4.";
             if (status.State == "paused" && item.ResidentPauseDesired == false)
             { item.State = DlState.Downloading; item.BytesPerSec = 0; item.EtaSeconds = 0; item.StatusText = "Background download resume requested"; }
             else if (status.State == "paused" || item.ResidentPauseDesired == true || (item.ResidentStaged && item.PauseRequested))
