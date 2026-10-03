@@ -39,7 +39,7 @@ See the [guide](https://xyhlo.github.io/SSPI/) for setup, storage and download d
 1. Download [`sspi5.11.5.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.5) from the 5.11.5 beta release. GitHub source archives are not installable packages.
 2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.5.pkg SHA256` and compare the result with `ab3f0c4a47ac405782449a1cb468ff5f9e468973201b7c69bbfa8f07dc1d47bc`.
 3. Install it over the existing app. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI.
-4. The footer should read `BETA 5.11 / cd56d53dc0d1`. Every 5.11 beta has the same app version, so if the footer still shows an earlier build, delete SSPI from the home screen and install the package again. Settings, service keys and the download queue are stored under `/data/SSPI` and are kept.
+4. The footer should read `BETA 5.11 / cd56d53dc0d1`, or a newer build ID once SSPI has installed an app update on its safe start screen. Every 5.11 beta has the same app version, so if the footer still shows an earlier build, delete SSPI from the home screen and install the package again. Settings, service keys and the download queue are stored under `/data/SSPI` and are kept.
 5. There is no in-app updater, so install updates manually from the release page.
 
 ## Setup
