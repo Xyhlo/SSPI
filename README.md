@@ -4,9 +4,9 @@
 
 Super Simple Package Installer is a package manager for homebrew-enabled PlayStation 4 consoles. It searches package sources, manages downloads and installs content from a controller-friendly interface.
 
-This repository is a source overview, so you can see what SSPI does on your console. It isn't complete enough to compile: builds from source are reserved for close collaborators. To use SSPI, install the PKG from the releases page.
+This repository is a source overview, so you can see what SSPI does on your console. It isn't complete enough to compile: builds from source are reserved for close collaborators. To use SSPI, install the PKG from the latest release. SSPI then updates itself through its in-app updater, so this repository only receives source code updates.
 
-Current release: [5.11.5 beta](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.5), build `cd56d53dc0d1`.
+Current release: [5.11.7 (Final)](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.7), build `0eb783eca1f3`. This is the final PKG release; later versions arrive through the in-app updater.
 
 [Releases](https://github.com/Xyhlo/SSPI/releases) · [Guide](https://xyhlo.github.io/SSPI/) · [Discord](https://discord.gg/hF2vw7ybRs) · [Issues](https://github.com/Xyhlo/SSPI/issues)
 
@@ -36,11 +36,11 @@ See the [guide](https://xyhlo.github.io/SSPI/) for setup, storage and download d
 
 ## Installation
 
-1. Download [`sspi5.11.5.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.5) from the 5.11.5 beta release. GitHub source archives are not installable packages.
-2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.5.pkg SHA256` and compare the result with `ab3f0c4a47ac405782449a1cb468ff5f9e468973201b7c69bbfa8f07dc1d47bc`.
+1. Download [`sspi5.11.7.pkg`](https://github.com/Xyhlo/SSPI/releases/tag/v5.11.7) from the 5.11.7 (Final) release. GitHub source archives are not installable packages.
+2. Check its SHA-256. On Windows, run `certutil -hashfile sspi5.11.7.pkg SHA256` and compare the result with `8813e4f8fd3a32e8208efa37f05337b196c787e28a3166fd079a250b9cde0b75`.
 3. Install it over the existing app. Launch SSPI once, fully restart the PS4, enable GoldHEN again and reopen SSPI.
-4. The footer should read `BETA 5.11 / cd56d53dc0d1`, or a newer build ID once SSPI has installed an app update on its safe start screen. Every 5.11 beta has the same app version, so if the footer still shows an earlier build, delete SSPI from the home screen and install the package again. Settings, service keys and the download queue are stored under `/data/SSPI` and are kept.
-5. There is no in-app updater, so install updates manually from the release page.
+4. The footer should read `BETA 5.11 / 0eb783eca1f3`, or a newer build ID once SSPI has installed an app update on its safe start screen. Every 5.11 beta has the same app version, so if the footer still shows an earlier build, delete SSPI from the home screen and install the package again. Settings, service keys and the download queue are stored under `/data/SSPI` and are kept.
+5. From then on, SSPI updates itself: on every launch its safe start screen checks for an update, installs it and restarts. Later versions are not published here as PKG downloads.
 
 ## Setup
 
