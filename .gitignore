@@ -245,6 +245,7 @@
 !/app/PixelBackground.cs
 !/app/CustomCovers.cs
 !/app/PairServer.Library.cs
+!/app/PairServer.Logs.cs
 !/app/PairServer.Queue.cs
 !/app/PhoneCompanion.html
 !/app/SearchWindow.SceneCache.cs

@@ -3,13 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#09090a">
+<meta name="theme-color" content="#141414">
 <meta name="referrer" content="no-referrer">
 <title>SSPI</title>
 <style>
-/* SSPI phone downloader. SSPI Windows tokens with the PS4 Cartridge silver. One dark look; no page backgrounds. */
-:root{color-scheme:dark;--world:#09090a;--card:#141416;--well:#0d0d0f;--raised:#1f1f23;--raised-2:#27272c;--line:rgba(255,255,255,.07);--line-2:rgba(255,255,255,.11);--line-3:rgba(255,255,255,.2);--ink:#f0f0ee;--ink-2:#cfcfd3;--muted:#a3a3a9;--faint:#76767d;--accent:#e4e4e1;--accent-ink:#111113;--good:#46a758;--warn:#d4a13d;--fail:#e5484d;--good-ink:#9dccaf;--warn-ink:#e4bf7a;--fail-ink:#eca3a7;--accent-grad:linear-gradient(90deg,color-mix(in srgb,var(--accent) 42%,#161616),var(--accent) 70%,color-mix(in srgb,var(--accent) 50%,#fff));--accent-face:linear-gradient(180deg,color-mix(in srgb,var(--accent) 62%,#fff),var(--accent) 50%,color-mix(in srgb,var(--accent) 82%,#000));--accent-glow:color-mix(in srgb,var(--accent) 55%,transparent);--metal:linear-gradient(145deg,#2d2d32,#19191c 58%,#121214);--glass:rgba(15,15,17,.74);--font:"Geist","Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,Roboto,sans-serif;--mono:"Geist Mono",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;--snappy:cubic-bezier(.2,.9,.25,1);--soft:cubic-bezier(.2,.8,.2,1);--bouncy:cubic-bezier(.3,1.4,.5,1);--bar-h:54px;--rail-h:68px;padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
-@supports not (color:color-mix(in srgb,red 50%,blue)){:root{--accent-grad:var(--accent);--accent-face:var(--accent);--accent-glow:transparent}}
+/* SSPI phone companion. The PS4 app's charcoal palette: flat surfaces, solid fills, no blur or background images. */
+:root{color-scheme:dark;--world:#141414;--card:#1b1b1b;--well:#101010;--raised:#262626;--raised-2:#2f2f2f;--line:#262626;--line-2:#323232;--line-3:#4a4a4a;--ink:#f3f3f1;--ink-2:#d6d6d2;--muted:#b8b8b4;--faint:#8e8e8a;--accent:#e4e4e1;--accent-ink:#202020;--good:#5fbf86;--warn:#e0b25c;--fail:#e5677a;--good-ink:#83d7a3;--warn-ink:#f0c674;--fail-ink:#f495a1;--accent-grad:var(--accent);--accent-face:var(--accent);--accent-glow:transparent;--metal:var(--raised);--glass:var(--world);--font:"Geist","Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,Roboto,sans-serif;--mono:"Geist Mono",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;--snappy:cubic-bezier(.2,.9,.25,1);--soft:cubic-bezier(.2,.8,.2,1);--bouncy:cubic-bezier(.3,1.4,.5,1);--bar-h:54px;--rail-h:68px;padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{height:100%;box-sizing:border-box;background:var(--world)}
 body{height:100%;margin:0;overflow:hidden;background:var(--world);color:var(--ink);font:400 14px/1.5 var(--font);-webkit-font-smoothing:antialiased;overscroll-behavior:none}
@@ -21,23 +20,23 @@ h1,h2,p{margin:0}
 .i.sm{width:16px;height:16px}
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;opacity:0}
-.glass{background:var(--glass);-webkit-backdrop-filter:blur(22px) saturate(1.6);backdrop-filter:blur(22px) saturate(1.6)}
+.glass{background:var(--glass)}
 
-/* Shell: glass title bar and a floating rail over the swipe pager */
+/* Shell: title bar and a floating rail over the swipe pager */
 .app{position:relative;height:100%;max-width:600px;margin:0 auto;overflow:hidden;background:var(--world)}
 @media(min-width:640px){.app{border-inline:1px solid var(--line)}}
 .titlebar{position:absolute;inset:0 0 auto;z-index:30;display:flex;align-items:center;gap:10px;height:var(--bar-h);padding:0 10px 0 16px;border-bottom:1px solid var(--line)}
 .brand{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
-.brand svg{width:26px;height:26px;flex:none;filter:drop-shadow(0 3px 8px rgba(0,0,0,.7))}
-.brand b{font-size:15px;font-weight:800;letter-spacing:.16em;background:linear-gradient(180deg,#fafafa 20%,#9d9d9d);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand svg{width:26px;height:26px;flex:none}
+.brand b{font-size:15px;font-weight:800;letter-spacing:.16em;color:var(--ink)}
 .brand span{font-size:12px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.conn{display:flex;align-items:center;gap:8px;height:34px;padding:0 13px;border-radius:99px;border:1px solid var(--line-2);background:rgba(255,255,255,.04);color:var(--ink-2);font-size:11.5px;transition:background .15s,transform .15s var(--snappy)}
+.conn{display:flex;align-items:center;gap:8px;height:34px;padding:0 13px;border-radius:99px;border:1px solid var(--line-2);background:var(--card);color:var(--ink-2);font-size:11.5px;transition:background .15s,transform .15s var(--snappy)}
 .conn:active{background:rgba(255,255,255,.09);transform:scale(.95)}
 .conn.offline .ping{background:var(--warn);animation:none}
 .conn.ended{color:var(--fail-ink)}
 .conn.ended .ping{background:var(--fail);animation:none}
 .ping{width:7px;height:7px;flex:none;border-radius:50%;background:var(--good);animation:ping 2.4s infinite}
-@keyframes ping{0%{box-shadow:0 0 0 0 rgba(70,167,88,.55)}70%,100%{box-shadow:0 0 0 7px rgba(70,167,88,0)}}
+@keyframes ping{0%{box-shadow:0 0 0 0 rgba(95,191,134,.5)}70%,100%{box-shadow:0 0 0 7px rgba(95,191,134,0)}}
 .pager{position:absolute;inset:0;display:flex;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x mandatory;overscroll-behavior-x:contain;scrollbar-width:none}
 .pager::-webkit-scrollbar,.page::-webkit-scrollbar{display:none}
 .page{flex:0 0 100%;min-width:0;scroll-snap-align:start;scroll-snap-stop:always;overflow-y:auto;overscroll-behavior-y:contain;scrollbar-width:none;padding:calc(var(--bar-h) + 16px) 16px calc(var(--rail-h) + 48px);display:flex;flex-direction:column;gap:16px}
@@ -46,26 +45,27 @@ h1,h2,p{margin:0}
 @keyframes peek{40%{transform:translateX(-36px)}}
 .heading h1{font-size:26px;font-weight:750;letter-spacing:-.04em;line-height:1.1;text-wrap:balance}
 .heading p{font-size:13px;color:var(--muted);margin-top:2px}
-.rail{position:absolute;left:12px;right:12px;bottom:12px;z-index:30;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));padding:6px;border-radius:26px;border:1px solid var(--line-2);box-shadow:0 22px 48px -18px rgba(0,0,0,.95),inset 0 1px 0 rgba(255,255,255,.07)}
-.rail button{position:relative;z-index:1;display:grid;justify-items:center;gap:3px;padding:7px 0 6px;border:0;background:none;color:var(--faint);font-size:10.5px;font-weight:550;letter-spacing:.01em;transition:color .2s}
+.rail{position:absolute;left:12px;right:12px;bottom:12px;z-index:30;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));padding:6px;border-radius:26px;border:1px solid var(--line-2);background:var(--card);box-shadow:0 16px 36px -16px rgba(0,0,0,.9)}
+.rail button{position:relative;z-index:1;display:grid;justify-items:center;gap:3px;padding:7px 0 6px;border:0;background:none;color:var(--faint);font-size:10px;font-weight:550;letter-spacing:0;transition:color .2s}
+.rail button>span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rail button[aria-current=page]{color:var(--ink)}
 .rail .i{width:22px;height:22px;transition:transform .3s var(--bouncy)}
 .rail button[aria-current=page] .i{transform:translateY(-1px) scale(1.07)}
 .rail button:active .i{transform:scale(.84)}
-.rail .pill{position:absolute;top:6px;bottom:6px;left:6px;width:calc((100% - 12px) / 5);pointer-events:none;will-change:transform;border-radius:20px;background:linear-gradient(180deg,rgba(255,255,255,.14),rgba(255,255,255,.05));box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 8px 18px -10px #000}
+.rail .pill{position:absolute;top:6px;bottom:6px;left:6px;width:calc((100% - 12px) / 6);pointer-events:none;will-change:transform;border-radius:20px;background:var(--raised-2)}
 .rail .bar{display:none}
-.rail .badge{position:absolute;top:2px;left:calc(50% + 7px);min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--ink);color:var(--world);font:700 10px/18px var(--font);font-style:normal;box-shadow:0 0 0 2px #151517;animation:pop .45s var(--bouncy)}
+.rail .badge{position:absolute;top:2px;left:calc(50% + 7px);min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--ink);color:var(--world);font:700 10px/18px var(--font);font-style:normal;box-shadow:0 0 0 2px var(--card);animation:pop .45s var(--bouncy)}
 .rail .badge.alert{background:var(--fail);color:#fff}
 @keyframes pop{from{transform:scale(.4)}}
 
 /* Surfaces */
-.card{position:relative;display:flex;flex-direction:column;gap:14px;min-width:0;padding:16px;border-radius:22px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.015));box-shadow:inset 0 1px 0 rgba(255,255,255,.045)}
+.card{position:relative;display:flex;flex-direction:column;gap:14px;min-width:0;padding:16px;border-radius:22px;border:1px solid var(--line);background:var(--card)}
 .card-head{display:flex;align-items:center;gap:12px;min-width:0}
 .card-head>div:not(.tile){flex:1;min-width:0}
 .card-head h2{font-size:16px;font-weight:650;letter-spacing:-.02em}
 .card-head p{margin-top:1px;font-size:12.5px;line-height:1.45;color:var(--muted)}
-.tile,.mono-tile{width:40px;height:40px;flex:none;display:grid;place-items:center;border-radius:12px;background:var(--metal);border:1px solid rgba(255,255,255,.09);box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 8px 16px -10px #000;color:var(--ink-2)}
-.mono-tile{font:700 11.5px var(--mono);letter-spacing:.06em;color:#d9d9d9;text-shadow:0 1px 0 rgba(0,0,0,.7)}
+.tile,.mono-tile{width:40px;height:40px;flex:none;display:grid;place-items:center;border-radius:12px;background:var(--raised);border:1px solid var(--line-2);color:var(--ink-2)}
+.mono-tile{font:700 11.5px var(--mono);letter-spacing:.06em;color:var(--ink-2)}
 .label{font-size:12px;font-weight:550;color:var(--ink-2)}
 .label output{float:right;color:var(--muted)}
 .hint{font-size:12.5px;line-height:1.55;color:var(--faint)}
@@ -82,18 +82,18 @@ h1,h2,p{margin:0}
 .state{display:flex;align-items:center;gap:6px;min-width:0;font-size:12px;color:var(--muted)}
 .state>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dot{width:7px;height:7px;flex:none;border-radius:50%;background:var(--faint)}
-.state[data-state=valid]{color:var(--good-ink)}.state[data-state=valid] .dot{background:var(--good);box-shadow:0 0 8px rgba(70,167,88,.8)}
+.state[data-state=valid]{color:var(--good-ink)}.state[data-state=valid] .dot{background:var(--good)}
 .state[data-state=limited],.state[data-state=plan_unknown],.state[data-state=unavailable]{color:var(--warn-ink)}
-.state[data-state=limited] .dot,.state[data-state=plan_unknown] .dot,.state[data-state=unavailable] .dot{background:var(--warn);box-shadow:0 0 8px rgba(212,161,61,.7)}
-.state[data-state=rejected]{color:var(--fail-ink)}.state[data-state=rejected] .dot{background:var(--fail);box-shadow:0 0 8px rgba(229,72,77,.7)}
+.state[data-state=limited] .dot,.state[data-state=plan_unknown] .dot,.state[data-state=unavailable] .dot{background:var(--warn)}
+.state[data-state=rejected]{color:var(--fail-ink)}.state[data-state=rejected] .dot{background:var(--fail)}
 .state[data-state=checking] .dot{width:11px;height:11px;background:none;border:1.5px solid var(--line-3);border-top-color:var(--ink);animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
 /* Controls */
-.switch{position:relative;width:50px;height:30px;flex:none;border:0;padding:0;border-radius:99px;background:#26262b;box-shadow:inset 0 1px 3px rgba(0,0,0,.6),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .25s}
-.switch::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:linear-gradient(180deg,#f6f6f4,#b4b4b1);box-shadow:0 2px 5px rgba(0,0,0,.5),inset 0 1px 0 #fff;transition:transform .42s var(--bouncy),width .16s,background .2s}
-.switch[aria-checked=true]{background:var(--accent-grad);box-shadow:inset 0 1px 2px rgba(0,0,0,.3),0 0 16px -4px var(--accent-glow)}
-.switch[aria-checked=true]::after{transform:translateX(20px);background:linear-gradient(180deg,#2c2c31,#101012);box-shadow:0 2px 5px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.12)}
+.switch{position:relative;width:50px;height:30px;flex:none;border:0;padding:0;border-radius:99px;background:var(--raised-2);box-shadow:inset 0 0 0 1px var(--line-3);transition:background .25s}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.45);transition:transform .42s var(--bouncy),width .16s,background .2s}
+.switch[aria-checked=true]{background:var(--accent);box-shadow:none}
+.switch[aria-checked=true]::after{transform:translateX(20px);background:var(--accent-ink)}
 .switch:active::after{width:29px}
 .switch[aria-checked=true]:active::after{transform:translateX(15px)}
 .switch:disabled{opacity:.45}
@@ -103,9 +103,9 @@ h1,h2,p{margin:0}
 .toggle-row small{font-size:12px;line-height:1.45;color:var(--muted)}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:50px;padding:0 18px;border-radius:16px;border:1px solid var(--line-2);background:rgba(255,255,255,.05);color:var(--ink);font-size:15px;font-weight:550;white-space:nowrap;transition:transform .16s var(--snappy),background .15s,opacity .15s,filter .15s}
 .btn:active{transform:scale(.96);background:rgba(255,255,255,.1)}
-.btn.primary{border-color:transparent;background:var(--accent-face);color:var(--accent-ink);font-weight:650;box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 12px 26px -14px var(--accent-glow)}
+.btn.primary{border-color:transparent;background:var(--accent);color:var(--accent-ink);font-weight:650}
 .btn.primary:active{filter:brightness(.9)}
-.btn.danger{color:var(--fail-ink);border-color:rgba(229,72,77,.35)}
+.btn.danger{color:var(--fail-ink);border-color:rgba(229,103,122,.4)}
 .btn.block{width:100%}
 .btn:disabled{opacity:.4;pointer-events:none}
 .btn.busy{pointer-events:none}
@@ -121,7 +121,7 @@ h1,h2,p{margin:0}
 .field input{flex:1;min-width:0;height:48px;border:0;outline:0;background:none;font-size:16px}
 .field input::placeholder,.area::placeholder{color:var(--faint)}
 .field>.i{color:var(--faint)}
-.field.bad{border-color:rgba(229,72,77,.65)}
+.field.bad{border-color:rgba(229,103,122,.65)}
 .shake{animation:shake .36s}
 @keyframes shake{20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
 .area{display:block;width:100%;min-height:150px;resize:vertical;padding:13px 14px;border-radius:16px;border:1px solid var(--line-2);background:var(--well);font:16px/1.5 var(--mono);color:var(--ink);outline:0;word-break:break-all;transition:border-color .15s,box-shadow .15s}
@@ -131,13 +131,14 @@ h1,h2,p{margin:0}
 .chip:active{transform:scale(.94)}
 .chip[aria-checked=true]{border-color:transparent;background:var(--ink);color:var(--world)}
 .tag{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:99px;font-size:11.5px;font-weight:550;color:var(--ink-2);background:rgba(255,255,255,.06);white-space:nowrap;animation:pop .35s var(--bouncy)}
-.tag.good{color:var(--good-ink);background:rgba(70,167,88,.12)}.tag.warn{color:var(--warn-ink);background:rgba(212,161,61,.12)}.tag.bad{color:var(--fail-ink);background:rgba(229,72,77,.12)}
+.tag.good{color:var(--good-ink);background:rgba(95,191,134,.12)}.tag.warn{color:var(--warn-ink);background:rgba(224,178,92,.12)}.tag.bad{color:var(--fail-ink);background:rgba(229,103,122,.12)}
 .seg{display:flex;gap:3px;padding:4px;border-radius:16px;background:rgba(255,255,255,.04);border:1px solid var(--line)}
 .seg button{flex:1;height:38px;border:0;border-radius:12px;background:transparent;color:var(--muted);font-size:13px;font-weight:550;transition:background .2s,color .2s}
-.seg button[aria-checked=true]{background:linear-gradient(180deg,rgba(255,255,255,.14),rgba(255,255,255,.07));color:var(--ink);box-shadow:inset 0 1px 0 rgba(255,255,255,.12),0 4px 10px -6px #000}
+.seg button[aria-checked=true]{background:var(--raised-2);color:var(--ink)}
 input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
-.note{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:16px;background:rgba(212,161,61,.08);border:1px solid rgba(212,161,61,.25);color:var(--warn-ink);font-size:13px}
-.note.bad{background:rgba(229,72,77,.08);border-color:rgba(229,72,77,.3);color:var(--fail-ink)}
+.note{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:16px;background:rgba(224,178,92,.08);border:1px solid rgba(224,178,92,.25);color:var(--warn-ink);font-size:13px}
+.note[hidden]{display:none}
+.note.bad{background:rgba(229,103,122,.08);border-color:rgba(229,103,122,.3);color:var(--fail-ink)}
 .kv{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--line);font-size:13.5px;color:var(--muted)}
 .kv b{color:var(--ink);font-weight:550}
 
@@ -147,42 +148,38 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 .games{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px 14px}
 @media(min-width:480px){.games{grid-template-columns:repeat(3,minmax(0,1fr))}}
 .game{display:flex;flex-direction:column;gap:9px;min-width:0;padding:0;border:0;background:none;text-align:left;-webkit-touch-callout:none}
-.case{position:relative;display:block;aspect-ratio:1080/1379;max-width:100%;border-radius:10px;overflow:hidden;background:#151515;box-shadow:0 18px 30px -18px #000,0 0 0 1px rgba(255,255,255,.06);transition:transform .22s var(--soft),box-shadow .22s}
-.case::after{content:"";position:absolute;inset:0;background:linear-gradient(125deg,rgba(255,255,255,.16),transparent 38%);pointer-events:none}
+.case{position:relative;display:block;aspect-ratio:1080/1379;max-width:100%;border-radius:10px;overflow:hidden;background:var(--card);box-shadow:0 0 0 1px var(--line-2);transition:transform .22s var(--soft),box-shadow .22s}
 .case img{display:block;width:100%;height:100%;object-fit:contain}
 .case.plain{display:grid;place-items:center;color:var(--faint)}
 .game:active .case{transform:translateY(-3px) scale(.98)}
-.game.held .case{transform:scale(1.06);box-shadow:0 26px 50px -16px #000,0 0 0 1px rgba(255,255,255,.12)}
+.game.held .case{transform:scale(1.06);box-shadow:0 0 0 1px var(--line-3)}
 .game b{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .game small{margin-top:-5px;font-size:11px;color:var(--faint)}
-.case .flag{position:absolute;right:7px;bottom:7px;z-index:1;height:22px;padding:0 9px;border-radius:99px;background:rgba(12,12,14,.85);color:var(--ink);font-size:10.5px;font-weight:650;line-height:22px}
+.case .flag{position:absolute;right:7px;bottom:7px;z-index:1;height:22px;padding:0 9px;border-radius:99px;background:rgba(20,20,20,.9);color:var(--ink);font-size:10.5px;font-weight:650;line-height:22px}
 .previews{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .previews figure{margin:0;display:flex;flex-direction:column;gap:6px;min-width:0}
-.previews canvas{display:block;width:100%;height:auto;max-width:100%;border-radius:12px;background:#1c1e22;box-shadow:0 14px 26px -16px #000}
+.previews canvas{display:block;width:100%;height:auto;max-width:100%;border-radius:12px;background:var(--card);box-shadow:0 0 0 1px var(--line)}
 .previews figcaption{font-size:11.5px;color:var(--faint)}
 .dots{display:flex;flex-wrap:wrap;gap:12px}
-.dots button{width:34px;height:34px;border-radius:50%;border:0;background:radial-gradient(circle at 34% 28%,rgba(255,255,255,.6),transparent 42%),var(--c);box-shadow:inset 0 0 0 1px rgba(255,255,255,.2);transition:transform .2s var(--bouncy),box-shadow .2s}
+.dots button{width:34px;height:34px;border-radius:50%;border:0;background:var(--c);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);transition:transform .2s var(--bouncy),box-shadow .2s}
 .dots button:active{transform:scale(.86)}
 .dots button[aria-checked=true]{box-shadow:0 0 0 3px var(--world),0 0 0 5px var(--c)}
 .swatches{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .swatch{position:relative;display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px 4px 11px;border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.025);color:var(--muted);font-size:12px;cursor:pointer;transition:transform .2s var(--bouncy),border-color .2s,background .2s}
 .swatch:active{transform:scale(.94)}
-.swatch i{width:34px;height:34px;border-radius:50%;background:radial-gradient(circle at 34% 28%,rgba(255,255,255,.6),transparent 42%),var(--c);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18),0 8px 18px -8px var(--c);transition:box-shadow .25s,transform .3s var(--bouncy)}
+.swatch i{width:34px;height:34px;border-radius:50%;background:var(--c);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);transition:box-shadow .25s,transform .3s var(--bouncy)}
 .swatch[aria-checked=true]{border-color:var(--line-3);background:rgba(255,255,255,.07);color:var(--ink)}
-.swatch[aria-checked=true] i{transform:scale(1.08);box-shadow:0 0 0 3px var(--world),0 0 0 5px var(--c),0 10px 22px -8px var(--c)}
+.swatch[aria-checked=true] i{transform:scale(1.08);box-shadow:0 0 0 3px var(--card),0 0 0 5px var(--c)}
 
 /* Downloads: hero, filters, transfer rows and the Finished folder */
 .heading.with-action{display:flex;align-items:flex-end;justify-content:space-between;gap:12px}
-.add-btn{width:42px;height:42px;flex:none;display:grid;place-items:center;border:0;border-radius:99px;background:var(--accent-face);color:var(--accent-ink);box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 12px 26px -12px var(--accent-glow);transition:transform .3s var(--bouncy)}
+.add-btn{width:42px;height:42px;flex:none;display:grid;place-items:center;border:0;border-radius:99px;background:var(--accent);color:var(--accent-ink);transition:transform .3s var(--bouncy)}
 .add-btn:active{transform:scale(.86) rotate(90deg)}
 .add-btn .i{width:24px;height:24px;stroke-width:2.2}
-.hero{position:relative;isolation:isolate;overflow:hidden;padding:12px 14px 12px 12px;border-radius:20px;border:1px solid var(--line-2);background:#111113;box-shadow:0 20px 44px -30px #000,inset 0 1px 0 rgba(255,255,255,.07);cursor:pointer;transition:transform .2s var(--snappy)}
+.hero{position:relative;isolation:isolate;overflow:hidden;padding:12px 14px 12px 12px;border-radius:20px;border:1px solid var(--line-2);background:var(--card);cursor:pointer;transition:transform .2s var(--snappy)}
 .hero:active{transform:scale(.985)}
-.hero-glow{position:absolute;inset:-40%;z-index:-2;opacity:.5;filter:blur(34px) saturate(1.8)}
-.hero-glow img{display:block;width:100%;height:100%;object-fit:cover}
-.hero::after{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(90deg,rgba(9,9,10,.2),rgba(9,9,10,.72) 70%)}
 .hero-row{display:flex;align-items:center;gap:13px}
-.hero-case{width:52px;flex:none;aspect-ratio:1080/1379;border-radius:7px;overflow:hidden;box-shadow:0 12px 24px -10px rgba(0,0,0,.95),0 0 0 1px rgba(255,255,255,.1)}
+.hero-case{width:52px;flex:none;aspect-ratio:1080/1379;border-radius:7px;overflow:hidden;box-shadow:0 0 0 1px var(--line-2)}
 .hero-case img{display:block;width:100%;height:100%;object-fit:cover}
 .hero-case.plain,.hero .tile{display:grid;place-items:center;background:var(--metal);color:var(--ink-2)}
 .hero-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
@@ -194,8 +191,7 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 .meter{position:relative;display:block;flex:1;height:6px;border-radius:99px;background:rgba(255,255,255,.1);overflow:hidden}
 .hero-pct{min-width:3.4ch;font:700 15px var(--mono);letter-spacing:-.02em;text-align:right}
 .meter-fill,.x-fill{position:relative;display:block;height:100%;width:0;overflow:hidden;border-radius:inherit;background:var(--accent-grad);transition:width .9s linear}
-.meter-fill{box-shadow:0 0 14px -2px var(--accent-glow)}
-.meter-fill.moving::after,.x-fill.moving::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 25%,rgba(255,255,255,.65) 50%,transparent 75%);transform:translateX(-100%);animation:sheen 2.2s ease-in-out infinite}
+.meter-fill.moving::after,.x-fill.moving::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 25%,rgba(255,255,255,.35) 50%,transparent 75%);transform:translateX(-100%);animation:sheen 2.2s ease-in-out infinite}
 @keyframes sheen{to{transform:translateX(100%)}}
 .hero-foot{font-size:12px;font-weight:500;font-variant-numeric:tabular-nums;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hero-next{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
@@ -204,7 +200,7 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 .hero.idle{cursor:pointer}
 .hero.idle .tile{color:var(--good-ink)}
 .xgroup{border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.028);overflow:hidden}
-.xgroup.failed{border-color:rgba(229,72,77,.3)}
+.xgroup.failed{border-color:rgba(229,103,122,.35)}
 .xgroup-head{display:flex;align-items:center;gap:12px;padding:10px 12px 4px 10px}
 .xgroup-text{flex:1;min-width:0;display:flex;flex-direction:column}
 .xgroup-text strong{font-size:14.5px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -212,7 +208,7 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 .xgroup-body{display:flex;flex-direction:column;padding:0 4px 4px 58px}
 .xgroup .xfer{border:0;border-radius:12px;background:transparent}
 .xgroup .xfer+.xfer{border-top:1px solid var(--line);border-radius:0}
-.xgroup .xfer.failed{background:rgba(229,72,77,.06)}
+.xgroup .xfer.failed{background:rgba(229,103,122,.07)}
 .xgroup .x-main{grid-template-columns:minmax(0,1fr);padding:9px 4px 9px 6px}
 .xgroup .x-main .thumb{display:none}
 .xgroup .x-top strong{font-size:13.5px;font-weight:600}
@@ -224,19 +220,19 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 .filters button{height:36px;padding:0 14px;border-radius:99px;border:1px solid var(--line-2);background:transparent;color:var(--muted);font-size:13px;font-weight:550;transition:background .2s,color .2s,border-color .2s,transform .15s var(--snappy)}
 .filters button b{margin-left:6px;font:650 12px var(--mono);color:var(--faint)}
 .filters button[aria-checked=true]{border-color:transparent;background:var(--ink);color:var(--world)}
-.filters button[aria-checked=true] b{color:#5c5c62}
+.filters button[aria-checked=true] b{color:#6a6a66}
 .filters button.alert b{color:var(--fail)}
 .filters button:active{transform:scale(.94)}
 .xlist{display:flex;flex-direction:column;gap:8px}
 .group-label{margin:6px 4px -2px;font-size:11px;font-weight:650;letter-spacing:.09em;text-transform:uppercase;color:var(--faint)}
 .xfer{display:flex;align-items:center;gap:4px;border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.028);transition:background .15s,transform .15s var(--snappy),border-color .2s}
 .xfer:has(>.x-main:active){background:rgba(255,255,255,.07);transform:scale(.985)}
-.xfer.failed{border-color:rgba(229,72,77,.3);background:linear-gradient(90deg,rgba(229,72,77,.1),rgba(229,72,77,.02))}
-.xfer.warn{border-color:rgba(212,161,61,.3);background:linear-gradient(90deg,rgba(212,161,61,.09),rgba(212,161,61,.015))}
+.xfer.failed{border-color:rgba(229,103,122,.35);background:rgba(229,103,122,.07)}
+.xfer.warn{border-color:rgba(224,178,92,.35);background:rgba(224,178,92,.06)}
 .xfer.fresh{animation:fresh 1.4s var(--soft)}
-@keyframes fresh{from{box-shadow:0 0 0 2px var(--accent),0 0 24px -4px var(--accent-glow)}}
+@keyframes fresh{from{box-shadow:0 0 0 2px var(--accent)}}
 .x-main{flex:1;min-width:0;display:grid;grid-template-columns:46px minmax(0,1fr);gap:12px;align-items:center;padding:10px 6px 10px 10px;border:0;border-radius:18px;background:none;text-align:left}
-.thumb{display:grid;place-items:center;width:46px;aspect-ratio:1080/1379;max-width:100%;border-radius:7px;overflow:hidden;background:var(--metal);color:var(--ink-2);box-shadow:0 8px 16px -10px #000,0 0 0 1px rgba(255,255,255,.07)}
+.thumb{display:grid;place-items:center;width:46px;aspect-ratio:1080/1379;max-width:100%;border-radius:7px;overflow:hidden;background:var(--raised);color:var(--ink-2);box-shadow:0 0 0 1px var(--line-2)}
 .thumb img{display:block;width:100%;height:100%;object-fit:cover}
 .x-body{min-width:0;display:flex;flex-direction:column}
 .x-top{display:flex;align-items:center;gap:8px;min-width:0}
@@ -260,15 +256,15 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 @keyframes blink{50%{opacity:.4}}
 .stagger>*{animation:rise .5s var(--soft) backwards;animation-delay:calc(var(--i,0) * 40ms)}
 @keyframes rise{from{opacity:0;transform:translateY(12px)}}
-.folder{border-radius:20px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.015));overflow:hidden}
+.folder{border-radius:20px;border:1px solid var(--line);background:var(--card);overflow:hidden}
 .folder-head{display:flex;align-items:center;gap:12px;width:100%;padding:12px 14px;border:0;background:none;text-align:left;transition:background .15s}
 .folder-head:active{background:rgba(255,255,255,.05)}
-.folder-icon{width:42px;height:42px;flex:none;display:grid;place-items:center;border-radius:13px;background:var(--metal);border:1px solid rgba(255,255,255,.09);box-shadow:inset 0 1px 0 rgba(255,255,255,.09);color:var(--good-ink)}
+.folder-icon{width:42px;height:42px;flex:none;display:grid;place-items:center;border-radius:13px;background:var(--raised);border:1px solid var(--line-2);color:var(--good-ink)}
 .folder-text{flex:1;min-width:0;display:flex;flex-direction:column}
 .folder-text strong{font-size:15px;font-weight:650}
 .folder-text small{font-size:12px;color:var(--muted)}
 .fan{display:flex;align-items:center;padding-left:12px}
-.fan img{width:26px;height:auto;margin-left:-12px;border-radius:4px;box-shadow:0 6px 12px -4px #000,0 0 0 1px rgba(0,0,0,.5);transform:rotate(var(--r));transition:transform .45s var(--bouncy)}
+.fan img{width:26px;height:auto;margin-left:-12px;border-radius:4px;box-shadow:0 0 0 1px rgba(0,0,0,.6);transform:rotate(var(--r));transition:transform .45s var(--bouncy)}
 .folder[data-open=true] .fan img{transform:rotate(0) translateY(-3px)}
 .chev{color:var(--faint);transition:transform .4s var(--snappy)}
 .folder[data-open=true] .chev{transform:rotate(90deg)}
@@ -284,25 +280,38 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 .detail-top .thumb{width:84px;border-radius:10px}
 .detail-top>div{flex:1;min-width:0}
 
+/* Logs: crash reports, the kernel log snapshot and log files, kept on this phone */
+.log-list{display:flex;flex-direction:column;gap:2px;margin:0 -6px}
+.log-row{display:flex;align-items:center;gap:12px;width:100%;min-height:58px;padding:9px 8px;border:0;border-radius:14px;background:none;text-align:left;transition:background .15s,transform .15s var(--snappy)}
+.log-row:active{background:rgba(255,255,255,.05);transform:scale(.985)}
+.log-row .tile{width:36px;height:36px;border-radius:11px}
+.log-row.crash .tile{color:var(--fail-ink)}
+.log-empty{padding:10px 2px;font-size:13px;color:var(--muted)}
+.log-group{margin:8px 2px 2px;font-size:11px;font-weight:650;letter-spacing:.09em;text-transform:uppercase;color:var(--faint)}
+.log-group:first-child{margin-top:0}
+.logview{margin:0;min-height:120px;max-height:46vh;overflow:auto;padding:12px;border-radius:14px;border:1px solid var(--line-2);background:var(--well);font:11.5px/1.55 var(--mono);color:var(--ink-2);white-space:pre-wrap;overflow-wrap:anywhere;-webkit-overflow-scrolling:touch}
+.logview .bad{color:var(--fail-ink)}
+.logview .warn{color:var(--warn-ink)}
+
 /* Overlays: toasts, pull to refresh, sheet */
 .toasts{position:absolute;left:12px;right:12px;bottom:calc(var(--rail-h) + 26px);z-index:40;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none}
-.toast{pointer-events:auto;width:100%;max-width:440px;display:grid;grid-template-columns:36px minmax(0,1fr) 36px;gap:10px;align-items:center;padding:10px 4px 10px 10px;border-radius:20px;border:1px solid var(--line-2);background:rgba(22,22,25,.84);-webkit-backdrop-filter:blur(22px) saturate(1.6);backdrop-filter:blur(22px) saturate(1.6);box-shadow:0 20px 44px -18px rgba(0,0,0,.95);touch-action:pan-y;animation:tin .5s var(--bouncy);transition:transform .25s var(--snappy),opacity .25s}
-.toast.success{--tone:var(--good)}.toast.warning{--tone:var(--warn)}.toast.error{--tone:var(--fail);border-color:rgba(229,72,77,.32)}
-.t-icon{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:rgba(255,255,255,.07);color:var(--tone,var(--ink-2))}
+.toast{pointer-events:auto;width:100%;max-width:440px;display:grid;grid-template-columns:36px minmax(0,1fr) 36px;gap:10px;align-items:center;padding:10px 4px 10px 10px;border-radius:20px;border:1px solid var(--line-2);background:var(--raised);box-shadow:0 16px 36px -16px rgba(0,0,0,.9);touch-action:pan-y;animation:tin .5s var(--bouncy);transition:transform .25s var(--snappy),opacity .25s}
+.toast.success{--tone:var(--good)}.toast.warning{--tone:var(--warn)}.toast.error{--tone:var(--fail);border-color:rgba(229,103,122,.4)}
+.t-icon{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:var(--raised-2);color:var(--tone,var(--ink-2))}
 .toast b{display:block;font-size:13.5px;font-weight:600}
 .toast small{display:block;font-size:12.5px;line-height:1.4;color:var(--muted);overflow-wrap:anywhere}
 .toast.out{opacity:0}
 @keyframes tin{from{transform:translateY(20px) scale(.94);opacity:0}}
-.ptr{position:absolute;top:calc(var(--bar-h) + 8px);left:50%;z-index:20;width:40px;height:40px;margin-left:-20px;display:grid;place-items:center;border-radius:50%;border:1px solid var(--line-2);background:rgba(30,30,34,.9);color:var(--muted);box-shadow:0 12px 26px -10px #000;opacity:0;transform:translateY(-50px);pointer-events:none;transition:transform .3s var(--snappy),opacity .2s}
+.ptr{position:absolute;top:calc(var(--bar-h) + 8px);left:50%;z-index:20;width:40px;height:40px;margin-left:-20px;display:grid;place-items:center;border-radius:50%;border:1px solid var(--line-2);background:var(--raised);color:var(--muted);box-shadow:0 8px 20px -10px #000;opacity:0;transform:translateY(-50px);pointer-events:none;transition:transform .3s var(--snappy),opacity .2s}
 .ptr.armed{color:var(--accent)}
 .ptr.spin .i{animation:spin .8s linear infinite}
-.scrim{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .3s;-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
+.scrim{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.6);opacity:0;pointer-events:none;transition:opacity .3s}
 .scrim.open{opacity:1;pointer-events:auto}
-.sheet{position:fixed;left:0;right:0;bottom:0;z-index:51;max-width:600px;max-height:88%;margin:0 auto;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom,0px);border-radius:28px 28px 0 0;border:1px solid var(--line-2);border-bottom:0;background:rgba(20,20,23,.94);-webkit-backdrop-filter:blur(26px) saturate(1.5);backdrop-filter:blur(26px) saturate(1.5);box-shadow:0 -24px 60px -24px #000;transform:translateY(105%);visibility:hidden;transition:transform .45s var(--snappy),visibility 0s .45s}
+.sheet{position:fixed;left:0;right:0;bottom:0;z-index:51;max-width:600px;max-height:88%;margin:0 auto;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom,0px);border-radius:28px 28px 0 0;border:1px solid var(--line-2);border-bottom:0;background:var(--card);box-shadow:0 -16px 40px -20px #000;transform:translateY(105%);visibility:hidden;transition:transform .45s var(--snappy),visibility 0s .45s}
 .sheet.open{transform:none;visibility:visible;transition:transform .45s var(--snappy),visibility 0s}
 .sheet:focus{outline:0}
 .grab{display:grid;place-items:center;height:24px;touch-action:none;cursor:grab}
-.grab::before{content:"";width:42px;height:5px;border-radius:3px;background:rgba(255,255,255,.22)}
+.grab::before{content:"";width:42px;height:5px;border-radius:3px;background:var(--line-3)}
 .sheet-head{display:flex;align-items:center;gap:12px;padding:0 8px 8px 18px;touch-action:none}
 .sheet-head h2{flex:1;min-width:0;font-size:19px;font-weight:700;letter-spacing:-.025em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sheet-body{overflow-y:auto;overscroll-behavior:contain;padding:4px 16px 22px;display:flex;flex-direction:column;gap:14px}
@@ -342,6 +351,9 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
 <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
 <symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol>
 <symbol id="i-folder-open" viewBox="0 0 24 24"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-file-text" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
 <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
 </svg>
 
@@ -407,6 +419,26 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
       <p class="hint">Tap a game to edit its cover. Press and hold for quick actions. Pull down to refresh.</p>
     </section>
 
+    <section class="page" id="logs" aria-label="Logs" data-refresh="logs">
+      <div class="heading with-action"><div><h1>Logs</h1><p>Crash reports and logs from your PS4.</p></div><button class="icon-btn" id="refreshLogs" type="button" aria-label="Refresh the file list"><svg class="i"><use href="#i-refresh"/></svg></button></div>
+      <p class="note" id="logsOffline" hidden></p>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-alert"/></svg></div><div><h2>Crash reports</h2><p>Crash and panic files left on your PS4.</p></div></div>
+        <div class="log-list" id="crashList"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-terminal"/></svg></div><div><h2>Kernel log</h2><p>Kernel messages since your PS4 last started.</p></div></div>
+        <div class="log-list" id="kernelList"></div>
+        <button class="btn block" id="kernelSnap" type="button"><svg class="i sm"><use href="#i-refresh"/></svg><span>Take a new snapshot</span></button>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="tile"><svg class="i"><use href="#i-folder"/></svg></div><div><h2>Log files</h2><p>SSPI and other payloads, grouped by folder.</p></div></div>
+        <div class="log-list" id="logFiles"></div>
+      </div>
+      <button class="btn primary block" id="saveReport" type="button"><svg class="i sm"><use href="#i-download"/></svg><span>Save a report</span></button>
+      <p class="hint">Logs you open are kept on this phone, so you can still read and save them if SSPI closes. Keep this tab open; reloading the page needs SSPI running.</p>
+    </section>
+
     <section class="page" id="appearance" aria-label="Appearance">
       <div class="heading"><h1>Appearance</h1><p>Accent color and phone feedback.</p></div>
       <div class="card">
@@ -427,6 +459,7 @@ input[type=range]{width:100%;height:28px;margin:0;accent-color:var(--accent)}
     <button type="button" data-page="packages"><svg class="i"><use href="#i-library"/></svg><span>Sources</span></button>
     <button type="button" data-page="downloads"><svg class="i"><use href="#i-download"/></svg><span>Downloads</span><em class="badge" id="dlBadge" hidden></em></button>
     <button type="button" data-page="library"><svg class="i"><use href="#i-gamepad"/></svg><span>Library</span></button>
+    <button type="button" data-page="logs"><svg class="i"><use href="#i-file-text"/></svg><span>Logs</span></button>
     <button type="button" data-page="appearance"><svg class="i"><use href="#i-palette"/></svg><span>Appearance</span></button>
   </nav>
 
@@ -1181,9 +1214,8 @@ function renderHero() {
   }
   if (heroKey !== i.id) {
     heroKey = i.id; hero.className = 'hero';
-    hero.innerHTML = '<div class="hero-glow"></div><div class="hero-row"><span class="hero-case"></span><div class="hero-info"><span class="eyebrow"><i class="ping"></i><span id="heroState"></span><span class="via" id="heroVia"></span></span><strong class="hero-title"></strong><div class="hero-line"><span class="meter"><span class="meter-fill" id="heroBar"></span></span><b class="hero-pct" id="heroPct"></b></div><span class="hero-foot" id="heroDone"></span></div></div><div class="hero-next" id="heroNext" hidden></div>';
+    hero.innerHTML = '<div class="hero-row"><span class="hero-case"></span><div class="hero-info"><span class="eyebrow"><i class="ping"></i><span id="heroState"></span><span class="via" id="heroVia"></span></span><strong class="hero-title"></strong><div class="hero-line"><span class="meter"><span class="meter-fill" id="heroBar"></span></span><b class="hero-pct" id="heroPct"></b></div><span class="hero-foot" id="heroDone"></span></div></div><div class="hero-next" id="heroNext" hidden></div>';
     setCover($('.hero-case', hero), i);
-    if (i.image || i.titleId) setCover($('.hero-glow', hero), i);
     hero.onclick = e => { if (e.target.closest('.hero-chip')) return; const current = queue.find(q => q.id === heroKey); if (current) openTransfer(current); };
   }
   const moving = i.phase === 'downloading' || i.phase === 'extracting';
@@ -1573,6 +1605,240 @@ function openCoverEditor(g) {
 document.addEventListener('touchstart', () => {}, { passive: true });
 $('#connText').textContent = location.hostname;
 renderServices(); renderSources(); renderSwatches(); renderQueue(); renderGames();
+/* Logs: crash reports, a kernel log snapshot and log files from the PS4. Everything opened here is kept on this
+   phone, so the page can still show and save it after SSPI closes. Plain HTTP pages cannot install an offline
+   copy of themselves, so the open tab and this storage are what remain when the PS4 stops answering. */
+const LOG_KEEP_CHARS = 2400000, LOG_FILE_CHARS = 600000, LOG_VIEW_LINES = 3000;
+const logCache = Object.assign({ at: 0, list: null, files: {}, kernel: null }, store.get('logs', {}));
+const issueBad = /panic|fatal|crash|exception|error|fail|abort|denied|segfault|sigsegv|sigbus|assert/i, issueWarn = /warn|timeout|timed out|retry|unavailable/i;
+let logsLoadedAt = 0, logsBusy = false, logsOnline = null;
+const logWhen = ms => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const lineCount = text => text ? text.replace(/\n$/, '').split('\n').length : 0;
+function saveLogCache() {
+  const ids = Object.keys(logCache.files).sort((a, b) => logCache.files[b].at - logCache.files[a].at);
+  let total = logCache.kernel ? logCache.kernel.text.length : 0;
+  for (const id of ids) {
+    const f = logCache.files[id];
+    if (f.text.length > LOG_FILE_CHARS) { f.text = f.text.slice(-LOG_FILE_CHARS); f.truncated = true; }
+    total += f.text.length;
+    if (total > LOG_KEEP_CHARS) delete logCache.files[id];
+  }
+  for (let tries = 0; tries < 6; tries++) {
+    try { localStorage.setItem('sspi.phone.logs', JSON.stringify(logCache)); return; }
+    catch {
+      const oldest = Object.keys(logCache.files).sort((a, b) => logCache.files[a].at - logCache.files[b].at)[0];
+      if (!oldest) return;
+      delete logCache.files[oldest];
+    }
+  }
+}
+function logFileName(parts, ext = '.txt') {
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '-');
+  return parts.filter(Boolean).join('-').replace(/\.(log|txt)$/i, '').replace(/[^\w.-]+/g, '-').toLowerCase() + '-' + stamp + ext;
+}
+function saveToPhone(name, data, type = 'text/plain;charset=utf-8') {
+  const blob = data instanceof Blob ? data : new Blob([data], { type });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.rel = 'noopener';
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  toast('Saved to your phone', name);
+}
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  const area = document.createElement('textarea');
+  area.value = text; area.setAttribute('readonly', ''); area.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+  document.body.append(area); area.select(); area.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch {}
+  area.remove();
+  return ok ? Promise.resolve() : Promise.reject(Error('Your browser blocked copying. Use Save to phone instead.'));
+}
+function logRow(f, cls, title, detail, iconId, tag) {
+  return `<button class="log-row ${cls}" type="button" data-log="${esc(f)}"><span class="tile">${icon(iconId, 'i sm')}</span><span class="row-text"><strong>${esc(title)}</strong><small>${esc(detail)}</small></span>${tag ? `<span class="tag">${esc(tag)}</span>` : ''}</button>`;
+}
+function renderLogs() {
+  const list = logCache.list, files = list ? list.files : [];
+  const offline = $('#logsOffline');
+  if (logsOnline === false && (list || logCache.kernel)) {
+    offline.hidden = false;
+    offline.innerHTML = `${icon('wifi', 'i sm')}<span>SSPI is not answering. Showing logs saved on this phone${logCache.at ? ' at ' + esc(logWhen(logCache.at)) : ''}.</span>`;
+  } else offline.hidden = true;
+  const saved = id => logCache.files[id] ? 'Saved' : '';
+  const crashes = files.filter(f => f.kind === 'crash');
+  $('#crashList').innerHTML = !list ? `<p class="log-empty">${logsBusy ? 'Checking your PS4…' : 'Crash reports appear here once SSPI answers.'}</p>`
+    : crashes.length ? crashes.map(f => logRow(f.id, 'crash', f.name, `${f.group} · ${fmtSize(f.size)} · ${logWhen(f.modified)}`, 'alert', saved(f.id))).join('')
+    : '<p class="log-empty">No crashes or failures recorded</p>';
+  const k = logCache.kernel;
+  $('#kernelList').innerHTML = k && k.text ? logRow('kernel', '', 'Kernel log snapshot', `Taken ${logWhen(k.at)} · ${lineCount(k.text).toLocaleString()} lines`, 'terminal', 'Saved')
+    : `<p class="log-empty">${esc(k && k.reason ? k.reason : 'No snapshot yet. Take one to save the kernel messages on this phone.')}</p>`;
+  const logs = files.filter(f => f.kind !== 'crash');
+  let html = '', group = null;
+  for (const f of logs) {
+    if (f.group !== group) { group = f.group; html += `<p class="log-group">${esc(group)}</p>`; }
+    html += logRow(f.id, '', f.name, `${fmtSize(f.size)} · ${logWhen(f.modified)}`, 'file-text', saved(f.id));
+  }
+  if (!list) {
+    const kept = Object.entries(logCache.files);
+    html = kept.length ? kept.map(([id, f]) => logRow(id, '', f.name, `${f.group} · saved ${logWhen(f.at)}`, 'file-text', 'Saved')).join('')
+      : `<p class="log-empty">${logsBusy ? 'Checking your PS4…' : 'No logs saved on this phone yet.'}</p>`;
+  }
+  $('#logFiles').innerHTML = html || '<p class="log-empty">No payload logs or crash reports</p>';
+}
+async function loadLogList() {
+  logsBusy = true; renderLogs();
+  try {
+    const list = await request('/logs');
+    logCache.list = list; logCache.at = Date.now(); logsOnline = true; logsLoadedAt = Date.now();
+    saveLogCache();
+    return list;
+  } catch (e) { logsOnline = false; throw e; }
+  finally { logsBusy = false; renderLogs(); }
+}
+async function fetchLog(id) {
+  const f = await request('/logs/file/' + encodeURIComponent(id));
+  logCache.files[id] = { name: f.name, group: f.group, path: f.path, size: f.size, truncated: f.truncated, text: f.text, at: Date.now() };
+  saveLogCache();
+  return logCache.files[id];
+}
+async function takeKernelSnapshot() {
+  const k = await request('/logs/kernel');
+  const old = logCache.kernel;
+  logCache.kernel = k.available ? { text: k.text, at: k.taken || Date.now() } : old && old.text ? { ...old, reason: k.reason } : { text: '', at: 0, reason: k.reason };
+  saveLogCache(); renderLogs();
+  return k;
+}
+// Keep SSPI's own combined log on this phone while connected, so it is still here if SSPI stops.
+async function prefetchLogs() {
+  if (ended || document.hidden) return;
+  try {
+    const list = await loadLogList();
+    const main = list.files.find(f => f.group === 'SSPI' && f.name === 'combined.log');
+    if (main) await fetchLog(main.id);
+    if (!logCache.kernel || !logCache.kernel.text) await takeKernelSnapshot().catch(() => {});
+    renderLogs();
+  } catch {}
+}
+function openLogViewer(id) {
+  const meta = logCache.list ? logCache.list.files.find(f => f.id === id) : null;
+  const kernel = id === 'kernel';
+  const kept = kernel ? logCache.kernel : logCache.files[id];
+  const name = kernel ? 'Kernel log snapshot' : (meta || kept || {}).name || 'Log';
+  if (meta && !meta.text) { openBinaryCrash(meta); return; }
+  let text = kept ? kept.text : '', filterText = '', issuesOnly = false;
+  openSheet(name, `<p class="hint mono" id="logPath"></p>
+    <div class="field"><svg class="i sm" aria-hidden="true"><use href="#i-search"/></svg><input id="logFilter" type="search" autocomplete="off" placeholder="Filter lines" aria-label="Filter lines"></div>
+    <div class="toggle-row"><div><strong>Show issues only</strong><small>Errors, failures, warnings and crashes.</small></div><button class="switch" id="logIssues" type="button" role="switch" aria-checked="false" aria-label="Show issues only"></button></div>
+    <p class="hint" id="logMeta"></p>
+    <pre class="logview" id="logView"></pre>
+    <div class="btn-row"><button class="btn" id="logCopy" type="button">${icon('copy', 'i sm')}<span>Copy the log</span></button><button class="btn primary" id="logSave" type="button">${icon('download', 'i sm')}<span>Save to phone</span></button></div>
+    ${kernel ? `<button class="text-btn" id="logRefresh" type="button">Take a new snapshot</button>` : `<button class="text-btn" id="logRefresh" type="button">Load the latest from your PS4</button>`}`, body => {
+    const view = $('#logView', body), info = $('#logMeta', body);
+    const visible = () => {
+      let lines = text ? text.replace(/\n$/, '').split('\n') : [];
+      if (filterText) { const q = filterText.toLowerCase(); lines = lines.filter(l => l.toLowerCase().includes(q)); }
+      if (issuesOnly) lines = lines.filter(l => issueBad.test(l) || issueWarn.test(l));
+      return lines;
+    };
+    const draw = (stick = true) => {
+      const all = visible(), lines = all.slice(-LOG_VIEW_LINES);
+      const entry = kernel ? logCache.kernel : logCache.files[id];
+      $('#logPath', body).textContent = kernel ? 'Kernel message buffer' : (entry && entry.path) || (meta && meta.path) || '';
+      if (!text) { view.textContent = 'This log is not saved on this phone yet.'; info.textContent = ''; return; }
+      view.innerHTML = lines.map(l => { const e = esc(l); return issueBad.test(l) ? `<span class="bad">${e}</span>` : issueWarn.test(l) ? `<span class="warn">${e}</span>` : e; }).join('\n') || 'No lines match.';
+      const total = lineCount(text);
+      info.textContent = [filterText || issuesOnly ? `${all.length.toLocaleString()} of ${total.toLocaleString()} lines` : `${total.toLocaleString()} lines`,
+        all.length > LOG_VIEW_LINES ? `showing the last ${LOG_VIEW_LINES.toLocaleString()}` : '',
+        entry && entry.truncated ? 'last part of the file' : '',
+        entry && entry.at ? (kernel ? 'taken ' : 'saved ') + logWhen(entry.at) : ''].filter(Boolean).join(' · ');
+      if (stick) view.scrollTop = view.scrollHeight;
+    };
+    const refresh = async quiet => {
+      const btn = $('#logRefresh', body); busy(btn, true);
+      try {
+        if (kernel) { const k = await takeKernelSnapshot(); if (!k.available) throw Error(k.reason); text = logCache.kernel.text; }
+        else text = (await fetchLog(id)).text;
+        draw(); renderLogs();
+        if (!quiet) toast(kernel ? 'New snapshot taken' : 'Log updated', name);
+      } catch (e) { if (!quiet || !text) toast('Could not load the log', e.message + (text ? ' Showing the copy saved on this phone.' : ''), text ? 'warning' : 'error'); }
+      finally { busy(btn, false); }
+    };
+    $('#logFilter', body).addEventListener('input', e => { filterText = e.target.value.trim(); draw(); });
+    $('#logIssues', body).addEventListener('click', e => { issuesOnly = flip(e.currentTarget); draw(); });
+    $('#logCopy', body).addEventListener('click', () => {
+      const lines = visible();
+      if (!lines.length) { toast('Nothing to copy', 'This log has no matching lines.', 'warning'); return; }
+      copyText(lines.join('\n')).then(() => toast('Copied', `${lines.length.toLocaleString()} lines from ${name}.`), e => toast('Could not copy', e.message, 'error'));
+    });
+    $('#logSave', body).addEventListener('click', () => {
+      if (!text) { toast('Nothing to save yet', 'Load the log from your PS4 first.', 'warning'); return; }
+      const entry = kernel ? logCache.kernel : logCache.files[id];
+      const head = `${name}\n${kernel ? 'Kernel message buffer' : (entry && entry.path) || ''}\n${kernel ? 'Taken' : 'Saved'} ${new Date(entry && entry.at || Date.now()).toLocaleString()}${entry && entry.truncated ? ' (last part of the file)' : ''}\n\n`;
+      saveToPhone(logFileName(kernel ? ['kernel-log'] : [entry && entry.group, name]), head + text);
+    });
+    $('#logRefresh', body).addEventListener('click', () => refresh(false));
+    draw();
+    if (!kernel && !ended) refresh(true);
+    if (kernel && !text && !ended) refresh(true);
+  });
+}
+function openBinaryCrash(f) {
+  openSheet(f.name, `<div><div class="kv"><span>Folder</span><b>${esc(f.group)}</b></div><div class="kv"><span>Size</span><b>${fmtSize(f.size)}</b></div><div class="kv"><span>Recorded</span><b>${esc(logWhen(f.modified))}</b></div></div>
+    <p class="hint mono">${esc(f.path)}</p>
+    <p class="hint">This crash report is not plain text. Save it to your phone to share it with your report.</p>
+    <button class="btn primary block" id="crashSave" type="button">${icon('download', 'i sm')}<span>Save to phone</span></button>`, body => {
+    $('#crashSave', body).addEventListener('click', async e => {
+      const btn = e.currentTarget; busy(btn, true);
+      try {
+        const r = await fetch(base + '/logs/raw/' + encodeURIComponent(f.id), { cache: 'no-store' });
+        if (!r.ok) throw Error((await r.text()).slice(0, 300) || `Your PS4 could not send it (error ${r.status}).`);
+        saveToPhone(f.name, await r.blob());
+      } catch (err) { toast('Could not save the crash report', err instanceof TypeError ? 'Your PS4 is not answering. Keep SSPI open and stay on the same network.' : err.message, 'error'); }
+      finally { busy(btn, false); }
+    });
+  });
+}
+async function saveReport(btn) {
+  busy(btn, true);
+  try {
+    if (!ended) {
+      try {
+        const list = await loadLogList();
+        const wanted = list.files.filter(f => (f.group === 'SSPI' && f.name === 'combined.log') || (f.kind === 'crash' && f.text && f.size < 2097152)).slice(0, 6);
+        for (const f of wanted) await fetchLog(f.id).catch(() => {});
+        await takeKernelSnapshot().catch(() => {});
+      } catch {}
+    }
+    const list = logCache.list, now = new Date(), out = [];
+    out.push('SSPI log report', `Saved ${now.toLocaleString()}`, `PS4 ${location.hostname}`);
+    if (list) out.push(`SSPI build ${list.build || 'unknown'} · firmware ${list.firmware || 'unknown'}`);
+    if (logsOnline === false) out.push(`SSPI was not answering; this report uses logs saved on this phone${logCache.at ? ' at ' + logWhen(logCache.at) : ''}.`);
+    const crashes = list ? list.files.filter(f => f.kind === 'crash') : [];
+    out.push('', '== Crash reports ==', ...(crashes.length ? crashes.map(f => `${f.path} · ${fmtSize(f.size)} · ${new Date(f.modified).toLocaleString()}`) : ['No crashes or failures recorded']));
+    if (list) out.push('', '== Log files on the PS4 ==', ...list.files.filter(f => f.kind !== 'crash').map(f => `${f.path} · ${fmtSize(f.size)} · ${new Date(f.modified).toLocaleString()}`));
+    const k = logCache.kernel;
+    out.push('', `== Kernel log snapshot${k && k.at ? ', taken ' + new Date(k.at).toLocaleString() : ''} ==`, k && k.text ? k.text : (k && k.reason) || 'No snapshot');
+    for (const f of Object.values(logCache.files).sort((a, b) => (a.group === 'SSPI' ? 0 : 1) - (b.group === 'SSPI' ? 0 : 1) || b.at - a.at))
+      out.push('', `== ${f.group} / ${f.name} (${f.path}), saved ${new Date(f.at).toLocaleString()}${f.truncated ? ', last part only' : ''} ==`, f.text);
+    saveToPhone(logFileName(['sspi-log-report']), out.join('\n') + '\n');
+  } finally { busy(btn, false); renderLogs(); }
+}
+const logsPage = $('#logs');
+logsPage.addEventListener('click', e => { const row = e.target.closest('[data-log]'); if (row) { buzz('tap'); openLogViewer(row.dataset.log); } });
+$('#kernelSnap').onclick = async e => {
+  const b = e.currentTarget; buzz('tap'); busy(b, true);
+  try { const k = await takeKernelSnapshot(); if (k.available) toast('New snapshot taken', `${lineCount(logCache.kernel.text).toLocaleString()} kernel lines saved on this phone.`); else toast('No kernel log', k.reason, 'warning'); }
+  catch (err) { toast('Could not take a snapshot', err.message, 'error'); }
+  finally { busy(b, false); }
+};
+$('#saveReport').onclick = e => { buzz('tap'); saveReport(e.currentTarget); };
+refreshers.logs = async () => { await loadLogList(); toast('Logs refreshed', `${logCache.list.files.length} files found on your PS4.`); };
+$('#refreshLogs').onclick = async e => { buzz('tap'); const b = e.currentTarget; b.disabled = true; try { await refreshers.logs(); } catch (err) { toast('Could not refresh', err.message + ' Showing logs saved on this phone.', 'warning'); } b.disabled = false; };
+onEnter.logs = () => { renderLogs(); if (Date.now() - logsLoadedAt > 15000) prefetchLogs(); };
+renderLogs();
+setTimeout(prefetchLogs, 4000);
+setInterval(prefetchLogs, 180000);
+
 onEnter.downloads = () => { refreshQueueView(true); pollQueue(); };
 onEnter.library = () => { if (!libraryLoaded) loadLibrary().catch(e => toast('Could not load your library', e.message, 'error')); };
 const start = Math.max(0, ids.indexOf(location.hash.slice(1)));

@@ -341,6 +341,7 @@ namespace Orbis
                 }
                 if (HandleQueue(stream, method, path, pairPrefix)) return;
                 if (HandleLibrary(stream, method, path, pairPrefix, contentType, bodyBytes)) return;
+                if (HandleLogs(stream, method, path, pairPrefix)) return;
                 if (wallpaper)
                 {
                     if (contentType != "application/octet-stream") { WriteResponse(stream, 400, "text/plain", "Use the Appearance page to upload a background."); return; }
