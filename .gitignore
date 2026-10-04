@@ -219,6 +219,7 @@
 !/app/PackageSourceEngineStatic.cs
 !/app/PackageSourceEngineStatic.Refresh.cs
 !/app/PackageSourceEngineStatic.RefreshParser.cs
+!/app/PackageSourceEngineStatic.Artwork.cs
 !/app/SearchWindow.Community.cs
 !/app/SearchWindow.MyFiles.cs
 !/app/SspiDataMigration.cs

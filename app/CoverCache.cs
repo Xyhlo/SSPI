@@ -429,8 +429,13 @@ namespace Orbis
                 if (source.StartsWith("local|", StringComparison.Ordinal))
                 {
                     string localPath = source.Substring(6);
-                    try { File.Copy(localPath, path, true); }
-                    catch { path = localPath; ownsCacheFile = false; }
+                    byte[] packed;
+                    if (PackageSourceEngineStatic.TryReadArtwork(localPath, out packed)) File.WriteAllBytes(path, packed);
+                    else
+                    {
+                        try { File.Copy(localPath, path, true); }
+                        catch { path = localPath; ownsCacheFile = false; }
+                    }
                 }
                 else
                 {

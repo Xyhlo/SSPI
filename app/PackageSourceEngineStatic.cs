@@ -31,6 +31,7 @@ namespace Orbis
             internal SourceTitleResult Title;
             internal string PackagesFile, NormalizedId, NormalizedName, SearchText;
             internal int ReleaseCount;
+            internal ArtworkSlice Art;
         }
         sealed class Shard
         {
@@ -162,7 +163,9 @@ namespace Orbis
                 RelativePath(Text(row, "path", 180, true));
                 Integer(row, "size", true); Sha(Text(row, "sha256", 64, true));
             }
-            Catalog catalog = LoadIndex(package.Descriptor, package.ReadCatalogFile, declared, null);
+            Catalog catalog = LoadIndex(package.Descriptor, package.ReadCatalogFile, declared,
+                file => { byte[] data = package.ReadCatalogFile(file); return data == null ? 0 : data.LongLength; }, null, null);
+            VerifyArtwork(catalog, package.ReadCatalogFile);
             long releases = 0;
             foreach (string path in catalog.PackageFiles)
             {
@@ -208,7 +211,7 @@ namespace Orbis
                 return data;
             };
             var declared = new HashSet<string>(files.Keys, StringComparer.Ordinal); declared.Add("source.json");
-            Catalog loaded = LoadIndex(source.Descriptor, read, declared, cancel);
+            Catalog loaded = LoadIndex(source.Descriptor, read, declared, file => Integer(files[file], "size", true), root, cancel);
             InitializeRefresh(loaded);
             lock (Gate)
             {
@@ -221,7 +224,9 @@ namespace Orbis
             return loaded;
         }
 
-        static Catalog LoadIndex(PackageSourceDescriptor descriptor, Func<string, byte[]> read, HashSet<string> declared, Func<bool> cancel)
+        // artworkRoot is the installed source folder; null while a package is only being validated.
+        static Catalog LoadIndex(PackageSourceDescriptor descriptor, Func<string, byte[]> read, HashSet<string> declared,
+            Func<string, long> declaredSize, string artworkRoot, Func<bool> cancel)
         {
             if (!IsCatalog(descriptor.Engine.Type) || descriptor.Engine.EntryFile != "catalog.json") throw Bad("Static engine entry must be catalog.json");
             if (descriptor.Engine.Type == EngineType && (descriptor.Permissions.NetworkOrigins.Count != 0 || descriptor.Permissions.RedirectOrigins.Count != 0)) throw Bad("Static catalogs cannot declare network origins");
@@ -234,7 +239,8 @@ namespace Orbis
             if (Text(root, "searchNormalization", 64, true) != "nfkd-lower-alnum-spaces-v1") throw Bad("Unsupported catalog search normalization");
             var indexFiles = Paths(root, "indexFiles", "index/", declared);
             var packageFiles = Paths(root, "packageFiles", "packages/", declared);
-            var expectedFiles = new HashSet<string>(indexFiles, StringComparer.Ordinal); expectedFiles.UnionWith(packageFiles); expectedFiles.Add("catalog.json");
+            var artworkFiles = ArtworkFiles(root, declared);
+            var expectedFiles = new HashSet<string>(indexFiles, StringComparer.Ordinal); expectedFiles.UnionWith(packageFiles); expectedFiles.UnionWith(artworkFiles); expectedFiles.Add("catalog.json");
             foreach (string file in declared) if (file != "source.json" && file != "signature.ed25519" && !expectedFiles.Contains(file)) throw Bad("Static source has unused payload files");
             var counts = Object(Value(root, "counts", true), "catalog counts");
             Integer(counts, "multipartGroups", true); Integer(counts, "unresolved", true);
@@ -259,10 +265,13 @@ namespace Orbis
                     if (releaseCount < 1 || releaseCount > 512) throw Bad("Indexed title has invalid package count");
                     foreach (object kind in Array(row, "kinds", 8, true)) CheckKind(kind as string);
                     string suppliedSearch = Text(row, "searchText", 2048, false);
+                    ArtworkSlice art = Artwork(row, artworkFiles, declaredSize);
+                    // A packed picture is local, so it wins over a remote icon URL.
+                    if (art != null && artworkRoot != null) icon = ArtworkReference(artworkRoot, art);
                     var title = new SourceTitleResult { SourceId = descriptor.SourceId, SourceVersion = descriptor.Version,
                         SourceAttribution = descriptor.DisplayName, TitleId = id, DisplayName = name, Region = region, ImageUrl = icon,
                         StableResultId = id + "|" + region };
-                    var record = new Record { Title = title, PackagesFile = packages, ReleaseCount = (int)releaseCount,
+                    var record = new Record { Title = title, PackagesFile = packages, ReleaseCount = (int)releaseCount, Art = art,
                         NormalizedId = NormalizeSearch(id), NormalizedName = NormalizeSearch(name), SearchText = NormalizeSearch(name + " " + id + " " + suppliedSearch) };
                     catalog.Records.Add(record); catalog.ById.Add(id, record);
                     if (catalog.Records.Count > MaxTitles) throw Bad("Catalog has too many indexed titles; split the source");
