@@ -612,7 +612,8 @@ namespace Orbis
                         int index = (first + i) % copy.Length;
                         GameHit hit = copy[index];
                         if (hit == null) continue;
-                        OrbisTitleMetadata metadata = OrbisClient.GetTitleMetadata(hit.TitleId);
+                        OrbisTitleMetadata metadata = InstalledTitleScan.IsHomebrew(hit.TitleId)
+                            ? HomebrewMetadata(hit) : OrbisClient.GetTitleMetadata(hit.TitleId);
                         if (gen != _libraryScanGen) return;
                         lock (_lock)
                         {
@@ -641,6 +642,31 @@ namespace Orbis
             }) { IsBackground = true, Name = "SSPI library metadata" }.Start();
         }
 
+        /// <summary>The newest version of a homebrew app in the enabled package sources. The
+        /// official update metadata only covers PS4 games, and a homebrew update is the whole
+        /// app again (a base package with a higher APP_VER).</summary>
+        OrbisTitleMetadata HomebrewMetadata(GameHit hit)
+        {
+            var metadata = new OrbisTitleMetadata { ExpiresUtc = DateTime.UtcNow.AddHours(6) };
+            try
+            {
+                string error;
+                Version best = null;
+                foreach (var candidate in _packageSources.Resolve(hit.TitleId, hit.Name, out error) ?? new List<PackageCandidate>())
+                {
+                    Version version;
+                    if (candidate == null || !string.Equals(candidate.TitleId, hit.TitleId, StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(candidate.PackageKindHint, "base", StringComparison.OrdinalIgnoreCase) ||
+                        !OrbisClient.TryAppVersion(candidate.PackageVersion, out version) || (best != null && version <= best)) continue;
+                    best = version;
+                    metadata.LatestVersion = candidate.PackageVersion.Trim();
+                }
+                metadata.Known = true;
+            }
+            catch (Exception ex) { SspiLog.Write("download", "homebrew update lookup " + hit.TitleId + " " + ex.GetType().Name); }
+            return metadata;
+        }
+
         string LibraryUpdateStatus(GameHit hit, out bool newer)
         {
             newer = false;
@@ -655,8 +681,9 @@ namespace Orbis
         static string LibraryInstalledVersion(GameHit hit)
         {
             Version version;
-            return hit != null && OrbisClient.TryAppVersion(hit.Version, out version)
-                ? "Installed v" + hit.Version.Trim() : "Installed · version unknown";
+            string kind = hit != null && InstalledTitleScan.IsHomebrew(hit.TitleId) ? "Homebrew · " : "";
+            return kind + (hit != null && OrbisClient.TryAppVersion(hit.Version, out version)
+                ? "Installed v" + hit.Version.Trim() : "Installed · version unknown");
         }
 
         int _pairRevision;

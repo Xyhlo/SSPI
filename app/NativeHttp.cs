@@ -56,6 +56,8 @@ namespace Orbis
         static int _nativeRootLoadResult = int.MinValue;
         static int _nativePinnedIntermediateCount;
         static int _nativeGenerationYRootCount;
+        // Last failure from switching off firmware redirects (int.MinValue: entry point missing).
+        static volatile int _autoRedirectOffResult;
         // sceHttpsLoadCert may retain these pointers for the HTTP context lifetime.
         static readonly List<IntPtr> NativeCaAllocations = new List<IntPtr>();
         static readonly string[] NativeRootSubjectMarkers =
@@ -70,6 +72,10 @@ namespace Orbis
             "CN=USERTrust RSA Certification Authority,",
             "CN=COMODO RSA Certification Authority,",
             "CN=Sectigo Public Server Authentication Root R46,",
+            // github.com and api.github.com serve an ECDSA chain to E46,
+            // cross-signed by USERTrust ECC; load both so either path verifies.
+            "CN=Sectigo Public Server Authentication Root E46,",
+            "CN=USERTrust ECC Certification Authority,",
             "CN=Amazon Root CA 1,",
             "CN=GTS Root R1,",
             "CN=GTS Root R2,",
@@ -94,6 +100,16 @@ namespace Orbis
         // server's cross-signed root chain. Its DER fingerprint is pinned.
         const string GoDaddySecureG2IntermediateSha256 =
             "973A41276FFD01E027A2AAD49E34C37846D3E976FF6A620B6712E33832041AA6";
+        // github.com and api.github.com serve Sectigo DV E36 (ECDSA) or DV R36
+        // (RSA) under the E46/R46 roots. The console still reported unknown CA
+        // intermittently with both roots loaded, so trust the exact issuing
+        // intermediates directly. Both verified against the bundled roots on
+        // 4 Oct 2026 and are valid through 2036-03-21.
+        static readonly string[] GitHubIntermediatePins =
+        {
+            "873F0BA80E3AC222656DFD04158CC15C2927D42D5D05F01DEE4A47EB43A916DF",
+            "8C54C334B66BA4E426772AF4A3F9136C19A1AEC729FDB28C535C07A5A4EF22E0"
+        };
         // AllDebrid's file CDN now uses Let's Encrypt Generation Y, while its
         // API uses Google Trust Services. Trust the official Y roots directly
         // so older firmware does not need to assemble their extra cross-sign.
@@ -341,6 +357,13 @@ namespace Orbis
                     certificates.InsertRange(0, supplement);
                     _log.Append("native_godaddy_intermediate=").Append(supplement.Count).Append("; ");
                 }
+                string gitHubIntermediatePath = FindGenerationYRoots("github-sectigo-dv.pem");
+                if (!string.IsNullOrEmpty(gitHubIntermediatePath))
+                {
+                    var supplement = ReadPemCertificates(gitHubIntermediatePath, false, false, false, false, false, true);
+                    certificates.InsertRange(0, supplement);
+                    _log.Append("native_github_intermediates=").Append(supplement.Count).Append("; ");
+                }
                 if (!string.IsNullOrEmpty(realDebridIntermediatePath))
                 {
                     List<byte[]> realDebridIntermediates =
@@ -464,7 +487,8 @@ namespace Orbis
 
         static List<byte[]> ReadPemCertificates(string path, bool allowPinnedIntermediate,
             bool allowGenerationYRoots = false, bool allowGenerationYIntermediates = false,
-            bool allowTorBoxIntermediate = false, bool allowGoDaddyIntermediate = false)
+            bool allowTorBoxIntermediate = false, bool allowGoDaddyIntermediate = false,
+            bool allowGitHubIntermediates = false)
         {
             const string begin = "-----BEGIN CERTIFICATE-----";
             const string end = "-----END CERTIFICATE-----";
@@ -496,7 +520,7 @@ namespace Orbis
                 try
                 {
                     cert = new X509Certificate2(der);
-                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && !allowTorBoxIntermediate && !allowGoDaddyIntermediate && i < NativeRootSubjectMarkers.Length; i++)
+                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && !allowTorBoxIntermediate && !allowGoDaddyIntermediate && !allowGitHubIntermediates && i < NativeRootSubjectMarkers.Length; i++)
                     {
                         if (cert.Subject.IndexOf(NativeRootSubjectMarkers[i], StringComparison.OrdinalIgnoreCase) >= 0)
                         {
@@ -524,6 +548,9 @@ namespace Orbis
                         selected = HasSha256Fingerprint(der, TorBoxGoogleIntermediateSha256);
                     if (!selected && allowGoDaddyIntermediate)
                         selected = HasSha256Fingerprint(der, GoDaddySecureG2IntermediateSha256);
+                    if (!selected && allowGitHubIntermediates)
+                        foreach (string pin in GitHubIntermediatePins)
+                            if (HasSha256Fingerprint(der, pin)) { selected = true; break; }
                 }
                 catch
                 {
@@ -1197,7 +1224,7 @@ namespace Orbis
             string referer, string bearer, int timeoutMs, string rangeHeader, string ifRangeHeader,
             string userAgent, out int tmpl, out int conn, out int req, out int status, out string finalUrl,
             bool artwork = false, Func<bool> cancel = null, Func<Uri, bool> allowOrigin = null,
-            int redirectLimit = MaxRedirects)
+            int redirectLimit = MaxRedirects, string accept = null, bool stopAtRedirect = false)
         {
             // OpenGate only covers create/config; SendRequest + status run unlocked so
             // parallel range workers overlap network RTT.
@@ -1238,6 +1265,15 @@ namespace Orbis
                         try { sceHttpSetConnectTimeOut(tmpl, ConnectTimeoutUs); } catch { }
                         try { sceHttpSetRecvTimeOut(tmpl, recvUs); } catch { }
                         try { sceHttpSetSendTimeOut(tmpl, SendTimeoutUs); } catch { }
+                        // libSceHttp follows redirects itself by default, so a caller that
+                        // wants the redirect target must switch that off to see the 3xx.
+                        if (stopAtRedirect)
+                        {
+                            int redirectRc;
+                            try { redirectRc = sceHttpSetAutoRedirect(tmpl, 0); }
+                            catch (EntryPointNotFoundException) { redirectRc = int.MinValue; }
+                            if (redirectRc < 0) _autoRedirectOffResult = redirectRc;
+                        }
 
                         // Use the same native connection path for GET and POST. On PS4,
                         // the non-keepalive branch can lose the custom HTTPS trust context.
@@ -1269,7 +1305,7 @@ namespace Orbis
                         if (!string.IsNullOrEmpty(referer))
                             sceHttpAddRequestHeader(req, "Referer", referer, HeaderOverwrite);
                         sceHttpAddRequestHeader(req, "Accept",
-                            useMethod == MethodPost ? "application/json,*/*" : "text/html,application/json,*/*",
+                            accept ?? (useMethod == MethodPost ? "application/json,*/*" : "text/html,application/json,*/*"),
                             HeaderOverwrite);
                         sceHttpAddRequestHeader(req, "Accept-Language", "en-US,en;q=0.8", HeaderOverwrite);
                         sceHttpAddRequestHeader(req, "Accept-Encoding", "identity", HeaderOverwrite);
@@ -1327,6 +1363,8 @@ namespace Orbis
                                 throw new Exception("Redirect without Location");
                             string next = ResolveRedirect(current, loc);
                             EnsureHttpsUrl(next, "redirect");
+                            // The caller wants the redirect target itself; the request stays open for it to close.
+                            if (stopAtRedirect) { finalUrl = next; return; }
                             current = next;
                             // 307/308 explicitly preserve the request method and entity.
                             // Match established browser behavior for 301/302/303.
@@ -1351,6 +1389,69 @@ namespace Orbis
                 tmpl = conn = req = -1;
                 throw;
             }
+        }
+
+        static readonly System.Text.RegularExpressions.Regex GitHubReleaseAsset = new System.Text.RegularExpressions.Regex(
+            @"\Ahttps://api\.github\.com/repos/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/releases/assets/[0-9]{1,15}\z");
+
+        /// <summary>A GitHub release asset API link (api.github.com/repos/{owner}/{repo}/releases/assets/{id}).</summary>
+        internal static bool IsGitHubReleaseAsset(string url)
+        {
+            return url != null && GitHubReleaseAsset.IsMatch(url);
+        }
+
+        /// <summary>The download link of a GitHub release asset. Asked for the binary, the API
+        /// redirects to a short-lived link on GitHub's file host, which downloads like any other
+        /// HTTPS file; github.com's own release links send a response header the PS4 cannot
+        /// parse. The redirect is returned, not followed.</summary>
+        internal static string GitHubReleaseAssetLocation(string url, int timeoutMs, Func<bool> cancel)
+        {
+            if (!IsGitHubReleaseAsset(url)) throw new IOException("Not a GitHub release asset link");
+            EnsureInit();
+            if (!_ready) throw new IOException("Firmware HTTP unavailable: " + _initError);
+            // Console TLS to api.github.com fails intermittently (unknown CA on
+            // one connection, success on the next). The lookup only asks for a
+            // redirect, so repeat it with fresh request objects a few times.
+            int[] delays = { 1000, 2000, 4000 };
+            for (int attempt = 0; ; attempt++)
+            {
+                if (cancel != null && cancel()) throw new OperationCanceledException();
+                try { return GitHubReleaseAssetLocationOnce(url, timeoutMs, cancel); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    if (attempt >= delays.Length || (cancel != null && cancel())) throw;
+                    int delay = delays[attempt];
+                    SspiLog.Write("network", "github_asset retry attempt=" + (attempt + 1) + " delay_ms=" + delay +
+                        " reason=" + Clip(ex.Message ?? ex.GetType().Name, 200));
+                    for (int waited = 0; waited < delay; waited += 100)
+                    {
+                        if (cancel != null && cancel()) throw new OperationCanceledException();
+                        Thread.Sleep(Math.Min(100, delay - waited));
+                    }
+                }
+            }
+        }
+
+        static string GitHubReleaseAssetLocationOnce(string url, int timeoutMs, Func<bool> cancel)
+        {
+            int tmpl, conn, req, status;
+            string location;
+            OpenFollow(MethodGet, url, null, null, null, null, timeoutMs, null, null, null,
+                out tmpl, out conn, out req, out status, out location, false, cancel, null, MaxRedirects,
+                "application/octet-stream", true);
+            try
+            {
+                if (IsRedirectStatus(status) && !string.Equals(location, url, StringComparison.Ordinal)) return location;
+                string type = null;
+                try { type = GetHeader(req, "Content-Type"); } catch { }
+                int redirectOff = _autoRedirectOffResult;
+                throw new IOException("GitHub did not return a download link for this release file (HTTP " + status +
+                    (string.IsNullOrEmpty(type) ? "" : ", " + type) +
+                    (redirectOff == 0 ? "" : redirectOff == int.MinValue ? ", auto-redirect setting missing" :
+                        ", auto-redirect off 0x" + unchecked((uint)redirectOff).ToString("X8")) + ")");
+            }
+            finally { Close(tmpl, conn, req); }
         }
 
         static bool IsRedirectStatus(int status)
@@ -1615,6 +1716,9 @@ namespace Orbis
 
         [DllImport("libSceHttp", EntryPoint = "sceHttpSetSendTimeOut", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceHttpSetSendTimeOut(int id, uint usec);
+
+        [DllImport("libSceHttp", EntryPoint = "sceHttpSetAutoRedirect", CallingConvention = CallingConvention.Cdecl)]
+        static extern int sceHttpSetAutoRedirect(int id, int enable);
 
         #endregion
     }

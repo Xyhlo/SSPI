@@ -19,7 +19,8 @@ namespace Orbis
         const int MaxJsonBytes = 2 * 1024 * 1024;
         const int MaxShardBytes = 1500000;
         const int MaxIndexBytes = 8 * 1024 * 1024;
-        static readonly Regex TitlePattern = new Regex(@"\A(?:CUSA|SLUS|SCUS|SLES|SCES|SLPS|SLPM|SCPS)[0-9]{5}\z");
+        // PS4 titles, PS1/PS2 classic serials and homebrew apps (APOL00004); PS5 catalogs stay unsupported.
+        static readonly Regex TitlePattern = new Regex(@"\A(?!PPSA)[A-Z]{4}[0-9]{5}\z");
         static readonly object Gate = new object();
         static readonly Dictionary<string, Catalog> Catalogs = new Dictionary<string, Catalog>(StringComparer.Ordinal);
         static readonly LinkedList<string> CatalogOrder = new LinkedList<string>();

@@ -4087,6 +4087,10 @@ namespace Orbis
                 else if (IsDirectAccess(job.AccessType))
                 {
                     foregroundStatus = "Downloading direct...";
+                    // GitHub's short-lived file links expire, so each start asks for a fresh one.
+                    if (NativeHttp.IsGitHubReleaseAsset(direct))
+                        direct = NativeHttp.GitHubReleaseAssetLocation(direct, 30000,
+                            () => job.AttemptId != attempt || job.CancelRequested);
                 }
                 // Unknown (including legacy empty values) preserves the old routing behavior.
                 else if (_cfg.UseUnlockProvider && UnlockProviders.EnabledIds(_cfg).Length > 0)
@@ -4659,7 +4663,8 @@ namespace Orbis
 
         bool WaitForSelectedBackground(DlItem job, int attempt, string reason = null)
         {
-            if (!BackgroundSelected || UseInAppThemeLicense(job) || BackgroundCannotOpen(job.DestPath)) return false;
+            if (!BackgroundSelected || UseInAppThemeLicense(job) || BackgroundCannotOpen(job.DestPath) ||
+                InstalledTitleScan.IsHomebrew(job.TitleId)) return false;
             bool logReason;
             if (string.IsNullOrEmpty(reason))
             {
@@ -4845,7 +4850,7 @@ namespace Orbis
                 bool nativeBgft = (actualKind == PkgContentKind.BaseGame || actualKind == PkgContentKind.Patch) &&
                     CanPrepareNativeBgft(job, BackgroundSelected) &&
                     CanInstallWithResidentDependency(ResidentDependencyId(job));
-                if (nativeBgft || !BackgroundCannotOpen(job.DestPath))
+                if (!InstalledTitleScan.IsHomebrew(actualTitleId) && (nativeBgft || !BackgroundCannotOpen(job.DestPath)))
                     return HandoffStagedPackage(job, attempt, direct, actualTitleId, actualKindName, contentId, packageSize, false, nativeBgft);
             }
             // SSPI owns WAN transfers. BGFT receives a validated local file at install time;
@@ -4853,7 +4858,8 @@ namespace Orbis
             if (NetHttp.CanUseParallelDownload(direct, actualTitleId))
                 SelectForegroundParallelDownload(job, attempt);
             else
-                SetFeederForegroundFallback(job, attempt, BackgroundCannotOpen(job.DestPath)
+                SetFeederForegroundFallback(job, attempt, InstalledTitleScan.IsHomebrew(actualTitleId)
+                    ? "Homebrew apps download in SSPI; keep SSPI open" : BackgroundCannotOpen(job.DestPath)
                     ? "Background service can't open this USB drive; keep SSPI open" : "Background downloader unavailable; keep SSPI open");
             return true;
         }
@@ -7388,6 +7394,37 @@ namespace Orbis
             SaveManifest();
         }
 
+        /// <summary>A homebrew update is the whole app again, with the same content ID as the
+        /// installed copy, and the PS4 does not install over it. When the verified package is a
+        /// newer version, SSPI uninstalls the older one first, as the Reinstall action does.</summary>
+        internal static bool ReplacesOlderHomebrew(string titleId, PkgContentKind kind, string packageVersion)
+        {
+            if (kind != PkgContentKind.BaseGame || !InstalledTitleScan.IsHomebrew(titleId)) return false;
+            string name, installedVersion, icon;
+            InstalledTitleScan.ReadMeta(titleId, out name, out installedVersion, out icon);
+            return IsNewerAppVersion(packageVersion, installedVersion);
+        }
+
+        /// <summary>The verified package's own APP_VER, so an archive's PKG or a mislabelled
+        /// listing still compares correctly; the listed version only when the file cannot be read.</summary>
+        internal static string HomebrewPackageVersion(string path, string listed)
+        {
+            try
+            {
+                string own = PkgIntegrity.SfoValue(PkgIntegrity.Entry(path, 0x1000), "APP_VER");
+                if (own.Length > 0) return own;
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException) { }
+            return listed ?? "";
+        }
+
+        /// <summary>APP_VER comparison ("02.32" > "02.06", "1.1.0" equals "1.1"); false when either is unreadable.</summary>
+        internal static bool IsNewerAppVersion(string candidate, string installed)
+        {
+            Version a, b;
+            return OrbisClient.TryAppVersion(candidate, out a) && OrbisClient.TryAppVersion(installed, out b) && a > b;
+        }
+
         void InstallValidatedLocalPackage(DlItem job, int attempt, PkgContentKind actualKind,
             string actualKindName, string actualTitleId)
         {
@@ -7406,8 +7443,16 @@ namespace Orbis
             string error;
             int taskId;
             if (WaitForSelectedBackground(job, attempt, "Local package installation is waiting for the resident worker")) return;
+            string packageVersion = actualKind == PkgContentKind.BaseGame && InstalledTitleScan.IsHomebrew(actualTitleId)
+                ? HomebrewPackageVersion(job.DestPath, job.PackageVersion) : job.PackageVersion;
+            bool replace = ReplacesOlderHomebrew(actualTitleId, actualKind, packageVersion);
+            if (replace)
+            {
+                lock (_lock) { if (job.AttemptId == attempt) job.StatusText = "Replacing the installed version with " + packageVersion + "..."; }
+                LogBgftEvent("homebrew-replace", job, "Installed version is older; uninstalling it before installing " + packageVersion);
+            }
             InstallOutcome outcome = PkgInstaller.InstallLocal(job.DestPath, actualTitleId,
-                actualKindName, out installedTitleId, out error, out taskId, false);
+                actualKindName, out installedTitleId, out error, out taskId, replace);
             if (outcome != InstallOutcome.Started && taskId >= 0)
             {
                 TrackLocalInstallTask(job.Id, attempt, taskId);

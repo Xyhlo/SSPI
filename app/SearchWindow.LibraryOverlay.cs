@@ -178,7 +178,7 @@ namespace Orbis
                 var game = _libraryGames[index]; int slot = index - first;
                 int x = 254 + (slot % 5) * 284, y = 247 + (slot / 5) * 295;
                 bool focus = index == _expandedLibraryFocus, newer;
-                string state = LibraryUpdateStatus(game, out newer);
+                string state = (InstalledTitleScan.IsHomebrew(game.TitleId) ? "Homebrew · " : "") + LibraryUpdateStatus(game, out newer);
                 var art = new SDL_Rect { x = x + 41, y = y, w = 176, h = 222 };
                 DrawCase(r, game, art);
                 var ring = new SDL_Rect { x = art.x - 6, y = y - 6, w = 188, h = 234 };

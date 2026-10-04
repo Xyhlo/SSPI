@@ -57,7 +57,21 @@ namespace Orbis
                    titleId.StartsWith("PPSA", StringComparison.OrdinalIgnoreCase) ||
                    // PS1/PS2 classic packages installed under their disc serial (SLUS00923).
                    System.Text.RegularExpressions.Regex.IsMatch(titleId, @"\AS[CL][A-Z]{2}[0-9]{5}\z",
-                       System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                       System.Text.RegularExpressions.RegexOptions.IgnoreCase) ||
+                   IsHomebrew(titleId);
+        }
+
+        /// <summary>A homebrew app: installed under its own title ID (APOL00004, RMTC00001)
+        /// rather than a PS4 game's CUSA ID or a classic's disc serial. Homebrew is labelled
+        /// separately, and its updates come from package sources. SSPI and its background
+        /// service (SRCH00001/2) update themselves and are not listed.</summary>
+        public static bool IsHomebrew(string titleId)
+        {
+            string id = (titleId ?? "").ToUpperInvariant();
+            return System.Text.RegularExpressions.Regex.IsMatch(id, @"\A[A-Z]{4}[0-9]{5}\z") &&
+                !id.StartsWith("CUSA", StringComparison.Ordinal) && !id.StartsWith("PPSA", StringComparison.Ordinal) &&
+                !System.Text.RegularExpressions.Regex.IsMatch(id, @"\AS[CL][A-Z]{2}[0-9]{5}\z") &&
+                id != "SRCH00001" && id != "SRCH00002";
         }
 
         internal static void ReadMeta(string titleId, out string name, out string version, out string icon)

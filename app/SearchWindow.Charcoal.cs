@@ -334,7 +334,7 @@ namespace Orbis
             if (count == 0)
             {
                 DesignIcon(r, "library", 930, 446, 48, Dim);
-                TextCentered(r, new SDL_Rect { x = ContentX, y = 530, w = ContentWidth, h = 45 }, 27, (_libraryScanBusy || _consoleScanBusy) ? "Reading your library…" : "Your installed games appear here", White);
+                TextCentered(r, new SDL_Rect { x = ContentX, y = 530, w = ContentWidth, h = 45 }, 27, (_libraryScanBusy || _consoleScanBusy) ? "Reading your library…" : "Your installed games and homebrew appear here", White);
                 TextCentered(r, new SDL_Rect { x = ContentX, y = 590, w = ContentWidth, h = 35 }, 20, "Search for a title above to view its packages.", Muted);
             }
             else
@@ -358,7 +358,8 @@ namespace Orbis
                 TextFit(r, ContentX, 818, 22, 1050, LibraryTitle(chosen), White);
                 bool hasUpdate; string updateInfo = LibraryUpdateStatus(chosen, out hasUpdate);
                 TextFit(r, ContentX, 858, 18, 1100, chosen.TitleId + " · " + LibraryInstalledVersion(chosen) + " · " + updateInfo, hasUpdate ? Warning : Muted);
-                TextFit(r, ContentX, 888, 16, 1100, "Official update metadata · DLC and backport availability unknown", Dim);
+                TextFit(r, ContentX, 888, 16, 1100, InstalledTitleScan.IsHomebrew(chosen.TitleId)
+                    ? "Homebrew app · updates come from your package sources" : "Official update metadata · DLC and backport availability unknown", Dim);
                 string page = (selected + 1) + " / " + count;
                 TextPx(r, ContentX + ContentWidth - UiFont.MeasurePx(18, page), 822, 18, page, Muted);
                 if (count > visible) { TextPx(r, ContentX - 36, 520, 32, _libraryScroll > 0 ? "‹" : "", Muted); TextPx(r, ContentX + ContentWidth + 16, 520, 32, _libraryScroll + visible < count ? "›" : "", Muted); }
@@ -406,7 +407,8 @@ namespace Orbis
                 DesignCard(r, new SDL_Rect { x = ContentX, y = y, w = ContentWidth, h = 114 }, on, GlideList);
                 DrawCase(r, hit, new SDL_Rect { x = ContentX + 22, y = y + 9 - FocusLift(on), w = 74, h = 94 });
                 TextFit(r, ContentX + 122, y + 18, 27, ContentWidth - 440, hit.Name, White);
-                TextFit(r, ContentX + 122, y + 65, 19, ContentWidth - 440, hit.TitleId ?? "", Muted);
+                TextFit(r, ContentX + 122, y + 65, 19, ContentWidth - 440,
+                    (hit.TitleId ?? "") + (InstalledTitleScan.IsHomebrew(hit.TitleId) ? " · Homebrew" : ""), Muted);
                 TextPx(r, ContentX + ContentWidth - 297, y + 45, 18, "View packages", on ? White : Dim);
                 DrawPillRight(r, ContentX + ContentWidth - 66, y + 41, hit.Region ?? "?", Muted);
                 DesignIcon(r, "chevron", ContentX + ContentWidth - 43, y + 46, 21, on ? White : Dim);
@@ -445,6 +447,7 @@ namespace Orbis
             bool installed = _libraryGames.Exists(g => string.Equals(g.TitleId, _selected.TitleId, StringComparison.OrdinalIgnoreCase));
             TextFit(r, ContentX, 148, 34, ContentWidth, LibraryTitle(_selected), White);
             string identity = _selected.TitleId ?? "";
+            if (InstalledTitleScan.IsHomebrew(_selected.TitleId)) identity += "  ·  Homebrew app";
             if (!string.IsNullOrWhiteSpace(_selected.Region) && _selected.Region != "?") identity += "  ·  " + _selected.Region;
             identity += "  ·  PS4 " + _firmwareVersion;
             TextFit(r, ContentX, 201, 18, ContentWidth - 280, identity, Muted);
