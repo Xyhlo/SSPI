@@ -2878,7 +2878,8 @@ namespace Orbis
                 string dependencyId;
                 bool dependencyConfirmed;
                 if (ResolveInstallDependency(item, out dependencyId, out dependencyConfirmed) &&
-                    !dependencyConfirmed && !CanReplaceFailedPatch(Find(dependencyId), item)) return dependencyId;
+                    !dependencyConfirmed && !InstallPrerequisiteReady(Find(dependencyId)) &&
+                    !CanReplaceFailedPatch(Find(dependencyId), item)) return dependencyId;
                 DlItem latest = null;
                 foreach (var other in _items)
                 {
@@ -2970,6 +2971,23 @@ namespace Orbis
                 !string.Equals(item.AccessType, "FanOutSource", StringComparison.OrdinalIgnoreCase);
         }
 
+        bool CanPublishQueuedResident(DlItem item, bool capacityAvailable)
+        {
+            return capacityAvailable && CanPrepareResidentHandoff(item, BackgroundSelected) &&
+                CanInstallWithResidentDependency(ResidentDependencyId(item)) && !HasUnstartedPrerequisite(item);
+        }
+
+        internal static bool ResumeQueuedOnStartup(DlItem item, string storedState, bool backgroundSelected)
+        {
+            if (item == null || item.PauseRequested || item.CancelRequested || item.RemoveRequested ||
+                item.ResidentRemovePending) return false;
+            bool queued = string.Equals(storedState, "Queued", StringComparison.OrdinalIgnoreCase);
+            // Enqueue/Resume persist Queued; an explicit pause persists Paused.
+            return (item.ParkedForProvider && queued) || (backgroundSelected &&
+                (queued || string.Equals(storedState, "Resolving", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(storedState, "Downloading", StringComparison.OrdinalIgnoreCase)));
+        }
+
         void WorkerLoop(int workerIndex)
         {
             long failureLoggedAt = -10000;
@@ -2986,6 +3004,8 @@ namespace Orbis
                 // Parked TorBox preparations are polled off-thread; the worker
                 // itself never waits on a provider that has not published a file.
                 PumpParkedPreparationsSafely();
+                string capacityReason = null;
+                bool residentCapacity = !BackgroundSelected || ResidentDownloadService.CanAcceptStagedJob(out capacityReason);
                 DlItem job = null;
                 int attempt = 0;
                 string activePath = null;
@@ -3023,9 +3043,11 @@ namespace Orbis
                         // Never claim a BGFT-owned row as a new foreground job.
                         string pathKey = NormalizePath(i.DestPath);
                         bool local = File.Exists(i.DestPath);
-                        bool publishOnly = residentBusy && CanPrepareResidentHandoff(i, BackgroundSelected) &&
-                            CanInstallWithResidentDependency(ResidentDependencyId(i));
+                        bool publishOnly = CanPublishQueuedResident(i, residentCapacity);
                         bool dependencyAllowed = publishOnly ? !HasUnstartedPrerequisite(i) : InstallDependencyReady(i);
+                        if (BackgroundSelected && CanPrepareResidentHandoff(i, true) && !residentCapacity &&
+                            i.State == DlState.Queued && !i.Background)
+                        { i.StatusText = capacityReason; continue; }
                         if (i.State == DlState.Queued && !i.Background && !i.ParkedForProvider)
                         {
                             if (!dependencyAllowed) i.StatusText = "Waiting for the required package installation";
@@ -3971,6 +3993,10 @@ namespace Orbis
                     return;
                 }
                 if (WaitForSelectedBackground(job, attempt)) return;
+                string capacityReason;
+                if (CanPrepareResidentHandoff(job, BackgroundSelected) &&
+                    !ResidentDownloadService.CanAcceptStagedJob(out capacityReason))
+                { WaitForSelectedBackground(job, attempt, capacityReason); return; }
                 if (job.LocalSource) { RunLocalSource(job, attempt); return; }
                 bool metadataOnly;
                 lock (_lock) { bool residentBusy; string waitingReason; HasBlockingPipelineOwner(out residentBusy, out waitingReason); metadataOnly = BackgroundSelected && residentBusy; }
@@ -5329,7 +5355,14 @@ namespace Orbis
             TraceBackgroundRoute(NetHttp.BackgroundRoute.Published);
             NetHttp.TraceDownloadDecision(true, NetHttp.DownloadDecision.ResidentSelected, lanes);
             lock (_lock) if (job.AttemptId == attempt)
-                job.StatusText = "Background queue saved; waiting for worker acknowledgement";
+            {
+                job.StatusText = autoInstall ? "Background download and installation queued" :
+                    "Background download queued; installation waits for SSPI";
+                job.RetryAfterUtcTicks = 0;
+                // There is no foreground I/O lease to cool down after a durable
+                // handoff. Prepare the next row before the user suspends SSPI.
+                _nextJobStartAt = TransferClockMs();
+            }
             return true;
         }
 
@@ -8450,6 +8483,7 @@ namespace Orbis
                 string titleId;
                 string kind;
                 bool loopback;
+                long expectedSize;
                 lock (_lock)
                 {
                     if (!item.Background) continue;
@@ -8461,6 +8495,8 @@ namespace Orbis
                     titleId = item.TitleId;
                     kind = item.Kind;
                     loopback = item.BgftLoopback;
+                    expectedSize = item.BgftExpectedSize > 0 ? item.BgftExpectedSize :
+                        (item.ExpectedByteSize > 0 ? item.ExpectedByteSize : item.Total);
                 }
 
                 const int DownloadStablePolls = 4; // ~2s
@@ -8527,7 +8563,7 @@ namespace Orbis
                 BgftProgress progress;
                 string error;
                 if (!PkgInstaller.TryGetBackgroundProgress(taskId,
-                    contentId, subType, out progress, out error))
+                    contentId, subType, expectedSize, out progress, out error))
                 {
                     lock (_lock)
                     {
@@ -8560,7 +8596,8 @@ namespace Orbis
                     if (cur.State == DlState.Completed || cur.State == DlState.Installed ||
                         cur.State == DlState.Canceled || cur.State == DlState.Failed) continue;
 
-                    if (progress.TaskId >= 0 && cur.BgftTaskId != progress.TaskId)
+                    if (cur.BgftTaskId >= 0 && cur.BgftTaskId != progress.TaskId) continue;
+                    if (progress.TaskId >= 0 && cur.BgftTaskId < 0)
                     {
                         cur.BgftTaskId = progress.TaskId;
                         ResetBgftTransientPolls(cur);
@@ -8651,10 +8688,10 @@ namespace Orbis
                                     FallbackBgftToLocal(cur,
                                         cur.BgftDirect
                                             ? (nearDone ? "direct transfer size mismatch"
-                                                : "direct transfer stalled at " + Human(progress.Done))
+                                                : "direct transfer stalled at " + BgftStallSize(progress.Done))
                                             : (nearDone ? "PS4 stopped importing near the end without confirming the whole package (PS4 " +
-                                                Human(progress.Done) + " of " + Human(progress.Total) + ", package " + Human(expected) + ")"
-                                                : "stalled at " + Human(progress.Done)));
+                                                BgftStallSize(progress.Done) + " of " + BgftStallSize(progress.Total) + ", package " + BgftStallSize(expected) + ")"
+                                                : "stalled at " + BgftStallSize(progress.Done)));
                                     stateChanged = true;
                                     // skip rest of state machine this tick
                                     goto after_bgft_tick;
@@ -9151,7 +9188,8 @@ namespace Orbis
             }
             string contentId = item.BgftContentId;
             int subType = item.BgftSubType;
-            long expectedSize = item.BgftExpectedSize > 0 ? item.BgftExpectedSize : item.Total;
+            long expectedSize = item.BgftExpectedSize > 0 ? item.BgftExpectedSize :
+                (item.ExpectedByteSize > 0 ? item.ExpectedByteSize : item.Total);
             string installedUpdatePath, installedUpdateVersion;
             if (TryFindInstalledUpdate(item, out installedUpdatePath, out installedUpdateVersion))
             {
@@ -9193,7 +9231,7 @@ namespace Orbis
                 string directProgressError;
                 if (PkgInstaller.TryGetBackgroundProgress(
                     item.BgftTaskId >= 0 ? item.BgftTaskId : -1, contentId, subType,
-                    out directProgress, out directProgressError) && directProgress != null &&
+                    expectedSize, out directProgress, out directProgressError) && directProgress != null &&
                     directProgress.ErrorResult == 0)
                 {
                     item.BgftLoopbackServed = true;
@@ -9265,7 +9303,7 @@ namespace Orbis
                     string progressError;
                     bool progressAttached = PkgInstaller.TryGetBackgroundProgress(
                         item.BgftTaskId >= 0 ? item.BgftTaskId : -1,
-                        contentId, subType,
+                        contentId, subType, expectedSize,
                         out residentProgress, out progressError) && residentProgress != null &&
                         residentProgress.ErrorResult == 0;
                     if (progressAttached)
@@ -9419,7 +9457,7 @@ namespace Orbis
                 string progressError;
                 if (PkgInstaller.TryGetBackgroundProgress(
                     item.BgftTaskId >= 0 ? item.BgftTaskId : -1, actualContentId,
-                    item.BgftSubType, out progress, out progressError) &&
+                    item.BgftSubType, size, out progress, out progressError) &&
                     progress != null && progress.ErrorResult == 0)
                 {
                     item.Background = true;
@@ -9912,12 +9950,12 @@ namespace Orbis
                                 it.StatusText = string.IsNullOrEmpty(it.StatusText)
                                     ? "Failed — CROSS retries" : it.StatusText;
                             }
-                            else if (it.ParkedForProvider && string.Equals(st, "Queued", StringComparison.OrdinalIgnoreCase) &&
-                                !it.PauseRequested && !it.CancelRequested && !it.RemoveRequested)
+                            else if (ResumeQueuedOnStartup(it, st, BackgroundSelected))
                             {
-                                // Provider parking is persisted queue ownership. Resume only
-                                // parked rows; ordinary queued downloads still require user start.
                                 it.State = DlState.Queued;
+                                it.StatusText = it.ParkedForProvider ? "Resuming provider preparation" : "Preparing background queue";
+                                it.HttpRetryUrl = null;
+                                it.HttpRetryRenewPending = false;
                             }
                             else
                             {
@@ -10333,6 +10371,11 @@ namespace Orbis
             var tag = new StringBuilder(12);
             for (int i = 0; i < 6; i++) tag.Append(digest[i].ToString("x2"));
             return tag.ToString();
+        }
+
+        static string BgftStallSize(long bytes)
+        {
+            return (bytes / 1000000000.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + " GB";
         }
 
         public static string Human(long bytes)

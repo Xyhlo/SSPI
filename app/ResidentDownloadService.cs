@@ -405,6 +405,22 @@ namespace Orbis
         { return Path.Combine(IpcRoot, "transfer-" + slot.ToString(CultureInfo.InvariantCulture) + "." + extension); }
         const int StagedSlotCount = 16;
 
+        // Admission hint only. Publication still uses the generation checks and
+        // exclusive create below, including races with the resident FTP inbox.
+        internal static bool CanAcceptStagedJob(out string reason)
+        {
+            reason = null;
+            lock (Gate)
+            {
+                if (File.Exists(JobPath) && !IsLocalStagedInstall())
+                { reason = "Waiting for the active resident archive or installation"; return false; }
+                for (int slot = 0; slot < StagedSlotCount; slot++)
+                    if (!File.Exists(StagedPath(slot, "job"))) return true;
+                reason = "Background queue is full; pending items will be prepared when a slot opens";
+                return false;
+            }
+        }
+
         static int FindStagedSlot(string id)
         {
             if (string.IsNullOrEmpty(id)) return -1;

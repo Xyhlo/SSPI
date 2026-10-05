@@ -498,9 +498,9 @@ namespace Orbis
                         mostPhase = Math.Max(mostPhase, installPhase);
                         pollsWithoutProgress = -1;
                     }
-                    int percent = (transferComplete || copySignal)
-                        ? Math.Min(100, Math.Max(installPhase, 1))
-                        : (total > 0 ? Math.Min(99, (int)(done * 100UL / total)) : installPhase);
+                    int percent = total > 0 && done < total
+                        ? Math.Min(99, (int)(done * 100UL / total))
+                        : ((transferComplete || copySignal) ? Math.Min(100, Math.Max(installPhase, 1)) : installPhase);
                     if (percent != lastPercent)
                     {
                         lastPercent = percent;
@@ -584,7 +584,7 @@ namespace Orbis
             }
         }
 
-        public static bool TryGetBackgroundProgress(int taskId, string contentId, int subType,
+        public static bool TryGetBackgroundProgress(int taskId, string contentId, int subType, long expectedSize,
             out BgftProgress progress, out string error)
         {
             progress = null;
@@ -598,8 +598,18 @@ namespace Orbis
             try
             {
                 BgftTaskProgress state = new BgftTaskProgress();
-                int activeTask;
-                if (!BgftCancellation.ResolveOwned(contentId, subType,
+                int activeTask = taskId;
+                // Updates share content identity; lookup may return an older finished task.
+                // A recorded task must stay pinned, even if its progress read fails.
+                if (taskId >= 0)
+                {
+                    if (!IsOwnedBackgroundTask(taskId, contentId, subType))
+                    {
+                        error = "BGFT task " + taskId + " is not owned by SSPI; operation refused";
+                        return false;
+                    }
+                }
+                else if (!BgftCancellation.ResolveOwned(contentId, subType,
                     sceBgftServiceDownloadFindTaskByContentId,
                     id => IsOwnedBackgroundTask(id, contentId, subType), out activeTask, out error)) return false;
                 int rc = activeTask >= 0 ? sceBgftServiceDownloadGetProgress(activeTask, out state) : BgftTaskNotFound;
@@ -612,6 +622,12 @@ namespace Orbis
                     return false;
                 }
 
+                ulong total = state.LengthTotal != 0 ? state.LengthTotal : state.Length;
+                if (taskId < 0 && expectedSize > 0 && total != (ulong)expectedSize)
+                {
+                    error = "BGFT task " + activeTask + " size " + total + " does not match expected " + expectedSize;
+                    return false;
+                }
                 progress = MapBackgroundProgress(activeTask, state);
                 return true;
             }
