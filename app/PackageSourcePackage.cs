@@ -271,6 +271,12 @@ namespace Orbis
             string version = RequiredAnyString(root, "version");
             ValidateVersion(version);
             string name = FirstString(root, "name", "displayName", "display_name");
+            // A source made for several consoles may give each edition its own name.
+            object displayNamesValue;
+            var displayNames = root.TryGetValue("displayNames", out displayNamesValue)
+                ? displayNamesValue as Dictionary<string, object> : null;
+            string ps4Name = displayNames != null ? displayNames.TryGetValue("ps4", out displayNamesValue) ? displayNamesValue as string : null : null;
+            if (!string.IsNullOrWhiteSpace(ps4Name) && ps4Name.Trim().Length <= 96) name = ps4Name.Trim();
             if (string.IsNullOrWhiteSpace(name) || name.Length > 96)
                 throw new InvalidDataException("Source display name is missing or too long");
 
@@ -287,6 +293,16 @@ namespace Orbis
                 HomepageUrl = FirstString(root, "homepage", "homepageUrl"),
                 SupportUrl = FirstString(root, "support", "supportUrl")
             };
+            object replacesValue;
+            var replaces = root.TryGetValue("replaces", out replacesValue) ? replacesValue as List<object> : null;
+            if (replacesValue != null && replaces == null) throw new InvalidDataException("replaces must be an array");
+            if (replaces != null) foreach (object replaced in replaces)
+            {
+                string replacedId = replaced as string;
+                if (replacedId == null) throw new InvalidDataException("replaces must list source ids");
+                ValidateId(replacedId);
+                if (replacedId != id && !descriptor.Replaces.Contains(replacedId)) descriptor.Replaces.Add(replacedId);
+            }
 
             object engineValue;
             var engine = root.TryGetValue("engine", out engineValue)

@@ -75,6 +75,8 @@ namespace Orbis
         public string UpdateDescriptorUrl = "";
         public string HomepageUrl = "";
         public string SupportUrl = "";
+        // Source IDs this source supersedes; importing it removes them.
+        public readonly List<string> Replaces = new List<string>();
     }
 
     internal sealed class PackageSourceInstallOrigin

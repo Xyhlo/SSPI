@@ -230,14 +230,21 @@ namespace Orbis
 
                     var entry = FromPackage(package, finalPath, enabled);
                     var replacement = new List<PackageSourceRegistryEntry>();
+                    var superseded = new List<string>();
                     foreach (var old in _entries)
-                        if (!string.Equals(old.SourceId, id, StringComparison.Ordinal)) replacement.Add(old);
+                    {
+                        if (string.Equals(old.SourceId, id, StringComparison.Ordinal)) continue;
+                        if (package.Descriptor.Replaces.Contains(old.SourceId)) { superseded.Add(old.SourceId); continue; }
+                        replacement.Add(old);
+                    }
                     replacement.Add(entry);
                     replacement.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
                     SaveRegistry(replacement);
                     _entries = replacement;
                     PackageSourceEngineStatic.Invalidate();
                     if (retired != null) TryDeleteDirectory(retired);
+                    // Like Remove: the registry no longer lists a superseded source before its files go.
+                    foreach (string old in superseded) TryDeleteDirectory(OwnedChild(_installedRoot, old));
                     return Clone(entry);
                 }
             }
