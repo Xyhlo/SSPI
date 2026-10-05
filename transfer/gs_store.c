@@ -201,6 +201,7 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32],const unsigned 
     // no-symlink policy atomically when opening, without a libc stat ABI.
     flags|=O_NOFOLLOW|O_NONBLOCK;
 #endif
+    int part_existed=access(j->part,F_OK)==0;
     j->fd=open(j->part,flags,0600);if(j->fd<0)return storage_failure(j,"package open",errno);
     j->header.magic=0x33585347;j->header.version=4;j->header.chunk_size=GS_XFER_CHUNK;
     j->header.total=(uint64_t)j->status.total;
@@ -214,23 +215,14 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32],const unsigned 
     if(!j->header.count || j->header.count>65536)return storage_failure(j,"package size validation",EFBIG);
     j->checkpoint_chunks=calloc(j->header.count,sizeof(GsChunk));
     j->chunks=calloc(j->header.count,sizeof(GsChunk));j->claims=calloc(j->header.count,1);j->attempts=calloc(j->header.count,1);
-    j->total_attempts=calloc(j->header.count,1);
     j->retry_at=calloc(j->header.count,sizeof(uint64_t));j->accepted=calloc(j->header.count,sizeof(uint64_t));
-    if(!j->chunks||!j->checkpoint_chunks||!j->claims||!j->attempts||!j->total_attempts||!j->retry_at||!j->accepted)return storage_failure(j,"resume-map allocation",ENOMEM);
+    if(!j->chunks||!j->checkpoint_chunks||!j->claims||!j->attempts||!j->retry_at||!j->accepted)return storage_failure(j,"resume-map allocation",ENOMEM);
     int map_present=access(j->map,F_OK)==0;
-    FILE *f=fopen(j->map,"rb");int valid=0,same_package=0,truncated_map=0;
+    FILE *f=fopen(j->map,"rb");int valid=0,same_package=0;
     if(map_present&&!f)return storage_failure(j,"resume-map open",errno?errno:EACCES);
     if(f) {
         uint32_t prefix[4]={0};
-        int64_t map_size=0;
-        if(gs_store_size(fileno(f),&map_size)){int error=errno;fclose(f);return storage_failure(j,"resume-map size query",error);}
-        if(fseek(f,0,SEEK_SET)){int error=errno;fclose(f);return storage_failure(j,"resume-map seek",error);}
-        truncated_map=map_size<(int64_t)sizeof(GsMapHeaderV3);
         if(fread(prefix,sizeof(prefix),1,f)==1 && !fseek(f,0,SEEK_SET)) {
-            size_t header_size=prefix[1]==3?sizeof(GsMapHeaderV3):prefix[1]==4?sizeof(GsMapHeader):0;
-            if(header_size)truncated_map=map_size<(int64_t)header_size ||
-                (prefix[0]==j->header.magic&&prefix[2]==GS_XFER_CHUNK&&prefix[3]>0&&prefix[3]<=65536&&
-                 map_size<(int64_t)(header_size+(uint64_t)prefix[3]*sizeof(GsChunk)));
             if(prefix[1]==3) {
                 GsMapHeaderV3 old;
                 if(fread(&old,1,sizeof(old),f)==sizeof(old)) {
@@ -270,20 +262,15 @@ int gs_store_open(GsJobState *j,const unsigned char identity[32],const unsigned 
                 }
             }
         }
-        if(ferror(f)){int error=errno;fclose(f);return storage_failure(j,"resume-map read",error?error:EIO);}
         fclose(f);
     }
     int64_t file_size=0;if(gs_store_size(j->fd,&file_size))return storage_failure(j,"package size query",errno);
     // A different package identity or publisher digest remains an operator
     // error. Matching packages with stale/missing representation proof are
     // safely restarted by committing an empty map before any network writes.
-    if(map_present&&!truncated_map&&!same_package)return storage_failure(j,"resume identity",EINVAL);
-    if(map_present&&!truncated_map&&file_size!=j->status.total)return storage_failure(j,"resume size",EINVAL);
-    if(!map_present||truncated_map) {
-        valid=0;
-        if(ftruncate(j->fd,0))return storage_failure(j,"incomplete checkpoint reset",errno);
-        gs_transfer_log(j,"incomplete-checkpoint-restarted");
-    }
+    if(map_present&&!same_package)return storage_failure(j,"resume identity",EINVAL);
+    if(map_present&&file_size!=j->status.total)return storage_failure(j,"resume size",EINVAL);
+    if(!map_present&&part_existed&&file_size>0)return storage_failure(j,"unmapped retained package",EINVAL);
     if(!valid || j->single)memset(j->chunks,0,j->header.count*sizeof(GsChunk));
     if(ftruncate(j->fd,j->status.total))return storage_failure(j,"package resize",errno);
     unsigned char *buffer=malloc(GS_XFER_BUFFER);if(!buffer)return storage_failure(j,"verification-buffer allocation",ENOMEM);
@@ -307,59 +294,7 @@ void gs_store_close(GsJobState *j)
     if(j->lock_fd>=0)close(j->lock_fd);j->lock_fd=-1;
     free(j->checkpoint_chunks);j->checkpoint_chunks=NULL;
     free(j->chunks);free(j->claims);free(j->attempts);j->chunks=NULL;j->claims=j->attempts=NULL;
-    free(j->total_attempts);j->total_attempts=NULL;
     free(j->retry_at);j->retry_at=NULL;free(j->accepted);j->accepted=NULL;
-}
-int gs_verify_completed_chunks(const char *destination,int64_t total,char *error,size_t error_size,
-    int (*canceled)(void *),void *argument)
-{
-    GsJobState job;memset(&job,0,sizeof(job));job.fd=job.lock_fd=-1;
-    job.verify_canceled=canceled;job.verify_argument=argument;
-    int rc=-1;FILE *map=NULL;unsigned char *buffer=NULL;uint32_t crc=0,prefix[4];
-    if(error&&error_size)error[0]=0;
-    if(!destination||strlen(destination)>=sizeof(job.dest)||total<4096)goto done;
-    snprintf(job.dest,sizeof(job.dest),"%s",destination);
-    if(acquire(&job))goto done;
-    snprintf(job.map,sizeof(job.map),"%s.map",destination);
-    snprintf(job.part,sizeof(job.part),"%s.part",destination);
-    map=fopen(job.map,"rb");
-    if(!map||fread(prefix,sizeof(prefix),1,map)!=1||fseek(map,0,SEEK_SET))goto done;
-    if(prefix[1]==4) {
-        if(fread(&job.header,1,sizeof(job.header),map)!=sizeof(job.header))goto done;
-        crc=job.header.crc;job.header.crc=0;
-        job.header.crc=gs_crc(&job.header,sizeof(job.header),0);
-    } else if(prefix[1]==3) {
-        GsMapHeaderV3 old;
-        if(fread(&old,1,sizeof(old),map)!=sizeof(old))goto done;
-        memcpy(&job.header,&old,offsetof(GsMapHeaderV3,single));job.header.single=old.single;
-        crc=old.crc;old.crc=0;job.header.crc=gs_crc(&old,sizeof(old),0);
-    } else goto done;
-    if(job.header.magic!=0x33585347||job.header.chunk_size!=GS_XFER_CHUNK||job.header.total!=(uint64_t)total||
-       !job.header.count||job.header.count>65536||job.header.count!=((uint64_t)total+GS_XFER_CHUNK-1)/GS_XFER_CHUNK||job.header.single>2)goto done;
-    job.chunks=calloc(job.header.count,sizeof(GsChunk));
-    if(!job.chunks||fread(job.chunks,sizeof(GsChunk),job.header.count,map)!=job.header.count||fgetc(map)!=EOF||ferror(map)||
-       crc!=gs_crc(job.chunks,job.header.count*sizeof(GsChunk),job.header.crc))goto done;
-    for(uint32_t i=0;i<job.header.count;i++)if(!job.chunks[i].done)goto done;
-    unsigned char expected=0;for(unsigned i=0;i<32;i++)expected|=job.header.expected[i];
-    // Whole-file streams did not record individual chunk hashes. Without a
-    // publisher checksum, let the engine fetch and validate them normally.
-    if(job.header.single&&!expected){rc=1;goto done;}
-    if(expected)for(unsigned i=0;i<32;i++)snprintf(job.expected+i*2,3,"%02x",job.header.expected[i]);
-    int flags=O_RDONLY;
-#ifdef _WIN32
-    flags|=_O_BINARY;
-#else
-    flags|=O_NOFOLLOW;
-#endif
-    job.fd=open(job.part,flags);int64_t size=0;
-    if(job.fd<0||gs_store_size(job.fd,&size)||size!=total)goto done;
-    job.status.total=job.status.done=total;job.single=job.header.single==1;
-    buffer=malloc(GS_XFER_BUFFER);if(!buffer)goto done;
-    rc=gs_verify_file(&job,buffer);
-done:
-    if(rc<0&&error&&error_size)snprintf(error,error_size,"%s; complete file retained",
-        job.storage_error[0]?job.storage_error:job.verification_error[0]?job.verification_error:"Completed checkpoint hash verification failed");
-    free(buffer);if(map)fclose(map);gs_store_close(&job);return rc;
 }
 int64_t sspi_xfer_durable(const char *destination)
 {

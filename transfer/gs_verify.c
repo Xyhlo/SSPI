@@ -53,8 +53,7 @@ int gs_verify_file(GsJobState *job,unsigned char *buffer)
     if(gs_store_read(job->fd,header,sizeof(header),0)||gs_verify_header(header,sizeof(header),job->status.total,job->title,job->content)<0)return invalid(job,-27,"PKG header failed during audit",NULL,NULL);
     gs_digest(header,sizeof(header),digest);if(memcmp(digest,job->header.identity,32))return invalid(job,-28,"header identity changed",job->header.identity,digest);
     for(uint64_t at=0;at<(uint64_t)job->status.total;) {
-        if(__atomic_load_n(&job->stop,__ATOMIC_ACQUIRE)||
-           (job->verify_canceled&&job->verify_canceled(job->verify_argument)))return -3;
+        if(__atomic_load_n(&job->stop,__ATOMIC_ACQUIRE))return -3;
         size_t n=(uint64_t)job->status.total-at;if(n>GS_XFER_BUFFER)n=GS_XFER_BUFFER;
         if(gs_store_read(job->fd,buffer,n,at))return invalid(job,-29,"file read failed during SHA-256 audit",NULL,NULL);
         if(job->expected[0])sha256_update(&hash,buffer,n);

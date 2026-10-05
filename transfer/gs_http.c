@@ -226,14 +226,11 @@ void gs_http_close(GsHttp *h)
     if(h->template_id>=0)http_delete_template(h->template_id);
     request_lock(h);
     int aborted=__atomic_load_n(&h->aborted,__ATOMIC_ACQUIRE);
-    int retry_after=h->retry_after,retry_after_invalid_time=h->retry_after_invalid_time;
     // Preserve the live lock, cancellation state and active-open clock while
     // clearing the connection cache. Redirect/setup cleanup must not turn time
     // queued for an open permit into active network time in the watchdog.
     memset(h,0,offsetof(GsHttp,request_gate));
     h->template_id=h->connection=h->request=-1;h->aborted=aborted;
-    // The worker consumes the response cooldown after connection cleanup.
-    h->retry_after=retry_after;h->retry_after_invalid_time=retry_after_invalid_time;
     request_unlock(h);
 }
 static int header(const char *block,size_t length,const char *name,char *out,size_t cap)
@@ -265,7 +262,7 @@ static int http_open_request(GsHttp *h,const char *url,const char *bearer,int64_
     char current[8192],initial[512],origin[512],value[8192];int rc=-1;
     int64_t if_range_date;
     if(strlen(url)>=sizeof(current)||gs_http_origin(url,initial,sizeof(initial))||
-       (if_range&&*if_range&&!gs_http_strong_etag(if_range)&&parse_http_date(if_range,&if_range_date)))return GS_XFER_PROTOCOL_ERROR;
+       (if_range&&*if_range&&!gs_http_strong_etag(if_range)&&parse_http_date(if_range,&if_range_date)))return -2;
     int cached=h->effective[0] && strcmp(h->effective,url) && !strcmp(h->source,url);
     snprintf(current,sizeof(current),"%s",cached?h->effective:url);
     for(int hop=0;hop<=8;hop++) {
@@ -275,7 +272,7 @@ static int http_open_request(GsHttp *h,const char *url,const char *bearer,int64_
         h->status=0;h->retry_after=0;h->location[0]=0;
         h->start=h->end=h->total=h->length=-1;h->reused=0;h->etag[0]=0;h->etag_value[0]=0;
         h->etag_present=h->etag_single=h->date_present=h->date_valid=h->last_modified_present=h->last_modified_single=h->last_modified_valid=0;h->stage="origin";
-        if(gs_http_origin(current,origin,sizeof(origin)))return GS_XFER_PROTOCOL_ERROR;
+        if(gs_http_origin(current,origin,sizeof(origin)))return -2;
         if(strcmp(origin,h->origin)) {
             gs_http_close(h);
             h->stage="template";
@@ -319,7 +316,7 @@ static int http_open_request(GsHttp *h,const char *url,const char *bearer,int64_
             if(if_range&&*if_range&&(rc=http_header(request,"If-Range",if_range,0))<0)return rc;
         }
         if(bearer && *bearer && !strcmp(origin,initial)) {
-            if(strpbrk(bearer,"\r\n")||strlen(bearer)>2040)return GS_XFER_PROTOCOL_ERROR;
+            if(strpbrk(bearer,"\r\n")||strlen(bearer)>2040)return -2;
             snprintf(value,sizeof(value),"Bearer %s",bearer);if((rc=http_header(request,"Authorization",value,0))<0)return rc;
         }
         h->stage="send";
@@ -336,31 +333,23 @@ static int http_open_request(GsHttp *h,const char *url,const char *bearer,int64_
         char *block=NULL;size_t length=0;
         h->stage="response-headers";
         if((rc=http_headers(request,&block,&length))<0)return rc;
-        if(!block||length>65536)return GS_XFER_PROTOCOL_ERROR;
+        if(!block||length>65536)return -2;
         int connection_header=header(block,length,"Connection",value,sizeof(value));
-        if(connection_header<0)return GS_XFER_PROTOCOL_ERROR;
+        if(connection_header<0)return -2;
         if(connection_header)for(const char *p=value;*p;p++)
             if((p==value||p[-1]==','||p[-1]==' ')&&!strncasecmp(p,"close",5)&&(p[5]==0||p[5]==','||p[5]==' ')){h->retire=1;break;}
-        if(header(block,length,"Location",h->location,sizeof(h->location))<0)return GS_XFER_PROTOCOL_ERROR;
+        if(header(block,length,"Location",h->location,sizeof(h->location))<0)return -2;
         h->retry_after=0;h->retry_after_invalid_time=0;
         if(header(block,length,"Retry-After",value,sizeof(value))>0)
             h->retry_after=parse_retry_after(value,&h->retry_after_invalid_time);
         if(h->status==301||h->status==302||h->status==303||h->status==307||h->status==308) {
-            if(hop==8||!h->location[0])return GS_XFER_PROTOCOL_ERROR;
+            if(hop==8||!h->location[0])return -2;
             char next[8192];int written;
             if(!strncmp(h->location,"//",2))written=snprintf(next,sizeof(next),"%.*s:%s",(int)(strchr(current,':')-current),current,h->location);
             else if(h->location[0]=='/')written=snprintf(next,sizeof(next),"%s%s",origin,h->location);
             else if(strstr(h->location,"://"))written=snprintf(next,sizeof(next),"%s",h->location);
-            else {
-                const char *path_end=current+strcspn(current,"?#"),*slash=NULL;
-                for(const char *p=current+strlen(origin);p<path_end;p++)if(*p=='/')slash=p;
-                if(h->location[0]=='?'||h->location[0]=='#') {
-                    const char *end=h->location[0]=='?'?path_end:current+strcspn(current,"#");
-                    written=snprintf(next,sizeof(next),"%.*s%s",(int)(end-current),current,h->location);
-                } else if(!slash)written=snprintf(next,sizeof(next),"%s/%s",origin,h->location);
-                else written=snprintf(next,sizeof(next),"%.*s/%s",(int)(slash-current),current,h->location);
-            }
-            if(written<0 || written>=(int)sizeof(next) || (!strncasecmp(current,"https://",8)&&strncasecmp(next,"https://",8)))return GS_XFER_PROTOCOL_ERROR;
+            else {char *slash=strrchr(current,'/');if(!slash||slash<current+strlen(origin))written=snprintf(next,sizeof(next),"%s/%s",origin,h->location);else written=snprintf(next,sizeof(next),"%.*s/%s",(int)(slash-current),current,h->location);}
+            if(written<0 || written>=(int)sizeof(next) || (!strncasecmp(current,"https://",8)&&strncasecmp(next,"https://",8)))return -2;
             snprintf(current,sizeof(current),"%s",next);continue;
         }
         // A cached redirect is scoped to this exact input URL. If that target
@@ -371,17 +360,17 @@ static int http_open_request(GsHttp *h,const char *url,const char *bearer,int64_
         }
         snprintf(h->effective,sizeof(h->effective),"%s",current);
         snprintf(h->source,sizeof(h->source),"%s",url);
-        if(gs_http_parse_response_validators(h,block,length))return GS_XFER_PROTOCOL_ERROR;
+        if(gs_http_parse_response_validators(h,block,length))return -2;
         h->start=h->end=h->total=h->length=-1;
         int got=header(block,length,"Content-Range",value,sizeof(value));
-        if(got<0 || (got && gs_range_parse(value,&h->start,&h->end,&h->total)))return GS_XFER_PROTOCOL_ERROR;
+        if(got<0 || (got && gs_range_parse(value,&h->start,&h->end,&h->total)))return -2;
         got=header(block,length,"Content-Length",value,sizeof(value));
-        if(got<0)return GS_XFER_PROTOCOL_ERROR;
-        if(got){const char *v=value;if(number(&v,&h->length)||*v)return GS_XFER_PROTOCOL_ERROR;}
+        if(got<0)return -2;
+        if(got){const char *v=value;if(number(&v,&h->length)||*v)return -2;}
         got=header(block,length,"Content-Encoding",value,sizeof(value));
-        if(got<0 || (got && *value && strcasecmp(value,"identity")))return GS_XFER_PROTOCOL_ERROR;
+        if(got<0 || (got && *value && strcasecmp(value,"identity")))return -2;
         return 0;
-    }return GS_XFER_PROTOCOL_ERROR;
+    }return -2;
 }
 static void failure_details(GsHttp *h)
 {
