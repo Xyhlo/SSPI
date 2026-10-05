@@ -113,9 +113,15 @@ namespace Orbis
                     string body = "{\"titleid\":\"" + titleId + "\",\"key\":\"" + key + "\"}";
                     string json = NetHttp.PostForm(Base + "/api/internal/loadpatches", body, 10000, pageUrl);
                     result = ParseTitleMetadata(json);
+                    if (!result.Known) SspiLog.Write("network", "Orbis metadata unavailable: response rejected or unrecognized");
                 }
+                else SspiLog.Write("network", "Orbis metadata unavailable: page key missing or unrecognized");
             }
-            catch { } // Offline or a changed response means unknown, never "up to date".
+            catch (Exception ex)
+            {
+                // Never log the page key or response body; unknown is not "up to date".
+                SspiLog.Write("network", "Orbis metadata unavailable: " + ex.GetType().Name);
+            }
             result.ExpiresUtc = DateTime.UtcNow.AddMinutes(result.Known ? 15 : 2);
             lock (MetadataGate)
             {
@@ -180,29 +186,41 @@ namespace Orbis
             if (string.IsNullOrEmpty(query) || query.Trim().Length < 2)
                 return list;
 
-            string url = Base + "/api/internal/search?term=" + Uri.EscapeDataString(query.Trim());
-            string json = NetHttp.GetString(url, 40000, Base + "/");
-            if (!JsonLite.GetBool(json, "success", false))
-                throw new Exception(JsonLite.GetString(json, "message") ?? "Orbis search rejected");
-
-            foreach (var obj in JsonLite.ExtractObjectArray(json, "results"))
+            try
             {
-                string tid = (JsonLite.GetString(obj, "titleid") ?? "").ToUpperInvariant();
-                if (!TitleIdRe.IsMatch(tid)) continue;
-                var hit = new GameHit
+                string url = Base + "/api/internal/search?term=" + Uri.EscapeDataString(query.Trim());
+                string json = NetHttp.GetString(url, 40000, Base + "/");
+                if (!JsonLite.GetBool(json, "success", false) ||
+                    !Regex.IsMatch(json ?? "", @"""results""\s*:\s*\["))
                 {
-                    TitleId = tid,
-                    Name = JsonLite.GetString(obj, "name") ?? tid,
-                    Region = JsonLite.GetString(obj, "region") ?? "?",
-                    ImageUrl = NormalizeImageUrl(JsonLite.GetString(obj, "icon")),
-                    Source = "orbis"
-                };
-                list.Add(hit);
-                // Resolve currently receives the selected TitleId/name pair only. Keep the
-                // authoritative Orbis region beside the search result so resolvers can rank
-                // exact-CUSA tables without changing UI/resolver method signatures.
-                lock (RegionGate) KnownRegions[tid] = hit.Region;
-                if (list.Count >= limit) break;
+                    SspiLog.Write("network", "Orbis search unavailable: response rejected or unrecognized");
+                    return list;
+                }
+
+                foreach (var obj in JsonLite.ExtractObjectArray(json, "results"))
+                {
+                    string tid = (JsonLite.GetString(obj, "titleid") ?? "").ToUpperInvariant();
+                    if (!TitleIdRe.IsMatch(tid)) continue;
+                    var hit = new GameHit
+                    {
+                        TitleId = tid,
+                        Name = JsonLite.GetString(obj, "name") ?? tid,
+                        Region = JsonLite.GetString(obj, "region") ?? "?",
+                        ImageUrl = NormalizeImageUrl(JsonLite.GetString(obj, "icon")),
+                        Source = "orbis"
+                    };
+                    list.Add(hit);
+                    // Resolve currently receives the selected TitleId/name pair only. Keep the
+                    // authoritative Orbis region beside the search result so resolvers can rank
+                    // exact-CUSA tables without changing UI/resolver method signatures.
+                    lock (RegionGate) KnownRegions[tid] = hit.Region;
+                    if (list.Count >= limit) break;
+                }
+            }
+            catch (Exception ex)
+            {
+                SspiLog.Write("network", "Orbis search unavailable: " + ex.GetType().Name);
+                list.Clear();
             }
             return list;
         }

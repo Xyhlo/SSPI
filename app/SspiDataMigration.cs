@@ -15,6 +15,16 @@ namespace Orbis
         static readonly object Gate = new object();
         static string LastOldRoot, LastNewRoot;
         static string Operation, OperationPath;
+        const int LegacyHeartbeatExpirySeconds = 300;
+        static readonly System.Collections.Generic.Dictionary<string, HeartbeatObservation> HeartbeatObservations =
+            new System.Collections.Generic.Dictionary<string, HeartbeatObservation>(StringComparer.Ordinal);
+
+        sealed class HeartbeatObservation
+        {
+            internal string Identity;
+            internal int Starts;
+            internal readonly Stopwatch Age = Stopwatch.StartNew();
+        }
 
         internal static string PreparePrimary()
         {
@@ -60,10 +70,61 @@ namespace Orbis
             try
             {
                 string first = File.ReadAllText(heartbeat);
+                DateTime firstWrite = File.GetLastWriteTimeUtc(heartbeat);
                 bool processKnown;
-                return IsHeartbeatProcessLive(first, out processKnown) || !processKnown;
+                bool live = IsHeartbeatProcessLive(first, out processKnown);
+                if (processKnown && !live) return false;
+                if (!HeartbeatExpired(heartbeat, first)) return true;
+                // A clock jump must not let us move files under a writer that is
+                // still publishing; use the existing observation window before expiry.
+                if (waitMilliseconds > 0)
+                {
+                    System.Threading.Thread.Sleep(Math.Min(waitMilliseconds, 1600));
+                    if (File.ReadAllText(heartbeat) != first || File.GetLastWriteTimeUtc(heartbeat) != firstWrite) return true;
+                }
+                return false;
             }
             catch { return true; }
+        }
+
+        static bool HeartbeatExpired(string path, string contents)
+        {
+            DateTime now = DateTime.UtcNow;
+            DateTime written = File.GetLastWriteTimeUtc(path);
+            DateTime newest = written;
+            string[] lines = (contents ?? "").Split('\n');
+            long ticks;
+            if (lines.Length > 1 && long.TryParse(lines[1].Trim(), out ticks) &&
+                ticks >= new DateTime(2020, 1, 1).Ticks && ticks <= DateTime.MaxValue.Ticks)
+            {
+                DateTime reported = new DateTime(ticks, DateTimeKind.Utc);
+                if (reported <= now && (newest > now || reported > newest)) newest = reported;
+            }
+            if (now.Year >= 2020 && newest <= now)
+                return (now - newest).TotalSeconds > LegacyHeartbeatExpirySeconds;
+
+            // With an unset/backwards clock, expire only an unchanged heartbeat:
+            // five minutes observed here, or three separate application starts.
+            string identity = Convert.ToBase64String(Encoding.UTF8.GetBytes(written.Ticks + "\n" + contents));
+            lock (Gate)
+            {
+                HeartbeatObservation observation;
+                if (!HeartbeatObservations.TryGetValue(path, out observation) || observation.Identity != identity)
+                {
+                    string marker = Path.Combine(Path.GetDirectoryName(path), ".migration-heartbeat-observed");
+                    int starts = 0;
+                    if (File.Exists(marker))
+                    {
+                        string[] previous = File.ReadAllLines(marker);
+                        if (previous.Length == 2 && previous[0] == identity)
+                            int.TryParse(previous[1], out starts);
+                    }
+                    observation = new HeartbeatObservation { Identity = identity, Starts = Math.Max(0, Math.Min(3, starts)) + 1 };
+                    AtomicFile.WriteText(marker, identity + "\n" + observation.Starts + "\n");
+                    HeartbeatObservations[path] = observation;
+                }
+                return observation.Starts >= 3 || observation.Age.Elapsed.TotalSeconds > LegacyHeartbeatExpirySeconds;
+            }
         }
 
         static bool IsHeartbeatProcessLive(string contents, out bool processKnown)
@@ -81,8 +142,7 @@ namespace Orbis
                 processKnown = true;
                 break;
             }
-            // Older native heartbeats have only version and timestamp lines. They
-            // carry no process identity, so age alone cannot prove the writer stopped.
+            // Unknown identity remains live only for the bounded age checked above.
             if (!processKnown) return true;
             try
             {
@@ -115,6 +175,21 @@ namespace Orbis
             Pending = true; Notice = "Checking data migration at " + newRoot + "; existing files are retained.";
             try
             {
+                string complete = Path.Combine(newRoot, ".migration-complete");
+                string completionIdentity = Convert.ToBase64String(Encoding.UTF8.GetBytes(oldRoot));
+                if (File.Exists(complete))
+                {
+                    RequirePlain(complete);
+                    string[] completed = File.ReadAllLines(complete);
+                    if (completed.Length >= 2 && completed[0] == completionIdentity)
+                    {
+                        File.Delete(Path.Combine(newRoot, ".migration-active"));
+                        Pending = false;
+                        Notice = completed[1] == "legacy_remaining=1"
+                            ? "SSPI data moved. Conflicting legacy files were retained for review; no files were overwritten." : "";
+                        return newRoot;
+                    }
+                }
                 At("inspect legacy storage", oldRoot);
                 bool exists = Directory.Exists(oldRoot);
                 if (!exists && !File.Exists(Path.Combine(newRoot, ".migration-active")))
@@ -131,12 +206,13 @@ namespace Orbis
                 Directory.CreateDirectory(newRoot); RequirePlain(newRoot);
                 string marker = Path.Combine(newRoot, ".migration-active");
                 At("write migration marker", marker);
-                File.WriteAllText(marker, "SSPI data migration\n");
+                AtomicFile.WriteText(marker, "SSPI data migration\n");
                 if (exists) Merge(oldRoot, newRoot);
                 RewriteTree(newRoot, oldRoot, newRoot);
                 At("retire empty legacy folder", oldRoot);
                 if (Directory.Exists(oldRoot) && Directory.GetFileSystemEntries(oldRoot).Length == 0) Directory.Delete(oldRoot, false);
                 At("finish migration", marker);
+                AtomicFile.WriteText(complete, completionIdentity + "\nlegacy_remaining=" + (Directory.Exists(oldRoot) ? "1" : "0") + "\n");
                 File.Delete(marker);
                 Notice = Directory.Exists(oldRoot) ? "SSPI data moved. Conflicting legacy files were retained for review; no files were overwritten." : "Settings and stored files moved to SSPI.";
                 SspiLog.Write("startup", "data_migration completed legacy_remaining=" + Directory.Exists(oldRoot));

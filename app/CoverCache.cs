@@ -13,6 +13,7 @@ namespace Orbis
     internal sealed class CoverCache
     {
         const int MaxEncodedBytes = 8 * 1024 * 1024;
+        const long MaxDiskCacheBytes = 256L * 1024 * 1024;
         const int MaxTextures = 24;
         const int MaxTextureBytes = 16 * 1024 * 1024;
         const int MaxPendingRequests = 24;
@@ -353,6 +354,7 @@ namespace Orbis
         void Worker()
         {
             CustomCovers.Load();
+            TrimDiskCache(null);
             while (_run)
             {
                 Req request;
@@ -452,8 +454,46 @@ namespace Orbis
                 request.Key.EndsWith("-BACKDROP", StringComparison.Ordinal),
                 stage => AppendLog(request.Key + " " + stage), request.Width > 0 &&
                     !source.StartsWith("local|" + Path.Combine(AppSettings.DataDir, "custom-covers") + Path.DirectorySeparatorChar, StringComparison.Ordinal));
+            if (ownsCacheFile)
+            {
+                // Explicitly record reads: filesystem access times may be disabled.
+                try { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); } catch { }
+                TrimDiskCache(path);
+            }
             return new ReadyImage { Pixels = pixels.Pixels, Width = pixels.Width, Height = pixels.Height,
                 Opaque = pixels.Opaque, Generation = request.Gen };
+        }
+
+        static void TrimDiskCache(string activePath)
+        {
+            try
+            {
+                var files = new List<FileInfo>();
+                long size = 0;
+                foreach (var file in new DirectoryInfo(AppSettings.CoversDir).GetFiles("*.img"))
+                {
+                    if ((file.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    files.Add(file);
+                    size += file.Length;
+                }
+                files.Sort((a, b) => {
+                    int order = a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc);
+                    return order != 0 ? order : StringComparer.Ordinal.Compare(a.Name, b.Name);
+                });
+                foreach (var file in files)
+                {
+                    if (size <= MaxDiskCacheBytes) break;
+                    if (string.Equals(file.FullName, activePath, StringComparison.OrdinalIgnoreCase)) continue;
+                    try
+                    {
+                        long length = file.Length;
+                        file.Delete();
+                        size -= length;
+                    }
+                    catch { }
+                }
+            }
+            catch { /* A cache maintenance failure must not hide usable artwork. */ }
         }
 
         string FindFallback(string key, string source)

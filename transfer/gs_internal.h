@@ -68,9 +68,11 @@ typedef enum {
 typedef struct {
     int handle, fd, active, limit, single, stop, finishing, preparing, lock_fd, resume_requested;
     int checkpointing, checkpoint_dirty, checkpoint_waiters, checkpoint_failed, target_limit, requested_limit, clean_chunks, verification_retries;
-    int preparation_started, preparation_joining, pkg_integrity;
+    int preparation_started, preparation_joining, pkg_integrity, last_retry_after;
     // The package's own digests can audit every payload byte (see gs_store_open).
     int pkg_capable;
+    int (*verify_canceled)(void *);
+    void *verify_argument;
     GsThread preparation_thread;
     GsHttp preparation_http;
     unsigned stream_failed_lanes;
@@ -82,7 +84,7 @@ typedef struct {
     char title[16], content[49], expected[65];
     GsMapHeader header;
     GsChunk *chunks, *checkpoint_chunks;
-    unsigned char *claims, *attempts;
+    unsigned char *claims, *attempts, *total_attempts;
     uint64_t *retry_at, *accepted;
     uint64_t checkpoint_at, next_retry, recovery_at, checkpoint_ms;
     uint64_t failure_window, backoff_until;

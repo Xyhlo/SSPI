@@ -405,11 +405,13 @@ namespace Orbis
                     DateTime started = DateTime.UtcNow;
                     SemaphoreSlim slots = IsStatic(captured) ? LocalSourceSlots : SourceSlots;
                     try {
+                        ThrowIfCanceled(callCancel);
                         while (!slots.Wait(100)) ThrowIfCanceled(callCancel); slot = true;
                         ThrowIfCanceled(callCancel);
                         started = DateTime.UtcNow;
                         var result = new SourceCall<T> { StartedUtc = started };
                         result.Results = run(captured, callCancel);
+                        ThrowIfCanceled(callCancel);
                         result.CompletedUtc = DateTime.UtcNow;
                         return result;
                     }

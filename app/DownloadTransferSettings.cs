@@ -119,6 +119,7 @@ namespace Orbis
 
     internal sealed class DownloadHttpException : IOException
     {
+        const int MaxRetryAfterSeconds = 24 * 60 * 60;
         internal readonly int StatusCode;
         internal readonly int RetryAfterSeconds;
         internal DownloadHttpException(int status, string retryAfter = null, string operation = "downloading")
@@ -130,12 +131,15 @@ namespace Orbis
         internal static int ParseRetryAfter(string value, DateTime now)
         {
             long seconds;
-            if (long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out seconds))
-                return (int)Math.Max(1, Math.Min(int.MaxValue, seconds));
+            if (long.TryParse((value ?? "").Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out seconds))
+                return (int)Math.Max(0, Math.Min(MaxRetryAfterSeconds, seconds));
+            // An absolute server date is unusable until the console clock is set.
+            // Returning zero lets the caller apply its short retry backoff.
+            if (now.Year < 2020) return 0;
             DateTimeOffset date;
             if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out date))
-                return (int)Math.Max(1, Math.Min(int.MaxValue, Math.Ceiling((date.UtcDateTime - now).TotalSeconds)));
+                return (int)Math.Max(0, Math.Min(MaxRetryAfterSeconds, Math.Ceiling((date.UtcDateTime - now).TotalSeconds)));
             return 0;
         }
         internal static DownloadHttpException Find(Exception error)

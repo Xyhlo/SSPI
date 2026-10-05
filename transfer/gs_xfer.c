@@ -63,6 +63,8 @@ typedef struct {
 } Lane;
 #define GS_STALL_READ_MS 8000U
 #define GS_STALL_OPEN_MS 15000U
+#define GS_CHUNK_FAILURE_LIMIT 16U
+#define GS_SINGLE_FAILURE_LIMIT 4U
 enum { GS_IO_OPEN=1, GS_IO_READ, GS_IO_EOF };
 static Lane lanes[GS_XFER_LANES];
 static unsigned allocated_lane_buffers;
@@ -315,7 +317,14 @@ static void owner_sample(const GsJobState *j,char *line,size_t capacity)
 }
 #endif
 static GsJobState *lookup(int handle) {for(int i=0;i<GS_XFER_JOBS;i++)if(jobs[i].handle==handle)return &jobs[i];return NULL;}
-static void fail(GsJobState *j,int code,const char *message) {j->status.state=GS_FAILED;j->status.error_code=code;snprintf(j->status.error,sizeof(j->status.error),"%s (0x%08X)",message,(unsigned)code);__atomic_store_n(&j->stop,3,__ATOMIC_RELEASE);gs_transfer_log(j,"failed");}
+static void fail(GsJobState *j,int code,const char *message)
+{
+    j->status.state=GS_FAILED;j->status.error_code=code;
+    if(code>=400&&code<=599&&j->last_retry_after>0)
+        snprintf(j->status.error,sizeof(j->status.error),"Retry-After: %d; %s (0x%08X)",j->last_retry_after,message,(unsigned)code);
+    else snprintf(j->status.error,sizeof(j->status.error),"%s (0x%08X)",message,(unsigned)code);
+    __atomic_store_n(&j->stop,3,__ATOMIC_RELEASE);gs_transfer_log(j,"failed");
+}
 static uint64_t add_deadline(uint64_t now,uint64_t delay)
 {
     return UINT64_MAX-now<delay?UINT64_MAX:now+delay;
@@ -678,6 +687,7 @@ static void useful_progress(GsJobState *j,uint64_t offset,uint64_t length)
     if(now>=j->recovery_at)govern(j,now);
     j->tls_failure_started=0;j->tls_failures=0;j->tls_failed_lanes=0;
     j->recovery_class=GS_FAILURE_NONE;j->recovery_deadline=0;j->recovery_detail[0]=0;
+    j->status.error_code=0;
 }
 static void note_tls_failure(GsJobState *j,unsigned lane)
 {
@@ -713,6 +723,7 @@ static const char *retry_chunk(GsJobState *j,uint32_t chunk,unsigned lane,int rc
         *delay=(uint64_t)seconds*1000U;
     }
     j->retry_at[chunk]=add_deadline(now,*delay);
+    j->status.error_code=rc;
     j->recovery_class=(rc==429||rc==503)?GS_FAILURE_COOLDOWN:tls?GS_FAILURE_TLS:GS_FAILURE_TRANSPORT;
     j->recovery_deadline=j->retry_at[chunk];
     snprintf(j->recovery_detail,sizeof(j->recovery_detail),"%s; retrying in %llu s",
@@ -754,7 +765,7 @@ static const char *retry_chunk(GsJobState *j,uint32_t chunk,unsigned lane,int rc
 static int refusal_code(int rc)
 {
     if(rc==401||rc==403||rc==410||rc==429||rc==503)return 1;
-    return rc<0&&rc!=-3&&rc!=-10&&rc!=-11&&rc!=-12&&rc!=-13&&rc!=-15&&rc!=-17;
+    return rc<0&&rc!=-3&&rc!=-10&&rc!=-11&&rc!=-12&&rc!=-13&&rc!=-15&&rc!=-17&&rc!=GS_XFER_PROTOCOL_ERROR&&rc!=GS_XFER_RETRY_LIMIT;
 }
 // A new connection to a connection-limited host that fails before any body
 // byte, while another lane of the same job holds an accepted connection, was
@@ -817,7 +828,7 @@ static int recover_stream(Lane *lane,GsJobState *j,int rc,unsigned attempt,uint6
         // lane to another origin while the throttled origin cools down.
         gs_http_close(h);return 0;
     }
-    int retryable=rc<0 && rc!=-3 && rc!=-10 && rc!=-12 && rc!=-13;
+    int retryable=rc<0 && rc!=-3 && rc!=-10 && rc!=-12 && rc!=-13 && rc!=GS_XFER_PROTOCOL_ERROR && rc!=GS_XFER_RETRY_LIMIT;
     retryable|=rc==408||rc==425||rc==429||rc==500||rc==502||rc==503||rc==504;
     if(!retryable || attempt>8 || j->single)return 0;
     uint64_t now=gs_clock();unsigned shift=attempt-1;if(shift>5)shift=5;
@@ -1017,7 +1028,7 @@ interrupted:
     // a send failure, so close it and replay the GET once at once on a fresh
     // one, without backoff or a budget penalty. A second failure takes the
     // normal recovery path.
-    if(!stale_retried && rc<0 && rc!=-1 && rc!=-3 && rc!=-15 && rc!=-16 && h->reused && !h->status && h->stage &&
+    if(!stale_retried && rc<0 && rc!=-1 && rc!=-3 && rc!=-15 && rc!=-16 && rc!=GS_XFER_PROTOCOL_ERROR && h->reused && !h->status && h->stage &&
        (!strcmp(h->stage,"send")||!strcmp(h->stage,"status")||!strcmp(h->stage,"response-headers")) &&
        done<length && !__atomic_load_n(&j->stop,__ATOMIC_ACQUIRE)) {
         stale_retried=1;
@@ -1027,6 +1038,16 @@ interrupted:
         log_line(j->dest,line);
         gs_http_close(h);
         goto reopen;
+    }
+    if(rc!=GS_XFER_PROTOCOL_ERROR && rc!=-3 && rc!=-10 && rc!=-12 && rc!=-13) {
+        // Unlike the backoff counter, this budget survives partial progress and
+        // reclaims by another lane. A few bytes cannot buy infinite retries.
+        uint32_t failed=j->single?0:(uint32_t)((start+(done<length?done:length-1))/GS_XFER_CHUNK);
+        gs_lock(&gate);
+        if(j->total_attempts[failed]<255)j->total_attempts[failed]++;
+        int exhausted=j->total_attempts[failed]>=(j->single?GS_SINGLE_FAILURE_LIMIT:GS_CHUNK_FAILURE_LIMIT);
+        gs_unlock(&gate);
+        if(exhausted)return GS_XFER_RETRY_LIMIT;
     }
     if(done<length && recover_stream(lane,j,rc,++failures,start+done,streamed))goto reopen;
     return rc;
@@ -1045,6 +1066,9 @@ static unsigned stall_watchdog_locked(GsJobState *j,char *line,size_t capacity)
         uint64_t since=lane->io_since;
         if(!since)continue;
         int reading=lane->io_kind!=GS_IO_OPEN;
+        // A whole-file stream cannot resume at the unread offset. Let the
+        // firmware receive timeout handle it instead of restarting after 8 s.
+        if(j->single&&reading)continue;
         // This clock begins only after admission and survives redirect/connection
         // cleanup. Queued time can never consume the active setup allowance.
         if(!reading)since=__atomic_load_n(&lane->http.open_started,__ATOMIC_ACQUIRE);
@@ -1196,15 +1220,20 @@ static void *worker(void *argument)
             }
             j->dirty++;clean_chunk(j);
         } else if(rc && !j->stop) {
+            j->last_retry_after=retry_after;
             // A refusal at the link's connection limit is not this chunk's failure:
             // its span returns to the lanes still streaming without a penalty.
             int refused=lane->refused;lane->refused=0;
+            if(rc==-17&&j->total_attempts[chunk]<255)j->total_attempts[chunk]++;
             j->status.retries++;if(!refused&&j->attempts[chunk]<255)j->attempts[chunk]++;
             int old_limit=j->limit;uint64_t delay=0;const char *scope="fatal";
             if(refused){delay=500;j->retry_at[chunk]=add_deadline(gs_clock(),delay);scope="connection-limit";}
             else if(rc==401||rc==403||rc==410) {
                 char message[160];snprintf(message,sizeof(message),"Provider rejected the signed link with HTTP %d; refresh it and resume",rc);fail(j,rc,message);
             }
+            else if(rc==GS_XFER_PROTOCOL_ERROR)fail(j,rc,"Provider returned an unsupported or invalid HTTP response or redirect; choose another source");
+            else if(rc==GS_XFER_RETRY_LIMIT||(rc==-17&&j->total_attempts[chunk]>=GS_CHUNK_FAILURE_LIMIT))
+                fail(j,status>=400&&status<=599?status:GS_XFER_RETRY_LIMIT,"Download retry limit reached; refresh the link or choose another source; committed chunks retained");
             else if(rc==-12)fail(j,rc,"Positioned disk write failed; committed chunks retained");
             else if(rc==-11)fail(j,rc,"Provider repeatedly ended the response before the validated Content-Length; completed chunks retained");
             else if(rc==-10||rc==-13)fail(j,rc,rc==-13?"Package identity validation failed; retained data was not replaced":"Provider returned an invalid range, length, encoding or EOF response");
@@ -1301,7 +1330,7 @@ init_failed:
 }
 static int preparation_transient(int rc)
 {
-    return (rc<0&&rc!=-3&&rc!=-10&&rc!=-12&&rc!=-13)||rc==408||rc==425||rc==429||rc==500||rc==502||rc==503||rc==504;
+    return (rc<0&&rc!=-3&&rc!=-10&&rc!=-12&&rc!=-13&&rc!=GS_XFER_PROTOCOL_ERROR&&rc!=GS_XFER_RETRY_LIMIT)||rc==408||rc==425||rc==429||rc==500||rc==502||rc==503||rc==504;
 }
 static void *prepare_job(void *argument)
 {
@@ -1360,6 +1389,7 @@ restart:
         const char *native_stage=h->stage?h->stage:"unknown";
         gs_http_abort(h);gs_http_close(h);
         gs_lock(&gate);j->active=0;
+        j->last_retry_after=retry_after;
         if(probe_origin[0])snprintf(j->origin,sizeof(j->origin),"%s",probe_origin);
         if((unsigned)rc==0x8095F00CU)note_tls_failure(j,round%GS_XFER_LANES);
         if(status==429||status==503) {
@@ -1377,12 +1407,18 @@ restart:
             strstr(probe_origin,"://")?strstr(probe_origin,"://")+3:"unknown");
         log_line(j->dest,diagnostic);
         if(!preparation_transient(rc))goto prepared;
+        if(round>=GS_CHUNK_FAILURE_LIMIT-1) {
+            snprintf(preparation_error,sizeof(preparation_error),"Source probe retry limit reached; refresh the link or choose another source");
+            if(rc<0)rc=GS_XFER_RETRY_LIMIT;
+            goto prepared;
+        }
         gs_lock(&gate);uint64_t now=gs_clock();
         if((unsigned)rc==0x8095F00CU&&tls_episode_terminal(j,now)){gs_unlock(&gate);goto prepared;}
         if(round<UINT32_MAX)round++;
         unsigned seconds=retry_after>0?(unsigned)retry_after:0;if(seconds>GS_RETRY_AFTER_MAX_SECONDS)seconds=GS_RETRY_AFTER_MAX_SECONDS;
         uint64_t delay=seconds?(uint64_t)seconds*1000U:retry_delay(round,status==500||status==502||status==504?250U:1000U);
         j->recovery_class=status==429||status==503?GS_FAILURE_COOLDOWN:(unsigned)rc==0x8095F00CU?GS_FAILURE_TLS:GS_FAILURE_TRANSPORT;
+        j->status.error_code=rc;
         j->recovery_deadline=add_deadline(now,delay);
         snprintf(j->recovery_detail,sizeof(j->recovery_detail),"%s during source probe; retrying in %llu s",
             (unsigned)rc==0x8095F00CU?"TLS trust failure":status==429||status==503?"Provider cooldown":"Transport interruption",
@@ -1424,6 +1460,7 @@ prepared:
     else if(stopping) { /* control() already published PAUSED or CANCELED */ }
     else if(rc) {
         const char *reason=j->storage_error[0]?j->storage_error:j->verification_error[0]?j->verification_error:preparation_error[0]?preparation_error:"Staged package verification failed";
+        if(rc==GS_XFER_PROTOCOL_ERROR)reason="Provider returned an unsupported or invalid HTTP response or redirect; choose another source";
         if((unsigned)rc==0x8095F00CU)reason="Provider TLS certificate not trusted on fresh probe sessions for two minutes with no useful progress";
         fail(j,rc,reason);
         char detail[512];snprintf(detail,sizeof(detail),"ms=%llu event=preparation-failed handle=%d storage_stage=%s storage_errno=%d code=%d reason=%s\n",(unsigned long long)gs_clock(),j->handle,j->storage_stage[0]?j->storage_stage:"none",j->storage_errno,rc,reason);log_line(j->dest,detail);
@@ -1442,6 +1479,7 @@ prepared:
         snprintf(j->fallback_reason,sizeof(j->fallback_reason),"%s",!j->single?"none":probe_range_unsupported?"range-unsupported":probe_etag_present?"etag-not-usable":"no-safe-validator");
         j->recovery_at=add_deadline(gs_clock(),10000);j->recovery_class=GS_FAILURE_NONE;j->recovery_detail[0]=0;
         j->status.state=complete?GS_COMPLETE:GS_DOWNLOADING;
+        j->status.error_code=0;
         gs_transfer_admission_log(j,probe_etag_present,probe_etag_usable,probe_date_present,
             probe_date_valid,probe_modified_present,probe_modified_valid,probe_date_modified_gap,header,got);
         gs_transfer_log(j,j->single?"single-representation-stream":j->etag[0]?"range-ready-etag":j->last_modified[0]?"range-ready-last-modified":!strcmp(j->validator_kind,"immutable-link")?"range-ready-immutable-link":j->pkg_integrity?"range-ready-pkg-sha":"range-ready-publisher-sha");

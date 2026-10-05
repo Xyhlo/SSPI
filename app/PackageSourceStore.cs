@@ -245,6 +245,7 @@ namespace Orbis
                     if (retired != null) TryDeleteDirectory(retired);
                     // Like Remove: the registry no longer lists a superseded source before its files go.
                     foreach (string old in superseded) TryDeleteDirectory(OwnedChild(_installedRoot, old));
+                    CleanupOldVersions(sourceRoot);
                     return Clone(entry);
                 }
             }
@@ -325,24 +326,77 @@ namespace Orbis
 
         List<PackageSourceRegistryEntry> LoadRegistry()
         {
-            try { if (File.Exists(_registryPath)) return ParseRegistry(File.ReadAllText(_registryPath, Encoding.UTF8)); } catch { }
+            List<PackageSourceRegistryEntry> loaded = null;
+            bool quarantined = false;
+            try
+            {
+                if (File.Exists(_registryPath))
+                    loaded = ParseRegistry(File.ReadAllText(_registryPath, Encoding.UTF8), true, out quarantined);
+            }
+            catch { }
+            if (loaded != null)
+            {
+                if (quarantined)
+                {
+                    try
+                    {
+                        File.Copy(_registryPath, _registryPath + ".corrupt", true);
+                        SaveRegistry(loaded);
+                    }
+                    catch (Exception ex) { SspiLog.Write("source-refresh", "event=registry-quarantine-save-failed error=" + ex.GetType().Name); }
+                }
+                return loaded;
+            }
             var recovered = new Dictionary<string, PackageSourceRegistryEntry>(StringComparer.Ordinal);
-            try { foreach (var entry in ParseRegistry(File.ReadAllText(_registryPath+".bak",Encoding.UTF8))) recovered[entry.SourceId]=entry; } catch { }
+            try { foreach (var entry in ParseRegistry(File.ReadAllText(_registryPath+".bak",Encoding.UTF8), true, out quarantined)) recovered[entry.SourceId]=entry; } catch { }
+            var communityHashes = LoadCommunityHashes();
             string[] sourceDirectories = Directory.GetDirectories(_installedRoot);
             Array.Sort(sourceDirectories, StringComparer.Ordinal);
-            foreach (string source in sourceDirectories) {
+            foreach (string source in sourceDirectories) try {
                 if ((File.GetAttributes(source)&FileAttributes.ReparsePoint)!=0) continue;
                 string[] versions = Directory.GetDirectories(source);
                 Array.Sort(versions, CompareInstalledVersionDescending);
                 foreach (string version in versions) try {
                     var package=PackageSourcePackage.OpenInstalled(version);
                     if (Path.GetFileName(source)!=package.Descriptor.SourceId || Path.GetFileName(version)!=package.Descriptor.Version) continue;
-                    if (!recovered.ContainsKey(package.Descriptor.SourceId)) recovered.Add(package.Descriptor.SourceId,FromPackage(package,version,false));
+                    if (!recovered.ContainsKey(package.Descriptor.SourceId))
+                    {
+                        var entry = FromPackage(package, version, false);
+                        string hash;
+                        // OpenInstalled has only a manifest hash; preserve the recorded archive
+                        // identity so the community directory can still follow this source.
+                        if (communityHashes.TryGetValue(entry.SourceId, out hash)) entry.PackageSha256 = hash;
+                        recovered.Add(entry.SourceId, entry);
+                    }
                 } catch { /* One broken source must not disable every other catalog. */ }
-            }
+            } catch { /* An unreadable source directory must not abort recovery. */ }
             var result=new List<PackageSourceRegistryEntry>(recovered.Values);
             if (File.Exists(_registryPath)) File.Copy(_registryPath,_registryPath+".corrupt",true);
             SaveRegistry(result);return result;
+        }
+
+        Dictionary<string, string> LoadCommunityHashes()
+        {
+            var hashes = new Dictionary<string, string>(StringComparer.Ordinal);
+            try
+            {
+                string path = Path.Combine(_root, "community.json");
+                if (!File.Exists(path) || new FileInfo(path).Length > 512 * 1024) return hashes;
+                var root = PackageSourceJson.Parse(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                object value;
+                var sources = root != null && root.TryGetValue("sources", out value) ? value as Dictionary<string, object> : null;
+                if (sources != null) foreach (var pair in sources)
+                {
+                    var row = pair.Value as Dictionary<string, object>;
+                    string hash = row != null && row.TryGetValue("sha256", out value) ? value as string : null;
+                    if (hash == null || hash.Length != 64) continue;
+                    bool valid = true;
+                    foreach (char c in hash) if (!Uri.IsHexDigit(c)) { valid = false; break; }
+                    if (valid) hashes[pair.Key] = hash.ToLowerInvariant();
+                }
+            }
+            catch { }
+            return hashes;
         }
 
         static int CompareInstalledVersionDescending(string leftPath, string rightPath)
@@ -430,6 +484,13 @@ namespace Orbis
 
         List<PackageSourceRegistryEntry> ParseRegistry(string json)
         {
+            bool quarantined;
+            return ParseRegistry(json, false, out quarantined);
+        }
+
+        List<PackageSourceRegistryEntry> ParseRegistry(string json, bool recoverEntries, out bool quarantined)
+        {
+            quarantined = false;
             var root = PackageSourceJson.Parse(json) as Dictionary<string, object>;
             object listValue;
             var list = root != null && root.TryGetValue("sources", out listValue) ? listValue as List<object> : null;
@@ -438,41 +499,51 @@ namespace Orbis
             var ids = new HashSet<string>(StringComparer.Ordinal);
             foreach (object value in list)
             {
-                var obj = value as Dictionary<string, object>;
-                if (obj == null) throw new InvalidDataException("Invalid registry source entry");
-                var item = new PackageSourceRegistryEntry
+                try
                 {
-                    SourceId = Text(obj, "id"),
-                    Version = Text(obj, "version"),
-                    Name = Text(obj, "name"),
-                    Enabled = Bool(obj, "enabled", true),
-                    Path = Text(obj, "path"),
-                    EngineType = Text(obj, "engine_type"),
-                    EntryFile = Text(obj, "entry_file"),
-                    Capabilities = (PackageSourceCapability)Integer(obj, "capabilities", 0),
-                    Trust = Text(obj, "trust"),
-                    PackageSha256 = Text(obj, "package_sha256")
-                };
-                if (!ids.Add(item.SourceId)) throw new InvalidDataException("Duplicate source id in registry");
-                string expected = OwnedChild(OwnedChild(_installedRoot, item.SourceId), item.Version);
-                if (!string.Equals(Path.GetFullPath(item.Path), expected, StringComparison.OrdinalIgnoreCase) ||
-                    !Directory.Exists(expected)) throw new InvalidDataException("Registry source path is invalid");
-                object originsValue;
-                var origins = obj.TryGetValue("origins", out originsValue) ? originsValue as List<object> : null;
-                if (origins != null) foreach (object origin in origins)
-                {
-                    string text = origin as string;
-                    if (text == null) throw new InvalidDataException("Invalid registry origin");
-                    item.Origins.Add(text);
+                    var obj = value as Dictionary<string, object>;
+                    if (obj == null) throw new InvalidDataException("Invalid registry source entry");
+                    var item = new PackageSourceRegistryEntry
+                    {
+                        SourceId = Text(obj, "id"),
+                        Version = Text(obj, "version"),
+                        Name = Text(obj, "name"),
+                        Enabled = Bool(obj, "enabled", true),
+                        Path = Text(obj, "path"),
+                        EngineType = Text(obj, "engine_type"),
+                        EntryFile = Text(obj, "entry_file"),
+                        Capabilities = (PackageSourceCapability)Integer(obj, "capabilities", 0),
+                        Trust = Text(obj, "trust"),
+                        PackageSha256 = Text(obj, "package_sha256")
+                    };
+                    if (ids.Contains(item.SourceId)) throw new InvalidDataException("Duplicate source id in registry");
+                    string expected = OwnedChild(OwnedChild(_installedRoot, item.SourceId), item.Version);
+                    if (!string.Equals(Path.GetFullPath(item.Path), expected, StringComparison.OrdinalIgnoreCase) ||
+                        !Directory.Exists(expected)) throw new InvalidDataException("Registry source path is invalid");
+                    object originsValue;
+                    var origins = obj.TryGetValue("origins", out originsValue) ? originsValue as List<object> : null;
+                    if (origins != null) foreach (object origin in origins)
+                    {
+                        string text = origin as string;
+                        if (text == null) throw new InvalidDataException("Invalid registry origin");
+                        item.Origins.Add(text);
+                    }
+                    item.Descriptor.SourceId = item.SourceId;
+                    item.Descriptor.Version = item.Version;
+                    item.Descriptor.DisplayName = item.Name;
+                    item.Descriptor.Engine.Type = item.EngineType;
+                    item.Descriptor.Engine.EntryFile = item.EntryFile;
+                    item.Descriptor.Capabilities = item.Capabilities;
+                    foreach (string origin in item.Origins) item.Descriptor.Permissions.NetworkOrigins.Add(origin);
+                    ids.Add(item.SourceId);
+                    result.Add(item);
                 }
-                item.Descriptor.SourceId = item.SourceId;
-                item.Descriptor.Version = item.Version;
-                item.Descriptor.DisplayName = item.Name;
-                item.Descriptor.Engine.Type = item.EngineType;
-                item.Descriptor.Engine.EntryFile = item.EntryFile;
-                item.Descriptor.Capabilities = item.Capabilities;
-                foreach (string origin in item.Origins) item.Descriptor.Permissions.NetworkOrigins.Add(origin);
-                result.Add(item);
+                catch (Exception ex)
+                {
+                    if (!recoverEntries) throw;
+                    quarantined = true;
+                    SspiLog.Write("source-refresh", "event=registry-entry-quarantined error=" + ex.GetType().Name);
+                }
             }
             return result;
         }
@@ -579,6 +650,25 @@ namespace Orbis
                     try { File.Delete(file); } catch { }
             }
             catch { }
+        }
+
+        void CleanupOldVersions(string sourceRoot)
+        {
+            try
+            {
+                if ((File.GetAttributes(sourceRoot) & FileAttributes.ReparsePoint) != 0) return;
+                foreach (string directory in Directory.GetDirectories(sourceRoot))
+                {
+                    string path = OwnedChild(sourceRoot, Path.GetFileName(directory));
+                    bool registered = false;
+                    foreach (var entry in _entries)
+                        if (string.Equals(Path.GetFullPath(entry.Path), path, StringComparison.OrdinalIgnoreCase))
+                        { registered = true; break; }
+                    if (registered || (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) continue;
+                    TryDeleteDirectory(path);
+                }
+            }
+            catch { /* Cleanup cannot roll back a successfully activated source. */ }
         }
 
         static void TryDeleteDirectory(string path)

@@ -147,7 +147,7 @@ namespace Orbis
             update = false; info = "";
             try {
                 string path = Path.Combine(CacheDir(), key + ".txt");
-                if (!File.Exists(path) || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromHours(6)) return false;
+                if (!File.Exists(path) || !IsFresh(File.GetLastWriteTimeUtc(path))) return false;
                 if (new FileInfo(path).Length > 16384) return false;
                 string[] text = File.ReadAllText(path).Split('\n');
                 if (text.Length != 2 || (text[0] != "0" && text[0] != "1")) return false;
@@ -176,7 +176,7 @@ namespace Orbis
             {
                 string path = Path.Combine(CacheDir(), name + ".txt");
                 if (!File.Exists(path)) return false;
-                if (DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromHours(MaxAgeHours))
+                if (!IsFresh(File.GetLastWriteTimeUtc(path)))
                 {
                     try { File.Delete(path); } catch { }
                     return false;
@@ -202,6 +202,14 @@ namespace Orbis
                 }
             }
             catch { }
+        }
+
+        static bool IsFresh(DateTime modified)
+        {
+            DateTime now = DateTime.UtcNow;
+            TimeSpan age = now - modified;
+            return now.Year >= 2020 && modified.Year >= 2020 && age >= TimeSpan.Zero &&
+                age <= TimeSpan.FromHours(MaxAgeHours);
         }
 
         static string CacheDir()

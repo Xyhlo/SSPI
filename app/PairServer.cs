@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -131,6 +132,10 @@ namespace Orbis
         }
         TcpListener _listener;
         Thread _thread;
+        const int MaxConcurrentClients = 4;
+        const int RequestTimeoutMilliseconds = 10000;
+        readonly object _clientsLock = new object();
+        readonly HashSet<TcpClient> _clients = new HashSet<TcpClient>();
         int _sessionMinutes = 5;
         volatile bool _stop;
         readonly object _lock = new object();
@@ -184,7 +189,8 @@ namespace Orbis
                 return;
             }
             Running = true;
-            _thread = new Thread(ListenLoop) { IsBackground = true };
+            TcpListener listener = _listener;
+            _thread = new Thread(() => ListenLoop(listener)) { IsBackground = true };
             _thread.Start();
         }
 
@@ -206,10 +212,15 @@ namespace Orbis
 
         public void Stop()
         {
-            _stop = true;
-            Running = false;
-            try { if (_listener != null) _listener.Stop(); } catch { }
-            _listener = null;
+            lock (_clientsLock)
+            {
+                _stop = true;
+                Running = false;
+                try { if (_listener != null) _listener.Stop(); } catch { }
+                _listener = null;
+                foreach (TcpClient client in _clients)
+                    try { client.Close(); } catch { }
+            }
             Status = "Stopped";
         }
 
@@ -223,14 +234,14 @@ namespace Orbis
             get { return Math.Max(0, (int)Math.Ceiling((ExpiresUtc - DateTime.UtcNow).TotalSeconds)); }
         }
 
-        void ListenLoop()
+        void ListenLoop(TcpListener listener)
         {
             try
             {
                 Status = "Pair server on " + PairUrl;
-                while (!_stop && !Expired)
+                while (!_stop && ReferenceEquals(_listener, listener) && !Expired)
                 {
-                    if (!_listener.Pending())
+                    if (!listener.Pending())
                     {
                         Thread.Sleep(50);
                         continue;
@@ -238,14 +249,27 @@ namespace Orbis
                     TcpClient client = null;
                     try
                     {
-                        client = _listener.AcceptTcpClient();
+                        client = listener.AcceptTcpClient();
                         client.ReceiveTimeout = 5000;
                         client.SendTimeout = 15000;
-                        HandleClient(client);
+                        lock (_clientsLock)
+                        {
+                            if (_stop || !ReferenceEquals(_listener, listener) || _clients.Count >= MaxConcurrentClients)
+                                continue;
+                            _clients.Add(client);
+                            TcpClient accepted = client;
+                            try
+                            {
+                                var worker = new Thread(() => ServeClient(accepted, listener)) { IsBackground = true };
+                                worker.Start();
+                                client = null; // The worker now owns the connection.
+                            }
+                            catch { _clients.Remove(accepted); throw; }
+                        }
                     }
                     catch (Exception ex)
                     {
-                        Status = "Client err: " + ex.GetType().Name;
+                        if (!_stop && ReferenceEquals(_listener, listener)) Status = "Client err: " + ex.GetType().Name;
                     }
                     finally
                     {
@@ -255,13 +279,38 @@ namespace Orbis
             }
             catch (Exception ex)
             {
-                Status = "Listen fail: " + ex.Message;
-                Running = false;
+                if (!_stop && ReferenceEquals(_listener, listener)) Status = "Listen fail: " + ex.Message;
             }
             finally
             {
-                try { if (_listener != null) _listener.Stop(); } catch { }
-                Running = false;
+                try { listener.Stop(); } catch { }
+                lock (_clientsLock)
+                {
+                    if (ReferenceEquals(_listener, listener))
+                    {
+                        _listener = null;
+                        Running = false;
+                        foreach (TcpClient client in _clients)
+                            try { client.Close(); } catch { }
+                    }
+                }
+            }
+        }
+
+        void ServeClient(TcpClient client, TcpListener listener)
+        {
+            try
+            {
+                if (!_stop && ReferenceEquals(_listener, listener)) HandleClient(client);
+            }
+            catch (Exception ex)
+            {
+                if (!_stop && ReferenceEquals(_listener, listener)) Status = "Client err: " + ex.GetType().Name;
+            }
+            finally
+            {
+                try { client.Close(); } catch { }
+                lock (_clientsLock) _clients.Remove(client);
             }
         }
 
@@ -278,11 +327,12 @@ namespace Orbis
 
         void HandleClient(TcpClient client)
         {
+            var requestTime = Stopwatch.StartNew();
             using (var stream = client.GetStream())
             {
                 string headers;
                 byte[] extra;
-                if (!ReadHeaders(stream, out headers, out extra)) return;
+                if (!ReadHeaders(stream, requestTime, out headers, out extra)) return;
                 string first = headers.Split('\n')[0];
                 string method = "GET";
                 string path = "/";
@@ -302,9 +352,10 @@ namespace Orbis
                 if (contentLength < 0 || ParseHeader(headers, "Transfer-Encoding") != null)
                 { WriteResponse(stream, 400, "text/plain", "Invalid request length"); return; }
                 string contentType = ParseHeader(headers, "Content-Type") ?? "";
-                byte[] bodyBytes = ReadBody(stream, extra, contentLength);
+                byte[] bodyBytes = ReadBody(stream, extra, contentLength, requestTime);
                 if (bodyBytes == null)
                 { WriteResponse(stream, 400, "text/plain", "Incomplete request; nothing saved"); return; }
+                SetRequestReadTimeout(stream, requestTime);
                 string body = wallpaper || cover ? "" : Encoding.UTF8.GetString(bodyBytes);
 
                 string pairPrefix = "/pair/" + OneTimeToken;
@@ -345,7 +396,8 @@ namespace Orbis
                 if (wallpaper)
                 {
                     if (contentType != "application/octet-stream") { WriteResponse(stream, 400, "text/plain", "Use the Appearance page to upload a background."); return; }
-                    string error = PixelBackground.Save(Settings, bodyBytes);
+                    string error;
+                    lock (_lock) error = PixelBackground.Save(Settings, bodyBytes);
                     if (error == null) Interlocked.Increment(ref Revision);
                     PublishPhoneNotice(error ?? "Background saved from phone", error != null);
                     WriteResponse(stream, error == null ? 200 : 400, error == null ? "application/json" : "text/plain", error ?? "{\"saved\":true}");
@@ -363,7 +415,11 @@ namespace Orbis
                     return;
                 }
                 if (Settings != null && method == "GET" && path == pairPrefix + "/config")
-                { WriteResponse(stream, 200, "application/json", ConfigJson()); return; }
+                {
+                    string config;
+                    lock (_lock) config = ConfigJson();
+                    WriteResponse(stream, 200, "application/json", config); return;
+                }
                 if (method == "POST" && path == pairPrefix + "/downloads")
                 {
                     try { WriteResponse(stream, 200, "application/json", QueueDownloads(ParseForm(body, "links"), ParseForm(body, "multipart") == "1")); }
@@ -388,7 +444,14 @@ namespace Orbis
             }
         }
 
-        static bool ReadHeaders(NetworkStream stream, out string headers, out byte[] extra)
+        static void SetRequestReadTimeout(NetworkStream stream, Stopwatch requestTime)
+        {
+            long remaining = RequestTimeoutMilliseconds - requestTime.ElapsedMilliseconds;
+            if (remaining <= 0) throw new IOException("Pairing request timed out");
+            stream.ReadTimeout = (int)Math.Min(5000, remaining);
+        }
+
+        static bool ReadHeaders(NetworkStream stream, Stopwatch requestTime, out string headers, out byte[] extra)
         {
             headers = "";
             extra = new byte[0];
@@ -397,6 +460,7 @@ namespace Orbis
             var one = new byte[1];
             while (ms.Length < 8192)
             {
+                SetRequestReadTimeout(stream, requestTime);
                 int n = stream.Read(one, 0, 1);
                 if (n <= 0) return false;
                 ms.WriteByte(one[0]);
@@ -435,7 +499,7 @@ namespace Orbis
             return null;
         }
 
-        static byte[] ReadBody(NetworkStream stream, byte[] extra, int contentLength)
+        static byte[] ReadBody(NetworkStream stream, byte[] extra, int contentLength, Stopwatch requestTime)
         {
             if (contentLength <= 0) return extra ?? new byte[0];
             byte[] body = new byte[contentLength];
@@ -448,6 +512,7 @@ namespace Orbis
             }
             while (got < contentLength)
             {
+                SetRequestReadTimeout(stream, requestTime);
                 int n = stream.Read(body, got, contentLength - got);
                 if (n <= 0) break;
                 got += n;

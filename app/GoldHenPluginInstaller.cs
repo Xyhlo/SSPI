@@ -25,6 +25,11 @@ namespace Orbis
             (BuildTag == null ? "" : "-" + BuildTag) + ".prx";
         const string ProbeTracePath = "/data/SSPI/resident/shell-load-probe.txt";
         static int _diagnosticProbeAttempted;
+        static readonly object UpdateGate = new object();
+        const string UpdateJournal = "/data/SSPI/resident/module-update.txt";
+        const int MaxWorkerStartAttempts = 3;
+        static bool _restartAttemptRecorded;
+        static bool _workerHealthSettled; // Guarded by UpdateGate.
 
         static string ResolveBuildTag()
         {
@@ -52,6 +57,11 @@ namespace Orbis
 
         internal static bool TryEnsureInstalled(bool requestActivation, out string status, out bool repaired)
         {
+            lock (UpdateGate) return TryEnsureInstalledLocked(requestActivation, out status, out repaired);
+        }
+
+        static bool TryEnsureInstalledLocked(bool requestActivation, out string status, out bool repaired)
+        {
             status = null;
             repaired = false;
             string operation = "validate application data directory";
@@ -60,6 +70,19 @@ namespace Orbis
             {
                 if (!AppSettings.DataDirWritable)
                     throw new IOException(AppSettings.DataDirError ?? "SSPI data directory is not writable: " + AppSettings.DataDir);
+                ModuleUpdate update = ReadModuleUpdate();
+                if (update != null && update.State == "pending")
+                {
+                    if (update.Build == BuildIdentity.SourceHash && ResidentDownloadService.HasDownloader)
+                    { update.State = "healthy"; SaveModuleUpdate(update); }
+                    else if (update.Build != BuildIdentity.SourceHash || update.Attempts >= MaxWorkerStartAttempts)
+                        RestoreModuleUpdate(update);
+                }
+                if (update != null && update.Build == BuildIdentity.SourceHash && update.State == "rolled-back")
+                {
+                    status = "shell-rollback-restart-required";
+                    return true;
+                }
                 SspiLog.Write("resident", "plugin staging_begin activation_requested=" + requestActivation + " build=" + BuildIdentity.Label);
                 string source = ResidentAppRoot() + "/resident/plugin/gs_resident_plugin.prx";
                 string shellSource = ResidentAppRoot() + "/resident/plugin/gs_resident_shell.prx";
@@ -92,6 +115,7 @@ namespace Orbis
                         StringComparison.Ordinal);
                 if (!current)
                 {
+                    BeginModuleUpdate(new[] { ShellPath, "/user" + ShellPath, PluginPath, versionPath });
                     operation = "stage resident worker"; operationPath = ShellPath;
                     StagePrx(shellSource, ShellPath);
                     operationPath = PluginPath;
@@ -100,7 +124,8 @@ namespace Orbis
                     WriteAtomic(versionPath, stagedIdentity + "\n");
                     repaired = true;
                 }
-                RemoveStaleResidentModules();
+                update = ReadModuleUpdate();
+                if (update != null && update.State == "healthy") RemoveStaleResidentModules();
 
                 string iniPath = GoldHenRoot + "/plugins.ini";
                 operation = "update GoldHEN plugin configuration"; operationPath = iniPath;
@@ -111,6 +136,8 @@ namespace Orbis
                 string merged = MergePluginsIni(original);
                 if (!string.Equals(original, merged, StringComparison.Ordinal))
                 {
+                    string backupPath = iniPath + ".sspi.bak";
+                    if (!File.Exists(backupPath)) WriteAtomicBytes(backupPath, originalBytes);
                     byte[] mergedBytes = new byte[merged.Length];
                     for (int i = 0; i < merged.Length; i++) mergedBytes[i] = (byte)merged[i];
                     WriteAtomicBytes(iniPath, mergedBytes);
@@ -118,6 +145,20 @@ namespace Orbis
                 }
                 if (ResidentDownloadService.RunningWorkerRequiresRestart)
                 {
+                    // An older worker may legitimately stay loaded for an active job.
+                    // Count its epoch once, rather than every app launch or status poll.
+                    if (requestActivation && !_restartAttemptRecorded)
+                    {
+                        string marker = UpdateJournal + ".restart";
+                        string identity = BuildIdentity.SourceHash + "\n" + ResidentDownloadService.ObservedWorkerIdentity;
+                        if (!File.Exists(marker) || File.ReadAllText(marker) != identity)
+                        { AtomicFile.WriteText(marker, identity); RecordWorkerStartAttempt(); }
+                        _restartAttemptRecorded = true;
+                        ObserveWorkerHealth(false);
+                        update = ReadModuleUpdate();
+                        if (update != null && update.State == "rolled-back")
+                        { status = "shell-rollback-restart-required"; return true; }
+                    }
                     status = "shell-restart-required";
                     return true;
                 }
@@ -134,6 +175,7 @@ namespace Orbis
                 operation = "activate resident worker"; operationPath = ShellPath;
                 TryStageSharedAlias(ShellPath, "/user" + ShellPath, "/user", StagePrx, MakeSharedDirectoryWritable);
                 bool freshTrace = PrepareLoaderTrace(LoaderTracePath);
+                RecordWorkerStartAttempt();
                 SspiLog.Write("resident", "loader begin worker=" + ShellPath);
                 int loadResult = gs_resident_load_shell_worker(ShellPath);
                 status = FormatLoaderResult(loadResult, freshTrace ? ReadLoaderTrace(LoaderTracePath) : null);
@@ -148,6 +190,117 @@ namespace Orbis
                 SspiLog.Write("resident", "operation=" + operation + " path=" + operationPath +
                     " exception=" + ex.GetType().FullName + " hresult=0x" + ex.HResult.ToString("X8") + " " + ex);
                 return true;
+            }
+        }
+
+        sealed class ModuleUpdate
+        {
+            internal string Build, State;
+            internal int Attempts;
+            internal readonly List<string> Paths = new List<string>();
+            internal readonly List<bool> Existed = new List<bool>();
+        }
+
+        static ModuleUpdate ReadModuleUpdate()
+        {
+            if (!File.Exists(UpdateJournal)) return null;
+            string[] lines = File.ReadAllLines(UpdateJournal);
+            int attempts;
+            if (lines.Length < 3 || !int.TryParse(lines[2], out attempts) || attempts < 0 ||
+                (lines[1] != "pending" && lines[1] != "healthy" && lines[1] != "rolled-back"))
+                throw new IOException("Resident rollback journal is invalid; previous files retained");
+            var update = new ModuleUpdate { Build = lines[0], State = lines[1], Attempts = attempts };
+            for (int i = 3; i < lines.Length; i++)
+            {
+                if (lines[i].Length < 3 || lines[i][1] != ' ' || (lines[i][0] != '0' && lines[i][0] != '1'))
+                    throw new IOException("Resident rollback entry is invalid");
+                update.Paths.Add(Encoding.UTF8.GetString(Convert.FromBase64String(lines[i].Substring(2))));
+                update.Existed.Add(lines[i][0] == '1');
+            }
+            return update;
+        }
+
+        static void SaveModuleUpdate(ModuleUpdate update)
+        {
+            var body = new StringBuilder().Append(update.Build).Append('\n').Append(update.State).Append('\n')
+                .Append(update.Attempts.ToString(CultureInfo.InvariantCulture)).Append('\n');
+            for (int i = 0; i < update.Paths.Count; i++)
+                body.Append(update.Existed[i] ? "1 " : "0 ")
+                    .Append(Convert.ToBase64String(Encoding.UTF8.GetBytes(update.Paths[i]))).Append('\n');
+            AtomicFile.WriteText(UpdateJournal, body.ToString());
+            lock (UpdateGate) _workerHealthSettled = update.State != "pending";
+        }
+
+        static void BeginModuleUpdate(string[] paths)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(UpdateJournal));
+            ModuleUpdate update = ReadModuleUpdate();
+            if (update != null && update.State == "pending" && update.Build != BuildIdentity.SourceHash)
+                RestoreModuleUpdate(update);
+            if (update != null && update.State == "rolled-back" && update.Build == BuildIdentity.SourceHash)
+                throw new IOException("Resident build was rolled back; previous files retained");
+            if (update == null || update.State != "pending")
+                update = new ModuleUpdate { Build = BuildIdentity.SourceHash, State = "pending" };
+            foreach (string path in paths)
+            {
+                if (update.Paths.Contains(path)) continue;
+                bool exists = File.Exists(path);
+                if (exists) StageFile(path, path + ".sspi-previous", false);
+                update.Paths.Add(path); update.Existed.Add(exists);
+            }
+            // Backups and this journal are durable before any live file changes.
+            SaveModuleUpdate(update);
+        }
+
+        static void RecordWorkerStartAttempt()
+        {
+            ModuleUpdate update = ReadModuleUpdate();
+            if (update == null || update.State != "pending" || update.Build != BuildIdentity.SourceHash) return;
+            update.Attempts++;
+            SaveModuleUpdate(update);
+        }
+
+        internal static void ObserveWorkerHealth(bool healthy)
+        {
+            lock (UpdateGate)
+            {
+                if (_workerHealthSettled) return;
+                try
+                {
+                    ModuleUpdate update = ReadModuleUpdate();
+                    if (update == null || update.State != "pending" || update.Build != BuildIdentity.SourceHash)
+                    { _workerHealthSettled = true; return; }
+                    if (healthy)
+                    { update.State = "healthy"; SaveModuleUpdate(update); }
+                    else if (update.Attempts >= MaxWorkerStartAttempts) RestoreModuleUpdate(update);
+                }
+                catch (Exception ex) { SspiLog.Write("resident", "module rollback check failed: " + ex.Message); }
+            }
+        }
+
+        static void RestoreModuleUpdate(ModuleUpdate update)
+        {
+            for (int i = 0; i < update.Paths.Count; i++)
+            {
+                string path = update.Paths[i];
+                if (update.Existed[i])
+                    StageFile(path + ".sspi-previous", path,
+                        path.EndsWith(".prx", StringComparison.Ordinal) || path.EndsWith(".bin", StringComparison.Ordinal));
+                else if (File.Exists(path)) File.Delete(path);
+            }
+            update.State = "rolled-back";
+            SaveModuleUpdate(update);
+            SspiLog.Write("resident", "module rollback restored prior file state build=" + update.Build +
+                " attempts=" + update.Attempts + "; restart PS4 and enable GoldHEN");
+        }
+
+        internal static void StageResidentFile(string source, string destination)
+        {
+            lock (UpdateGate)
+            {
+                if (FilesMatch(source, destination)) return;
+                BeginModuleUpdate(new[] { destination });
+                StageFile(source, destination, true);
             }
         }
 
@@ -398,13 +551,18 @@ namespace Orbis
 
         static void StageFile(string source, string destination, bool executable)
         {
-            string staged = destination + ".new";
-            File.Copy(source, staged, true);
-            if (!FilesMatch(source, staged)) throw new IOException("Resident staged file differs from the bundled file: " + Path.GetFileName(destination));
-            int rc = executable ? gs_resident_chmod(staged, 493) : 0;
-            if (rc != 0) throw new IOException("Resident file chmod failed: " + rc);
-            rc = sceKernelRename(staged, destination);
-            if (rc != 0) throw new IOException("Resident atomic file replace failed: " + rc);
+            string staged = destination + "." + Guid.NewGuid().ToString("N") + ".new";
+            try
+            {
+                using (var input = File.OpenRead(source))
+                using (var output = new FileStream(staged, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                { input.CopyTo(output); output.Flush(true); }
+                if (!FilesMatch(source, staged)) throw new IOException("Resident staged file differs from the bundled file: " + Path.GetFileName(destination));
+                int rc = executable ? gs_resident_chmod(staged, 493) : 0;
+                if (rc != 0) throw new IOException("Resident file chmod failed: " + rc);
+                ReplaceFile(staged, destination);
+            }
+            finally { try { if (File.Exists(staged)) File.Delete(staged); } catch { } }
         }
 
         static bool FilesMatch(string source, string destination)
@@ -579,14 +737,36 @@ namespace Orbis
 
         static void WriteAtomic(string path, string body)
         {
-            WriteAtomicBytes(path, new UTF8Encoding(false).GetBytes(body));
+            AtomicFile.WriteText(path, body);
         }
 
         static void WriteAtomicBytes(string path, byte[] body)
         {
-            string tmp = path + ".tmp";
-            File.WriteAllBytes(tmp, body);
-            if (sceKernelRename(tmp, path) != 0) throw new IOException("Atomic rename failed: " + path);
+            // plugins.ini is preserved byte-for-byte, including non-UTF8 comments.
+            string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var file = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                { file.Write(body, 0, body.Length); file.Flush(true); }
+                ReplaceFile(tmp, path);
+            }
+            finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
+        }
+
+        static void ReplaceFile(string source, string destination)
+        {
+            try
+            {
+                if (sceKernelRename(source, destination) != 0) throw new IOException("Atomic rename failed: " + destination);
+            }
+            catch (DllNotFoundException) { ReplaceManagedFile(source, destination); }
+            catch (EntryPointNotFoundException) { ReplaceManagedFile(source, destination); }
+        }
+
+        static void ReplaceManagedFile(string source, string destination)
+        {
+            if (File.Exists(destination)) File.Replace(source, destination, null);
+            else File.Move(source, destination);
         }
 
         [DllImport("libkernel", EntryPoint = "sceKernelRename", CallingConvention = CallingConvention.Cdecl)]

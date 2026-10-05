@@ -46,6 +46,7 @@ namespace Orbis
         static readonly object Gate = new object();
         static readonly object InstallRegisterGate = new object();
         static readonly Dictionary<int, string> OwnedWebTasks = new Dictionary<int, string>();
+        static readonly HashSet<int> ReplacementTasks = new HashSet<int>();
         static bool _ownedJournalLoaded;
         const string OwnedJournalName = "bgft_owned.tsv";
 
@@ -119,6 +120,7 @@ namespace Orbis
             {
                 LoadOwnedJournal();
                 string error;
+                ReplacementTasks.Remove(taskId);
                 if (OwnedWebTasks.Remove(taskId)) SaveOwnedJournal(out error);
             }
         }
@@ -263,6 +265,7 @@ namespace Orbis
                 return InstallOutcome.NotReady;
             }
 
+            bool oldVersionRemoved = false;
             try
             {
                 string appInstPath;
@@ -303,14 +306,8 @@ namespace Orbis
                     error = "AppExists 0x" + rc.ToString("X");
                     return InstallOutcome.NotReady;
                 }
-                if (contentKind == PkgContentKind.BaseGame && exists != 0)
-                {
-                    // AppExists includes incomplete dashboard placeholders. Only
-                    // the owned task's completion path may certify installation.
-                    if (uninstallFirst && !UninstallAndWait(titleId, out error))
-                        return InstallOutcome.UninstallFailed;
-                }
-                else if (PkgInstallPolicy.RequiresInstalledBase(contentKind) && exists == 0 &&
+                bool replace = contentKind == PkgContentKind.BaseGame && exists != 0 && uninstallFirst;
+                if (PkgInstallPolicy.RequiresInstalledBase(contentKind) && exists == 0 &&
                     !(contentKind == PkgContentKind.AddOn && InstalledGameAcceptingAddon(packageContentId, expectedTitleId) != null))
                 {
                     error = (contentKind == PkgContentKind.Patch ? "Update" : "DLC") +
@@ -318,11 +315,20 @@ namespace Orbis
                     return InstallOutcome.InstallFailed;
                 }
 
-                if (contentKind == PkgContentKind.BaseGame && UseLoopbackInstall(contentKind, pkgPath))
+                if (!replace && contentKind == PkgContentKind.BaseGame && UseLoopbackInstall(contentKind, pkgPath))
                     return InstallOutcome.QueueRequired;
 
                 lock (InstallRegisterGate)
                 {
+                    string replacementTitleId = titleId;
+                    string uninstallError = null;
+                    Func<string> beforeInstall = () =>
+                    {
+                        if (!replace || oldVersionRemoved) return null;
+                        if (!UninstallAndWait(replacementTitleId, out uninstallError)) return uninstallError;
+                        oldVersionRemoved = true;
+                        return null;
+                    };
                     if (contentKind == PkgContentKind.AddOn)
                     {
                         if (IsAddonInstalled(pkgPath, true)) return InstallOutcome.AlreadyInstalled;
@@ -333,8 +339,10 @@ namespace Orbis
                         return PkgIntegrity.IsInstalledBaseUnavailable(error) ? InstallOutcome.NotReady : InstallOutcome.InvalidPackage;
                     string bgftError;
                     if (TryStartBgftInstall(pkgPath, titleId, contentKind,
-                        out bgftAttempted, out bgftError, out taskId))
+                        out bgftAttempted, out bgftError, out taskId, replace ? beforeInstall : null))
                         return InstallOutcome.Started;
+                    if (uninstallError != null)
+                    { error = uninstallError; return InstallOutcome.UninstallFailed; }
                     if (bgftAttempted && !string.IsNullOrEmpty(bgftError) &&
                         bgftError.StartsWith("ALREADY_INSTALLED:", StringComparison.Ordinal))
                     {
@@ -359,7 +367,7 @@ namespace Orbis
                     bool allowFallback = !bgftAttempted && taskId < 0;
 
                     string fallbackError = null;
-                    if (allowFallback && TryInstallWithAppInstUtil(pkgPath, out fallbackError))
+                    if (allowFallback && TryInstallWithAppInstUtil(pkgPath, beforeInstall, out fallbackError))
                     {
                         taskId = -1;
                         error = null;
@@ -371,7 +379,7 @@ namespace Orbis
                     if (!string.IsNullOrEmpty(fallbackError))
                         error = error + " | fallback " + fallbackError;
                     LogInstall(error);
-                    return InstallOutcome.InstallFailed;
+                    return uninstallError != null ? InstallOutcome.UninstallFailed : InstallOutcome.InstallFailed;
                 }
             }
             catch (Exception ex)
@@ -379,6 +387,25 @@ namespace Orbis
                 error = ex.GetType().Name + ": " + ex.Message;
                 return InstallOutcome.InstallFailed;
             }
+            finally
+            {
+                if (oldVersionRemoved && taskId >= 0)
+                    lock (InstallRegisterGate) ReplacementTasks.Add(taskId);
+                if (oldVersionRemoved && !string.IsNullOrEmpty(error))
+                {
+                    error = DescribeReplacementFailure(error);
+                    LogInstall(error);
+                }
+            }
+        }
+
+        static string DescribeReplacementFailure(string error)
+        {
+            const string warning = "The old version was removed; replacement installation is not confirmed. PKG retained. ";
+            // Keep route/ownership prefixes readable by the queue.
+            foreach (string prefix in new[] { PkgInstallPolicy.StorageHttpFallback, "BGFT_UNRESOLVED:", "ALREADY_INSTALLED:" })
+                if (error.StartsWith(prefix, StringComparison.Ordinal)) return prefix + warning + error.Substring(prefix.Length);
+            return warning + error;
         }
 
         public static bool WaitForInstall(int taskId, Action<int> progress, out string error)
@@ -545,6 +572,15 @@ namespace Orbis
             {
                 error = "BGFT progress " + ex.GetType().Name + ": " + ex.Message;
                 return false;
+            }
+            finally
+            {
+                lock (InstallRegisterGate)
+                {
+                    if (ReplacementTasks.Contains(taskId) && !string.IsNullOrEmpty(error))
+                        error = DescribeReplacementFailure(error);
+                    if (localCopyComplete) ReplacementTasks.Remove(taskId);
+                }
             }
         }
 
@@ -887,6 +923,11 @@ namespace Orbis
 
         public static bool TryInstallWithAppInstUtil(string pkgPath, out string error)
         {
+            return TryInstallWithAppInstUtil(pkgPath, null, out error);
+        }
+
+        static bool TryInstallWithAppInstUtil(string pkgPath, Func<string> beforeInstall, out string error)
+        {
             error = null;
             PkgContentKind kind; string kindError;
             if (!PkgValidator.TryGetContentKind(pkgPath, out kind, out kindError)) { error = kindError; return false; }
@@ -910,6 +951,7 @@ namespace Orbis
                 }
                 lock (InstallRegisterGate)
                 {
+                    if (beforeInstall != null && (error = beforeInstall()) != null) return false;
                     int rc = sceAppInstUtilAppInstallPkg(nativePath, IntPtr.Zero);
                     LogInstall("api=sceAppInstUtilAppInstallPkg rc=" + Hex(rc) + " task=-1 title=" + nativeTitleId +
                         " subtype=" + (kind == PkgContentKind.AddOn ? 7 : 6) + " path=" + nativePath + " file={" + nativeState + "}");
@@ -1124,7 +1166,7 @@ namespace Orbis
         }
 
         static bool TryStartBgftInstall(string pkgPath, string titleId, PkgContentKind contentKind,
-            out bool attempted, out string error, out int taskId)
+            out bool attempted, out string error, out int taskId, Func<string> beforeInstall = null)
         {
             attempted = false;
             error = null;
@@ -1198,6 +1240,11 @@ namespace Orbis
                 string journalError;
                 if (!PrepareOwnedJournal(out journalError))
                 { error = "BGFT_UNRESOLVED:" + journalError + "; PKG retained"; return false; }
+                if (beforeInstall != null)
+                {
+                    if ((error = beforeInstall()) != null) return false;
+                    ex.Slot = 0; // The preflight slot belonged to the removed application.
+                }
                 attempted = true; // register mutates system state
                 int rc = sceBgftServiceIntDownloadRegisterTaskByStorageEx(ref ex, out taskId);
                 LogInstall("api=sceBgftServiceIntDownloadRegisterTaskByStorageEx rc=" + Hex(rc) + " task=" + taskId +

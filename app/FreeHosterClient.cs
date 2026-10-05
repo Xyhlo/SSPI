@@ -15,9 +15,6 @@ internal static class FreeHosterClient
         static readonly Regex MediaFireDl = new Regex(
             @"https?://download\d*\.mediafire\.com/[^""'\s<>]+",
             RegexOptions.IgnoreCase);
-        static readonly Regex GofileId = new Regex(
-            @"gofile\.io/(?:\?c=|d/|file/)([A-Za-z0-9]+)",
-            RegexOptions.IgnoreCase);
 static readonly Regex PixelId = new Regex(
 @"pixeldrain\.com/(?:u|l)/([A-Za-z0-9_-]+)",
 RegexOptions.IgnoreCase);
@@ -72,7 +69,7 @@ public static bool IsSupportedHoster(Uri uri)
                 return ResolveMediaFire(hosterUrl);
 
             if (host == "gofile.io" || host.EndsWith(".gofile.io"))
-                return ResolveGofile(u);
+                throw new Exception("GoFile links need an account token and are not supported");
 
             if (host == "1fichier.com" || host.EndsWith(".1fichier.com"))
                 throw new Exception("This host needs wait/captcha — select a supported service in Connections");
@@ -129,26 +126,6 @@ public static bool IsSupportedHoster(Uri uri)
                     return href;
             }
             throw new Exception("MediaFire free link not found (page may need browser)");
-        }
-
-        static string ResolveGofile(Uri u)
-        {
-            var m = GofileId.Match(u.ToString());
-            if (!m.Success)
-                throw new Exception("Bad GoFile URL");
-            // Public content API. Do not embed undocumented website tokens in the client.
-            string id = m.Groups[1].Value;
-            string json = NetHttp.GetString(
-                "https://api.gofile.io/contents/" + id,
-                25000, "https://gofile.io/");
-            // "link":"https://...
-            var lm = Regex.Match(json ?? "", @"""link""\s*:\s*""(https?:[^""]+)""", RegexOptions.IgnoreCase);
-            if (lm.Success)
-                return lm.Groups[1].Value.Replace("\\/", "/");
-            var dm = Regex.Match(json ?? "", @"""directLink""\s*:\s*""(https?:[^""]+)""", RegexOptions.IgnoreCase);
-            if (dm.Success)
-                return dm.Groups[1].Value.Replace("\\/", "/");
-            throw new Exception("GoFile free API returned no file link");
         }
 
         static bool LooksLikeDirectFile(Uri u)

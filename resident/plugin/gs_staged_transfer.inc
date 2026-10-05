@@ -191,6 +191,7 @@ done:
 }
 
 static int gs_stage_stopped(GsStage *stage) { return g_stop || stage->canceled || stage->failed; }
+static int gs_stage_audit_stopped(void *stage) { return gs_stage_stopped((GsStage *)stage); }
 
 static int gs_stage_validate(GsStage *stage, const char *path)
 {
@@ -270,8 +271,14 @@ static void *gs_stage_worker(void *opaque)
     }
     /* A complete checkpoint is local ownership, even if its CDN URL is gone. */
     if (sspi_xfer_durable(stage->job.destination) == stage->job.total) {
+        gs_stage_status(stage, "validating", "Recovering completed file locally...");
+        int verified = gs_verify_completed_chunks(stage->job.destination, stage->job.total, stage->error, sizeof(stage->error),
+            gs_stage_audit_stopped, stage);
+        if (verified < 0) goto done;
+        if (verified > 0) goto start_transfer;
         stage->done = stage->job.total;
         if (gs_stage_validate(stage, stage->part)) goto done;
+        if (gs_stage_stopped(stage)) goto done;
         if (gs_storage_matches(stage->job.storage_root, stage->job.storage_token) &&
             !rename(stage->part, stage->job.destination)) {
             char map[1150]; snprintf(map, sizeof(map), "%s.map", stage->job.destination); unlink(map);
@@ -279,6 +286,7 @@ static void *gs_stage_worker(void *opaque)
         } else snprintf(stage->error, sizeof(stage->error), "Completed file could not be renamed; input retained (errno %d)", errno);
         goto done;
     }
+ start_transfer:
     if (sspi_xfer_init(gs_http)) { snprintf(stage->error, sizeof(stage->error), "Firmware transfer pool initialization failed"); goto done; }
     /* A restarted engine (resume after a park, retry, reconnect) re-hashes its
      * retained chunks from zero before any network read. Publish the bytes its

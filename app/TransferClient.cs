@@ -37,7 +37,7 @@ namespace Orbis
         [UnmanagedFunctionPointer(CallingConvention.Cdecl, CharSet = CharSet.Ansi)] delegate long DurableFn(string path);
         static StartFn start;
         static PollFn poll;
-        static ControlFn pause, destroy;
+        static ControlFn pause, cancel, destroy;
         static DurableFn durable;
         static T Bind<T>(int module, string name) where T : class
         {
@@ -61,6 +61,7 @@ namespace Orbis
                 start = Bind<StartFn>(module, "sspi_xfer_start");
                 poll = Bind<PollFn>(module, "sspi_xfer_poll");
                 pause = Bind<ControlFn>(module, "sspi_xfer_pause");
+                cancel = Bind<ControlFn>(module, "sspi_xfer_cancel");
                 destroy = Bind<ControlFn>(module, "sspi_xfer_destroy");
                 durable = Bind<DurableFn>(module, "sspi_xfer_durable");
                 int result = Bind<InitFn>(module, "sspi_xfer_init")(context);
@@ -129,6 +130,7 @@ namespace Orbis
             // their chunks across a new link, so they wait longer first.
             long unreachableMs = string.IsNullOrEmpty(content) ? UnreachableArchiveMs : UnreachablePackageMs;
             var watchdog = new DeadLinkWatchdog(unreachableMs);
+            var failureWatchdog = new PermanentFailureWatchdog();
             var clock = System.Diagnostics.Stopwatch.StartNew();
             try
             {
@@ -137,6 +139,18 @@ namespace Orbis
                     Status state;
                     if (poll(handle, out state) != 0) throw new IOException("Native transfer status unavailable");
                     if (canceled != null && canceled()) { pause(handle); throw new OperationCanceledException(); }
+                    if (failureWatchdog.Repeated(state.State, state.ErrorCode, state.NetworkBytes,
+                            state.Done, state.Total, state.Retries, clock.ElapsedMilliseconds))
+                    {
+                        if (state.ErrorCode >= 400 && state.ErrorCode < 500)
+                        {
+                            pause(handle);
+                            throw new DownloadHttpException(state.ErrorCode, "0");
+                        }
+                        cancel(handle);
+                        throw new IOException("Native transfer repeatedly returned the same failure without progress; " +
+                            "choose another source or update the transfer engine. Verified chunks retained.");
+                    }
                     if (watchdog.Unreachable(state.State, state.NetworkBytes, state.Done, state.Total, state.Retries,
                             clock.ElapsedMilliseconds))
                         throw new DownloadLinkUnreachableException(
@@ -161,7 +175,8 @@ namespace Orbis
                     if (state.State == 6)
                     {
                         if (state.ErrorCode >= 400 && state.ErrorCode <= 599)
-                            throw new DownloadHttpException(state.ErrorCode, state.Error);
+                            throw new DownloadHttpException(state.ErrorCode,
+                                NativeRetryAfter(state.Error).ToString(System.Globalization.CultureInfo.InvariantCulture));
                         throw new IOException(state.Error);
                     }
                     if (state.State == 7) throw new OperationCanceledException();
@@ -177,6 +192,19 @@ namespace Orbis
                     while (destroy(handle) == -2) Thread.Sleep(50);
                 }
             }
+        }
+
+        static int NativeRetryAfter(string detail)
+        {
+            if (string.IsNullOrEmpty(detail)) return 0;
+            const string header = "Retry-After:";
+            int at = detail.IndexOf(header, StringComparison.OrdinalIgnoreCase);
+            if (at < 0) return 0;
+            at += header.Length;
+            while (at < detail.Length && detail[at] == ' ') at++;
+            int end = at;
+            while (end < detail.Length && detail[end] >= '0' && detail[end] <= '9') end++;
+            return end == at ? 0 : DownloadHttpException.ParseRetryAfter(detail.Substring(at, end - at), DateTime.UtcNow);
         }
 
         internal static bool HasCompletedJournal(string destination)
@@ -316,6 +344,28 @@ namespace Orbis
             }
             if (total > 0 && doneBytes >= total) return false;
             return retryCount > retries && nowMs - since >= limitMs;
+        }
+    }
+    // Count repeated explicit failure codes, not polls or generic recovery text.
+    internal sealed class PermanentFailureWatchdog
+    {
+        long network = -1, done = -1, since;
+        int code, firstRetry;
+        internal bool Repeated(int state, int errorCode, long networkBytes, long doneBytes,
+            long total, int retryCount, long nowMs)
+        {
+            bool deterministic = errorCode == -2 || errorCode == -10 || errorCode == -12 || errorCode == -13 ||
+                errorCode == -18 || errorCode == -19 ||
+                (errorCode >= 400 && errorCode < 500 && errorCode != 408 && errorCode != 425 && errorCode != 429);
+            if ((state != 1 && state != 2) || (total > 0 && doneBytes >= total) ||
+                !deterministic || networkBytes != network || doneBytes != done ||
+                code != errorCode || retryCount < firstRetry || nowMs < since)
+            {
+                network = networkBytes; done = doneBytes; code = deterministic ? errorCode : 0;
+                firstRetry = retryCount; since = nowMs;
+                return false;
+            }
+            return retryCount - firstRetry >= 2 && nowMs - since >= 10000;
         }
     }
     // Allocated only for an active native transfer. No timer, task, file I/O or

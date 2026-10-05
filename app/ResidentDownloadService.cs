@@ -91,7 +91,6 @@ namespace Orbis
     internal static class ResidentDownloadService
     {
         const string Version = "5.11-api3";
-        const string PreviousVersion = "5.10-api3";
         const string HostDaemonTitleId = "NPXS20119";
         const int LncAppNotFound = unchecked((int)0x80940005);
         const long SystemAuthId = 0x3800000000000010;
@@ -372,6 +371,7 @@ namespace Orbis
                         {
                             if (FreshHeartbeat())
                             {
+                                GoldHenPluginInstaller.ObserveWorkerHealth(true);
                                 _nextActivationAttemptUtc = DateTime.MinValue;
                                 return new LaunchMaintenanceAttempt { Status = "ready", Repaired = repaired };
                             }
@@ -379,6 +379,7 @@ namespace Orbis
                         } while (DateTime.UtcNow < until);
                     }
                     if (LaunchMaintenanceStop.WaitOne(0)) return null;
+                    GoldHenPluginInstaller.ObserveWorkerHealth(false);
                     WorkerHeartbeat loaded;
                     WriteLastError(stageFailed ? ExplainLoaderStatus(pluginStatus) :
                         TryReadHeartbeat(out loaded) && loaded.Current ? loaded.NotReadyReason :
@@ -1227,6 +1228,7 @@ namespace Orbis
                 {
                     if (ActivationFailedBeforeAcknowledgement(pluginStatus))
                     {
+                        GoldHenPluginInstaller.ObserveWorkerHealth(false);
                         error = ExplainLoaderStatus(pluginStatus);
                         WriteLastError(error); return false;
                     }
@@ -1243,6 +1245,7 @@ namespace Orbis
                         Thread.Sleep(100);
                     }
                     WorkerHeartbeat loaded;
+                    GoldHenPluginInstaller.ObserveWorkerHealth(false);
                     error = TryReadHeartbeat(out loaded) && loaded.Current ? loaded.NotReadyReason :
                         _heartbeatReadError ?? ExplainLoaderStatus(pluginStatus);
                     _lastError = error;
@@ -1265,6 +1268,8 @@ namespace Orbis
 
         internal static string ExplainLoaderStatus(string status)
         {
+            if (status == "shell-rollback-restart-required")
+                return "The new resident worker did not become ready. Its staged update was rolled back; restart PS4 and enable GoldHEN";
             if (!string.IsNullOrEmpty(status) && status.StartsWith("native-binding-failed:", StringComparison.Ordinal))
                 return "SSPI native binding failed: " + status.Substring("native-binding-failed:".Length).Trim() + ". See logs/resident.log";
             if (!string.IsNullOrEmpty(status) && status.StartsWith("plugin-stage-failed:", StringComparison.Ordinal))
@@ -1312,6 +1317,7 @@ namespace Orbis
         internal static bool ActivationFailedBeforeAcknowledgement(string status)
         {
             return status != null && (status.StartsWith("plugin-stage-failed:", StringComparison.Ordinal) ||
+                status == "shell-rollback-restart-required" ||
                 status.StartsWith("native-binding-failed:", StringComparison.Ordinal) ||
                 status.StartsWith("shell-load-failed:", StringComparison.Ordinal) ||
                 status.StartsWith("shell-api-rejected:", StringComparison.Ordinal) ||
@@ -1353,11 +1359,9 @@ namespace Orbis
 
         public static bool IsAlive(string id)
         {
-            string runningVersion;
+            WorkerHeartbeat heartbeat;
             // The prior revision keeps its existing job until an orderly restart.
-            if (!TryReadFreshHeartbeat(out runningVersion) ||
-                (runningVersion != Version && runningVersion != PreviousVersion && runningVersion != "5.10-r15" &&
-                 runningVersion != "5.10-r14" && runningVersion != "5.10-r13" && runningVersion != "5.10-r12" && runningVersion != "5.10-r11" && runningVersion != "5.10-r10" && runningVersion != "5.10-r9" && runningVersion != "5.10-r8" && runningVersion != "5.10-r7" && runningVersion != "5.10-r6")) return false;
+            if (!TryReadHeartbeat(out heartbeat) || !heartbeat.Compatible) return false;
             ResidentDownloadStatus current;
             if (TryGetStagedStatus(id, out current)) return current.State != "failed" && current.State != "canceled" && current.State != "released";
             if (!TryReadStatus(out current)) return true;
@@ -2144,7 +2148,9 @@ namespace Orbis
         {
             if (!AppSettings.DataDirWritable || AppSettings.DataMigrationPending) return false;
             WorkerHeartbeat heartbeat;
-            return TryReadHeartbeat(out heartbeat) && heartbeat.Ready && heartbeat.Current;
+            bool fresh = TryReadHeartbeat(out heartbeat) && heartbeat.Ready && heartbeat.Current;
+            if (fresh) GoldHenPluginInstaller.ObserveWorkerHealth(true);
+            return fresh;
         }
 
         // A ready worker that advertises ftpinbox=1 watches <data>/pkg-rars itself.
@@ -2241,11 +2247,34 @@ namespace Orbis
             }
         }
 
+        internal static string ObservedWorkerIdentity
+        {
+            get
+            {
+                WorkerHeartbeat heartbeat;
+                return TryReadHeartbeat(out heartbeat)
+                    ? heartbeat.Version + "/" + heartbeat.Build + "/" + heartbeat.Epoch + "/" + heartbeat.ProcessId
+                    : "unknown";
+            }
+        }
+
         internal sealed class WorkerHeartbeat
         {
             public string Version, Build, Epoch, NotReadyReason;
             public int ProcessId;
-            public bool Current, Ready, SevenZip, UsbFilesystemContext, FtpInbox;
+            public bool Current, Ready, Compatible, SevenZip, UsbFilesystemContext, FtpInbox;
+        }
+
+        internal static bool IsSupportedWorkerVersion(string version)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(version ?? "", @"\A([0-9]+)\.([0-9]+)-(r|api)([0-9]+)\z");
+            int major, minor, revision;
+            if (!match.Success || !int.TryParse(match.Groups[1].Value, out major) ||
+                !int.TryParse(match.Groups[2].Value, out minor) || !int.TryParse(match.Groups[4].Value, out revision) ||
+                major < 5 || (major == 5 && minor < 10)) return false;
+            // Product versions may advance independently; API 3 is the protocol we speak.
+            if (match.Groups[3].Value == "api") return revision == 3;
+            return revision > 0 && (major > 5 || minor > 10 || revision >= 6);
         }
 
         internal static WorkerHeartbeat ParseHeartbeat(string[] lines, long nowTicks, string expectedBuild)
@@ -2267,10 +2296,12 @@ namespace Orbis
             int pid; long epoch;
             bool identified = int.TryParse(value("pid"), NumberStyles.Integer, CultureInfo.InvariantCulture, out pid) && pid > 0 &&
                 long.TryParse(value("epoch"), NumberStyles.Integer, CultureInfo.InvariantCulture, out epoch) && epoch > 0;
-            bool current = identified && !string.IsNullOrEmpty(expectedBuild) &&
+            bool compatible = IsSupportedWorkerVersion(lines[0]) && (value("api") == null || value("api") == "3");
+            bool current = compatible && identified && !string.IsNullOrEmpty(expectedBuild) &&
                 string.Equals(value("build"), expectedBuild, StringComparison.Ordinal) &&
                 value("v") == "2" && value("api") == "3" && value("staged") == "10";
             return new WorkerHeartbeat { Version = lines[0], Build = value("build"), Epoch = value("epoch"), ProcessId = pid,
+                Compatible = compatible,
                 SevenZip = value("sevenzip") == "1",
                 UsbFilesystemContext = value("usbcontext") == "1",
                 FtpInbox = value("ftpinbox") == "1",
@@ -2330,15 +2361,6 @@ namespace Orbis
             string shared = SharedIpcRoot;
             return string.Equals(_liveHeartbeatRoot, shared, StringComparison.Ordinal)
                 ? new[] { shared, primary } : new[] { primary, shared };
-        }
-
-        static bool TryReadFreshHeartbeat(out string runningVersion)
-        {
-            runningVersion = null;
-            WorkerHeartbeat heartbeat;
-            if (!TryReadHeartbeat(out heartbeat)) return false;
-            runningVersion = heartbeat.Current ? Version : heartbeat.Version;
-            return true;
         }
 
         static long ReadNetworkBytes(string[] lines, int index)
@@ -2638,9 +2660,7 @@ namespace Orbis
         {
             try
             {
-                NativeUnlink(destination);
-                NativeCopyFile(source, destination);
-                NativeChmod(destination, 511);
+                GoldHenPluginInstaller.StageResidentFile(source, destination);
                 WriteLaunchLog("staged " + destination + " " + DescribeManagedFile(destination));
             }
             catch (Exception ex)

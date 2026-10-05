@@ -76,13 +76,16 @@ namespace Orbis
             error = null;
             try
             {
+                ThrowIfCanceled(request == null ? null : request.Cancel);
                 string recipe = LoadRecipe(descriptor, packageDirectory);
                 var steps = ExtractObjectArray(recipe, "searchSteps");
                 if (steps.Count == 0) return output;
                 if (steps.Count > MaxSteps) throw new Exception("Recipe exceeds 24 steps");
                 ExecuteSearch(descriptor, request ?? new SourceSearchRequest(), steps, output);
+                ThrowIfCanceled(request == null ? null : request.Cancel);
                 return output;
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 error = "Recipe: " + SafeMessage(ex.Message);
@@ -120,6 +123,7 @@ namespace Orbis
             error = null;
             try
             {
+                ThrowIfCanceled(request == null ? null : request.Cancel);
                 string recipe = LoadRecipe(descriptor, packageDirectory);
                 var steps = ExtractObjectArray(recipe, "resolveSteps");
                 if (steps.Count == 0) steps = ExtractObjectArray(recipe, "steps");
@@ -128,8 +132,10 @@ namespace Orbis
                 if (steps.Count > MaxSteps) throw new Exception("Recipe exceeds 24 steps");
 
                 Execute(descriptor, request ?? new SourceResolveRequest(), steps, results);
+                ThrowIfCanceled(request == null ? null : request.Cancel);
                 return results;
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 error = "Recipe: " + SafeMessage(ex.Message);
@@ -163,7 +169,7 @@ namespace Orbis
             int limit = request.Limit <= 0 ? 20 : Math.Min(MaxResults, request.Limit);
             foreach (string step in steps)
             {
-                CheckDeadline(deadline);
+                CheckDeadline(deadline, request.Cancel);
                 if (JsonLite.GetBool(step, "onlyIfEmpty", false) && output.Count > 0)
                     continue;
                 string op = First(step, "op", "type", "operation");
@@ -200,7 +206,7 @@ namespace Orbis
                         {
                             if (++requests > MaxRequests)
                                 throw new Exception("Recipe exceeds " + MaxRequests + " HTTP requests");
-                            CheckDeadline(deadline);
+                            CheckDeadline(deadline, request.Cancel);
                             string url = ExpandSearchItem(template, request, items[i]);
                             url = MakeAbsolute(FirstOrigin(descriptor), url);
                             Uri uri = RequireHttpUrl(url);
@@ -214,10 +220,9 @@ namespace Orbis
                             {
                                 int remaining = (int)Math.Max(1000,
                                     Math.Min(30000, (deadline - DateTime.UtcNow).TotalMilliseconds));
-                                body = ResolverPageCache.Get(descriptor.SourceId + "@" + descriptor.Version, uri.AbsoluteUri, remaining,
-                                    string.IsNullOrEmpty(referer) ? null : referer, null, ua,
-                                    target => OriginAllowed(descriptor, target));
+                                body = FetchPage(descriptor, uri, remaining, referer, ua, request.Cancel);
                             }
+                            catch (OperationCanceledException) { throw; }
                             catch (Exception ex)
                             {
                                 fetchError = ex;
@@ -251,12 +256,14 @@ namespace Orbis
                         bool continueOnError = JsonLite.GetBool(step, "continueOnError", false);
                         for (int q = 0; q < queries.Count && q < 4; q++)
                         {
+                            CheckDeadline(deadline, request.Cancel);
                             if (++requests > MaxRequests)
                                 throw new Exception("Recipe exceeds " + MaxRequests + " HTTP requests");
                             var probe = new SourceSearchRequest
                             {
                                 Query = queries[q], TitleId = request.TitleId, Name = request.Name,
-                                Region = request.Region, Limit = request.Limit, Cursor = request.Cursor
+                                Region = request.Region, Limit = request.Limit, Cursor = request.Cursor,
+                                Cancel = request.Cancel
                             };
                             string url = ExpandSearch(template, probe);
                             Uri uri = RequireHttpUrl(MakeAbsolute(FirstOrigin(descriptor), url));
@@ -268,10 +275,11 @@ namespace Orbis
                             string body;
                             try
                             {
-                                body = ResolverPageCache.Get(descriptor.SourceId + "@" + descriptor.Version, uri.AbsoluteUri, 30000,
-                                    string.IsNullOrEmpty(referer) ? null : referer, null, ua,
-                                    target => OriginAllowed(descriptor, target)) ?? "";
+                                int remaining = (int)Math.Max(1,
+                                    Math.Min(30000, (deadline - DateTime.UtcNow).TotalMilliseconds));
+                                body = FetchPage(descriptor, uri, remaining, referer, ua, request.Cancel) ?? "";
                             }
+                            catch (OperationCanceledException) { throw; }
                             catch
                             {
                                 // The first query still reports transport failure. Later alias
@@ -318,6 +326,7 @@ namespace Orbis
                     string backportField = First(step, "backport"); if (string.IsNullOrEmpty(backportField)) backportField = "backport";
                     foreach (string row in JsonLite.ExtractObjectArray(json, array))
                     {
+                        CheckDeadline(deadline, request.Cancel);
                         string id = (JsonLite.GetString(row, titleField) ?? "").Trim().ToUpperInvariant();
                         if (!ExactTitleIdRegex.IsMatch(id)) continue;
                         string image = JsonLite.GetString(row, imageField) ?? "";
@@ -346,6 +355,7 @@ namespace Orbis
                 {
                     foreach (WorkItem item in items)
                     {
+                        CheckDeadline(deadline, request.Cancel);
                         if (output.Count >= limit) break;
                         if (string.IsNullOrEmpty(item.TitleId) ||
                             !ExactTitleIdRegex.IsMatch(item.TitleId)) continue;
@@ -366,7 +376,7 @@ namespace Orbis
 
             foreach (string step in steps)
             {
-                CheckDeadline(deadline);
+                CheckDeadline(deadline, request.Cancel);
                 string op = First(step, "op", "type", "operation");
                 if (string.IsNullOrEmpty(op)) throw new Exception("Recipe step has no operation");
 
@@ -401,7 +411,7 @@ namespace Orbis
                         Exception fetchError = null;
                     for (int i = 0; i < inputs.Count && i < MaxItems; i++)
                     {
-                        CheckDeadline(deadline);
+                        CheckDeadline(deadline, request.Cancel);
                         string url = ExpandItem(template, request, inputs[i]);
                         url = MakeAbsolute(FirstOrigin(descriptor), url);
                         Uri uri = RequireHttpUrl(url);
@@ -419,10 +429,9 @@ namespace Orbis
                         string body;
                         try
                         {
-                            body = ResolverPageCache.Get(descriptor.SourceId + "@" + descriptor.Version, uri.AbsoluteUri, remaining,
-                                string.IsNullOrEmpty(referer) ? null : referer, null, ua,
-                                target => OriginAllowed(descriptor, target));
+                            body = FetchPage(descriptor, uri, remaining, referer, ua, request.Cancel);
                         }
+                        catch (OperationCanceledException) { throw; }
                         catch (Exception ex)
                         {
                             fetchError = ex;
@@ -470,7 +479,7 @@ namespace Orbis
                     var links = new List<WorkItem>();
                     foreach (WorkItem document in items)
                     {
-                        CheckDeadline(deadline);
+                        CheckDeadline(deadline, request.Cancel);
                         MatchCollection rows = RowRegex.Matches(document.Html ?? "");
                         if (rows.Count == 0)
                             AddAnchors(document.Html, document.Text, document, links);
@@ -482,6 +491,7 @@ namespace Orbis
                             string runningTitleId = "";
                             foreach (Match row in rows)
                             {
+                                CheckDeadline(deadline, request.Cancel);
                                 if (links.Count >= MaxItems) break;
                                 string rowText = StripTags(row.Value);
                                 Match titleMatch = TitleIdRegex.Match(rowText);
@@ -500,6 +510,7 @@ namespace Orbis
                     var filtered = new List<WorkItem>();
                     foreach (WorkItem item in items)
                     {
+                        CheckDeadline(deadline, request.Cancel);
                         if (ContainsToken(item.Text, titleId) ||
                             (ContainsToken(item.DocumentText, titleId) &&
                              CountToken(item.DocumentText, titleId) == 1))
@@ -512,6 +523,7 @@ namespace Orbis
                     string baseTemplate = First(step, "base", "baseUrl");
                     foreach (WorkItem item in items)
                     {
+                        CheckDeadline(deadline, request.Cancel);
                         string baseUrl = string.IsNullOrEmpty(baseTemplate)
                             ? item.Html : ExpandItem(baseTemplate, request, item);
                         item.Url = MakeAbsolute(baseUrl, item.Url);
@@ -525,6 +537,7 @@ namespace Orbis
                     string access = First(step, "accessType", "access");
                     foreach (WorkItem item in items)
                     {
+                        CheckDeadline(deadline, request.Cancel);
                         if (output.Count >= MaxResults) break;
                         Uri uri = RequireHttpUrl(item.Url);
                         string kind = string.IsNullOrEmpty(fixedKind) || Eq(fixedKind, "auto")
@@ -1430,8 +1443,33 @@ namespace Orbis
             return value.Length <= 160 ? value : value.Substring(0, 160);
         }
 
-        static void CheckDeadline(DateTime deadline)
+        static string FetchPage(PackageSourceDescriptor descriptor, Uri uri, int timeout,
+            string referer, string userAgent, Func<bool> cancel)
         {
+            ThrowIfCanceled(cancel);
+            try
+            {
+                string body = ResolverPageCache.Get(descriptor.SourceId + "@" + descriptor.Version, uri.AbsoluteUri,
+                    timeout, string.IsNullOrEmpty(referer) ? null : referer, null, userAgent,
+                    target => OriginAllowed(descriptor, target), cancel);
+                ThrowIfCanceled(cancel);
+                return body;
+            }
+            catch
+            {
+                ThrowIfCanceled(cancel);
+                throw;
+            }
+        }
+
+        static void ThrowIfCanceled(Func<bool> cancel)
+        {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+        }
+
+        static void CheckDeadline(DateTime deadline, Func<bool> cancel)
+        {
+            ThrowIfCanceled(cancel);
             if (DateTime.UtcNow >= deadline) throw new TimeoutException("Recipe exceeded 60 seconds");
         }
 

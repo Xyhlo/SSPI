@@ -9,6 +9,7 @@
 #define GS_XFER_JOBS 2
 #define GS_XFER_LANES 25
 #define GS_RETRY_AFTER_MAX_SECONDS 3600
+enum { GS_XFER_PROTOCOL_ERROR=-18, GS_XFER_RETRY_LIMIT=-19 };
 enum { GS_QUEUED=1, GS_DOWNLOADING, GS_PAUSED, GS_VALIDATING, GS_COMPLETE, GS_FAILED, GS_CANCELED };
 typedef struct {
     int state, lanes, retries, error_code;
@@ -44,6 +45,9 @@ int sspi_xfer_resume(int handle);
 int sspi_xfer_cancel(int handle);
 int sspi_xfer_destroy(int handle);
 int64_t sspi_xfer_durable(const char *destination);
+/* Resident-only local recovery audit; 1 means no stored digest can prove it. */
+int gs_verify_completed_chunks(const char *destination, int64_t total, char *error, size_t error_size,
+    int (*canceled)(void *), void *argument);
 /* Receipt-only proof for resident archive workers. The sidecar is tied to the
  * logical destination, expected SHA-256, exact size, short-file/header identity,
  * and current file stamp. Empty title/content permits raw archive formats. */

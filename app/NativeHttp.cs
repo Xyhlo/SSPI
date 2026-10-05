@@ -44,9 +44,12 @@ namespace Orbis
 
         static readonly object Gate = new object();
         static readonly object OpenGate = new object();
+        static readonly object DeadlineGate = new object();
+        static readonly Dictionary<int, RequestDeadline> RequestDeadlines = new Dictionary<int, RequestDeadline>();
         static bool _tried;
         static bool _ready;
         static string _initError = "not initialized";
+        // Initialization only, under Gate; runtime events are written individually.
         static readonly StringBuilder _log = new StringBuilder();
         static int _netPool = -1;
         static int _sslCtx = -1;
@@ -217,18 +220,6 @@ namespace Orbis
                     // trust store is too old for some current public certificate chains.
                     TryLoadBundledRoots();
 
-                    // 5) live probe
-                    try
-                    {
-                        string probe = GetStringRaw("https://api.real-debrid.com/rest/1.0/time", 15000, null, null, 256);
-                        _log.Append("probe_ok len=").Append(probe != null ? probe.Length : 0).Append("; ");
-                    }
-                    catch (Exception pex)
-                    {
-                        // init contexts OK but request failed — still mark ready so callers see Native HTTPS: errors
-                        _log.Append("probe_fail=").Append(pex.Message).Append("; ");
-                    }
-
                     _ready = true;
                     _initError = "ok";
                     _log.Append("READY");
@@ -245,7 +236,7 @@ namespace Orbis
                 {
                     Fail(ex.GetType().Name + ": " + ex.Message);
                 }
-                FlushLog();
+                finally { FlushLog(); }
             }
         }
 
@@ -314,6 +305,7 @@ namespace Orbis
                 SspiLog.Write("network", "native_http " + body);
             }
             catch { }
+            finally { _log.Length = 0; }
         }
 
         static void TryLoadBundledRoots()
@@ -372,6 +364,7 @@ namespace Orbis
                     // old NanoSSL builds are unreliable when many CAs are loaded.
                     certificates.InsertRange(0, realDebridIntermediates);
                 }
+                AddAssetPinnedCertificates(certificates);
                 if (certificates.Count == 0)
                 {
                     _log.Append("native_ca=empty; ");
@@ -485,10 +478,72 @@ namespace Orbis
             return null;
         }
 
+        // Asset pins are an additive union with the compiled anchors. Only a
+        // reviewed certificate and its exact DER SHA-256 belong in this manifest.
+        static void AddAssetPinnedCertificates(List<byte[]> certificates)
+        {
+            string manifest = FindGenerationYRoots("native-pins.txt");
+            if (string.IsNullOrEmpty(manifest)) return;
+            try
+            {
+                if (new FileInfo(manifest).Length > 64 * 1024)
+                    throw new InvalidDataException("Native CA pin manifest is too large");
+                var files = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+                int entries = 0;
+                foreach (string raw in File.ReadAllLines(manifest))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
+                    if (++entries > 64) throw new InvalidDataException("Too many native CA asset pins");
+                    string[] fields = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    bool valid = fields.Length == 2 && fields[0].Length == 64;
+                    if (valid)
+                        foreach (char digit in fields[0])
+                            if (HexNibble(digit) < 0) { valid = false; break; }
+                    if (!valid || !System.Text.RegularExpressions.Regex.IsMatch(fields[1],
+                        @"\A[A-Za-z0-9][A-Za-z0-9._-]*\.(?:pem|crt)\z",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    {
+                        RecordRuntimeError("invalid native CA asset pin entry " + entries);
+                        continue;
+                    }
+                    HashSet<string> pins;
+                    if (!files.TryGetValue(fields[1], out pins))
+                    {
+                        pins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        files.Add(fields[1], pins);
+                    }
+                    pins.Add(fields[0]);
+                }
+                var loaded = new HashSet<string>(StringComparer.Ordinal);
+                foreach (byte[] certificate in certificates) loaded.Add(Convert.ToBase64String(certificate));
+                int added = 0;
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        string path = Path.Combine(Path.GetDirectoryName(manifest), file.Key);
+                        if (new FileInfo(path).Length > 2 * 1024 * 1024)
+                            throw new InvalidDataException("Native CA asset is too large");
+                        var supplement = ReadPemCertificates(path, false, assetPins: file.Value);
+                        if (supplement.Count == 0) RecordRuntimeError("native CA asset has no matching pin");
+                        foreach (byte[] certificate in supplement)
+                            if (loaded.Add(Convert.ToBase64String(certificate)))
+                            {
+                                certificates.Insert(added++, certificate);
+                            }
+                    }
+                    catch (Exception ex) { RecordRuntimeError("native CA asset: " + ex.GetType().Name); }
+                }
+                _log.Append("native_asset_pins=").Append(added).Append("; ");
+            }
+            catch (Exception ex) { RecordRuntimeError("native CA pin manifest: " + ex.GetType().Name); }
+        }
+
         static List<byte[]> ReadPemCertificates(string path, bool allowPinnedIntermediate,
             bool allowGenerationYRoots = false, bool allowGenerationYIntermediates = false,
             bool allowTorBoxIntermediate = false, bool allowGoDaddyIntermediate = false,
-            bool allowGitHubIntermediates = false)
+            bool allowGitHubIntermediates = false, HashSet<string> assetPins = null)
         {
             const string begin = "-----BEGIN CERTIFICATE-----";
             const string end = "-----END CERTIFICATE-----";
@@ -520,7 +575,7 @@ namespace Orbis
                 try
                 {
                     cert = new X509Certificate2(der);
-                    for (int i = 0; !allowGenerationYRoots && !allowGenerationYIntermediates && !allowTorBoxIntermediate && !allowGoDaddyIntermediate && !allowGitHubIntermediates && i < NativeRootSubjectMarkers.Length; i++)
+                    for (int i = 0; assetPins == null && !allowGenerationYRoots && !allowGenerationYIntermediates && !allowTorBoxIntermediate && !allowGoDaddyIntermediate && !allowGitHubIntermediates && i < NativeRootSubjectMarkers.Length; i++)
                     {
                         if (cert.Subject.IndexOf(NativeRootSubjectMarkers[i], StringComparison.OrdinalIgnoreCase) >= 0)
                         {
@@ -551,6 +606,19 @@ namespace Orbis
                     if (!selected && allowGitHubIntermediates)
                         foreach (string pin in GitHubIntermediatePins)
                             if (HasSha256Fingerprint(der, pin)) { selected = true; break; }
+                    if (!selected && assetPins != null)
+                        foreach (string pin in assetPins)
+                            if (HasSha256Fingerprint(der, pin))
+                            {
+                                foreach (X509Extension extension in cert.Extensions)
+                                {
+                                    if (extension.Oid.Value != "2.5.29.19") continue;
+                                    var constraints = new X509BasicConstraintsExtension(extension, extension.Critical);
+                                    selected = constraints.CertificateAuthority;
+                                    break;
+                                }
+                                break;
+                            }
                 }
                 catch
                 {
@@ -621,6 +689,8 @@ namespace Orbis
             string userAgent = null, Func<bool> cancel = null, Func<Uri, bool> allowOrigin = null,
             int redirectLimit = MaxRedirects)
         {
+            int budget = timeoutMs > 0 ? timeoutMs : 45000;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             EnsureInit();
             if (!_ready) throw new Exception(_initError);
             if (cancel != null && cancel()) throw new OperationCanceledException();
@@ -628,15 +698,13 @@ namespace Orbis
             // The SSL library can briefly run out of memory (0x809517D5) while other HTTPS
             // work holds its pool. A GET is safe to repeat; each attempt creates fresh
             // request objects, within the caller's original time budget.
-            int budget = timeoutMs > 0 ? timeoutMs : 45000;
-            var clock = System.Diagnostics.Stopwatch.StartNew();
             for (int attempt = 0; ; attempt++)
             {
                 try
                 {
                     int status;
                     return Request(MethodGet, url, null, null, referer, bearer,
-                        (int)Math.Max(1000, budget - clock.ElapsedMilliseconds), maxBytes, out status,
+                        RemainingTimeout(clock, budget), maxBytes, out status,
                         userAgent, true, cancel, allowOrigin, redirectLimit);
                 }
                 catch (Exception ex)
@@ -662,45 +730,43 @@ namespace Orbis
                 (ex.Message ?? "").IndexOf("sceHttp send 0x809517D5", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        static string GetStringRaw(string url, int timeoutMs, string referer, string bearer, int maxBytes)
-        {
-            int status;
-            return Request(MethodGet, url, null, null, referer, bearer, timeoutMs, maxBytes, out status, null);
-        }
-
         public static string PostForm(string url, string formBody, int timeoutMs, string referer, string bearer,
             Func<bool> cancel = null)
         {
+            int budget = timeoutMs > 0 ? timeoutMs : 45000;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             EnsureInit();
             if (!_ready) throw new Exception(_initError);
             if (cancel != null && cancel()) throw new OperationCanceledException();
             byte[] data = Encoding.UTF8.GetBytes(formBody ?? "");
             int status;
             string body = Request(MethodPost, url, data, "application/x-www-form-urlencoded",
-                referer, bearer, timeoutMs, MaxBodyDefault, out status, null, true, cancel);
+                referer, bearer, RemainingTimeout(clock, budget), MaxBodyDefault, out status, null, true, cancel);
             return body;
         }
 
         public static HttpRangeResult ReadRange(string url, long start, int count, int timeoutMs, string bearer = null)
         {
+            int budget = timeoutMs > 0 ? timeoutMs : 45000;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            EnsureInit();
+            if (!_ready) throw new Exception(_initError);
             // Mirror networks redirect each request to a different replica, and a
             // busy replica answers 5xx. A fresh request usually lands elsewhere, so
             // retry briefly here instead of parking the whole job for a queue cycle.
             for (int attempt = 1; ; attempt++)
             {
-                try { return ReadRangeOnce(url, start, count, timeoutMs, bearer); }
+                try { return ReadRangeOnce(url, start, count, RemainingTimeout(clock, budget), bearer); }
                 catch (DownloadHttpException ex)
                 {
                     if (attempt >= 4 || (ex.StatusCode != 500 && ex.StatusCode != 502 && ex.StatusCode != 504)) throw;
                 }
-                Thread.Sleep(400 * attempt);
+                Thread.Sleep(Math.Min(400 * attempt, RemainingTimeout(clock, budget)));
             }
         }
 
         static HttpRangeResult ReadRangeOnce(string url, long start, int count, int timeoutMs, string bearer)
         {
-            EnsureInit();
-            if (!_ready) throw new Exception(_initError);
             if (start < 0 || count <= 0) throw new ArgumentOutOfRangeException();
 
             string finalUrl;
@@ -931,11 +997,12 @@ namespace Orbis
             int status;
             int tmpl, conn, req;
             OpenDownload(url, bearer, timeoutMs, range, etag,
-                out tmpl, out conn, out req, out status, out finalUrl);
-            var cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(req));
+                out tmpl, out conn, out req, out status, out finalUrl, true, cancel);
+            TransferCancellation cancellation = null;
             long need = end - start + 1;
             try
             {
+                cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(req));
                 if (status != 206 && status != 200) throw new DownloadHttpException(status, GetHeader(req, "Retry-After"));
                 if ((etag != null && !string.Equals(etag, GetHeader(req, "ETag"), StringComparison.Ordinal)) ||
                     finalUrl != url || !DownloadTransferSettings.IdentityEncoding(GetHeader(req, "Content-Encoding")))
@@ -968,7 +1035,7 @@ namespace Orbis
             }
             finally
             {
-                cancellation.Dispose();
+                if (cancellation != null) cancellation.Dispose();
                 Close(tmpl, conn, req);
             }
         }
@@ -984,14 +1051,15 @@ namespace Orbis
             // Parallel checkpoints require their exact validator; older sequential checkpoints keep their migration behavior.
             OpenDownload(url, bearer, timeoutMs, range,
                 resume != null && resume.StrictIdentity ? resume.IfRange : null,
-                out tmpl, out conn, out req, out status, out finalUrl);
-            var cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(req));
+                out tmpl, out conn, out req, out status, out finalUrl, true, cancel);
+            TransferCancellation cancellation = null;
             long bytesReadThis = 0;
             long expectedResponse = -1;
             long expectedFinal = -1;
             long expectedRangeSpan = -1;
             try
             {
+                cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(req));
                 if (status != 200 && status != 206 && status != 416)
                     throw new DownloadHttpException(status, GetHeader(req, "Retry-After"));
 
@@ -1097,7 +1165,7 @@ namespace Orbis
             }
             finally
             {
-                cancellation.Dispose();
+                if (cancellation != null) cancellation.Dispose();
                 Close(tmpl, conn, req);
             }
 
@@ -1132,13 +1200,15 @@ namespace Orbis
         internal static long DownloadArtwork(string url, string path, Func<bool> cancel,
             int maxBytes, int timeoutMs)
         {
+            int budget = timeoutMs > 0 ? timeoutMs : 45000;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             EnsureInit();
             if (!Available) throw new IOException("Artwork HTTPS unavailable");
             if (cancel != null && cancel()) throw new OperationCanceledException();
             string finalUrl;
             int template, connection, request, status;
-            OpenFollow(MethodGet, url, null, null, null, null, timeoutMs, null, null, null,
-                out template, out connection, out request, out status, out finalUrl, true);
+            OpenFollow(MethodGet, url, null, null, null, null, RemainingTimeout(clock, budget), null, null, null,
+                out template, out connection, out request, out status, out finalUrl, true, cancel);
             try
             {
                 if (status != 200) throw new IOException("Artwork HTTP " + status);
@@ -1172,12 +1242,13 @@ namespace Orbis
             OpenFollow(method, url, body, contentType, referer, bearer, timeoutMs, null, null,
                 userAgent, out tmpl, out conn, out req, out status, out finalUrl, cancel: cancel,
                 allowOrigin: allowOrigin, redirectLimit: redirectLimit);
-            if (method != MethodPost && cancel != null && cancel()) { Close(tmpl, conn, req); throw new OperationCanceledException(); }
-            var cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(req));
+            TransferCancellation cancellation = null;
             bool httpFailure = failHttp && (status < 200 || status >= 300);
             string retryAfter = null;
             try
             {
+                if (method != MethodPost && cancel != null && cancel()) throw new OperationCanceledException();
+                cancellation = new TransferCancellation(cancel, () => sceHttpAbortRequest(req));
                 if (httpFailure) retryAfter = GetHeader(req, "Retry-After");
                 using (var ms = new MemoryStream())
                 {
@@ -1196,6 +1267,7 @@ namespace Orbis
                     ms.Write(buf, 0, n);
                 }
                 string response = Encoding.UTF8.GetString(ms.ToArray());
+                CheckRequestDeadline(req);
                 if (method != MethodPost && cancel != null && cancel()) throw new OperationCanceledException();
                 if (httpFailure) throw new ServiceHttpException(status, retryAfter, response);
                 return response;
@@ -1209,22 +1281,24 @@ namespace Orbis
                 if (httpFailure) throw new ServiceHttpException(status, retryAfter, "");
                 throw;
             }
-            finally { cancellation.Dispose(); Close(tmpl, conn, req); }
+            finally { if (cancellation != null) cancellation.Dispose(); Close(tmpl, conn, req); }
         }
 
         static void OpenDownload(string url, string bearer, int timeoutMs, string range, string ifRange,
-            out int template, out int connection, out int request, out int status, out string effective)
+            out int template, out int connection, out int request, out int status, out string effective,
+            bool streaming = false, Func<bool> cancel = null)
         {
             template = connection = -1;
             OpenFollow(MethodGet, url, null, null, null, bearer, timeoutMs, range, ifRange, null,
-                out template, out connection, out request, out status, out effective);
+                out template, out connection, out request, out status, out effective, cancel: cancel, streaming: streaming);
         }
 
         static void OpenFollow(int method, string url, byte[] body, string contentType,
             string referer, string bearer, int timeoutMs, string rangeHeader, string ifRangeHeader,
             string userAgent, out int tmpl, out int conn, out int req, out int status, out string finalUrl,
             bool artwork = false, Func<bool> cancel = null, Func<Uri, bool> allowOrigin = null,
-            int redirectLimit = MaxRedirects, string accept = null, bool stopAtRedirect = false)
+            int redirectLimit = MaxRedirects, string accept = null, bool stopAtRedirect = false,
+            bool streaming = false)
         {
             // OpenGate only covers create/config; SendRequest + status run unlocked so
             // parallel range workers overlap network RTT.
@@ -1234,8 +1308,8 @@ namespace Orbis
             string current = url;
             EnsureHttpsUrl(current, "request");
             string initialOrigin = OriginOf(url);
-            uint recvUs = artwork ? (uint)Math.Max(1000000L, Math.Min(30000000L, (long)timeoutMs * 1000L)) :
-                (uint)Math.Max(120000000L, (long)timeoutMs * 1000L);
+            int budget = timeoutMs > 0 ? timeoutMs : 45000;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             int useMethod = method;
             byte[] useBody = body;
             string useContentType = contentType;
@@ -1257,14 +1331,16 @@ namespace Orbis
 
                     lock (OpenGate)
                     {
+                        int remaining = RemainingTimeout(clock, budget);
+                        uint recvUs = (uint)Math.Min(uint.MaxValue, (long)remaining * 1000L);
                         tmpl = sceHttpCreateTemplate(_httpCtx, ua, HttpVersion11, 0);
                         if (tmpl < 0) throw new Exception("sceHttpCreateTemplate 0x" + tmpl.ToString("X"));
 
                         // Leave firmware certificate checks at their secure defaults. Do not
                         // install a verification callback or disable chain/hostname checks.
-                        try { sceHttpSetConnectTimeOut(tmpl, ConnectTimeoutUs); } catch { }
+                        try { sceHttpSetConnectTimeOut(tmpl, Math.Min(ConnectTimeoutUs, recvUs)); } catch { }
                         try { sceHttpSetRecvTimeOut(tmpl, recvUs); } catch { }
-                        try { sceHttpSetSendTimeOut(tmpl, SendTimeoutUs); } catch { }
+                        try { sceHttpSetSendTimeOut(tmpl, Math.Min(SendTimeoutUs, recvUs)); } catch { }
                         // libSceHttp follows redirects itself by default, so a caller that
                         // wants the redirect target must switch that off to see the 3xx.
                         if (stopAtRedirect)
@@ -1283,6 +1359,9 @@ namespace Orbis
                         ulong contentLen = useBody != null ? (ulong)useBody.Length : 0UL;
                         req = sceHttpCreateRequestWithURL(conn, useMethod, current, contentLen);
                         if (req < 0) throw new Exception("sceHttpCreateRequestWithURL 0x" + req.ToString("X"));
+                        lock (DeadlineGate)
+                            RequestDeadlines.Add(req, new RequestDeadline(req, RemainingTimeout(clock, budget),
+                                streaming ? budget : 0));
 
                         // Some retail libSceHttp builds do not reliably retain the body size
                         // from CreateRequestWithURL. Set it explicitly before adding headers.
@@ -1292,11 +1371,11 @@ namespace Orbis
                             {
                                 int lengthRc = sceHttpSetRequestContentLength(req, contentLen);
                                 if (lengthRc < 0)
-                                    _log.Append("post_length=0x").Append(lengthRc.ToString("X")).Append("; ");
+                                    RecordRuntimeError("post_length=0x" + lengthRc.ToString("X"));
                             }
                             catch (Exception lengthEx)
                             {
-                                _log.Append("post_length_ex=").Append(lengthEx.GetType().Name).Append("; ");
+                                RecordRuntimeError("post_length_ex=" + lengthEx.GetType().Name);
                             }
                         }
 
@@ -1333,6 +1412,7 @@ namespace Orbis
                         try
                         {
                             if (cancel != null && cancel()) throw new OperationCanceledException();
+                            CheckRequestDeadline(req);
                             int send;
                             if (useBody != null && useBody.Length > 0 && useMethod == MethodPost)
                             {
@@ -1342,6 +1422,7 @@ namespace Orbis
                             }
                             else
                                 send = sceHttpSendRequest(req, IntPtr.Zero, UIntPtr.Zero);
+                            CheckRequestDeadline(req);
                             if (send < 0)
                             {
                                 if (cancel != null && cancel()) throw new OperationCanceledException();
@@ -1352,8 +1433,9 @@ namespace Orbis
 
                         if (cancel != null && cancel()) throw new OperationCanceledException();
                         int st = 0;
-                        if (sceHttpGetStatusCode(req, out st) < 0)
-                            throw new Exception("sceHttpGetStatusCode failed");
+                        int statusResult = sceHttpGetStatusCode(req, out st);
+                        CheckRequestDeadline(req);
+                        if (statusResult < 0) throw new Exception("sceHttpGetStatusCode failed");
                         status = st;
 
                         if (IsRedirectStatus(status))
@@ -1364,7 +1446,7 @@ namespace Orbis
                             string next = ResolveRedirect(current, loc);
                             EnsureHttpsUrl(next, "redirect");
                             // The caller wants the redirect target itself; the request stays open for it to close.
-                            if (stopAtRedirect) { finalUrl = next; return; }
+                            if (stopAtRedirect) { CheckRequestDeadline(req); finalUrl = next; return; }
                             current = next;
                             // 307/308 explicitly preserve the request method and entity.
                             // Match established browser behavior for 301/302/303.
@@ -1378,6 +1460,9 @@ namespace Orbis
                         }
 
                         finalUrl = current;
+                        CheckRequestDeadline(req, streaming);
+                        if (streaming)
+                            try { sceHttpSetRecvTimeOut(req, (uint)Math.Min(uint.MaxValue, (long)budget * 1000L)); } catch { }
                         return;
                     }
                 }
@@ -1407,6 +1492,8 @@ namespace Orbis
         internal static string GitHubReleaseAssetLocation(string url, int timeoutMs, Func<bool> cancel)
         {
             if (!IsGitHubReleaseAsset(url)) throw new IOException("Not a GitHub release asset link");
+            int budget = timeoutMs > 0 ? timeoutMs : 45000;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             EnsureInit();
             if (!_ready) throw new IOException("Firmware HTTP unavailable: " + _initError);
             // Console TLS to api.github.com fails intermittently (unknown CA on
@@ -1416,12 +1503,14 @@ namespace Orbis
             for (int attempt = 0; ; attempt++)
             {
                 if (cancel != null && cancel()) throw new OperationCanceledException();
-                try { return GitHubReleaseAssetLocationOnce(url, timeoutMs, cancel); }
+                try { return GitHubReleaseAssetLocationOnce(url, RemainingTimeout(clock, budget), cancel); }
                 catch (OperationCanceledException) { throw; }
+                catch (TimeoutException) { throw; }
                 catch (Exception ex)
                 {
                     if (attempt >= delays.Length || (cancel != null && cancel())) throw;
                     int delay = delays[attempt];
+                    if (clock.ElapsedMilliseconds + delay >= budget) throw;
                     SspiLog.Write("network", "github_asset retry attempt=" + (attempt + 1) + " delay_ms=" + delay +
                         " reason=" + Clip(ex.Message ?? ex.GetType().Name, 200));
                     for (int waited = 0; waited < delay; waited += 100)
@@ -1524,18 +1613,17 @@ namespace Orbis
 
         static void RecordRuntimeError(string message)
         {
-            lock (Gate)
-            {
-                _log.Append("runtime_error=").Append(message).Append("; ");
-                FlushLog();
-            }
+            SspiLog.Write("network", "native_http runtime_error=" + message);
         }
 
         static string GetHeader(int req, string name)
         {
+            CheckRequestDeadline(req);
             IntPtr hdrPtr;
             UIntPtr hdrSize;
-            if (sceHttpGetAllResponseHeaders(req, out hdrPtr, out hdrSize) < 0 || hdrPtr == IntPtr.Zero)
+            int result = sceHttpGetAllResponseHeaders(req, out hdrPtr, out hdrSize);
+            CheckRequestDeadline(req);
+            if (result < 0 || hdrPtr == IntPtr.Zero)
                 return null;
             int n = (int)hdrSize.ToUInt32();
             if (n <= 0 || n > 1024 * 1024) return null;
@@ -1553,10 +1641,101 @@ namespace Orbis
             return null;
         }
 
+        static int RemainingTimeout(System.Diagnostics.Stopwatch clock, int budget)
+        {
+            long remaining = budget - clock.ElapsedMilliseconds;
+            if (remaining <= 0) throw new TimeoutException("Native HTTPS request deadline exceeded");
+            return (int)remaining;
+        }
+
+        // The timer stays armed through body reads. Dispose and abort share a lock
+        // so a queued callback cannot act on an ID that firmware has already reused.
+        sealed class RequestDeadline : IDisposable
+        {
+            readonly object gate = new object();
+            readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
+            readonly Timer timer;
+            readonly int request;
+            readonly int idleTimeoutMs;
+            long expiresAt;
+            bool expired;
+            bool disposed;
+
+            internal RequestDeadline(int request, int timeoutMs, int idleTimeoutMs)
+            {
+                this.request = request;
+                this.idleTimeoutMs = idleTimeoutMs;
+                expiresAt = timeoutMs;
+                timer = new Timer(Expire, null, Timeout.Infinite, Timeout.Infinite);
+                timer.Change(timeoutMs, Timeout.Infinite);
+            }
+
+            void Expire(object state)
+            {
+                lock (gate)
+                {
+                    if (disposed || expired) return;
+                    long remaining = expiresAt - clock.ElapsedMilliseconds;
+                    if (remaining > 0)
+                    {
+                        timer.Change((int)remaining, Timeout.Infinite);
+                        return;
+                    }
+                    expired = true;
+                    try { sceHttpAbortRequest(request); } catch { }
+                }
+            }
+
+            internal void Check(bool activity)
+            {
+                lock (gate)
+                {
+                    if (disposed) return;
+                    if (expired || clock.ElapsedMilliseconds >= expiresAt)
+                    {
+                        RecordRuntimeError("request deadline exceeded");
+                        throw new TimeoutException("Native HTTPS request deadline exceeded");
+                    }
+                    // Bulk PKGs may run for hours: after headers, bound inactivity
+                    // rather than cutting off a healthy download at the API deadline.
+                    if (activity && idleTimeoutMs > 0)
+                    {
+                        expiresAt = clock.ElapsedMilliseconds + idleTimeoutMs;
+                        timer.Change(idleTimeoutMs, Timeout.Infinite);
+                    }
+                }
+            }
+
+            public void Dispose()
+            {
+                lock (gate)
+                {
+                    if (disposed) return;
+                    disposed = true;
+                    timer.Dispose();
+                }
+            }
+        }
+
+        static void CheckRequestDeadline(int request, bool activity = false)
+        {
+            RequestDeadline deadline;
+            lock (DeadlineGate) RequestDeadlines.TryGetValue(request, out deadline);
+            if (deadline != null) deadline.Check(activity);
+        }
+
         static void Close(int tmpl, int conn, int req)
         {
             lock (OpenGate)
             {
+                RequestDeadline deadline;
+                lock (DeadlineGate)
+                {
+                    RequestDeadlines.TryGetValue(req, out deadline);
+                    RequestDeadlines.Remove(req);
+                }
+                // Join any abort before firmware can reuse the request ID.
+                if (deadline != null) deadline.Dispose();
                 try { if (req >= 0) sceHttpDeleteRequest(req); } catch { }
                 try { if (conn >= 0) sceHttpDeleteConnection(conn); } catch { }
                 try { if (tmpl >= 0) sceHttpDeleteTemplate(tmpl); } catch { }
@@ -1687,22 +1866,34 @@ namespace Orbis
 
         static int sceHttpGetResponseContentLength(int reqId, out int result, out UIntPtr contentLength)
         {
-            return sceHttpGetResponseContentLengthNative(reqId, out result, out contentLength);
+            CheckRequestDeadline(reqId);
+            int status = sceHttpGetResponseContentLengthNative(reqId, out result, out contentLength);
+            CheckRequestDeadline(reqId);
+            return status;
         }
 
         [DllImport("libSceHttp", EntryPoint = "sceHttpReadData", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceHttpReadDataNative(int reqId, byte[] data, uint size);
 
         static int sceHttpReadData(int reqId, byte[] data, uint size)
-        { return sceHttpReadDataNative(reqId, data, size); }
+        {
+            CheckRequestDeadline(reqId);
+            int read = sceHttpReadDataNative(reqId, data, size);
+            CheckRequestDeadline(reqId, read > 0);
+            return read;
+        }
 
         [DllImport("libSceHttp", EntryPoint = "sceHttpReadData", CallingConvention = CallingConvention.Cdecl)]
         static extern int sceHttpReadDataPointer(int reqId, IntPtr data, uint size);
 
         static unsafe int ReadDownloadBlock(int request, byte[] buffer, int offset, int count)
         {
+            CheckRequestDeadline(request);
+            int read;
             fixed (byte* data = buffer)
-                return sceHttpReadDataPointer(request, (IntPtr)(data + offset), (uint)count);
+                read = sceHttpReadDataPointer(request, (IntPtr)(data + offset), (uint)count);
+            CheckRequestDeadline(request, read > 0);
+            return read;
         }
 
         [DllImport("libSceHttp", EntryPoint = "sceHttpGetAllResponseHeaders", CallingConvention = CallingConvention.Cdecl)]

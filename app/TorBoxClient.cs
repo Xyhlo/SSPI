@@ -16,6 +16,7 @@ namespace Orbis
         static readonly Dictionary<string, Pending> PendingDownloads = new Dictionary<string, Pending>();
         static readonly object CreationGate = new object();
         static readonly Stopwatch CreationClock = Stopwatch.StartNew();
+        static readonly Dictionary<string, List<long>> ProcessAdmissions = new Dictionary<string, List<long>>();
         static long NextCreation;
 
         // Local-only seams used by the source-linked host regression harness.
@@ -29,6 +30,7 @@ namespace Orbis
         {
             lock (PendingDownloads) PendingDownloads.Clear();
             NextCreation = 0;
+            ProcessAdmissions.Clear();
             CreationClock.Restart();
         }
 
@@ -891,14 +893,33 @@ namespace Orbis
                         attempts.Add(ticks);
                     }
                 }
-                long now = DateTime.UtcNow.Ticks;
+                DateTime utcNow = DateTime.UtcNow;
+                long now = utcNow.Ticks;
                 long cutoff = now - TimeSpan.FromHours(1).Ticks;
-                attempts.RemoveAll(ticks => ticks < cutoff);
-                if (attempts.Count >= 60)
+                long minimumClock = new DateTime(2020, 1, 1).Ticks;
+                attempts.RemoveAll(ticks => utcNow.Year < 2020 || ticks < minimumClock || ticks > now || ticks < cutoff);
+                // CreationGate serializes admissions. Keep a monotonic process
+                // history as well, since persisted UTC ages can become unknown.
+                long elapsed = CreationClock.ElapsedMilliseconds;
+                long window = (long)TimeSpan.FromHours(1).TotalMilliseconds;
+                List<long> processAttempts;
+                if (!ProcessAdmissions.TryGetValue(account, out processAttempts))
                 {
-                    attempts.Sort();
-                    int retry = (int)Math.Max(1, Math.Ceiling(TimeSpan.FromHours(1).TotalSeconds -
-                        TimeSpan.FromTicks(Math.Max(0, now - attempts[0])).TotalSeconds));
+                    processAttempts = new List<long>();
+                    ProcessAdmissions[account] = processAttempts;
+                }
+                processAttempts.RemoveAll(at => elapsed - at >= window);
+                if (attempts.Count >= 60 || processAttempts.Count >= 60)
+                {
+                    int retry = 1;
+                    if (attempts.Count >= 60)
+                    {
+                        attempts.Sort();
+                        retry = (int)Math.Max(retry, Math.Ceiling(TimeSpan.FromHours(1).TotalSeconds -
+                            TimeSpan.FromTicks(now - attempts[0]).TotalSeconds));
+                    }
+                    if (processAttempts.Count >= 60)
+                        retry = (int)Math.Max(retry, Math.Ceiling((window - (elapsed - processAttempts[0])) / 1000.0));
                     var limited = (DebridResolutionError)DebridResolutionError.FromResponse("TorBox", sourceUrl,
                         "{\"error\":\"RATE_LIMITED\"}");
                     limited.IsRateLimited = true;
@@ -907,10 +928,14 @@ namespace Orbis
                     limited.HttpStatusCode = 429;
                     throw limited;
                 }
-                attempts.Add(now);
-                var text = new StringBuilder("TORBOX-ADMISSIONS-1\n");
-                foreach (long ticks in attempts) text.Append(ticks.ToString(CultureInfo.InvariantCulture)).Append('\n');
-                AtomicFile.WriteText(path, text.ToString());
+                if (utcNow.Year >= 2020)
+                {
+                    attempts.Add(now);
+                    var text = new StringBuilder("TORBOX-ADMISSIONS-1\n");
+                    foreach (long ticks in attempts) text.Append(ticks.ToString(CultureInfo.InvariantCulture)).Append('\n');
+                    AtomicFile.WriteText(path, text.ToString());
+                }
+                processAttempts.Add(elapsed);
             }
         }
 

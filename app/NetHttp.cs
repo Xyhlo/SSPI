@@ -67,7 +67,8 @@ namespace Orbis
         internal static void TraceBackgroundRoute(BackgroundRoute reason, string worker)
         {
             string version = !string.IsNullOrEmpty(worker) &&
-                System.Text.RegularExpressions.Regex.IsMatch(worker, "\\A5[.]10-r[0-9]{1,3}\\z") ? worker : "unavailable";
+                worker.Length <= 64 && System.Text.RegularExpressions.Regex.IsMatch(worker,
+                    "\\A[0-9]+[.][0-9]+-(?:r|api)[0-9]+\\z") ? worker : "unavailable";
             WriteTransferTrace("event=background_route reason=" + reason + " worker=" + version);
         }
 
