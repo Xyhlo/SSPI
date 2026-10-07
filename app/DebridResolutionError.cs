@@ -13,21 +13,73 @@ namespace Orbis
         internal readonly string ProviderCode;
         internal readonly bool CanTryProvider;
         readonly string Detail;
+        // The same diagnosis without mirror advice, for a package that has no other mirror.
+        readonly string SingleMirrorDetail;
         internal bool IsRateLimited;
         internal bool IsTransient;
         internal bool NeedsAction;
         internal int RetryAfterSeconds;
         internal int HttpStatusCode;
+        // Short transport detail (for example "HTTP 522" or "HTTPS read 0x..."), when known.
+        internal string Diagnostic = "";
 
         DebridResolutionError(string provider, string host, string message, bool canTryMirror, string code = "", bool canTryProvider = false)
             : base(provider + ": " + message + " (" + host + ")")
-        { Provider = provider; Host = host; Detail = message; CanTryMirror = canTryMirror; ProviderCode = code; CanTryProvider = canTryProvider; }
+        {
+            Provider = provider; Host = host; Detail = message; CanTryMirror = canTryMirror; ProviderCode = code; CanTryProvider = canTryProvider;
+            SingleMirrorDetail = WithoutMirrorAdvice(provider, message);
+        }
+
+        /// <summary>The message for a queue row. Advice to choose another mirror is only
+        /// kept when the row still lists one; otherwise the same diagnosis is shown with
+        /// advice the player can act on.</summary>
+        internal string MessageFor(bool otherMirror)
+        {
+            if (otherMirror || SingleMirrorDetail == null) return Message;
+            return Provider + ": " + SingleMirrorDetail + " (" + Host + ")";
+        }
+
+        static string WithoutMirrorAdvice(string provider, string message)
+        {
+            if (string.IsNullOrEmpty(message)) return null;
+            string account = provider == "TorBox"
+                ? "Retry later, or check this download in your TorBox account."
+                : "Retry later or check your " + provider + " account.";
+            string[] advice = {
+                "Retry or choose another mirror.", account,
+                "Choose another mirror or retry later.", "Retry later.",
+                "Try another provider or mirror.", "Retry later, or enable another link service for this host in Connections.",
+                "Choose another supported mirror.", "Retry later, or enable a link service that supports this host in Connections.",
+                "Choose another mirror.", "No other mirror is listed for this package."
+            };
+            for (int i = 0; i < advice.Length; i += 2)
+            {
+                int at = message.IndexOf(advice[i], StringComparison.Ordinal);
+                if (at >= 0) return message.Substring(0, at) + advice[i + 1] + message.Substring(at + advice[i].Length);
+            }
+            return null;
+        }
+
+        /// <summary>The provider holds the finished file, but repeated requests for its
+        /// download link failed without a verdict on the file, so the mirror is not at fault.</summary>
+        internal static DebridResolutionError LinkRequestFailed(DebridResolutionError cause)
+        {
+            string detail = !string.IsNullOrEmpty(cause.Diagnostic) ? cause.Diagnostic :
+                !string.IsNullOrEmpty(cause.ProviderCode) ? cause.ProviderCode : "no usable reply";
+            return new DebridResolutionError(cause.Provider, cause.Host, cause.Provider +
+                " has this file ready, but its download link request kept failing (" + detail +
+                "). Check the connection, then retry from Downloads; the " + cause.Provider + " download was kept.",
+                false, cause.ProviderCode, false) {
+                HttpStatusCode = cause.HttpStatusCode, RetryAfterSeconds = cause.RetryAfterSeconds, Diagnostic = cause.Diagnostic
+            };
+        }
 
         internal DebridResolutionError ForArchivePart(int part, int count)
         {
             return new DebridResolutionError(Provider, Host, "Archive part " + part + "/" + count + ": " + Detail,
                 CanTryMirror, ProviderCode, CanTryProvider) { IsRateLimited = IsRateLimited, IsTransient = IsTransient,
-                    NeedsAction = NeedsAction, RetryAfterSeconds = RetryAfterSeconds, HttpStatusCode = HttpStatusCode };
+                    NeedsAction = NeedsAction, RetryAfterSeconds = RetryAfterSeconds, HttpStatusCode = HttpStatusCode,
+                    Diagnostic = Diagnostic };
         }
 
         /// <summary>A host this build cannot download from without a link service (a wait
@@ -163,6 +215,10 @@ namespace Orbis
             else if (provider == "TorBox" && (code == "DATABASE_ERROR" || code == "UNKNOWN_ERROR" ||
                 code == "NO_SERVERS_AVAILABLE_ERROR" || code == "REDIRECT_ERROR"))
                 message = "TorBox could not prepare the link right now (" + code + "). Retrying shortly.";
+            else if (provider == "TorBox")
+                // Name an unlisted code so a report identifies the cause; never echo free text.
+                message = "TorBox could not provide a download link for this file" +
+                    (IsCodeToken(code) ? " (" + code + ")" : "") + ". Retry or choose another mirror.";
             // Never include the raw provider body: it can echo a signed URL or token.
             string providerCode = provider == "Real-Debrid" && number != 0
                 ? number.ToString(System.Globalization.CultureInfo.InvariantCulture) : code;
@@ -202,6 +258,14 @@ namespace Orbis
                 IsTransient = transient || rateLimited,
                 NeedsAction = needsAction
             };
+        }
+
+        static bool IsCodeToken(string code)
+        {
+            if (string.IsNullOrEmpty(code) || code.Length > 40) return false;
+            foreach (char c in code)
+                if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return false;
+            return true;
         }
 
         internal static Exception FromTransport(string provider, string url, Exception error)
@@ -290,6 +354,7 @@ namespace Orbis
             return new DebridResolutionError(provider, HostName(url),
                 (tls ? "The secure connection to the provider failed." : "The service request failed.") +
                 diagnostic + " Check the connection and retry.", false, "", rejectedHandshake) {
+                Diagnostic = diagnostic.Trim().TrimEnd('.'),
                 RetryAfterSeconds = retryAfter,
                 HttpStatusCode = httpStatus,
                 IsRateLimited = httpStatus == 429 || httpStatus == 503 ||

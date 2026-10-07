@@ -3864,8 +3864,8 @@ namespace Orbis
                             else
                             {
                                 target.ParkedForProvider = false;
-                                failMessage = rejection == null
-                                    ? TorBoxClient.PreparationFailure(failedUrl, poll).Message : rejection.Message;
+                                failMessage = ResolutionFailureText(target,
+                                    rejection ?? TorBoxClient.PreparationFailure(failedUrl, poll));
                             }
                             changed = true;
                             break;
@@ -3924,7 +3924,7 @@ namespace Orbis
                                 target.ParkedForProvider = false;
                                 failMessage = rejection == null
                                     ? (string.IsNullOrEmpty(poll.Error) ? "AllDebrid preparation failed" : poll.Error)
-                                    : rejection.Message;
+                                    : ResolutionFailureText(target, rejection);
                             }
                             changed = true;break;
                     }
@@ -4441,8 +4441,26 @@ namespace Orbis
                 if (TryScheduleHttpRetry(job, attempt, ex)) return;
                 if (TryScheduleSupportRetry(job, attempt, ex)) return;
                 job.HttpRetryUrl = null;
-                SetFailureIfCurrent(job, attempt, ex.Message);
+                SetFailureIfCurrent(job, attempt, ResolutionFailureText(job, ex));
             }
+        }
+
+        /// <summary>A provider failure for a row without another mirror must not ask the
+        /// player to choose one; the same diagnosis is shown with usable advice.</summary>
+        static string ResolutionFailureText(DlItem job, Exception error)
+        {
+            var rejection = error as DebridResolutionError;
+            return rejection == null ? error.Message : rejection.MessageFor(HasOtherMirror(job));
+        }
+
+        /// <summary>True when the row still lists a compatible mirror it is not using.
+        /// Archive rows never record the package's other mirrors, so their advice stays.</summary>
+        static bool HasOtherMirror(DlItem job)
+        {
+            if (job == null || !string.IsNullOrEmpty(job.ArchiveVolumes)) return true;
+            foreach (var mirror in PackageMirrorFallback.Decode(job.MirrorCandidates))
+                if (!string.Equals(mirror.Url, job.HosterUrl, StringComparison.Ordinal)) return true;
+            return false;
         }
 
         // Host support that could not be read (a busy network while renewing an
@@ -4806,7 +4824,8 @@ namespace Orbis
 
         bool DeferWhileResidentTransfers(DlItem job, int attempt)
         {
-            bool busy = ResidentDownloadService.StagedTransfersActive;
+            string residentTransfer;
+            bool busy = ResidentDownloadService.HasLiveStagedTransfer(job.Id, out residentTransfer);
             lock (_lock)
             {
                 foreach (var other in _items)

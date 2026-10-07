@@ -680,6 +680,125 @@ namespace Orbis
             }
         }
 
+        // Every transfer-N.job file still owns its slot and staging files (above), but it is
+        // not evidence of a running transfer: staged, installed, failed and canceled records
+        // stay until their queue row releases them, and a record whose row is gone may never
+        // be released. Work that must not overlap a resident range transfer waits only for a
+        // record the current worker is transferring (the resident's own singleton gate counts
+        // running stages the same way), one too new to have been acknowledged, or an earlier
+        // record of the same queue ID. Other records are logged once and left on disk.
+        static readonly TimeSpan StagedAcknowledgementGrace = TimeSpan.FromMinutes(2);
+        static readonly TimeSpan StagedRunningStatusInterval = TimeSpan.FromMinutes(1);
+        static readonly TimeSpan StagedSilentStatusLimit = TimeSpan.FromMinutes(10);
+        static readonly System.Collections.Generic.HashSet<string> IgnoredResidentRecords =
+            new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+
+        internal static bool HasLiveStagedTransfer(string ownerId, out string detail)
+        {
+            detail = null;
+            WorkerHeartbeat heartbeat;
+            string epoch = TryReadHeartbeat(out heartbeat) ? heartbeat.Epoch : null;
+            DateTime now = DateTime.UtcNow;
+            for (int slot = 0; slot < StagedSlotCount; slot++)
+            {
+                string jobPath = StagedPath(slot, "job");
+                if (!File.Exists(jobPath)) continue;
+                string[] record;
+                string id = null, title = null, generation = null;
+                TimeSpan recordAge = TimeSpan.Zero;
+                try
+                {
+                    recordAge = now - File.GetLastWriteTimeUtc(jobPath);
+                    record = File.ReadAllLines(jobPath);
+                    if (IsStagedRecord(record))
+                    {
+                        id = Decode(record[1]); title = Decode(record[4]);
+                        if (record[0] == "10" || record[0] == "13" || record[0] == "16" || record[0] == "18") generation = record[11];
+                    }
+                }
+                catch (FileNotFoundException) { continue; }
+                catch (DirectoryNotFoundException) { continue; }
+                catch (Exception) { id = null; }
+                if (id != null && !string.IsNullOrEmpty(ownerId) && id == ownerId)
+                { detail = "the previous background attempt of this package is still being released"; return true; }
+                ResidentDownloadStatus status = null;
+                string statusPath = StagedPath(slot, "status");
+                if (id != null && !TryGetStagedStatusAt(statusPath, jobPath, id, out status))
+                {
+                    statusPath = MapToSharedIpcRoot(statusPath);
+                    if (statusPath == null || !TryGetStagedStatusAt(statusPath, MapToSharedIpcRoot(jobPath) ?? jobPath, id, out status))
+                        status = null;
+                }
+                TimeSpan statusAge = TimeSpan.Zero;
+                if (status != null) try { statusAge = now - File.GetLastWriteTimeUtc(statusPath); } catch { }
+                string staleReason;
+                if (IsLiveStagedTransfer(id != null, recordAge, status, statusAge, epoch, out staleReason))
+                {
+                    string name = "another background download" + (string.IsNullOrEmpty(title) ? "" : " (" + title + ")");
+                    detail = status == null ? "the background worker has not accepted a new transfer yet" :
+                        status.State == "storage-wait" && !string.IsNullOrEmpty(status.Error) ? name + " is waiting: " + status.Error :
+                        name + " is still running";
+                    return true;
+                }
+                NoteIgnoredResidentRecord("transfer-" + slot.ToString(CultureInfo.InvariantCulture), id, generation,
+                    status != null ? status.State : null, staleReason);
+            }
+            return false;
+        }
+
+        internal static bool IsLiveStagedTransfer(bool validRecord, TimeSpan recordAge,
+            ResidentDownloadStatus status, TimeSpan statusAge, string workerEpoch, out string staleReason)
+        {
+            staleReason = null;
+            // A record still being written, or not yet taken in by the worker's next poll.
+            bool young = recordAge.Duration() < StagedAcknowledgementGrace;
+            if (!validRecord) { if (young) return true; staleReason = "invalid-record"; return false; }
+            if (status == null) { if (young) return true; staleReason = "no-worker-status"; return false; }
+            string state = status.State ?? "";
+            if (state != "ready" && state != "feeding" && state != "validating" && state != "storage-wait")
+            { staleReason = "not-transferring"; return false; }
+            // A restarted worker rewrites every record it takes over; a running state from
+            // an earlier worker instance belongs to a record the current one rejected.
+            bool epochKnown = !string.IsNullOrEmpty(workerEpoch) && !string.IsNullOrEmpty(status.WorkerEpoch);
+            if (epochKnown && !string.Equals(status.WorkerEpoch, workerEpoch, StringComparison.Ordinal))
+            { staleReason = "previous-worker"; return false; }
+            // A running stage rewrites storage-wait twice a second; a queued one writes it once.
+            if (state == "storage-wait" && statusAge.Duration() >= StagedRunningStatusInterval)
+            { staleReason = "storage-wait-idle"; return false; }
+            if (!epochKnown && statusAge.Duration() >= StagedSilentStatusLimit)
+            { staleReason = "silent-status"; return false; }
+            return true;
+        }
+
+        // status.txt keeps "installed" after the worker releases a finished singleton job
+        // (other outcomes are reset to idle), and a restarted worker keeps the previous
+        // instance's status until it starts a job. Without job.txt neither owns the worker.
+        static bool SingletonStatusReleased(ResidentDownloadStatus status)
+        {
+            if (status == null || File.Exists(JobPath)) return false;
+            WorkerHeartbeat heartbeat;
+            string epoch = TryReadHeartbeat(out heartbeat) ? heartbeat.Epoch : null;
+            string reason = status.State == "installed" ? "installed-and-released" :
+                !string.IsNullOrEmpty(epoch) && !string.IsNullOrEmpty(status.WorkerEpoch) &&
+                !string.Equals(epoch, status.WorkerEpoch, StringComparison.Ordinal) ? "previous-worker" : null;
+            if (reason == null) return false;
+            NoteIgnoredResidentRecord("status", status.Id, status.Generation, status.State, reason);
+            return true;
+        }
+
+        static void NoteIgnoredResidentRecord(string record, string id, string generation, string state, string reason)
+        {
+            string key = record + "|" + id + "|" + generation + "|" + state + "|" + reason;
+            lock (IgnoredResidentRecords)
+            {
+                if (!IgnoredResidentRecords.Add(key)) return;
+                if (IgnoredResidentRecords.Count > 256) { IgnoredResidentRecords.Clear(); IgnoredResidentRecords.Add(key); }
+            }
+            SspiLog.Write("resident", "event=stale-record-ignored record=" + record + " job=" + (id ?? "unreadable") +
+                " generation=" + (string.IsNullOrEmpty(generation) ? "none" : generation) + " state=" + (state ?? "none") +
+                " reason=" + reason + " files=retained");
+        }
+
         public static bool TryStartStagedPackage(string id, string url, string destination, string titleId,
             string sha256, string contentId, long size, int expectedKind, int rangeCount,
             out string error, out bool busy)
@@ -1119,7 +1238,8 @@ namespace Orbis
                 if (!ValidArchivePassword(password)) { error = "Archive password exceeds 256 UTF-8 bytes or is invalid"; return false; }
                 if (!IsGeneration(generation)) { error = "Resident ownership generation is invalid"; return false; }
                 if (!EnsureAvailableLocked(out error)) return false;
-                if (StagedTransfersActive) { error = "Resident range transfers are active"; return false; }
+                string liveTransfer;
+                if (HasLiveStagedTransfer(id, out liveTransfer)) { error = liveTransfer; return false; }
                 if (File.Exists(JobPath))
                 {
                     // Publication owns the singleton until its worker retires it. A retry
@@ -1134,7 +1254,7 @@ namespace Orbis
                     error = "Another resident job is active"; return false;
                 }
                 ResidentDownloadStatus current;
-                if (TryReadStatus(out current) && current.State != "idle" && current.Id != id)
+                if (TryReadStatus(out current) && current.State != "idle" && current.Id != id && !SingletonStatusReleased(current))
                 { error = "Another resident job is active"; return false; }
                 if (volumes == null || paths == null || volumes.Count == 0 || volumes.Count > 512 || volumes.Count != paths.Count)
                 { error = "Archive volume metadata is incomplete"; return false; }

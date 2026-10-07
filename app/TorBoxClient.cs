@@ -95,11 +95,8 @@ namespace Orbis
                     continue;
                 }
                 transient = 0;
-                if (outcome.Kind == PreparedPollKind.Rejected)
-                    throw outcome.NeedsAction
-                        ? DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "WEB_DOWNLOAD_RECONCILIATION_REQUIRED", outcome.Error)
-                        : DebridResolutionError.FromResponse("TorBox", hostUrl, outcome.RawJson);
-                if (outcome.Kind == PreparedPollKind.Terminal) throw PreparationFailure(hostUrl, outcome);
+                if (outcome.Kind == PreparedPollKind.Rejected || outcome.Kind == PreparedPollKind.Terminal)
+                    throw PreparationFailure(hostUrl, outcome);
                 if (outcome.Visible) listed++;
                 fileId = outcome.Kind == PreparedPollKind.Ready ? outcome.FileId : null;
                 if (!string.IsNullOrEmpty(fileId)) break;
@@ -126,17 +123,92 @@ namespace Orbis
                 throw new Exception("TorBox is still preparing this file after " + (int)elapsed.Elapsed.TotalSeconds +
                     "s (" + detail + "). The prepared download was kept; retry from Downloads shortly.");
             }
-            return RefreshPrepared(token, hostUrl, cancel);
+            return RequestPreparedLink(token, hostUrl, cancel);
         }
 
         internal static int PollDelayMs(int poll) { return poll == 0 ? 1000 : poll == 1 ? 2000 : 5000; }
         // Bounded tolerance for a list query that fails outright. The prepared
         // download id is retained across the retries, so one cloud job is reused.
         internal const int TransientListAttempts = 3;
+
+        // The link request for a finished file is a read-only GET: repeating it never
+        // creates a cloud job. Requests per resolve, then resolves (each handed to the
+        // queue's provider backoff) before the row fails with the last diagnosis.
+        internal const int LinkRequestAttempts = 3;
+        internal const int LinkRequestRounds = 4;
+        internal const int LinkRequestRetrySeconds = 15;
+        static readonly Dictionary<string, int> LinkRequestFailures = new Dictionary<string, int>();
+
+        sealed class UnreadableResponseException : IOException
+        { internal UnreadableResponseException() : base("TorBox returned an invalid JSON response. Retry shortly.") { } }
+
         static Dictionary<string, object> Response(string json)
         {
             try { return Object(PackageSourceJson.Parse(json)); }
-            catch { throw new IOException("TorBox returned an invalid JSON response. Retry shortly."); }
+            catch { throw new UnreadableResponseException(); }
+        }
+
+        /// <summary>
+        /// Requests the download link of a file TorBox already finished. A failure that
+        /// says nothing about the file (no response, a dropped or failed TLS read, a
+        /// server error, an unreadable reply or a TorBox fault marked temporary) is
+        /// retried here and then returned as transient, so the queue waits and asks
+        /// again instead of failing the download. The source mirror is never blamed.
+        /// </summary>
+        static string RequestPreparedLink(string token, string sourceUrl, Func<bool> cancel)
+        {
+            string key = PendingKey(token, sourceUrl);
+            for (int attempt = 1; ; attempt++)
+            {
+                DebridResolutionError failure;
+                try
+                {
+                    string link = RefreshPrepared(token, sourceUrl, cancel);
+                    lock (LinkRequestFailures) LinkRequestFailures.Remove(key);
+                    return link;
+                }
+                catch (DebridResolutionError ex)
+                {
+                    if (!RetryableLinkFailure(ex)) throw;
+                    failure = ex;
+                }
+                catch (UnreadableResponseException ex)
+                {
+                    failure = (DebridResolutionError)DebridResolutionError.FromTransport("TorBox", sourceUrl, ex);
+                }
+                SspiLog.Write("download", "event=torbox-link-request-failed attempt=" + attempt + "/" + LinkRequestAttempts +
+                    " http=" + failure.HttpStatusCode + " code=" + (string.IsNullOrEmpty(failure.ProviderCode) ? "-" : failure.ProviderCode) +
+                    " detail=" + (string.IsNullOrEmpty(failure.Diagnostic) ? "-" : failure.Diagnostic.Replace(' ', '_')));
+                // A long Retry-After is honoured by the queue backoff, not by blocking here.
+                if (attempt < LinkRequestAttempts && failure.RetryAfterSeconds <= 5)
+                {
+                    Wait(PollDelayWithRetryAfter(PollDelayMs(attempt - 1), failure.RetryAfterSeconds), cancel);
+                    continue;
+                }
+                int rounds;
+                lock (LinkRequestFailures)
+                {
+                    LinkRequestFailures.TryGetValue(key, out rounds);
+                    rounds++;
+                    if (rounds >= LinkRequestRounds) LinkRequestFailures.Remove(key);
+                    else LinkRequestFailures[key] = rounds;
+                }
+                SspiLog.Write("download", "event=torbox-link-request-round round=" + rounds + "/" + LinkRequestRounds);
+                if (rounds >= LinkRequestRounds) throw DebridResolutionError.LinkRequestFailed(failure);
+                failure.IsTransient = true;
+                failure.RetryAfterSeconds = Math.Max(failure.RetryAfterSeconds, LinkRequestRetrySeconds);
+                throw failure;
+            }
+        }
+
+        // Rate limits keep the provider's own backoff, and an explicit rejection or
+        // account problem is reported at once. A TLS handshake the console rejected
+        // keeps its existing provider fallback.
+        static bool RetryableLinkFailure(DebridResolutionError ex)
+        {
+            if (ex.IsRateLimited || ex.NeedsAction || ex.CanTryMirror) return false;
+            if (ex.IsTransient || ex.HttpStatusCode >= 500) return true;
+            return ex.HttpStatusCode == 0 && string.IsNullOrEmpty(ex.ProviderCode) && !ex.CanTryProvider;
         }
         static Dictionary<string, object> Object(object value)
         {
@@ -418,7 +490,10 @@ namespace Orbis
                 result.Error = transport == null ? ex.Message : transport.Message;
                 bool hasProviderResponse = transport != null &&
                     (transport.HttpStatusCode != 0 || !string.IsNullOrEmpty(transport.ProviderCode));
-                if (hasProviderResponse && !transport.IsTransient && !transport.IsRateLimited)
+                // Any server error (5xx) on this read-only list query says nothing about
+                // the prepared download, so it is retried like a lost response.
+                if (hasProviderResponse && !transport.IsTransient && !transport.IsRateLimited &&
+                    transport.HttpStatusCode < 500)
                 {
                     result.Kind = PreparedPollKind.Rejected;
                     result.NeedsAction = transport.NeedsAction;
@@ -836,7 +911,13 @@ namespace Orbis
                 var action = DebridResolutionError.AmbiguousCreate("TorBox", hostUrl, "WEB_DOWNLOAD_RECONCILIATION_REQUIRED", outcome.Error);
                 return outcome.PartCount > 0 ? action.ForArchivePart(outcome.PartNumber, outcome.PartCount) : action;
             }
-            var failure = DebridResolutionError.FromResponse("TorBox", hostUrl,
+            // A list request refused at the HTTP level has no TorBox body; keep its
+            // transport diagnosis instead of reporting an unexplained failure.
+            var refused = outcome.Kind == PreparedPollKind.Rejected && string.IsNullOrEmpty(outcome.RawJson) && outcome.Transport != null
+                ? outcome.Transport as DebridResolutionError ??
+                    DebridResolutionError.FromTransport("TorBox", hostUrl, outcome.Transport) as DebridResolutionError
+                : null;
+            var failure = refused ?? DebridResolutionError.FromResponse("TorBox", hostUrl,
                 outcome.Kind == PreparedPollKind.Terminal ? "{\"error\":\"DOWNLOAD_FAILED\"}" : outcome.RawJson);
             return outcome.PartCount > 0 ? failure.ForArchivePart(outcome.PartNumber, outcome.PartCount) : failure;
         }
