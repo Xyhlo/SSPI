@@ -205,6 +205,18 @@ namespace Orbis
                         case 1005: detail = "RAR decoder initialization failed; restart SSPI after installing the updated package"; break;
                         default: detail = "RAR decoder could not read this archive"; break;
                     }
+                    // A part shorter than its headers declare stops the decoder late, as an
+                    // unreadable archive or, on an encrypted file, as a data check failure that
+                    // reads like a wrong password: name that part instead, as the background
+                    // worker does. An archive found inside the download is a complete copy.
+                    int code = -count;
+                    if (allowNested && (code == 1013 || code == 1012 || code == 12 || code == 15 || code == 18 || code == 21))
+                    {
+                        bool inbox = LocalInstallSource.IsInboxPath(paths[0].Replace('\\', '/')), verified;
+                        string problem = RarVolumes.SetProblem(paths, inbox, out verified);
+                        if (problem != null) detail = problem;
+                        else if (code == 1013 && verified) detail = RarVolumes.Damaged(inbox, paths.Count);
+                    }
                     string failure = detail + " (decoder " + count + "). Archive retained.";
                     var reported = new InvalidDataException(failure);
                     try { reported.Data[RarFailureKey] = new RarFailureEvidence {

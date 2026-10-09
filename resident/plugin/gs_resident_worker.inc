@@ -49,6 +49,9 @@ static OrbisPthread gs_worker;
 static int gs_worker_created;
 static volatile int gs_worker_running, gs_validated, gs_served;
 static volatile int gs_paused, gs_canceled, gs_release;
+/* Remove anyway: a release the user confirmed after the PS4 did not confirm stopping
+ * the job's task. SSPI then drops its tracking without another BGFT call. */
+static volatile int gs_detach;
 static volatile int64_t gs_done;
 static volatile int64_t gs_network_bytes;
 static int gs_http = -1;
@@ -345,6 +348,9 @@ static int gs_read_control_action(const char *path)
         if (strcmp(line, "resume") == 0) action = 2;
         if (strcmp(line, "cancel") == 0) action = 3;
         if (strcmp(line, "release") == 0) action = 4;
+        /* An optional last line marks a release the user confirmed as Remove anyway (5).
+         * Older workers stop reading before it and see an ordinary release. */
+        if (action == 4 && !gs_line(file, line, sizeof(line)) && !strcmp(line, "detach")) action = 5;
         // Keep the desired state. Unlinking after this read can remove a newer
         // atomic replacement (notably resume arriving while pause is applied).
     }
@@ -360,7 +366,8 @@ static void gs_control(void)
     if (action == 1 && !gs_paused && !gs_pause_archive_task(1)) gs_paused = 1;
     if (action == 2 && gs_paused && !gs_pause_archive_task(0)) gs_paused = 0;
     if (action >= 3) gs_canceled = 1;
-    if (action == 4) gs_release = 1;
+    if (action >= 4) gs_release = 1;
+    if (action == 5) gs_detach = 1;
 }
 
 static void gs_archive_control(void);
@@ -1094,7 +1101,26 @@ static int gs_stopped_install_journal(const char *path)
     return length == 45 || (body[45] == ' ' && body[46] >= '6' && body[46] <= '9');
 }
 
-static int gs_archive_cancel_before_start(const GsJob *job)
+/* Why a Remove needs no BGFT stop for this journal: a finished child ("<content> <task>
+ * 1 0 <route> [kind]") or an accepted AppInstUtil add-on ("<content> -1 0 2 6"). NULL
+ * keeps ownership. Links and anything longer than a journal are refused. */
+static const char *gs_settled_install_journal(const char *path)
+{
+    char body[130], id[49], extra; int task, complete, pending, version, kind = 0;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return NULL;
+    FILE *file = fdopen(fd, "rb"); if (!file) { close(fd); return NULL; }
+    size_t length = fread(body, 1, sizeof(body) - 1, file); fclose(file);
+    if (!length || length > 128) return NULL;
+    body[length] = 0;
+    int fields = sscanf(body, "%48s %d %d %d %d %d %c", id, &task, &complete, &pending, &version, &kind, &extra);
+    if ((fields != 5 && fields != 6) || strlen(id) != 36 || task < -1) return NULL;
+    if (complete == 1 && !pending) return "complete-receipt";
+    if (fields == 5 && task == -1 && !complete && pending == 2 && version == 6) return "addon-submitted";
+    return NULL;
+}
+
+static int gs_archive_cancel_before_start(const GsJob *job, int release)
 {
     if (job->archive != 1) return 0;
     if (!gs_storage_matches(job->storage_root, job->storage_token)) return -1;
@@ -1110,13 +1136,23 @@ static int gs_archive_cancel_before_start(const GsJob *job)
     if (directory_kind != 1) return directory_kind == 0 ? 0 : -1;
     /* No worker has restored child task IDs yet. Even a completion receipt
      * must retain ownership until the installer can verify it; only a journal
-     * that owns no task releases it. */
+     * that owns no task releases it. A Remove (release) of a job canceled before
+     * a restart never runs that installer again, so a finished child or an
+     * AppInstUtil submission, which leave no task to stop, release it too. */
+    int finished = 0, submitted = 0;
     for (int ordinal = 1; ordinal <= 256; ordinal++) {
         snprintf(path, sizeof(path), "%s/install-%03d.txt", directory, ordinal);
         int present = gs_nofollow_path(path, 0);
         if (present == 0) continue;
-        if (present != 1 || !gs_stopped_install_journal(path)) return -1;
+        if (present != 1) return -1;
+        if (gs_stopped_install_journal(path)) continue;
+        const char *settled = release ? gs_settled_install_journal(path) : NULL;
+        if (!settled) return -1;
+        if (!strcmp(settled, "complete-receipt")) finished++; else submitted++;
     }
+    if (finished || submitted)
+        gs_log_write("resident", "archive-release-before-start job=%s complete_receipts=%d addon_submissions=%d outcome=tracking-released",
+            job->id, finished, submitted);
     return 0;
 }
 
@@ -1130,8 +1166,10 @@ static void gs_worker_poll(void)
     gs_inbox_poll(); // FTP uploads, also while SSPI is closed; throttled to one scan per 2 s.
     gs_control();
     if (gs_canceled && !gs_worker_running && gs_job.id[0]) {
-        if ((!gs_worker_created && !gs_archive_journal[0] &&
-                (gs_archive_cancel_before_start(&gs_job) || (gs_job.archive != 1 && gs_job.expected_kind &&
+        /* Remove anyway skips the unconfirmed stop; gs_cancel_task records that decision. */
+        int detached = gs_release && gs_detach;
+        if ((!detached && !gs_worker_created && !gs_archive_journal[0] &&
+                (gs_archive_cancel_before_start(&gs_job, gs_release) || (gs_job.archive != 1 && gs_job.expected_kind &&
                     gs_retire_parked_package(gs_job.id, gs_job.content, gs_job.expected_kind, gs_release)))) || gs_cancel_task()) {
             gs_release = 0; gs_write_status("failed", "BGFT cancellation unconfirmed; ownership retained");
         } else gs_write_status("canceled", NULL);
@@ -1157,21 +1195,21 @@ static void gs_worker_poll(void)
                 return;
             }
         }
-        memset(&gs_job, 0, sizeof(gs_job)); gs_stream_slot = -1; gs_validated = gs_served = gs_canceled = gs_paused = gs_release = 0;
+        memset(&gs_job, 0, sizeof(gs_job)); gs_stream_slot = -1; gs_validated = gs_served = gs_canceled = gs_paused = gs_release = gs_detach = 0;
         gs_done = 0; gs_current_task = -1; if (!installed) gs_write_status("idle", NULL);
         gs_archive_journal[0] = 0;
     }
     if (!gs_worker_running && !strcmp(gs_state, "complete")) gs_write_status("complete", NULL);
     if (gs_job.id[0] || gs_worker_running || gs_read_job(&candidate)) return;
     if (gs_stage_transfer_active() || g_client_count) return;
-    gs_network_bytes = 0;gs_job = candidate; gs_stream_slot = -1; gs_transfer_verified = 0; gs_interval_count = 0; gs_done = 0; gs_validated = gs_served = gs_paused = gs_canceled = gs_release = 0;
+    gs_network_bytes = 0;gs_job = candidate; gs_stream_slot = -1; gs_transfer_verified = 0; gs_interval_count = 0; gs_done = 0; gs_validated = gs_served = gs_paused = gs_canceled = gs_release = gs_detach = 0;
     /* Apply retained intent against this generation before extraction can run.
      * A staged archive may already have a durable singleton install record. */
     for (int i = 0; i < GS_STAGE_COUNT; i++) {
         GsStage *stage = &gs_stages[i];
         if (strcmp(stage->job.id, candidate.id) || strcmp(stage->job.generation, candidate.generation)) continue;
         gs_stage_control(stage);
-        gs_paused = stage->paused; gs_canceled = stage->canceled; gs_release = stage->release;
+        gs_paused = stage->paused; gs_canceled = stage->canceled; gs_release = stage->release; gs_detach = stage->detach;
         break;
     }
     gs_control();

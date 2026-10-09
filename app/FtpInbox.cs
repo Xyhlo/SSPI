@@ -20,7 +20,13 @@ namespace Orbis
     // existing claim marks the upload as processed. A claim body holds owner, name,
     // size, mtime, job and state lines; the worker may append its set's file count
     // and bytes. While a ready worker advertises ftpinbox=1 in its heartbeat, the app
-    // only shows progress and leaves the upload to it.
+    // only shows progress and leaves the upload to it, except encrypted RAR sets: the
+    // worker has no archive password, so it leaves those to the app.
+    //
+    // A RAR set is handed off only when every present part holds what its headers
+    // declare and the last part says the set ends there (RarVolumes.InboxHold, in step
+    // with gs_inbox_rar_hold). A client that stalls inside a part, or sends the next
+    // part under a temporary name, otherwise passes the quiet check with an incomplete set.
     internal static class FtpInbox
     {
         internal sealed class Snapshot
@@ -30,6 +36,7 @@ namespace Orbis
             public double BytesPerSecond;
             public bool Background;
             public string[] Names = new string[0];
+            public string Waiting = ""; // what a held RAR set waits for, with its first file name
         }
 
         sealed class Entry
@@ -52,6 +59,7 @@ namespace Orbis
         static Snapshot _snapshot = new Snapshot();
         static Thread _thread;
         static DateTime _retryUtc = DateTime.MinValue, _pruneUtc = DateTime.MinValue;
+        static string _waiting = "", _noticed = "";
 
         internal static string Root { get { return LocalInstallSource.InboxRoot; } }
         static string ClaimRoot { get { return Path.Combine(AppSettings.DataDir, "ftp-inbox-claims"); } }
@@ -188,18 +196,21 @@ namespace Orbis
 
         // handoff receives the complete PKGs and first RAR volumes this app owns and
         // returns false when the pipeline cannot accept them yet. background reports
-        // uploads that the resident worker claimed.
-        internal static void Start(Action<string> arrival, Func<List<string>, bool> handoff, Action changed, Action<string> background)
+        // uploads that the resident worker claimed; waiting reports a RAR set held for
+        // a missing or incomplete part, once per status.
+        internal static void Start(Action<string> arrival, Func<List<string>, bool> handoff, Action changed, Action<string> background,
+            Action<string> waiting = null)
         {
             lock (Gate)
             {
                 if (_thread != null) return;
-                _thread = new Thread(() => Run(arrival, handoff, changed, background)) { IsBackground = true, Name = "sspi-ftp-inbox" };
+                _thread = new Thread(() => Run(arrival, handoff, changed, background, waiting)) { IsBackground = true, Name = "sspi-ftp-inbox" };
             }
             _thread.Start();
         }
 
-        static void Run(Action<string> arrival, Func<List<string>, bool> handoff, Action changed, Action<string> background)
+        static void Run(Action<string> arrival, Func<List<string>, bool> handoff, Action changed, Action<string> background,
+            Action<string> waiting)
         {
             try
             {
@@ -209,13 +220,14 @@ namespace Orbis
             catch (Exception ex) { SspiLog.Write("download", "ftp-inbox unavailable " + SspiLog.Clean(ex.Message)); }
             while (true)
             {
-                try { Poll(arrival, handoff, changed, background); }
+                try { Poll(arrival, handoff, changed, background, waiting); }
                 catch (Exception ex) { SspiLog.Write("download", "ftp-inbox poll " + SspiLog.Clean(ex.Message)); }
                 Thread.Sleep(PollMilliseconds);
             }
         }
 
-        static void Poll(Action<string> arrival, Func<List<string>, bool> handoff, Action changed, Action<string> background)
+        static void Poll(Action<string> arrival, Func<List<string>, bool> handoff, Action changed, Action<string> background,
+            Action<string> waiting = null)
         {
             if (!Directory.Exists(Root)) { Directory.CreateDirectory(Root); return; }
             DateTime now = DateTime.UtcNow;
@@ -299,8 +311,9 @@ namespace Orbis
                 long received = 0; var names = new List<string>();
                 foreach (Entry entry in Tracked.Values) { received += entry.Size; if (names.Count < 3) names.Add(entry.Name); }
                 names.Sort(StringComparer.OrdinalIgnoreCase);
+                if (Tracked.Count == 0) _waiting = "";
                 _snapshot = new Snapshot { Files = Tracked.Count, ReceivedBytes = received, Background = resident,
-                    BytesPerSecond = grown / (PollMilliseconds / 1000.0), Names = names.ToArray() };
+                    BytesPerSecond = grown / (PollMilliseconds / 1000.0), Names = names.ToArray(), Waiting = _waiting };
             }
             // The worker posts its own PS4 notification for a new upload.
             if (firstArrival != null && wasIdle && arrival != null && !resident) arrival(firstArrival);
@@ -308,12 +321,44 @@ namespace Orbis
             // Redraw only while uploads change; an idle inbox costs one folder scan.
             if (changed != null && (firstArrival != null || grown > 0 || ready != null || takenByWorker.Count > 0 ||
                 (!wasIdle && present.Count == 0))) changed();
-            if (ready == null || ready.Count == 0 || defer) return;
+            if (ready == null || ready.Count == 0) return;
+            // A RAR set waits for its missing or incomplete part. The worker has no archive
+            // password and leaves an encrypted set to the app, so that set is not deferred.
+            var held = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var encryptedSets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string status = "";
+            foreach (Entry entry in ready)
+            {
+                string set; int index; bool encrypted;
+                if (Kind(entry.Name) != 1 || !ArchiveVolumeSet.TryIndex(entry.Name, out set, out index)) continue;
+                string hold = RarVolumes.InboxHold(entry.Path, out encrypted);
+                if (hold != null) { held.Add(set); if (status.Length == 0) status = hold + ": " + entry.Name; }
+                else if (encrypted) encryptedSets.Add(set);
+            }
+            lock (Gate)
+            {
+                _waiting = status; _snapshot.Waiting = status;
+                if (held.Count > 0) _retryUtc = now.AddSeconds(30); // checked again after a pause, not every poll
+            }
+            if (status != _noticed)
+            {
+                _noticed = status;
+                if (status.Length > 0) SspiLog.Write("download", "ftp-inbox hold " + SspiLog.Clean(status));
+                if (status.Length > 0 && waiting != null && !resident) waiting(status); // the worker posts its own
+            }
+            Func<Entry, bool> takes = entry =>
+            {
+                string set; int index;
+                bool rar = ArchiveVolumeSet.TryIndex(entry.Name, out set, out index);
+                if (rar && held.Contains(set)) return false;
+                return !defer || (rar && encryptedSets.Contains(set));
+            };
+            if (!ready.Exists(entry => takes(entry))) return;
             var owned = new List<Entry>();
             var paths = new List<string>();
             bool retry = false;
             var primaries = new List<Entry>();
-            foreach (Entry entry in ready) if (Kind(entry.Name) == 1) primaries.Add(entry);
+            foreach (Entry entry in ready) if (Kind(entry.Name) == 1 && takes(entry)) primaries.Add(entry);
             primaries.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
             foreach (Entry entry in primaries)
             {
@@ -323,9 +368,9 @@ namespace Orbis
                 if (claim > 0) { owned.Add(entry); paths.Add(entry.Path); }
                 else if (claim < 0) retry = true;
             }
-            // Continuation volumes travel with their set's claim.
+            // Continuation volumes travel with their set's claim; a held set keeps them unclaimed.
             foreach (Entry entry in ready)
-                if (Kind(entry.Name) == 2) TryClaim(entry.Name, entry.Size, entry.MtimeSeconds, "volume");
+                if (Kind(entry.Name) == 2 && takes(entry)) TryClaim(entry.Name, entry.Size, entry.MtimeSeconds, "volume");
             paths.Sort(StringComparer.Ordinal);
             bool accepted = paths.Count == 0;
             if (paths.Count > 0)
@@ -344,8 +389,8 @@ namespace Orbis
                 if (retry) _retryUtc = DateTime.UtcNow.AddSeconds(30);
                 if (accepted)
                     foreach (Entry entry in ready)
-                        if (Kind(entry.Name) == 2 || owned.Contains(entry)) Tracked.Remove(entry.Path);
-                if (Tracked.Count == 0) _snapshot = new Snapshot();
+                        if ((Kind(entry.Name) == 2 && takes(entry)) || owned.Contains(entry)) Tracked.Remove(entry.Path);
+                if (Tracked.Count == 0) { _snapshot = new Snapshot(); _waiting = ""; }
             }
             if (changed != null) changed();
         }

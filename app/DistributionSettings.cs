@@ -84,6 +84,29 @@ namespace Orbis
             return Get("archivePassword." + page.DnsSafeHost.ToLowerInvariant());
         }
 
+        /// <summary>Archive passwords configured for a source host that a bracketed tag in an
+        /// uploaded file's name names ("[host] Title.part1.rar"): the values a download from that
+        /// host receives, in the same order. Empty when no tag names a configured host.</summary>
+        internal static string[] ArchivePasswordsForFileName(string name)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrEmpty(name)) return result.ToArray();
+            int tags = 0;
+            for (int open = name.IndexOf('['); open >= 0 && result.Count == 0 && ++tags <= 8; open = name.IndexOf('[', open + 1))
+            {
+                int close = name.IndexOf(']', open + 1);
+                if (close < 0) break;
+                string host = name.Substring(open + 1, close - open - 1).Trim().TrimEnd('.').ToLowerInvariant();
+                if (host.Length > 253 || host.IndexOf('.') <= 0 || Uri.CheckHostName(host) != UriHostNameType.Dns) continue;
+                for (int i = 0; i < 4; i++)
+                {
+                    string value = Get("archivePassword." + host + (i == 0 ? "" : "." + (i + 1)));
+                    if (value.Length > 0 && !result.Contains(value)) result.Add(value);
+                }
+            }
+            return result.ToArray();
+        }
+
         internal static string[] ArchivePasswordFallbacks(string sourcePageUrl, string primary, string encoded)
         {
             var values = new List<string>(ArchivePasswordDefaults.Decode(encoded));

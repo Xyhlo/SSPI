@@ -164,14 +164,16 @@ namespace Orbis
                 bool unknown = true;
                 foreach (string id in EnabledIds(cfg))
                     if (DebridHostSupport.Load(cfg, id, false) != null) { unknown = false; break; }
-                throw DebridResolutionError.HostSupport("Enabled services", hosterUrl, unknown);
+                // Name the services that were checked, so the player knows which one to fix.
+                throw DebridResolutionError.HostSupport(DisplayNames(EnabledIds(cfg)), hosterUrl, unknown);
             }
             Exception last = null;
             DebridResolutionError mirrorFailure = null;
+            var refused = new List<string>();
             foreach (string selected in ids)
             {
                 if (cancel != null && cancel()) throw new OperationCanceledException();
-                if (unavailableProviders != null && unavailableProviders.Contains(selected)) continue;
+                if (unavailableProviders != null && unavailableProviders.Contains(selected)) { refused.Add(selected); continue; }
                 try
                 {
                     if (progress != null) progress("Resolving with " + DisplayName(selected));
@@ -202,7 +204,19 @@ namespace Orbis
             }
             if (mirrorFailure != null) throw mirrorFailure;
             if (last != null) throw last;
-            throw new Exception("No enabled link service could resolve this mirror");
+            // Every service that supports this host refused this mirror earlier in the
+            // download. Say so: another mirror may work, and Retry asks them again.
+            throw DebridResolutionError.ProvidersRefused(DisplayNames(refused), hosterUrl);
+        }
+
+        /// <summary>"TorBox", "TorBox and Real-Debrid" or "TorBox, Real-Debrid and AllDebrid".</summary>
+        internal static string DisplayNames(IList<string> ids)
+        {
+            var names = new List<string>();
+            if (ids != null) foreach (string id in ids) names.Add(DisplayName(id));
+            if (names.Count == 0) return "Enabled services";
+            if (names.Count == 1) return names[0];
+            return string.Join(", ", names.GetRange(0, names.Count - 1).ToArray()) + " and " + names[names.Count - 1];
         }
 
         sealed class AccountCache { public string Status; public DateTime Until; }

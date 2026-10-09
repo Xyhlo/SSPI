@@ -2237,10 +2237,14 @@ namespace Orbis
                 }
                 DlItem item = OverlayDownload();
                 _uiOverlay = UiOverlay.None;
+                bool anyway = RemoveAnyway(item);
                 RunDownloadAction(() => {
                     string error = null;
                     bool ok = item != null && _dlMgr.Remove(item.Id, out error);
-                    User.NotifyToast(ok ? "Removal requested" : Clip(error ?? "Remove failed", 48));
+                    User.NotifyToast(!ok ? Clip(error ?? "Remove failed", 48) : !anyway ? "Removal requested" :
+                        ResidentDownloadService.DetachWorkerState == "previous-build"
+                            ? "Stopped tracking; restart the PS4 to let the background worker release it"
+                            : "Stopped tracking; PS4 download and files kept");
                 });
             }
             else if (_uiOverlay == UiOverlay.ConfirmClearToken)
@@ -2291,14 +2295,16 @@ namespace Orbis
             DlItem item = OverlayDownload();
             string title = _uiOverlay == UiOverlay.Install ? "Install package?" :
                 (_uiOverlay == UiOverlay.DownloadActions ? (item == null ? "Package actions" : PackageTitle(item.Kind)) :
-                (_uiOverlay == UiOverlay.ConfirmSaveSettings ? "Save settings?" : _overlayTitle));
+                (_uiOverlay == UiOverlay.ConfirmSaveSettings ? "Save settings?" :
+                (_uiOverlay == UiOverlay.ConfirmRemove || _uiOverlay == UiOverlay.ConfirmCancel) && _removeGroupIds == null &&
+                    RemoveAnyway(item) ? "Remove anyway?" : _overlayTitle));
             TextFit(r, panel.x + 36, panel.y + 30, 30, panel.w - 72, title, White);
             Fill(r, panel.x + 36, panel.y + 78, panel.w - 72, 1, Border);
             if (_uiOverlay == UiOverlay.DownloadActions)
             {
                 string primary = NeedsArchivePassword(item) ? "Enter archive password" : item != null && item.State == DlState.Paused ? "Resume" :
                     (item != null && (item.State == DlState.Failed || item.State == DlState.Canceled) ? "Retry" : "Pause");
-                string[] actions = { primary, "Move up", "Remove", "Cancel" };
+                string[] actions = { primary, "Move up", RemoveAnyway(item) ? "Remove anyway" : "Remove", "Cancel" };
                 for (int i = 0; i < actions.Length; i++) {
                     var action = new SDL_Rect { x = panel.x + 28, y = panel.y + 98 + i * 78, w = panel.w - 56, h = 64 };
                     bool focused = _overlayFocus == i; var tone = i == 2 ? Danger : Accent;
@@ -2328,7 +2334,11 @@ namespace Orbis
                     ((item == null ? "PKG" : PackageTitle(item.Kind)) + " · install from local storage") :
                     (_uiOverlay == UiOverlay.ConfirmClearToken ? "Downloads will use direct links until paired again." :
                     (_uiOverlay == UiOverlay.ConfirmClearHistory ? "Finished and removable rows will be cleared." :
-                    _removeGroupIds != null ? "All " + _removeGroupIds.Length + " queued packages. Installed games and USB originals are kept." : "Remove this package from the queue. Installed games and USB originals are kept."));
+                    _removeGroupIds != null ? "All " + _removeGroupIds.Length + " queued packages. Installed games and USB originals are kept." +
+                        (ReadDownloadSnapshot().Exists(x => RemoveAnyway(x) && Array.IndexOf(_removeGroupIds, x.Id) >= 0)
+                            ? " Rows the PS4 did not confirm stopping are no longer tracked." : "") :
+                    RemoveAnyway(item) ? "The PS4 did not confirm stopping it. SSPI stops tracking it; the PS4 download, installed content and files are kept." :
+                    "Remove this package from the queue. Installed games and USB originals are kept."));
                 int split = consequence.Length > 72 ? consequence.LastIndexOf(' ', Math.Min(72, consequence.Length - 1)) : -1;
                 TextFit(r, panel.x + 36, panel.y + 108, 21, panel.w - 72, split > 0 ? consequence.Substring(0, split) : consequence, Muted);
                 if (split > 0) TextFit(r, panel.x + 36, panel.y + 142, 21, panel.w - 72, consequence.Substring(split + 1), Muted);
@@ -2349,6 +2359,10 @@ namespace Orbis
         {
             RunDownloadAction(() => { string message = _dlMgr.DownloadNext(item.Id); SetStatus(message); User.NotifyToast(message); });
         }
+
+        // A removal the background worker has not confirmed for a minute: removing it again stops
+        // SSPI tracking it and leaves the PS4 download, installed content and files as they are.
+        static bool RemoveAnyway(DlItem item) { return item != null && item.ResidentRemovePending && item.ResidentRemoveStuck; }
 
         void ActOnDownload(DlItem item)
         {
@@ -2812,6 +2826,9 @@ namespace Orbis
         string ResolveEmptyDescription()
         {
             if (!string.IsNullOrEmpty(_resolveError)) return _resolveError;
+            // Without an enabled link service only direct files and a few free hosts work.
+            if (_links.Count > 0 && _detailTypeCounts[0] == 0 && _cfg != null && !_cfg.HasActiveUnlock)
+                return "These mirrors need a link service. Connect Real-Debrid or TorBox in Connections and enable it.";
             if (_links.Count > 0 && _detailTypeCounts[0] == 0)
                 return HostListsUnavailable()
                     ? "SSPI could not read your link service's list of supported hosts, so no mirror can be shown yet. Check the network, then retry the check or check Connections."

@@ -107,6 +107,34 @@ namespace Orbis
             return (length == 0 && lengthTotal == 0) || expectedBytes <= 0;
         }
 
+        // An In-app install can wait on the PS4 without any progress report: the add-on
+        // installer call reports none. After this quiet period the row says where to look.
+        // It is a notice only; nothing is failed, retried or deleted. Without a progress
+        // report a package also gets the time it needs at 20 MB/s when that is longer.
+        internal static long LocalInstallQuietLimitMs(long packageBytes, bool progressReported)
+        {
+            const long Minimum = 10L * 60 * 1000;
+            return progressReported || packageBytes <= 0 ? Minimum : Math.Max(Minimum, packageBytes / 20000);
+        }
+
+        /// <summary>Status for an In-app install SSPI is waiting on. Null keeps the text the
+        /// installer's own percentage callback wrote.</summary>
+        internal static string LocalInstallWaitStatus(bool installerOwnsText, long elapsedMs, long quietMs,
+            long quietLimitMs, int percent, long checkDone, long checkTotal)
+        {
+            if (checkTotal > 0 && checkDone >= 0)
+                return "Verifying the add-on already on the PS4 · " +
+                    Math.Min(99, (int)(Math.Min(checkDone, checkTotal) * 100 / checkTotal)) + "%";
+            // The row clips long text at its end, so the finding and where to look come first.
+            if (quietMs >= quietLimitMs)
+                return (percent >= 0 ? "Installing " + percent + "% · " : "") + "PS4 reported no progress for " +
+                    quietMs / 60000 + " min · check Notifications > Downloads · SSPI keeps checking, PKG kept";
+            if (installerOwnsText) return null;
+            long seconds = Math.Max(0, elapsedMs / 1000);
+            string clock = seconds / 60 + ":" + (seconds % 60).ToString("00");
+            return "PS4 installing " + (percent >= 0 ? percent + "% · " : "· ") + clock + " elapsed";
+        }
+
         public static bool UseStorageBgft(PkgContentKind kind)
         {
             // Storage BGFT identifies an update by the already-installed base title and can

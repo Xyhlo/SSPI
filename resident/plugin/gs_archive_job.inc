@@ -1556,6 +1556,19 @@ static int gs_pause_archive_task(int paused)
 static int gs_cancel_task(void)
 {
     int (*stop)(int), (*remove)(int); int module;
+    /* Remove anyway: the user confirmed that SSPI stops tracking this job although the
+     * PS4 did not confirm stopping its task. No BGFT call is made and the journal is
+     * kept; the PS4 task stays in Notifications > Downloads as it is. */
+    if (gs_release && gs_detach) {
+        static char noted[260]; char key[260];
+        snprintf(key, sizeof(key), "%s/%s", gs_job.id, gs_job.generation);
+        if (strcmp(key, noted)) {
+            snprintf(noted, sizeof(noted), "%s", key);
+            gs_log_write("resident", "bgft-detach job=%s generation=%s task=%d journal=%s outcome=tracking-released reason=remove-anyway",
+                gs_job.id, gs_job.generation, (int)gs_archive_task, gs_archive_journal[0] ? "retained" : "none");
+        }
+        gs_archive_task = -1; return 0;
+    }
     if (gs_archive_task < 0 && gs_archive_journal[0]) {
         char id[49], extra; int task, complete, pending, version, kind = gs_job.expected_kind;
         FILE *journal = fopen(gs_archive_journal, "rb");
@@ -1566,7 +1579,10 @@ static int gs_cancel_task(void)
                 // AppInstUtil add-ons have no BGFT task to cancel. An explicit
                 // Remove can release tracking; the manager retains unconfirmed
                 // DLC inputs and this receipt so it cannot submit twice on retry.
-                if (gs_release && gs_job.expected_kind == 7 && kind == 7 && task == -1 && version == 6) {
+                // An archive job has no package kind of its own: its five-field
+                // journal takes this form only after an AppInstUtil submission.
+                int addon = gs_job.archive == 1 ? fields == 5 || kind == 7 : gs_job.expected_kind == 7 && kind == 7;
+                if (gs_release && addon && task == -1 && version == 6) {
                     gs_log_write("resident", "addon-tracking-released job=%s outcome=unconfirmed", gs_job.id);
                     return 0;
                 }
@@ -1580,13 +1596,35 @@ static int gs_cancel_task(void)
         gs_bind(module, "sceBgftServiceIntDownloadUnregisterTask", &remove)) return -1;
     stop(gs_archive_task);
     int rc = remove(gs_archive_task);
-    gs_log_write("resident", "bgft-unregister job=%s task=%d result=0x%08X", gs_job.id, gs_archive_task, (unsigned)rc);
-    if (rc && (uint32_t)rc != 0x80990019u) return -1;
+    const char *settled = NULL;
+    if (rc && (uint32_t)rc != 0x80990019u) {
+        /* The PS4 refused to unregister. A task it no longer knows, stopped with an
+         * error or finished has nothing left to stop. A task that may still run keeps
+         * ownership until the PS4 confirms or the user chooses Remove anyway. Storage
+         * tasks report no byte totals and can report copy=100 at startup, so only a
+         * task with byte totals counts as finished. */
+        int (*progress)(int, GsBgftProgress *); GsBgftProgress state = {0};
+        int state_rc = gs_bind(module, "sceBgftServiceDownloadGetProgress", &progress) ? -1 : progress(gs_archive_task, &state);
+        uint64_t length = state.length_total ? state.length_total : state.length;
+        uint64_t done = state.length_total ? state.transferred_total : state.transferred;
+        settled = (uint32_t)state_rc == 0x80990019u ? "task-gone" : state_rc ? NULL : state.error ? "stopped-by-ps4" :
+            length && done >= length && state.preparing >= 100 && state.copy >= 100 ? "finished" : NULL;
+    }
+    /* The poll loop retries an unconfirmed stop every second; log each outcome once. */
+    static int noted_task = -2; static unsigned noted_rc; static const char *noted_outcome;
+    if (gs_archive_task != noted_task || (unsigned)rc != noted_rc || settled != noted_outcome) {
+        noted_task = gs_archive_task; noted_rc = (unsigned)rc; noted_outcome = settled;
+        if (!rc || (uint32_t)rc == 0x80990019u)
+            gs_log_write("resident", "bgft-unregister job=%s task=%d result=0x%08X", gs_job.id, gs_archive_task, (unsigned)rc);
+        else gs_log_write("resident", "bgft-unregister job=%s task=%d result=0x%08X outcome=%s", gs_job.id, gs_archive_task,
+            (unsigned)rc, settled ? settled : "unconfirmed");
+    }
+    if (rc && (uint32_t)rc != 0x80990019u && !settled) return -1;
     if (gs_archive_journal[0]) {
         char record[96]; snprintf(record, sizeof(record), "%s -1 0 0 6", gs_job.content);
         if (write_atomic(gs_archive_journal, record)) return -1;
     }
-    gs_archive_task = -1; return 0;
+    gs_archive_task = -1; noted_task = -2; return 0;
 }
 
 static int gs_park_task(void)
@@ -1952,6 +1990,206 @@ static int gs_archive_install_receipt(int64_t total)
     return write_atomic(receipt, body);
 }
 
+/* RAR volume structure, read from a volume's own headers without a password and
+ * without decoding. A part whose upload or copy stopped early fails this check at
+ * once, while the decoder reports it only after decoding everything before the
+ * gap: as an unreadable archive, or as a data check failure that on an encrypted
+ * file reads like a wrong password. Encrypted headers cannot be read without the
+ * password, so such a volume stays undecided. RarVolumes in app/ArchiveVolumeSet.cs
+ * reads volumes the same way; keep the two in step. */
+enum { GS_RAR_VOLUME_UNKNOWN, GS_RAR_VOLUME_COMPLETE, GS_RAR_VOLUME_TRUNCATED };
+typedef struct {
+    int state, format;      /* format 4: RAR 1.5-4.x, 5: RAR 5.0, 0: neither signature */
+    int more;               /* complete: the volume says another one follows it */
+    int encrypted;          /* file data or headers are encrypted */
+    int unchecked;          /* something encrypted has no RAR 5.0 password check value */
+    int64_t size, needed;   /* length; truncated: end of the first block past it (0: unknown) */
+} GsRarVolume;
+
+static uint32_t gs_rar_crc32(const unsigned char *data, size_t length)
+{
+    uint32_t crc = 0xffffffffu;
+    while (length--) {
+        crc ^= *data++;
+        for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+/* RAR 5.0 variable-length integer at data[*at]; 0 when it does not end before limit. */
+static int gs_rar_vint(const unsigned char *data, size_t limit, size_t *at, uint64_t *value)
+{
+    *value = 0;
+    for (int shift = 0; *at < limit && shift < 64; shift += 7) {
+        unsigned char byte = data[(*at)++];
+        *value |= (uint64_t)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) return 1;
+    }
+    return 0;
+}
+
+static uint32_t gs_rar_le32(const unsigned char *p)
+{ return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+
+/* RAR 5.0 encryption parameters (archive encryption header or a file header's
+ * encryption record) start with a version and flags; flag 1 stores the password
+ * check value that the decoder tests before it decodes anything. */
+static void gs_rar_crypt_flags(const unsigned char *data, size_t limit, size_t at, GsRarVolume *volume)
+{
+    uint64_t version, flags;
+    volume->encrypted = 1;
+    if (!gs_rar_vint(data, limit, &at, &version) || !gs_rar_vint(data, limit, &at, &flags) || !(flags & 1)) volume->unchecked = 1;
+}
+
+/* 0 with *volume filled in; -1 when the file cannot be opened or read. */
+static int gs_rar_volume_inspect(const char *path, GsRarVolume *volume)
+{
+    enum { HEADER_LIMIT = 65536 };
+    memset(volume, 0, sizeof(*volume));
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return -1;
+    unsigned char *header = (unsigned char *)malloc(HEADER_LIMIT);
+    int64_t size = sceKernelLseek(fd, 0, SEEK_END), pos;
+    int result = header && size >= 0 ? 0 : -1, split = 0;
+    volume->size = size;
+    if (!result && size >= 8 && sceKernelPread(fd, header, 8, 0) == 8) {
+        if (!memcmp(header, "Rar!\x1a\x07\x01\x00", 8)) volume->format = 5;
+        else if (!memcmp(header, "Rar!\x1a\x07\x00", 7)) volume->format = 4;
+    }
+    pos = volume->format == 5 ? 8 : 7;
+    for (int blocks = 0; volume->format && blocks < 4096; blocks++) {
+        uint64_t data = 0;
+        if (volume->format == 5) {
+            /* CRC32, header size (at most 3 bytes), header; data follows. Every volume
+             * ends with an end of archive header, so running out before it is a gap. */
+            if (size - pos < 7) {
+                volume->state = GS_RAR_VOLUME_TRUNCATED; volume->needed = pos < size ? pos + 7 : 0;
+                break;
+            }
+            if (sceKernelPread(fd, header, 7, pos) != 7) break;
+            uint32_t crc = gs_rar_le32(header); size_t at = 4; uint64_t length, type, flags, extra = 0;
+            /* A block type other than 1-5 is not a RAR 5.0 header: undecided, never short. */
+            if (!gs_rar_vint(header, 7, &at, &length) || !length || length > 2 * 1024 * 1024 ||
+                (at < 7 && (header[at] == 0 || header[at] > 5))) break;
+            int64_t header_end = pos + (int64_t)at + (int64_t)length;
+            if (header_end > size) { volume->state = GS_RAR_VOLUME_TRUNCATED; volume->needed = header_end; break; }
+            size_t span = at - 4 + (size_t)length;
+            if (span > HEADER_LIMIT || sceKernelPread(fd, header, span, pos + 4) != span ||
+                gs_rar_crc32(header, span) != crc) break;
+            at -= 4;
+            if (!gs_rar_vint(header, span, &at, &type) || !gs_rar_vint(header, span, &at, &flags) ||
+                ((flags & 1) && !gs_rar_vint(header, span, &at, &extra)) ||
+                ((flags & 2) && !gs_rar_vint(header, span, &at, &data)) || extra > span - at) break;
+            if (type == 4) { gs_rar_crypt_flags(header, span, at, volume); break; } /* the rest needs the password */
+            if (type == 5) {
+                uint64_t end;
+                if (!gs_rar_vint(header, span, &at, &end)) break;
+                volume->more = (int)(end & 1); volume->state = GS_RAR_VOLUME_COMPLETE; break;
+            }
+            if (type == 2 && (flags & 1)) {
+                /* Extra area records: size, type, data. Type 1 holds encryption parameters. */
+                for (size_t record = span - (size_t)extra; record < span;) {
+                    size_t field = record; uint64_t record_size, record_type;
+                    if (!gs_rar_vint(header, span, &field, &record_size) || !record_size || record_size > span - field) break;
+                    record = field + (size_t)record_size;
+                    if (gs_rar_vint(header, record, &field, &record_type) && record_type == 1)
+                        gs_rar_crypt_flags(header, record, field, volume);
+                }
+            }
+            pos = header_end;
+        } else {
+            /* CRC16 (low half of CRC32), type, flags, header size; data follows. RAR 2.x
+             * volumes have no end of archive header, so a file may end after a block. */
+            if (pos == size) { volume->state = GS_RAR_VOLUME_COMPLETE; volume->more = split; break; }
+            if (size - pos < 7) { volume->state = GS_RAR_VOLUME_TRUNCATED; volume->needed = pos + 7; break; }
+            if (sceKernelPread(fd, header, 7, pos) != 7) break;
+            unsigned crc = header[0] | header[1] << 8, type = header[2], flags = header[3] | header[4] << 8;
+            unsigned length = header[5] | header[6] << 8; int check = 0;
+            if (length < 7 || type < 0x72 || type > 0x7b) break; /* not a RAR 1.5-4.x block: undecided */
+            if (pos + length > size) { volume->state = GS_RAR_VOLUME_TRUNCATED; volume->needed = pos + length; break; }
+            if (sceKernelPread(fd, header, length, pos) != length) break;
+            if (type == 0x73) check = !(flags & 0x2);            /* main header; an old comment is outside its CRC */
+            else if (type == 0x74 || type == 0x7a) {              /* file or service header: packed size */
+                if (length < ((flags & 0x100) ? 40u : 32u)) break;
+                data = gs_rar_le32(header + 7) | ((flags & 0x100) ? (uint64_t)gs_rar_le32(header + 32) << 32 : 0);
+                check = !(flags & 0x8);
+            } else if (type == 0x7b) check = !(flags & 0x4);      /* end of archive; recovery volumes zero its tail */
+            else if (type == 0x77 || type == 0x78 || (flags & 0x8000)) {
+                if (length < 11) break;
+                data = gs_rar_le32(header + 7);
+            }
+            if (check && (gs_rar_crc32(header + 2, length - 2) & 0xffffu) != crc) break;
+            if (type == 0x73 && (flags & 0x80)) { volume->encrypted = volume->unchecked = 1; break; } /* encrypted headers */
+            if (type == 0x74) { split = (flags & 0x2) != 0; if (flags & 0x4) volume->encrypted = volume->unchecked = 1; }
+            if (type == 0x7b) { volume->more = (int)(flags & 1); volume->state = GS_RAR_VOLUME_COMPLETE; break; }
+            pos += length;
+        }
+        if (data > (uint64_t)(INT64_MAX - pos)) break;
+        if (pos + (int64_t)data > size) { volume->state = GS_RAR_VOLUME_TRUNCATED; volume->needed = pos + (int64_t)data; break; }
+        pos += (int64_t)data;
+    }
+    free(header); close(fd);
+    return result;
+}
+
+/* Decimal units, as the Downloads page shows sizes, without floating point. */
+static void gs_rar_bytes(int64_t bytes, char *out, size_t capacity)
+{
+    if (bytes >= 1000000000) snprintf(out, capacity, "%lld.%02lld GB", (long long)(bytes / 1000000000), (long long)(bytes % 1000000000 / 10000000));
+    else snprintf(out, capacity, "%lld.%lld MB", (long long)(bytes / 1000000), (long long)(bytes % 1000000 / 100000));
+}
+
+/* After a failed RAR extraction: describes a supplied part that is shorter than its
+ * headers declare, or the part after the last one when that one says the set goes
+ * on. When no part's headers can be read (encrypted headers), parts are compared
+ * by size instead: RAR writes every part except the last at the same size.
+ * Returns 1 with message set (it ends in "then retry"), 0 when no part shows such
+ * a problem. *verified is 1 when everything encrypted is RAR 5.0 with a password
+ * check value: the decoder tests that value before decoding, so a later data check
+ * failure is damage, not a wrong password. inbox selects the advice for FTP uploads. */
+static int gs_rar_set_problem(const char *const *paths, int count, int inbox, char *message, size_t capacity, int *verified)
+{
+    GsRarVolume volume; int64_t *sizes = count > 0 && count <= GS_MAX_VOLUMES ? (int64_t *)calloc((size_t)count, sizeof(int64_t)) : NULL;
+    int part = 0, total = 0, missing = 0, unreadable = 0, readable = 0, encrypted = 0, checked = 1, rar5 = 1;
+    int64_t size = 0, needed = 0;
+    *verified = 0;
+    if (!sizes) return 0;
+    for (int i = 0; i < count; i++) {
+        if (gs_rar_volume_inspect(paths[i], &volume)) { free(sizes); return 0; }
+        sizes[i] = volume.size; encrypted |= volume.encrypted;
+        if (volume.unchecked) checked = 0;
+        if (volume.format != 5) rar5 = 0;
+        if (volume.state != GS_RAR_VOLUME_UNKNOWN) readable = 1;
+        else if (!volume.encrypted) unreadable = 1;
+        if (volume.state == GS_RAR_VOLUME_TRUNCATED && !part) { part = i + 1; size = volume.size; needed = volume.needed; }
+        if (volume.state == GS_RAR_VOLUME_COMPLETE && !volume.more && !total) total = i + 1;
+        if (i == count - 1 && volume.state == GS_RAR_VOLUME_COMPLETE && volume.more) missing = count + 1;
+    }
+    if (!part && !readable && !unreadable) {
+        int64_t largest = 0;
+        for (int i = 0; i < count; i++) if (sizes[i] > largest) largest = sizes[i];
+        for (int i = 0; i < count - 1 && !part; i++) if (sizes[i] < largest) { part = i + 1; size = sizes[i]; needed = largest; }
+    }
+    free(sizes);
+    *verified = rar5 && encrypted && checked && !unreadable;
+    const char *action = inbox ? "Upload" : "Copy or download";
+    if (part) {
+        char have[32], want[32], of[16] = "";
+        if (total) snprintf(of, sizeof(of), " of %d", total);
+        gs_rar_bytes(size, have, sizeof(have)); gs_rar_bytes(needed, want, sizeof(want));
+        if (needed > size) snprintf(message, capacity, "RAR part %d%s is incomplete: %s of at least %s. %s that part again, then retry",
+            part, of, have, want, action);
+        else snprintf(message, capacity, "RAR part %d%s is incomplete: its end is missing. %s that part again, then retry", part, of, action);
+        return 1;
+    }
+    if (missing) {
+        snprintf(message, capacity, "RAR part %d is missing: part %d says the set continues. %s every part, then retry",
+            missing, missing - 1, inbox ? "Upload" : "Supply");
+        return 1;
+    }
+    return 0;
+}
+
 static int gs_run_archive(void)
 {
     char directory[1024], alias[1300], first[1300], leaf[256], archives[1150];
@@ -2108,7 +2346,22 @@ extract_set:
         char error[256], detail[400];
         // A resident stop is not a cancel; done: reports the job as waiting to resume.
         if (gs_canceled || g_stop) { if (gs_canceled) gs_write_status("canceled", "Archive extraction canceled; input retained"); goto done; }
-        if (seven) snprintf(error, sizeof(error), "%s", seven_error[0] ? seven_error : "Split 7z archives are not supported; original retained");
+        /* A part shorter than its headers declare stops the decoder late, as an
+         * unreadable archive or, on an encrypted file, as a data check failure that
+         * reads like a wrong password: name that part instead. Only the downloaded set
+         * is checked; an archive found inside it is a complete temporary copy. */
+        char volume_problem[200] = ""; int verified = 0;
+        int inbox = gs_job.borrowed_source && strstr(gs_job.destination, "/pkg-rars/") != NULL;
+        if (rar && !nested_failed && (count == -GS_RAR_ENCRYPTED_BAD_DATA || count == -GS_RAR_MISSING_VOLUME ||
+                count == -12 || count == -15 || count == -18 || count == -21) &&
+            !gs_rar_set_problem(set_paths, set_count, inbox, volume_problem, sizeof(volume_problem), &verified)) {
+            volume_problem[0] = 0;
+            if (count == -GS_RAR_ENCRYPTED_BAD_DATA && verified)
+                snprintf(volume_problem, sizeof(volume_problem), "RAR data is damaged: an encrypted file failed its checksum after its key was verified. %s %s again, then retry",
+                    inbox ? "Upload" : "Copy or download", set_count > 1 ? "the parts" : "the archive");
+        }
+        if (volume_problem[0]) snprintf(error, sizeof(error), "%s. Archive retained.", volume_problem);
+        else if (seven) snprintf(error, sizeof(error), "%s", seven_error[0] ? seven_error : "Split 7z archives are not supported; original retained");
         else if (!zip && count == -1010) snprintf(error, sizeof(error), "RAR holds another archive. Unpacking it needs free space of about twice that archive's size on the staging drive; archive retained. Free space and retry, or extract it on a computer.");
         else if (!zip && count == -1001) snprintf(error, sizeof(error), "RAR header reading timed out; input retained. Remove the queue entry or retry after checking the archive.");
         else if (!zip && count == -1002) snprintf(error, sizeof(error), "RAR scan found no PKG filename or package signature; archive retained. Check that the source supplied a PS4 package archive.");

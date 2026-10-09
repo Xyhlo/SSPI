@@ -13,7 +13,8 @@ namespace Orbis
                 name => User.NotifyToast(Clip("FTP transfer detected: " + name, 160)),
                 HandOffFtpInbox,
                 () => { lock (_lock) Invalidated = true; },
-                name => User.NotifyToast(Clip("FTP upload sent to background installation: " + name, 160)));
+                name => User.NotifyToast(Clip("FTP upload sent to background installation: " + name, 160)),
+                status => User.NotifyToast(Clip("FTP upload " + char.ToLowerInvariant(status[0]) + status.Substring(1), 160)));
         }
 
         // Runs on the inbox thread with the PKGs, ZIP or 7z archives and first RAR
@@ -90,7 +91,9 @@ namespace Orbis
             string names = ftp.Names.Length == 0 ? "" : string.Join("  ·  ", ftp.Names);
             string state = ftp.BytesPerSecond > 0 ? "Receiving" :
                 ftp.Background ? "Background installation starts when the upload finishes" : "Waiting for the upload to finish";
-            TextFit(renderer, strip.x + 58, y + 66, 17, strip.w - 90, state + "  ·  " + names, Dim);
+            // A RAR set held for a missing or incomplete part says which part it needs.
+            string line = ftp.BytesPerSecond <= 0 && !string.IsNullOrEmpty(ftp.Waiting) ? ftp.Waiting : state + "  ·  " + names;
+            TextFit(renderer, strip.x + 58, y + 66, 17, strip.w - 90, line, Dim);
             return y + strip.h + 20;
         }
     }

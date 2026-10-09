@@ -5,7 +5,8 @@
  * that flat folder every two seconds, announces a new upload with a PS4
  * notification, and once every tracked file has kept the same size and time for
  * the grace period it claims each upload and publishes it as a borrowed
- * local-source staged job. The existing staged validation, archive extraction
+ * local-source staged job; a RAR set also waits until its headers show every part
+ * complete (gs_inbox_rar_hold). The existing staged validation, archive extraction
  * and BGFT installation paths then do the work.
  *
  * Ownership is shared with the application through one claim file per upload
@@ -668,6 +669,79 @@ static void gs_inbox_retry_changed_sets(void)
     gs_inbox_recheck_count = 0;
 }
 
+/* Part `index` (2 or more) of the RAR set whose first volume is name, spelled as
+ * gs_read_volumes looks for it: name.partN.rar keeps the first part's digit count;
+ * name.rar continues as name.r00 .. name.z99 in the case of its extension, then in
+ * the other case. 1: present and not empty (path set), 0: absent, -1: past the scheme. */
+static int gs_inbox_rar_part(const char *directory, const char *name, int index, char *path, size_t capacity)
+{
+    size_t n = strlen(name); int prefix = -1, digits = 0, upper = n > 3 && name[n - 3] == 'R';
+    char leaf[300]; int64_t size, mtime;
+    for (int i = (int)n - 5; i >= 5; i--) if (!strncasecmp(name + i - 5, ".part", 5)) {
+        char *end; long first = strtol(name + i, &end, 10);
+        if (end == name + n - 4 && first == 1 && end > name + i && end - (name + i) <= 6) { prefix = i; digits = (int)(end - (name + i)); break; }
+    }
+    for (int attempt = 0; attempt < (prefix >= 0 ? 1 : 2); attempt++) {
+        if (prefix >= 0) snprintf(leaf, sizeof(leaf), "%.*s%0*d%s", prefix, name, digits, index, name + n - 4);
+        else {
+            int letter = 'r' + (index - 2) / 100;
+            if (letter > 'z') return -1;
+            if (attempt ? !upper : upper) letter -= 'a' - 'A';
+            snprintf(leaf, sizeof(leaf), "%.*s.%c%02d", (int)n - 4, name, letter, (index - 2) % 100);
+        }
+        if (snprintf(path, capacity, "%s/%s", directory, leaf) >= (int)capacity) return -1;
+        if (!gs_inbox_stat(path, &size, &mtime)) return 1;
+    }
+    return 0;
+}
+
+/* Notices already posted for held sets, so a set that keeps waiting is announced once. */
+static uint64_t gs_inbox_notices[16];
+static int gs_inbox_notice_next;
+
+/* RAR sets arrive one part at a time, and a phone FTP client can stall inside a
+ * part for longer than the quiet period or send the next part under a temporary
+ * name this scan does not list. Extraction started then fails only after decoding
+ * up to the gap, often as "password probably incorrect" on encrypted files. A set
+ * therefore stays in the inbox while a present part is shorter than its headers
+ * declare or the last present part says another follows (gs_rar_volume_inspect in
+ * gs_archive_job.inc). An encrypted set is left to the application: it applies
+ * archive passwords and offers Enter password, and this worker has no password
+ * for an upload. Sets whose headers cannot be read keep the quiet period alone.
+ * Returns 1 to leave the set in the inbox for now; app/FtpInbox.cs does the same. */
+static int gs_inbox_rar_hold(const GsInboxEntry *entry, const char *directory)
+{
+    char path[1100], name[248], detail[300]; GsRarVolume volume;
+    int truncated = 0, missing = 0, encrypted = 0, more = 0; int64_t size = 0, needed = 0;
+    if (!gs_inbox_ends_with(entry->name, ".rar") ||
+        snprintf(path, sizeof(path), "%s/%s", directory, entry->name) >= (int)sizeof(path)) return 0;
+    for (int part = 1; part <= GS_MAX_VOLUMES; part++) {
+        if (part > 1) {
+            int found = gs_inbox_rar_part(directory, entry->name, part, path, sizeof(path));
+            if (found <= 0) { if (!found && more) missing = part; break; }
+        }
+        if (gs_rar_volume_inspect(path, &volume)) return 0; // cannot tell: the quiet period decides
+        encrypted |= volume.encrypted;
+        if (volume.state == GS_RAR_VOLUME_TRUNCATED) { truncated = part; size = volume.size; needed = volume.needed; break; }
+        more = volume.state == GS_RAR_VOLUME_COMPLETE && volume.more;
+        if (volume.state == GS_RAR_VOLUME_COMPLETE && !more) break; // the set ends with this part
+    }
+    if (!truncated && !missing && !encrypted) return 0;
+    gs_inbox_printable(entry->name, name, sizeof(name));
+    const char *reason = truncated ? "part-incomplete" : missing ? "part-missing" : "encrypted";
+    int part = truncated ? truncated : missing;
+    if (truncated) snprintf(detail, sizeof(detail), "%.150s: waiting for part %d to finish uploading", name, part);
+    else if (missing) snprintf(detail, sizeof(detail), "%.150s: waiting for part %d", name, part);
+    else snprintf(detail, sizeof(detail), "%.150s is password-protected; it installs while SSPI is open", name);
+    uint64_t key = gs_inbox_hash(detail, gs_inbox_hash(entry->name, 0xcbf29ce484222325ULL));
+    for (int i = 0; i < 16; i++) if (gs_inbox_notices[i] == key) return 1;
+    gs_inbox_notices[gs_inbox_notice_next] = key; gs_inbox_notice_next = (gs_inbox_notice_next + 1) % 16;
+    gs_download_notification("FTP upload", detail);
+    gs_log_write("resident", "ftp-inbox hold reason=%s part=%d bytes=%lld needed=%lld name=%s", reason, part,
+        (long long)size, (long long)needed, name);
+    return 1;
+}
+
 /* Claims and publishes one ready upload whose primary file is entry. */
 static void gs_inbox_take(const GsInboxEntry *entry, const char *directory)
 {
@@ -814,13 +888,23 @@ static void gs_inbox_poll(void)
     /* While the free staged slots settle, ready uploads stay tracked and are
      * handed off at a later poll without a new quiet period. */
     if (now < gs_inbox_slots_settled_at) return;
+    uint64_t held[GS_INBOX_SETS]; int held_count = 0;
     for (int i = 0; i < gs_inbox_count; i++) {
         GsInboxEntry *entry = &gs_inbox_entries[i];
-        if (gs_inbox_kind(entry->name) == 1) gs_inbox_take(entry, directory);
+        if (gs_inbox_kind(entry->name) != 1) continue;
+        if (!gs_inbox_rar_hold(entry, directory)) gs_inbox_take(entry, directory);
+        else if (held_count < GS_INBOX_SETS) held[held_count++] = gs_inbox_set_key(entry->name);
     }
-    /* Continuation volumes belong to their set's claim; mark them processed. */
-    for (int i = 0; i < gs_inbox_count; i++)
-        if (gs_inbox_kind(gs_inbox_entries[i].name) == 2) gs_inbox_claim(&gs_inbox_entries[i], "", "volume", -1, -1);
+    /* Continuation volumes belong to their set's claim; mark them processed. A held
+     * set keeps its volumes unclaimed until it is taken. */
+    for (int i = 0; i < gs_inbox_count; i++) {
+        if (gs_inbox_kind(gs_inbox_entries[i].name) != 2) continue;
+        uint64_t key = gs_inbox_set_key(gs_inbox_entries[i].name); int kept = 0;
+        for (int j = 0; j < held_count && !kept; j++) kept = held[j] == key;
+        if (!kept) gs_inbox_claim(&gs_inbox_entries[i], "", "volume", -1, -1);
+    }
     gs_inbox_count = 0;
+    /* A held set is checked again after its next quiet period; it is not a new upload. */
+    if (held_count) gs_inbox_retry_at = sceKernelGetProcessTime() + GS_INBOX_RETRY_US;
     if (sceKernelGetProcessTime() >= gs_inbox_retry_at) gs_inbox_announced[0] = 0; // Nothing deferred.
 }

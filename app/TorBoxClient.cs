@@ -29,6 +29,7 @@ namespace Orbis
         internal static void ResetForTests()
         {
             lock (PendingDownloads) PendingDownloads.Clear();
+            lock (Activities) Activities.Clear();
             NextCreation = 0;
             ProcessAdmissions.Clear();
             CreationClock.Restart();
@@ -54,6 +55,8 @@ namespace Orbis
             internal string RawJson = "";
             internal bool Visible;
             internal bool NeedsAction;
+            // TorBox reported forward progress since its previous answer in this session.
+            internal bool Advanced;
             internal Exception Transport;
             internal string FailedUrl;
             internal int PartNumber, PartCount, RetryAfterSeconds;
@@ -63,6 +66,9 @@ namespace Orbis
         // regression harness overrides both seams so the loop can be driven
         // deterministically without sleeping or waiting ten minutes.
         internal static TimeSpan PreparationDeadline = TimeSpan.FromMinutes(10);
+        // A parked preparation waits while TorBox reports progress: it fails after
+        // PreparationDeadline without any, or after this limit in total.
+        internal static TimeSpan PreparationLimit = TimeSpan.FromHours(12);
         internal static Action<int, Func<bool>> WaitImpl;
 
         public static string Unrestrict(string token, string hostUrl, Action<string> progress = null, Func<bool> cancel = null)
@@ -389,6 +395,38 @@ namespace Orbis
             return string.Join(" · ", parts.ToArray());
         }
 
+        // What TorBox reported for each prepared download in this session: the best
+        // completion and the states seen. A slow host fetch that still advances is
+        // told apart from a stalled one.
+        sealed class Activity { internal double Best = -1; internal string States = "|"; }
+        static readonly Dictionary<string, Activity> Activities = new Dictionary<string, Activity>();
+
+        /// <summary>True when TorBox reports forward progress since its previous answer:
+        /// a higher completion, a state it had not reported yet, or bytes arriving from
+        /// the host.</summary>
+        static bool RecordActivity(string key, Dictionary<string, object> job, string state)
+        {
+            double progress = Number(job, "progress"), speed = Number(job, "download_speed");
+            lock (Activities)
+            {
+                Activity seen;
+                if (!Activities.TryGetValue(key, out seen))
+                {
+                    if (Activities.Count >= 512) Activities.Clear();
+                    Activities[key] = seen = new Activity();
+                }
+                bool advanced = speed > 0;
+                if (progress >= 0 && progress <= 1 && progress > seen.Best) { seen.Best = progress; advanced = true; }
+                if (!string.IsNullOrEmpty(state) && seen.States.Length < 512 &&
+                    seen.States.IndexOf("|" + state + "|", StringComparison.Ordinal) < 0)
+                {
+                    seen.States += state + "|";
+                    advanced = true;
+                }
+                return advanced;
+            }
+        }
+
         static string HashKey(string value)
         {
             using (var sha = SHA256.Create())
@@ -583,6 +621,8 @@ namespace Orbis
                     result.FileName = fileName;
                     result.Metric = MetricText(job);
                     result.StatusText = PreparationProgress(result.Metric, TimeSpan.Zero);
+                    result.Advanced = true;
+                    lock (Activities) Activities.Remove(key);
                     return result;
                 }
                 string state = Text(job, "download_state") ?? "preparing";
@@ -596,6 +636,7 @@ namespace Orbis
                     result.Error = "TorBox host download failed: " + state;
                     return result;
                 }
+                result.Advanced = RecordActivity(key, job, state);
             }
             else result.StatusText = "TorBox preparing";
             result.Kind = PreparedPollKind.Preparing;
@@ -836,6 +877,8 @@ namespace Orbis
                 throw new IOException("Invalid TorBox archive part count");
             int start = (int)((long)Math.Max(0, pass) * 4 % urls.Count);
             string lastMetric = "";
+            // A part newly accepted or finished, or one TorBox reports moving, is progress.
+            bool advanced = false;
             for (int n = 0; n < Math.Min(4, urls.Count); n++)
             {
                 if (cancel != null && cancel()) throw new OperationCanceledException();
@@ -866,7 +909,7 @@ namespace Orbis
                             Kind = PreparedPollKind.Preparing, Visible = true,
                             ProviderState = "waiting for capacity", Metric = waitingMetric,
                             StatusText = "TorBox preparing archive · " + waitingMetric,
-                            RetryAfterSeconds = Math.Max(30, ex.RetryAfterSeconds)
+                            RetryAfterSeconds = Math.Max(30, ex.RetryAfterSeconds), Advanced = advanced
                         };
                     }
                     throw ex.ForArchivePart(index + 1, urls.Count);
@@ -878,6 +921,7 @@ namespace Orbis
                     poll.Error = "Archive part " + (index + 1) + "/" + urls.Count + ": " + poll.Error;
                     return poll;
                 }
+                advanced |= pending == null || poll.Advanced || poll.Kind == PreparedPollKind.Ready;
                 lastMetric = string.IsNullOrEmpty(poll.Metric) ? "" : " · part " + (index + 1) + "/" + urls.Count + ": " + poll.Metric;
                 report(poll.Kind == PreparedPollKind.Ready ? "Ready" : string.IsNullOrEmpty(poll.Metric) ?
                     "Waiting for TorBox" : poll.Metric);
@@ -889,7 +933,7 @@ namespace Orbis
                 Kind = completed == urls.Count ? PreparedPollKind.Ready : PreparedPollKind.Preparing,
                 Visible = true, ProviderState = "preparing archive",
                 Metric = metric,
-                StatusText = "TorBox preparing archive · " + metric
+                StatusText = "TorBox preparing archive · " + metric, Advanced = advanced
             };
         }
 
@@ -1114,6 +1158,7 @@ namespace Orbis
         {
             File.Delete(PendingPath(key));
             lock (PendingDownloads) PendingDownloads.Remove(key);
+            lock (Activities) Activities.Remove(key);
         }
 
         public static string ProbeUser(string token)

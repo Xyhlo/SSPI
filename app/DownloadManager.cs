@@ -129,6 +129,12 @@ namespace Orbis
         public bool ResidentRemovePending;
         // Transient (not saved): when this removal started, and since when no worker heartbeat was seen.
         public long ResidentRemoveStarted, ResidentRemoveSilentSince;
+        // Remove anyway (saved): the user chose to stop tracking a removal the background worker
+        // could not confirm. The worker releases it without stopping the PS4 task; files are kept.
+        public bool ResidentDetachRequested;
+        // Transient: when Remove anyway was sent, and whether this removal now waits for that choice.
+        internal long ResidentDetachSentAt;
+        internal bool ResidentRemoveStuck;
         public bool RemoveRequested;
         public bool ResidentAutoInstall;
         public string ResidentGeneration;
@@ -243,6 +249,8 @@ namespace Orbis
         internal string ArchiveProviderState = "";
         internal string ParkLastState = "";
         internal long ParkStartedUtcTicks;
+        // Transient: last time this session saw the parked provider report progress.
+        internal long ParkProgressUtcTicks;
         internal int ProviderTransientRetries;
         // Fresh same-link attempts after a provider reported the host download failed.
         internal int ProviderHostRetries;
@@ -422,8 +430,7 @@ namespace Orbis
 
         bool TryParkProviderPreparation(DlItem job, int attempt, out HashSet<string> unavailableProviders)
         {
-            unavailableProviders = RejectedProviders(job);
-            if (unavailableProviders.Count > 0) return false;
+            if (!ForgetStaleRejections(job, out unavailableProviders)) return false;
             DebridHostSupport.RefreshEnabled(_cfg);
             if (!AllDebridIsFirstProvider(_cfg, job.HosterUrl))
                 return TryParkTorBoxPreparation(job, attempt, out unavailableProviders);
@@ -857,6 +864,11 @@ namespace Orbis
                     if (!seen.Add(canonical)) continue;
                     LocalInstallSource source = LocalInstallSource.Read(canonical, true);
                     bool ftp = LocalInstallSource.IsInboxPath(canonical);
+                    // An FTP upload has no source row, so it gets the archive passwords a
+                    // download receives from the host its file name is tagged with, if any.
+                    string set; int volume;
+                    string[] passwords = ftp && source.Kind == "archive" && ArchiveVolumeSet.TryIndex(Path.GetFileName(canonical), out set, out volume)
+                        ? DistributionSettings.ArchivePasswordsForFileName(Path.GetFileName(canonical)) : new string[0];
                     pending.Add(new DlItem {
                         Id = "usb_" + Guid.NewGuid().ToString("N"), TitleId = source.TitleId,
                         Name = source.Name, ImageUrl = source.ImagePath, Kind = source.Kind,
@@ -865,6 +877,8 @@ namespace Orbis
                         CandidateId = source.Fingerprint, LocalSource = true, LocalSourceFingerprint = source.Fingerprint,
                         ExpectedContentId = source.ContentId, ExpectedByteSize = source.Size,
                         PackageVersion = source.Version, Total = source.Size, Done = source.Size,
+                        ArchivePassword = passwords.Length > 0 ? passwords[0] : "",
+                        ArchivePasswords = ArchivePasswordDefaults.EncodeLenient(passwords),
                         State = DlState.Queued, StatusText = ftp ? "Queued for installation; FTP file retained" :
                             "Queued for USB installation; source file retained"
                     });
@@ -1112,6 +1126,8 @@ namespace Orbis
                         ContainerFormat = i.ContainerFormat,
                         ResidentStaged = i.ResidentStaged,
                         ResidentRemovePending = i.ResidentRemovePending,
+                        ResidentDetachRequested = i.ResidentDetachRequested,
+                        ResidentRemoveStuck = i.ResidentRemoveStuck,
                         RemoveRequested = i.RemoveRequested,
                         ResidentAutoInstall = i.ResidentAutoInstall,
                         ResidentGeneration = i.ResidentGeneration,
@@ -1502,6 +1518,9 @@ namespace Orbis
                          it.State == DlState.Canceled)
                 {
                     if (it.State == DlState.Failed) ForgetUnconfirmedTorBoxCreates(it);
+                    // Retry asks every enabled service again. A refusal recorded for this row
+                    // only steered its automatic retries; kept, it blocked the only service.
+                    if (it.State == DlState.Failed) ClearProviderRejections(it);
                     bool restartRequired = it.State == DlState.Failed &&
                         !File.Exists(it.DestPath) && DownloadResumeInfo.IsRestartRequired(it.Error) &&
                         !TransferClient.HasCompletedJournal(it.DestPath);
@@ -1785,20 +1804,33 @@ namespace Orbis
                     (it.Background || it.ResidentRemovePending || ResidentDownloadService.HasJob(it.Id)))
                 {
                     bool wasPending = it.ResidentRemovePending, wasCanceled = it.CancelRequested;
+                    bool wasDetached = it.ResidentDetachRequested;
                     string wasGeneration = it.ResidentGeneration;
                     string previousStatus = it.StatusText;
+                    // Removing again a removal the worker has not confirmed for a minute is the
+                    // user's Remove anyway: SSPI stops tracking it and leaves the PS4 task as it is.
+                    bool removeAnyway = wasPending && it.ResidentRemoveStuck && !wasDetached;
+                    if (removeAnyway) it.ResidentDetachRequested = true;
                     string ownedGeneration;
                     bool ownedJobFound = ResidentDownloadService.TryGetJobIdentity(it.Id, it.DestPath, out ownedGeneration);
                     if (string.IsNullOrEmpty(it.ResidentGeneration) && ownedJobFound && !string.IsNullOrEmpty(ownedGeneration))
                         it.ResidentGeneration = ownedGeneration;
                     it.ResidentRemovePending = true;
                     it.CancelRequested = true;
-                    it.StatusText = "Removing background job; waiting for worker acknowledgement";
+                    it.StatusText = it.ResidentDetachRequested ? "Stopping tracking; the PS4 download and downloaded files are kept"
+                        : "Removing background job; waiting for worker acknowledgement";
                     if (!SaveManifest())
                     {
                         it.ResidentRemovePending = wasPending; it.CancelRequested = wasCanceled;
-                        it.ResidentGeneration = wasGeneration;
+                        it.ResidentGeneration = wasGeneration; it.ResidentDetachRequested = wasDetached;
                         it.StatusText = previousStatus; error = "Could not save the removal request"; return false;
+                    }
+                    if (removeAnyway)
+                    {
+                        it.ResidentDetachSentAt = DateTime.UtcNow.Ticks; it.ResidentRemoveStuck = false;
+                        SspiLog.Write("download", "event=remove-anyway job=" + it.Id + " generation=" +
+                            (string.IsNullOrEmpty(it.ResidentGeneration) ? "none" : it.ResidentGeneration) +
+                            " worker=" + ResidentDownloadService.DetachWorkerState);
                     }
                     // ReleaseResidentJob adopts the owner of this ID when the saved
                     // generation or destination is stale; skipping here left it unreleased.
@@ -2262,6 +2294,43 @@ namespace Orbis
             }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
+        }
+
+        /// <summary>True when a resident extraction directory of this row keeps an install
+        /// journal that is not stopped (an add-on AppInstUtil accepted, or a finished child).</summary>
+        static bool HasUnstoppedResidentJournal(DlItem item)
+        {
+            if (item == null || !item.ResidentArchive || item.InstallConfirmed ||
+                !System.Text.RegularExpressions.Regex.IsMatch(item.Id ?? "", @"\A[A-Za-z0-9_-]{1,190}\z")) return false;
+            var directories = new List<string>();
+            string root = ResidentExtractionRoot(item);
+            if (root != null) directories.Add(Path.Combine(root, "extract-" + item.Id));
+            directories.Add(Path.Combine(AppSettings.DataDir, "resident", "archives", item.Id));
+            directories.Add(Path.Combine("/user/data/SSPI/resident", "archives", item.Id));
+            foreach (string directory in directories)
+                try
+                {
+                    if (!Directory.Exists(directory)) continue;
+                    foreach (string journal in Directory.GetFiles(directory, "install-*.txt"))
+                        if (System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(journal), @"\Ainstall-\d{3}\.txt\z") &&
+                            !IsStoppedResidentInstallJournal(journal)) return true;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            return false;
+        }
+
+        // Remove anyway: the worker released the job without stopping its PS4 task, or applies the
+        // durable request when it next runs. That task may still read the downloaded files, so all
+        // of them are kept for Stored files. Caller holds _lock.
+        void FinishDetachedRemoval(DlItem item, bool acknowledged, string worker)
+        {
+            PreserveConfirmedDependency(item);
+            _items.Remove(item);
+            SaveManifest();
+            SspiLog.Write("download", "event=remove-detached job=" + item.Id + " generation=" +
+                (string.IsNullOrEmpty(item.ResidentGeneration) ? "none" : item.ResidentGeneration) +
+                " acknowledged=" + (acknowledged ? "1" : "0") + " worker=" + worker + " files=retained");
         }
 
         internal static string ResidentExtractionRoot(DlItem item)
@@ -2951,6 +3020,9 @@ namespace Orbis
                     item.SubmittedWaitStartedMs = -1;
                     item.SubmittedNeedsAttention = false;
                 }
+                // A removal unconfirmed for a minute waits on its own record or on the user's
+                // Remove anyway; it must not hold new downloads behind it.
+                if (item.ResidentRemovePending && (item.ResidentRemoveStuck || item.ResidentDetachRequested)) continue;
                 if (item.State == DlState.Failed || item.SubmittedNeedsAttention) continue;
                 if (item.Background && item.ResidentStaged && item.ResidentAutoInstall)
                 { residentBusy = true; continue; }
@@ -3162,6 +3234,10 @@ namespace Orbis
                 if (rejection.Provider == "TorBox" && rejection.ProviderCode == "DOWNLOAD_SERVER_ERROR" && rejection.IsTransient)
                 {
                     serverFaultFailures = Math.Max(0, job.ParkTransientFailures) + 1;
+                    // TorBox refused to create the cloud download, so no download link exists yet.
+                    SspiLog.Write("download", "event=torbox-create-server-error job=" + (job.Id ?? "") +
+                        " failure=" + serverFaultFailures + " max_retries=3 http=" + rejection.HttpStatusCode +
+                        " retry_after=" + rejection.RetryAfterSeconds + " cached=" + (cachedAtTorBox ? 1 : 0));
                     if (serverFaultFailures <= 3)
                     {
                         // The explicit provider error confirms no create was accepted;
@@ -3175,7 +3251,13 @@ namespace Orbis
                             RetryAfterSeconds = rejection.RetryAfterSeconds
                         };
                     }
-                    else serverFaultRetriesExhausted = true;
+                    else
+                    {
+                        serverFaultRetriesExhausted = true;
+                        // The automatic retries are spent. A later Retry from Downloads gets
+                        // its own three instead of failing again on the first refusal.
+                        lock (_lock) if (job.AttemptId == attempt) job.ParkTransientFailures = 0;
+                    }
                 }
                 if (poll == null)
                 {
@@ -3250,12 +3332,17 @@ namespace Orbis
                 long retryDelayMs = retryServerFault
                     ? Math.Min(60000L, 5000L << Math.Max(0, serverFaultFailures - 1))
                     : QueueScheduler.NextPollDelayMs(0);
-                job.ParkPollDueUtcTicks = nowTicks + TimeSpan.FromMilliseconds(Math.Max(
-                    retryDelayMs, (long)poll.RetryAfterSeconds * 1000)).Ticks;
+                retryDelayMs = Math.Max(retryDelayMs, (long)poll.RetryAfterSeconds * 1000);
+                job.ParkPollDueUtcTicks = nowTicks + TimeSpan.FromMilliseconds(retryDelayMs).Ticks;
                 job.BytesPerSec = 0;
                 job.EtaSeconds = 0;
+                // The player has nothing to fix here: say that SSPI sends the request
+                // again by itself, when, and which TorBox code refused it.
+                long retrySeconds = Math.Max(1, (retryDelayMs + 999) / 1000);
                 job.StatusText = retryServerFault
-                    ? "TorBox download server error · retry " + serverFaultFailures + "/3 · other downloads continue"
+                    ? "TorBox server error · retries automatically in " +
+                        (retrySeconds < 120 ? retrySeconds + "s" : (retrySeconds + 59) / 60 + " min") +
+                        " (" + serverFaultFailures + "/3) · DOWNLOAD_SERVER_ERROR"
                     : ParkedPreparationStatus(poll);
                 // A park must free the queue immediately: the post-claim cooldown
                 // exists to pace transfers, not to delay an unrelated game.
@@ -3343,6 +3430,42 @@ namespace Orbis
             var ids = RejectedProviders(job);
             ids.Add(provider);
             job.ParkRejectedProviderIds = string.Join(",", ids);
+        }
+
+        /// <summary>A refusal recorded for this row steers its automatic retries to another
+        /// enabled service. When no other enabled service supports the source, it would
+        /// leave nothing to ask, so it is dropped and the remaining service is asked
+        /// again. Returns true when no refusal remains.</summary>
+        bool ForgetStaleRejections(DlItem job, out HashSet<string> remaining)
+        {
+            remaining = RejectedProviders(job);
+            if (remaining.Count == 0) return true;
+            DebridHostSupport.RefreshEnabled(_cfg);
+            int before = remaining.Count;
+            remaining.RemoveWhere(id => !UnlockProviders.HasSupportedAlternative(_cfg, new[] { job.HosterUrl }, id));
+            if (remaining.Count != before)
+            {
+                string kept = string.Join(",", remaining);
+                lock (_lock) job.ParkRejectedProviderIds = kept;
+                SspiLog.Write("download", "event=provider-rejection-cleared cleared=" + (before - remaining.Count) +
+                    " kept=" + remaining.Count);
+            }
+            return remaining.Count == 0;
+        }
+
+        /// <summary>The player chose Retry, so every enabled service is asked again.
+        /// Archive parts keep the service bound to them for link renewal.</summary>
+        static void ClearProviderRejections(DlItem job)
+        {
+            job.ParkRejectedProviderIds = "";
+            if (string.IsNullOrEmpty(job.ArchiveProviderState)) return;
+            var kept = new StringBuilder();
+            foreach (string row in job.ArchiveProviderState.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] fields = row.Split('|');
+                if (fields.Length == 3 && fields[1].Length > 0) kept.Append(fields[0]).Append('|').Append(fields[1]).Append("|;");
+            }
+            job.ArchiveProviderState = kept.ToString();
         }
 
         static bool HasArchiveProviderState(DlItem job)
@@ -3617,12 +3740,14 @@ namespace Orbis
             return ranked.Length > 0 && string.Equals(ranked[0], UnlockProviders.TorBoxId, StringComparison.OrdinalIgnoreCase);
         }
 
-        static string ParkedPreparationStatus(TorBoxClient.PreparedPollResult poll)
+        static string ParkedPreparationStatus(TorBoxClient.PreparedPollResult poll, long idleMinutes = 0)
         {
             if (poll.Kind == TorBoxClient.PreparedPollKind.Transient)
                 return "Preparing in TorBox · list request retry 1/" + TorBoxClient.TransientListAttempts +
                     " · other downloads continue";
             string metric = string.IsNullOrEmpty(poll.Metric) ? "" : " · " + poll.Metric;
+            // Before the no-progress limit fails the row, say how long TorBox has been still.
+            if (idleMinutes >= 2) metric += " · no progress for " + idleMinutes + " min";
             if (!poll.Visible)
                 return "Preparing in TorBox · waiting for the provider to list it" + metric + " · other downloads continue";
             return "Preparing in TorBox" + metric + " · other downloads continue";
@@ -3724,8 +3849,9 @@ namespace Orbis
                 {
                     bool allDebrid = string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase);
                     token = allDebrid ? _cfg.AllDebridApiKey : _cfg.TorBoxApiKey;
-                    expired = nowTicks - target.ParkStartedUtcTicks >
-                        (allDebrid ? AllDebridClient.PreparationDeadline : TorBoxClient.PreparationDeadline).Ticks;
+                    expired = allDebrid
+                        ? nowTicks - target.ParkStartedUtcTicks > AllDebridClient.PreparationDeadline.Ticks
+                        : TorBoxParkExpired(target, nowTicks);
                 }
             }
             if (rearmed) SaveManifest();
@@ -3848,7 +3974,9 @@ namespace Orbis
                             target.ParkLastState = poll.ProviderState ?? "";
                             target.ParkPollDueUtcTicks = DateTime.UtcNow.Ticks +
                                 TimeSpan.FromMilliseconds(Math.Max(ParkPollDelayMs(target), (long)poll.RetryAfterSeconds * 1000)).Ticks;
-                            target.StatusText = ParkedPreparationStatus(poll);
+                            // TorBox's own progress keeps a slow host fetch parked (TorBoxParkExpired).
+                            if (poll.Advanced) target.ParkProgressUtcTicks = DateTime.UtcNow.Ticks;
+                            target.StatusText = ParkedPreparationStatus(poll, ParkIdleMinutes(target, DateTime.UtcNow.Ticks));
                             changed = true;
                             break;
                         case TorBoxClient.PreparedPollKind.Transient:
@@ -3962,21 +4090,50 @@ namespace Orbis
 
         void ExpireParkedPreparation(DlItem target, int attempt)
         {
-            long seconds;
+            long seconds, idleMinutes = 0;
             string detail;
+            bool allDebrid = string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase);
             lock (_lock)
             {
                 if (!object.ReferenceEquals(Find(target.Id), target) || target.AttemptId != attempt ||
                     !target.ParkedForProvider) return;
                 target.ParkedForProvider = false;
-                seconds = Math.Max(1, (DateTime.UtcNow.Ticks - target.ParkStartedUtcTicks) / TimeSpan.TicksPerSecond);
+                long nowTicks = DateTime.UtcNow.Ticks;
+                seconds = Math.Max(1, (nowTicks - target.ParkStartedUtcTicks) / TimeSpan.TicksPerSecond);
+                // Within its overall limit, a TorBox row expires only for lack of progress.
+                if (!allDebrid && nowTicks - target.ParkStartedUtcTicks <= TorBoxClient.PreparationLimit.Ticks)
+                    idleMinutes = Math.Max(1, ParkIdleMinutes(target, nowTicks));
                 detail = string.IsNullOrEmpty(target.ParkLastState)
                     ? "the provider never listed the prepared download"
                     : "last provider state " + target.ParkLastState;
             }
-            string provider = string.Equals(target.ParkProviderId, UnlockProviders.AllDebridId, StringComparison.OrdinalIgnoreCase) ? "AllDebrid" : "TorBox";
-            SetFailureIfCurrent(target, attempt, provider + " is still preparing this file after " + seconds + "s (" +
-                detail + "). The prepared download ID was kept; retry from Downloads shortly.");
+            if (idleMinutes > 0)
+                SetFailureIfCurrent(target, attempt, "TorBox reported no progress on this file for " + idleMinutes + " min (" +
+                    detail + "). The TorBox download was kept; retry from Downloads to keep waiting.");
+            else if (!allDebrid)
+                SetFailureIfCurrent(target, attempt, "TorBox is still preparing this file after " +
+                    Math.Max(1, seconds / 3600) + " h (" + detail + "). The TorBox download was kept; retry from Downloads to keep waiting.");
+            else
+                SetFailureIfCurrent(target, attempt, "AllDebrid is still preparing this file after " + seconds + "s (" +
+                    detail + "). The prepared download ID was kept; retry from Downloads shortly.");
+        }
+
+        /// <summary>A slow host fetch at TorBox can take hours, so a parked TorBox row
+        /// waits while TorBox reports progress. It fails after PreparationDeadline without
+        /// any, or after PreparationLimit in total. The idle clock starts at this
+        /// session's first look, so after a restart TorBox is asked before the row is
+        /// judged. Caller holds _lock.</summary>
+        static bool TorBoxParkExpired(DlItem target, long nowTicks)
+        {
+            if (target.ParkProgressUtcTicks <= target.ParkStartedUtcTicks) target.ParkProgressUtcTicks = nowTicks;
+            return nowTicks - target.ParkProgressUtcTicks > TorBoxClient.PreparationDeadline.Ticks ||
+                nowTicks - target.ParkStartedUtcTicks > TorBoxClient.PreparationLimit.Ticks;
+        }
+
+        static long ParkIdleMinutes(DlItem target, long nowTicks)
+        {
+            long since = Math.Max(target.ParkStartedUtcTicks, target.ParkProgressUtcTicks);
+            return since <= 0 || nowTicks <= since ? 0 : (nowTicks - since) / TimeSpan.TicksPerMinute;
         }
 
         void RunJob(DlItem job, int attempt)
@@ -5585,7 +5742,8 @@ namespace Orbis
                     return isCurrent;
                 }
             };
-            Action release = () => ResidentDownloadService.Release(id, generation, publishIfCurrent);
+            bool detach = item.ResidentDetachRequested;
+            Action release = () => ResidentDownloadService.Release(id, generation, publishIfCurrent, detach);
             if (System.Threading.Monitor.IsEntered(_lock)) ThreadPool.QueueUserWorkItem(_ => release());
             else release();
         }
@@ -5939,8 +6097,10 @@ namespace Orbis
             { SetFailureIfCurrent(job, attempt, "Archive password exceeds 256 UTF-8 bytes or is invalid"); return true; }
             if (!InstallDependencyReady(job)) return false;
             lock (_lock) foreach (var other in _items)
-                if (other != job && other.Background && other.State != DlState.Failed && !other.SubmittedNeedsAttention) return false;
+                if (other != job && other.Background && other.State != DlState.Failed && !other.SubmittedNeedsAttention &&
+                    !(other.ResidentRemovePending && (other.ResidentRemoveStuck || other.ResidentDetachRequested))) return false;
             if (_cfg == null || !_cfg.UseBgftDirect || !ResidentDownloadService.HasDownloader) return false;
+            if (ResidentDownloadService.SingletonHeldByOther(job.Id)) return false;
             var resolved = new List<ArchiveVolume>();
             for (int volumeIndex = 0; volumeIndex < volumes.Count; volumeIndex++)
             {
@@ -6002,6 +6162,12 @@ namespace Orbis
                 HashSet<string> volumeRejected;
                 GetArchiveProviderState(job, volume.Url, out selectedProvider, out volumeRejected);
                 if (unavailable != null) foreach (string id in unavailable) volumeRejected.Add(id);
+                // A refusal with no other service supporting this part would leave nothing to ask.
+                if (volumeRejected.Count > 0)
+                {
+                    DebridHostSupport.RefreshEnabled(_cfg);
+                    volumeRejected.RemoveWhere(id => !UnlockProviders.HasSupportedAlternative(_cfg, new[] { volume.Url }, id));
+                }
                 return ResolveArchiveProviderSlot(() => UnlockProviders.Unrestrict(_cfg, volume.Url,
                     text => { lock (_lock) { if (!canceled()) job.StatusText = "RAR part " + (index + 1) + "/" + count + " · " + text; } },
                     canceled, id =>
@@ -6018,6 +6184,9 @@ namespace Orbis
                     selectedProvider, volumeRejected, true, !string.IsNullOrEmpty(selectedProvider),
                     rejected =>
                     {
+                        // Kept only to steer this part to another service; with none, the
+                        // refusal would block the only one.
+                        if (!UnlockProviders.HasSupportedAlternative(_cfg, new[] { volume.Url }, rejected)) return;
                         lock (_lock)
                         {
                             if (canceled()) throw new OperationCanceledException();
@@ -6173,6 +6342,9 @@ namespace Orbis
                         job.ResolvedProviderId, unavailableProviders, true, false,
                         rejected =>
                         {
+                            // A refusal is kept only to steer later attempts to another
+                            // service; with none, it would block the only one.
+                            if (!UnlockProviders.HasSupportedAlternative(_cfg, new[] { url }, rejected)) return;
                             lock (_lock)
                             {
                                 if (cancelled()) throw new OperationCanceledException();
@@ -7586,6 +7758,14 @@ namespace Orbis
         void InstallValidatedLocalPackage(DlItem job, int attempt, PkgContentKind actualKind,
             string actualKindName, string actualTitleId, bool replace, string packageVersion)
         {
+            var watch = new LocalInstallWatch(job, attempt, actualKind == PkgContentKind.AddOn);
+            try { InstallValidatedLocalPackage(job, attempt, actualKind, actualKindName, actualTitleId, replace, packageVersion, watch); }
+            finally { StopLocalInstallWatch(watch); }
+        }
+
+        void InstallValidatedLocalPackage(DlItem job, int attempt, PkgContentKind actualKind,
+            string actualKindName, string actualTitleId, bool replace, string packageVersion, LocalInstallWatch watch)
+        {
             if (CommitRequestedStop(job, attempt)) return;
             lock (_lock)
             {
@@ -7606,8 +7786,9 @@ namespace Orbis
                 lock (_lock) { if (job.AttemptId == attempt) job.StatusText = "Replacing the installed version with " + packageVersion + "..."; }
                 LogBgftEvent("homebrew-replace", job, "Installed version is older; uninstalling it before installing " + packageVersion);
             }
+            StartLocalInstallWatch(watch);
             InstallOutcome outcome = PkgInstaller.InstallLocal(job.DestPath, actualTitleId,
-                actualKindName, out installedTitleId, out error, out taskId, replace);
+                actualKindName, out installedTitleId, out error, out taskId, replace, watch.NoteCheck);
             if (outcome != InstallOutcome.Started && taskId >= 0)
             {
                 TrackLocalInstallTask(job.Id, attempt, taskId);
@@ -7639,6 +7820,7 @@ namespace Orbis
                 bool completed = PkgInstaller.WaitForInstall(taskId, checkTitleId, actualKind,
                     percent =>
                     {
+                        watch.NotePercent(percent);
                         lock (_lock)
                         {
                             if (!AcceptInstallCallback(job, attempt)) return;
@@ -7695,13 +7877,145 @@ namespace Orbis
             if (CommitRequestedStop(job, attempt)) return;
             if (outcome == InstallOutcome.AlreadyInstalled)
             {
-                if (actualKind == PkgContentKind.AddOn && PkgInstaller.IsAddonInstalled(job.DestPath, true))
+                // InstallLocal returns this for an add-on only after comparing every byte with the
+                // installed copy, minutes for a large one; checking that it is still there suffices.
+                if (actualKind == PkgContentKind.AddOn && PkgInstaller.IsAddonInstalled(job.DestPath, false))
                 { MarkInstalled(job.Id, "Add-on installation confirmed by PS4 content", false, attempt); return; }
                 MarkAlreadyInstalled(job.Id, "Already installed; local PKG kept", attempt);
                 return;
             }
             if (outcome == InstallOutcome.NotReady && RetryLocalInstall(job, attempt, error)) return;
             MarkInstallFailed(job.Id, error ?? "Local PKG install failed", attempt);
+        }
+
+        /// <summary>Keeps an In-app install row current while the single queue worker waits on the
+        /// PS4. The add-on installer call reports no progress and may return only after the copy,
+        /// and comparing an add-on already on the PS4 with the PKG takes minutes for a large one.
+        /// The watch only writes the status line and logs; it never fails, retries or deletes.</summary>
+        sealed class LocalInstallWatch
+        {
+            internal const long LogIntervalMs = 5 * 60 * 1000;
+            internal readonly DlItem Job;
+            internal readonly int Attempt;
+            internal readonly bool AddOn;
+            internal Timer Timer;
+            internal string[] InstalledPaths = new string[0];
+            internal bool Stopped, Grew, Quiet;
+            internal int Busy, Percent = -1;
+            internal long Bytes, BeganMs, PhaseMs, ProgressMs, NextLogMs, CheckDone = -1, CheckTotal, InstalledBytes = -1;
+
+            internal LocalInstallWatch(DlItem job, int attempt, bool addOn) { Job = job; Attempt = attempt; AddOn = addOn; }
+
+            // Queue worker: progress of the comparison with an add-on already on the PS4,
+            // then (-1, -1) when the add-on installer is called.
+            internal void NoteCheck(long done, long total)
+            {
+                long now = TransferClockMs();
+                if (total < 0) { Interlocked.Exchange(ref CheckTotal, 0); Interlocked.Exchange(ref CheckDone, -1); Interlocked.Exchange(ref PhaseMs, now); }
+                else { Interlocked.Exchange(ref CheckDone, done); Interlocked.Exchange(ref CheckTotal, total); }
+                Interlocked.Exchange(ref ProgressMs, now);
+            }
+
+            // Queue worker: the PS4 task reported a new percentage.
+            internal void NotePercent(int percent)
+            {
+                Interlocked.Exchange(ref Percent, percent);
+                Interlocked.Exchange(ref ProgressMs, TransferClockMs());
+            }
+        }
+
+        void StartLocalInstallWatch(LocalInstallWatch watch)
+        {
+            try
+            {
+                if (watch.AddOn) watch.InstalledPaths = PkgInstaller.InstalledAddonPaths(watch.Job.DestPath);
+                try { watch.Bytes = new FileInfo(watch.Job.DestPath).Length; } catch (Exception) { }
+                watch.InstalledBytes = InstalledAddonBytes(watch.InstalledPaths);
+                watch.BeganMs = watch.PhaseMs = watch.ProgressMs = TransferClockMs();
+                watch.NextLogMs = watch.BeganMs + LocalInstallWatch.LogIntervalMs;
+                LogBgftEvent("local-install-wait-start", watch.Job, DescribeLocalInstallWatch(watch, watch.BeganMs));
+                lock (_lock)
+                    if (!watch.Stopped && watch.Timer == null)
+                        watch.Timer = new Timer(delegate { TickLocalInstallWatch(watch); }, null, 2000, 5000);
+            }
+            catch (Exception) { } // Status only: the install never depends on its watch.
+        }
+
+        void StopLocalInstallWatch(LocalInstallWatch watch)
+        {
+            Timer timer;
+            lock (_lock)
+            {
+                if (watch.Stopped) return;
+                watch.Stopped = true;
+                timer = watch.Timer;
+                watch.Timer = null;
+            }
+            if (timer == null) return;
+            timer.Dispose();
+            LogBgftEvent("local-install-wait-end", watch.Job, DescribeLocalInstallWatch(watch, TransferClockMs()) +
+                " state=" + watch.Job.State + " status=" + ClipMsg(watch.Job.StatusText, 120));
+        }
+
+        void TickLocalInstallWatch(LocalInstallWatch watch)
+        {
+            if (Interlocked.Exchange(ref watch.Busy, 1) != 0) return;
+            try
+            {
+                long now = TransferClockMs();
+                bool checking = Interlocked.Read(ref watch.CheckTotal) > 0;
+                long installed = InstalledAddonBytes(watch.InstalledPaths);
+                if (installed != watch.InstalledBytes)
+                {
+                    // The add-on installer reports nothing; its installed container growing is the
+                    // only sign of progress. A full-size file at once may be preallocated.
+                    if (installed > 0 && installed > watch.InstalledBytes && installed < watch.Bytes) watch.Grew = true;
+                    watch.InstalledBytes = installed;
+                    if (!checking) Interlocked.Exchange(ref watch.ProgressMs, now);
+                }
+                int percent = !watch.AddOn ? Volatile.Read(ref watch.Percent) :
+                    watch.Grew && installed > 0 && installed < watch.Bytes ? (int)(installed * 100 / watch.Bytes) : -1;
+                long quietMs = now - Interlocked.Read(ref watch.ProgressMs);
+                long limit = PkgInstallPolicy.LocalInstallQuietLimitMs(watch.Bytes, watch.Grew || (!watch.AddOn && percent >= 0));
+                string text = PkgInstallPolicy.LocalInstallWaitStatus(!watch.AddOn, now - Interlocked.Read(ref watch.PhaseMs),
+                    quietMs, limit, percent, Interlocked.Read(ref watch.CheckDone), Interlocked.Read(ref watch.CheckTotal));
+                bool quiet = !checking && quietMs >= limit;
+                lock (_lock)
+                {
+                    DlItem job = watch.Job;
+                    if (watch.Stopped || job.AttemptId != watch.Attempt || job.State != DlState.Installing ||
+                        !object.ReferenceEquals(Find(job.Id), job)) return;
+                    // A requested stop keeps its own message until the installer returns.
+                    if (text != null && !job.CancelRequested && !job.RemoveRequested && !job.PauseRequested) job.StatusText = text;
+                }
+                if (quiet != watch.Quiet || now >= watch.NextLogMs)
+                {
+                    watch.Quiet = quiet;
+                    watch.NextLogMs = now + LocalInstallWatch.LogIntervalMs;
+                    LogBgftEvent(quiet ? "local-install-quiet" : "local-install-wait", watch.Job, DescribeLocalInstallWatch(watch, now));
+                }
+            }
+            catch (Exception) { }
+            finally { Interlocked.Exchange(ref watch.Busy, 0); }
+        }
+
+        static string DescribeLocalInstallWatch(LocalInstallWatch watch, long now)
+        {
+            return "add_on=" + watch.AddOn + " elapsed_s=" + (now - watch.BeganMs) / 1000 +
+                " phase_s=" + (now - Interlocked.Read(ref watch.PhaseMs)) / 1000 +
+                " quiet_s=" + (now - Interlocked.Read(ref watch.ProgressMs)) / 1000 +
+                " percent=" + Volatile.Read(ref watch.Percent) +
+                " check=" + Interlocked.Read(ref watch.CheckDone) + "/" + Interlocked.Read(ref watch.CheckTotal) +
+                " installed_bytes=" + watch.InstalledBytes + " bytes=" + watch.Bytes;
+        }
+
+        static long InstalledAddonBytes(string[] paths)
+        {
+            long size = -1;
+            foreach (string path in paths)
+                try { var info = new FileInfo(path); if (info.Exists) size = Math.Max(size, info.Length); }
+                catch (Exception) { }
+            return size;
         }
 
         public void TrackLocalInstallTask(string id, int attempt, int taskId)
@@ -8065,8 +8379,10 @@ namespace Orbis
                 // no heartbeat at all, retire its pre-install record here so the removal
                 // finishes like any other.
                 bool workerSeen = ResidentDownloadService.WorkerHeartbeatSeen;
+                // Only this build's worker applies Remove anyway; an older one does after a PS4 restart.
+                string workerState = ResidentDownloadService.DetachWorkerState;
                 long now = DateTime.UtcNow.Ticks;
-                bool retireOrphan;
+                bool retireOrphan, finishDetached;
                 lock (_lock)
                 {
                     if (!object.ReferenceEquals(Find(item.Id), item)) return;
@@ -8075,20 +8391,58 @@ namespace Orbis
                     else if (item.ResidentRemoveSilentSince == 0) item.ResidentRemoveSilentSince = now;
                     retireOrphan = !workerSeen && now - item.ResidentRemoveSilentSince >= TimeSpan.TicksPerMinute &&
                         !_activeIds.Contains(item.Id) && !item.InstallSubmitted && item.BgftTaskId < 0;
+                    // Remove anyway that the running worker cannot apply now (an older build until the
+                    // PS4 restarts, or none running), or did not apply within a minute: the durable
+                    // request stays on disk for the worker and the row goes now, keeping its files.
+                    if (item.ResidentDetachRequested && item.ResidentDetachSentAt == 0) item.ResidentDetachSentAt = now;
+                    finishDetached = item.ResidentDetachRequested && !_activeIds.Contains(item.Id) &&
+                        ((workerState != "current" && workerState != "unknown") || now - item.ResidentDetachSentAt >= TimeSpan.TicksPerMinute);
                 }
                 if (retireOrphan) ResidentDownloadService.TryRetireOrphanedStagedJob(item.Id, generation);
+                if (finishDetached)
+                {
+                    ReleaseResidentJob(item, attempt, generation, true); // republish the request, off the lock
+                    lock (_lock)
+                    {
+                        if (!object.ReferenceEquals(Find(item.Id), item) || _activeIds.Contains(item.Id)) return;
+                        FinishDetachedRemoval(item, !ResidentDownloadService.HasJob(item.Id), workerState);
+                    }
+                    return;
+                }
                 lock (_lock)
                 {
                     if (!object.ReferenceEquals(Find(item.Id), item)) return;
                     if (_activeIds.Contains(item.Id) || ResidentDownloadService.HasJob(item.Id))
                     {
                         ReleaseResidentJob(item, attempt, generation, true);
-                        item.StatusText = blocked != null ? "Removal waiting for the background worker: " + blocked
-                            : !workerSeen ? "Background worker is not running; removal finishes within a minute"
-                            : now - item.ResidentRemoveStarted > TimeSpan.TicksPerMinute * 3
-                                ? "Background worker has not stopped this download yet; restart the PS4 to finish removing it"
-                                : "Removing background job; waiting for worker acknowledgement";
+                        // After a minute without acknowledgement the removal is bounded by the
+                        // user's choice: removing it again stops tracking it (Remove anyway).
+                        bool stuck = !item.ResidentDetachRequested && now - item.ResidentRemoveStarted >= TimeSpan.TicksPerMinute;
+                        if (stuck && !item.ResidentRemoveStuck)
+                            SspiLog.Write("download", "event=remove-unconfirmed job=" + item.Id + " worker=" + workerState +
+                                " choice=remove-anyway-offered detail=" + (blocked ?? "no worker acknowledgement"));
+                        item.ResidentRemoveStuck = stuck;
+                        item.StatusText = item.ResidentDetachRequested ? "Stopping tracking; waiting for the background worker to release it"
+                            : !stuck ? (blocked != null ? "Removal waiting for the background worker: " + blocked
+                                : !workerSeen ? "Background worker is not running; removal finishes within a minute"
+                                : "Removing background job; waiting for worker acknowledgement")
+                            : workerState == "previous-build" ? "Restart the PS4 so the updated background worker can finish removing it, or remove it again to stop tracking it now"
+                            : !workerSeen ? "Background worker is not running. Remove again to stop tracking it; downloaded files are kept"
+                            : "Remove again to stop tracking it; the PS4 download and files are kept. " +
+                                (blocked != null ? "The PS4 did not confirm stopping it: " + blocked : "The background worker has not confirmed the removal");
                         return;
+                    }
+                    // The worker has released the job, so a later cleanup failure is not an
+                    // unconfirmed removal and must not offer Remove anyway.
+                    item.ResidentRemoveStuck = false;
+                    if (item.ResidentDetachRequested) { FinishDetachedRemoval(item, true, workerState); return; }
+                    // A released job can keep an install journal that is not stopped: an add-on that
+                    // AppInstUtil accepted or a child the PS4 finished. Its files stay, as for any
+                    // unconfirmed installation, instead of cleanup waiting on that journal forever.
+                    if (!item.InstallConfirmed && !item.InstallSubmitted && HasUnstoppedResidentJournal(item))
+                    {
+                        item.InstallSubmitted = true;
+                        SspiLog.Write("download", "event=remove-files-retained job=" + item.Id + " reason=unconfirmed-install-journal");
                     }
                     // The native owner removes its durable job only after readers, transfer
                     // threads and any owned BGFT task have stopped. Until then keep the data.
@@ -9044,6 +9398,7 @@ namespace Orbis
                         sb.Append("\"container_format\":\"").Append(JsonLite.Escape(it.ContainerFormat)).Append("\",");
                         sb.Append("\"resident_staged\":").Append(it.ResidentStaged ? "true" : "false").Append(',');
                         sb.Append("\"resident_remove_pending\":").Append(it.ResidentRemovePending ? "true" : "false").Append(',');
+                        sb.Append("\"resident_detach_requested\":").Append(it.ResidentDetachRequested ? "true" : "false").Append(',');
                         sb.Append("\"remove_requested\":").Append(it.RemoveRequested ? "true" : "false").Append(',');
                         sb.Append("\"cancel_requested\":").Append(it.CancelRequested ? "true" : "false").Append(',');
                         sb.Append("\"install_submitted\":").Append(it.InstallSubmitted ? "true" : "false").Append(',');
@@ -9667,6 +10022,7 @@ namespace Orbis
                         ContainerFormat = JsonLite.GetString(obj, "container_format") ?? "",
                         ResidentStaged = JsonLite.GetBool(obj, "resident_staged"),
                         ResidentRemovePending = JsonLite.GetBool(obj, "resident_remove_pending"),
+                        ResidentDetachRequested = JsonLite.GetBool(obj, "resident_detach_requested"),
                         RemoveRequested = JsonLite.GetBool(obj, "remove_requested"),
                         CancelRequested = JsonLite.GetBool(obj, "cancel_requested"),
                         InstallSubmitted = JsonLite.GetBool(obj, "install_submitted") ||

@@ -241,8 +241,11 @@ namespace Orbis
             }
         }
 
+        /// <param name="addonProgress">Add-ons only: (done, total) while an add-on already on the
+        /// PS4 is compared with this PKG, then (-1, -1) when the PS4 add-on installer is called.</param>
         public static InstallOutcome InstallLocal(string pkgPath, string expectedTitleId, string requestedKind,
-            out string titleId, out string error, out int taskId, bool uninstallFirst = false)
+            out string titleId, out string error, out int taskId, bool uninstallFirst = false,
+            Action<long, long> addonProgress = null)
         {
             titleId = "";
             error = null;
@@ -331,7 +334,8 @@ namespace Orbis
                     };
                     if (contentKind == PkgContentKind.AddOn)
                     {
-                        if (IsAddonInstalled(pkgPath, true)) return InstallOutcome.AlreadyInstalled;
+                        if (IsAddonInstalled(pkgPath, true, addonProgress)) return InstallOutcome.AlreadyInstalled;
+                        if (addonProgress != null) addonProgress(-1, -1);
                         return TryInstallWithAppInstUtil(pkgPath, out error) ? InstallOutcome.Started : InstallOutcome.InstallFailed;
                     }
                     bool bgftAttempted;
@@ -781,7 +785,8 @@ namespace Orbis
             catch { return false; }
         }
 
-        internal static bool IsAddonInstalled(string source, bool full)
+        /// <param name="progress">Full checks only: (bytes compared, size) every 64 MiB.</param>
+        internal static bool IsAddonInstalled(string source, bool full, Action<long, long> progress = null)
         {
             PkgContentKind kind; string detail;
             if (PkgValidator.TryGetContentKind(source, out kind, out detail) && kind == PkgContentKind.SystemTheme)
@@ -799,8 +804,9 @@ namespace Orbis
                 try {
                     using (var a = File.OpenRead(source))
                     using (var b = File.OpenRead(path)) {
-                        byte[] left = new byte[65536], right = new byte[65536]; long remaining = a.Length;
+                        byte[] left = new byte[65536], right = new byte[65536]; long remaining = a.Length, total = remaining;
                         while (remaining > 0) {
+                            if (progress != null && (total - remaining) % (64L << 20) == 0) progress(total - remaining, total);
                             int n = (int)Math.Min(remaining, left.Length);
                             if (a.Read(left, 0, n) != n || b.Read(right, 0, n) != n) return false;
                             for (int i = 0; i < n; i++) if (left[i] != right[i]) return false;
@@ -811,6 +817,19 @@ namespace Orbis
                 } catch { }
             }
             return PkgIntegrity.IsNoDataLicense(source) && IsLicenseRegistered("/user/license", content);
+        }
+
+        /// <summary>Where the PS4 keeps this add-on once installed (internal, then extended
+        /// storage); empty when the PKG has no add-on identity. Its size is a progress hint for
+        /// installs that report none, never installation proof.</summary>
+        internal static string[] InstalledAddonPaths(string source)
+        {
+            string content;
+            if (!PkgValidator.TryGetContentId(source, out content) || content == null || content.Length != 36) return new string[0];
+            string title = content.Substring(7, 9), label = content.Substring(20);
+            if (!System.Text.RegularExpressions.Regex.IsMatch(title, "^CUSA[0-9]{5}$") ||
+                !System.Text.RegularExpressions.Regex.IsMatch(label, "^[A-Za-z0-9_-]{16}$")) return new string[0];
+            return new[] { "/user/addcont/" + title + "/" + label + "/ac.pkg", "/mnt/ext0/user/addcont/" + title + "/" + label + "/ac.pkg" };
         }
 
         // A no-data license creates no /user/addcont folder. The PS4 records it in the
@@ -968,9 +987,13 @@ namespace Orbis
                 lock (InstallRegisterGate)
                 {
                     if (beforeInstall != null && (error = beforeInstall()) != null) return false;
+                    // How long the installer call blocks is unproven on console; these lines bracket it.
+                    LogInstall("api=sceAppInstUtilAppInstallPkg submit title=" + nativeTitleId + " path=" + nativePath);
+                    long submitted = System.Diagnostics.Stopwatch.GetTimestamp();
                     int rc = sceAppInstUtilAppInstallPkg(nativePath, IntPtr.Zero);
                     LogInstall("api=sceAppInstUtilAppInstallPkg rc=" + Hex(rc) + " task=-1 title=" + nativeTitleId +
-                        " subtype=" + (kind == PkgContentKind.AddOn ? 7 : 6) + " path=" + nativePath + " file={" + nativeState + "}");
+                        " subtype=" + (kind == PkgContentKind.AddOn ? 7 : 6) + " path=" + nativePath + " file={" + nativeState + "}" +
+                        " elapsed_ms=" + (System.Diagnostics.Stopwatch.GetTimestamp() - submitted) * 1000 / System.Diagnostics.Stopwatch.Frequency);
                     if (rc != 0)
                     {
                         error = DescribeInstallError("sceAppInstUtilAppInstallPkg", rc) +

@@ -670,6 +670,22 @@ namespace Orbis
         public static bool HasStagedDownloader { get { return FreshHeartbeat(); } }
         internal static bool HasPendingOwnership
         { get { return StagedTransfersActive || File.Exists(JobPath); } }
+
+        // True while another job owns the worker's single archive/install slot, so an archive
+        // handoff can wait without resolving and probing every part only to be refused.
+        internal static bool SingletonHeldByOther(string id)
+        {
+            lock (Gate)
+                try
+                {
+                    if (!File.Exists(JobPath)) return false;
+                    string[] lines = File.ReadAllLines(JobPath);
+                    return lines.Length < 2 || Decode(lines[1]) != id;
+                }
+                catch (FileNotFoundException) { return false; }
+                catch (DirectoryNotFoundException) { return false; }
+                catch { return true; }
+        }
         public static bool StagedTransfersActive
         {
             get
@@ -924,7 +940,8 @@ namespace Orbis
                     {
                         string[] control = File.ReadAllLines(StagedPath(slot, "control"));
                         retiring |= control.Length >= 3 && (control[0] == "1" ||
-                            (control[0] == "2" && control.Length == 4 && control[3] == StagedGeneration(slot))) && Decode(control[1]) == id &&
+                            (control[0] == "2" && (control.Length == 4 || (control.Length == 5 && control[4] == "detach")) &&
+                                control[3] == StagedGeneration(slot))) && Decode(control[1]) == id &&
                             (control[2] == "cancel" || control[2] == "release");
                     }
                     catch { }
@@ -1753,8 +1770,9 @@ namespace Orbis
                 string[] lines = File.ReadAllLines(ControlPath);
                 if (lines.Length < 3 || Decode(lines[1]) != id ||
                     (lines[2] != "cancel" && lines[2] != "release")) return false;
-                if (lines[0] == "1") return string.IsNullOrEmpty(generation) && lines.Length == 3;
-                return lines[0] == "2" && lines.Length == 4 && lines[3] == (generation ?? "");
+                if (lines[0] == "1") return string.IsNullOrEmpty(generation) && (lines.Length == 3 || (lines.Length == 4 && lines[3] == "detach"));
+                return lines[0] == "2" && (lines.Length == 4 || (lines.Length == 5 && lines[4] == "detach")) &&
+                    lines[3] == (generation ?? "");
             }
             catch { return false; }
         }
@@ -2104,6 +2122,28 @@ namespace Orbis
             WriteControl(id, "release", -1, expectedGeneration, true, publishIfCurrent);
         }
 
+        /// <summary>Release with detach: the user chose Remove anyway after the PS4 did not
+        /// confirm stopping this job. A current worker drops its tracking without another stop
+        /// call and leaves the PS4 task alone; an older worker reads an ordinary release.</summary>
+        public static void Release(string id, string expectedGeneration, Func<Action, bool> publishIfCurrent, bool detach)
+        {
+            WriteControl(id, "release", -1, expectedGeneration, true, publishIfCurrent, detach);
+        }
+
+        /// <summary>Whether the running worker can apply Remove anyway: "current" (this build),
+        /// "previous-build" (an older worker runs until the PS4 restarts), "unknown" (its
+        /// heartbeat cannot be read) or "absent".</summary>
+        internal static string DetachWorkerState
+        {
+            get
+            {
+                if (!AppSettings.DataDirWritable || AppSettings.DataMigrationPending) return "unknown";
+                WorkerHeartbeat heartbeat;
+                if (TryReadHeartbeat(out heartbeat)) return heartbeat.Current ? "current" : "previous-build";
+                return _heartbeatReadError != null ? "unknown" : "absent";
+            }
+        }
+
         public static string GetError(string id)
         {
             ResidentDownloadStatus status;
@@ -2111,15 +2151,16 @@ namespace Orbis
         }
 
         static bool WriteControl(string id, string action, int fallbackTaskId = -1,
-            string expectedGeneration = null, bool bindGeneration = false, Func<Action, bool> publishIfCurrent = null)
+            string expectedGeneration = null, bool bindGeneration = false, Func<Action, bool> publishIfCurrent = null,
+            bool detach = false)
         {
             if (string.IsNullOrEmpty(id)) return false;
             return LegacyBgftAttach.ExecuteSerialized(() =>
-                WriteControlSerialized(id, action, fallbackTaskId, expectedGeneration, bindGeneration, publishIfCurrent));
+                WriteControlSerialized(id, action, fallbackTaskId, expectedGeneration, bindGeneration, publishIfCurrent, detach));
         }
 
         static bool WriteControlSerialized(string id, string action, int fallbackTaskId,
-            string expectedGeneration, bool bindGeneration, Func<Action, bool> publishIfCurrent = null)
+            string expectedGeneration, bool bindGeneration, Func<Action, bool> publishIfCurrent = null, bool detach = false)
         {
             try
             {
@@ -2130,7 +2171,8 @@ namespace Orbis
                     return true;
                 string generation = bindGeneration ? boundGeneration : currentGeneration;
                 if (publishIfCurrent != null && !publishIfCurrent(null)) return true;
-                if ((action == "cancel" || action == "release") && !OwnsBgftLifetime(id))
+                // Remove anyway leaves every PS4 task as it is, including an app-attached one.
+                if ((action == "cancel" || action == "release") && !detach && !OwnsBgftLifetime(id))
                 {
                     int legacyTask;
                     string legacyGeneration;
@@ -2150,7 +2192,7 @@ namespace Orbis
                 {
                     Directory.CreateDirectory(IpcRoot);
                     WriteAtomic(slot >= 0 ? StagedPath(slot, "control") : ControlPath,
-                        CreateControlRecord(id, action, generation));
+                        CreateControlRecord(id, action, generation, detach && action == "release"));
                 };
                 if (publishIfCurrent != null) publishIfCurrent(publish);
                 else publish();
@@ -2205,10 +2247,12 @@ namespace Orbis
             }
         }
 
-        internal static string CreateControlRecord(string id, string action, string generation)
+        internal static string CreateControlRecord(string id, string action, string generation, bool detach = false)
         {
+            // A last "detach" line marks a release confirmed as Remove anyway. Workers read
+            // only the lines before it, so an older worker still sees an ordinary release.
             return (generation == null ? "1\n" : "2\n") + Encode(id) + "\n" + action +
-                (generation == null ? "" : "\n" + generation);
+                (generation == null ? "" : "\n" + generation) + (detach ? "\ndetach" : "");
         }
 
         public static bool HasDownloader { get { return FreshHeartbeat(); } }

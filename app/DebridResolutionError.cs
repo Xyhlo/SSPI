@@ -46,6 +46,7 @@ namespace Orbis
                 ? "Retry later, or check this download in your TorBox account."
                 : "Retry later or check your " + provider + " account.";
             string[] advice = {
+                "Retry from Downloads to ask again, or choose another mirror.", "Retry from Downloads to ask again.",
                 "Retry or choose another mirror.", account,
                 "Choose another mirror or retry later.", "Retry later.",
                 "Try another provider or mirror.", "Retry later, or enable another link service for this host in Connections.",
@@ -102,10 +103,19 @@ namespace Orbis
             return Uri.TryCreate(url, UriKind.Absolute, out uri) ? uri.DnsSafeHost : "unknown host";
         }
 
+        /// <summary>Every enabled service that supports this host already refused this
+        /// mirror for the row. Another mirror may work, and Retry asks them again.</summary>
+        internal static DebridResolutionError ProvidersRefused(string services, string url)
+        {
+            return new DebridResolutionError(services, HostName(url),
+                "Each service that supports this host already refused this mirror for this download. " +
+                "Retry from Downloads to ask again, or choose another mirror.", true, "PROVIDERS_REFUSED", false);
+        }
+
         internal static DebridResolutionError HostSupport(string provider, string url, bool unknown)
         {
             return new DebridResolutionError(provider, HostName(url), unknown ?
-                "Host support could not be checked. Retry shortly or check Connections." :
+                "Host support could not be checked. Check the network and the key in Connections, then retry." :
                 "This host is not currently supported or its allowance is exhausted. Choose another supported mirror.",
                 !unknown, unknown ? "SUPPORT_UNAVAILABLE" : "HOST_UNAVAILABLE", true) { IsTransient = unknown };
         }

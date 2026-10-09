@@ -26,6 +26,7 @@ typedef struct { GsStage *stage; int ordinal; OrbisPthread thread; int created; 
 struct GsStage {
     GsJob job;
     int slot, created, running, pending, canceled, paused, release, failed, active, range_mode;
+    int detach; /* release confirmed as Remove anyway: drop tracking without a BGFT stop */
     int fd, journal_fd, chunks, completed, next;
     volatile int lock, checkpoint_lock;
     int64_t done;
@@ -78,9 +79,10 @@ static void gs_archive_control(void)
     }
     if (!action && !gs_ipc_path(path, sizeof(path), "/control.txt")) action = gs_read_control_action(path);
     if (action >= 3) {
-        if (!gs_canceled) gs_log_write("resident", "archive-control job=%s action=%s accepted=1", gs_job.id, action == 4 ? "release" : "cancel");
+        if (!gs_canceled) gs_log_write("resident", "archive-control job=%s action=%s accepted=1", gs_job.id, action >= 4 ? "release" : "cancel");
         gs_canceled = 1;
-        if (action == 4) gs_release = 1;
+        if (action >= 4) gs_release = 1;
+        if (action == 5) gs_detach = 1;
     } else if (action == 1) gs_paused = 1;
     else if (action == 2) gs_paused = 0;
 }
@@ -378,7 +380,12 @@ static void gs_stage_control(GsStage *stage)
         if (!strcmp(line, "pause")) stage->paused = 1;
         if (!strcmp(line, "resume")) stage->paused = 0;
         if (!strcmp(line, "cancel")) stage->canceled = 1;
-        if (!strcmp(line, "release")) { stage->canceled = 1; stage->release = 1; }
+        if (!strcmp(line, "release")) {
+            stage->canceled = 1; stage->release = 1;
+            /* Optional last line: the user confirmed this release as Remove anyway. */
+            char flag[16];
+            if (!gs_line(file, flag, sizeof(flag)) && !strcmp(flag, "detach")) stage->detach = 1;
+        }
         if ((!was_paused && stage->paused) || (!was_canceled && stage->canceled)) {
             __atomic_add_fetch(&stage->control_epoch, 1, __ATOMIC_RELEASE);
             gs_stage_lock(&stage->lock);
@@ -729,7 +736,11 @@ static void gs_stage_queue_reason(const char *reason)
 static void gs_stage_download_poll(void)
 {
     char reason[200];
-    if (gs_job.id[0] || gs_worker_running || gs_worker_created) {
+    /* A canceled singleton job whose worker thread has exited only waits for the PS4 to
+     * confirm stopping its task, or for the user's Remove anyway. It transfers nothing,
+     * so downloads may start; their installation still waits for the singleton slot. */
+    int retiring = gs_job.id[0] && gs_canceled && !gs_worker_running && !gs_worker_created;
+    if ((gs_job.id[0] && !retiring) || gs_worker_running || gs_worker_created) {
         snprintf(reason, sizeof(reason), "Queued; waiting for another background job (%s) to finish",
             gs_job.title[0] ? gs_job.title : "in progress");
         gs_stage_queue_reason(reason); return;
@@ -738,7 +749,7 @@ static void gs_stage_download_poll(void)
     if (gs_stage_transfer_active()) { gs_stage_queue_reason("Queued; waiting for the current download to finish"); return; }
     if (sceKernelGetProcessTime() < gs_stage_install_after) return;
     GsJob existing;
-    if (!gs_read_job(&existing)) {
+    if (!gs_read_job(&existing) && !(retiring && !strcmp(existing.id, gs_job.id))) {
         snprintf(reason, sizeof(reason), "Queued; waiting for another background job (%s) to finish",
             existing.title[0] ? existing.title : "saved");
         gs_stage_queue_reason(reason); return;
@@ -815,14 +826,19 @@ static void gs_stage_poll(void)
                     gs_stage_status(stage, "queued", "Queued; waiting for the current package to finish");
             }
             if (stage->install_owned && !strcmp(gs_job.id, stage->job.id)) {
-                if (stage->canceled) { gs_canceled = 1; if (stage->release) gs_release = 1; }
+                if (stage->canceled) { gs_canceled = 1; if (stage->release) gs_release = 1; if (stage->detach) gs_detach = 1; }
                 else if (stage->paused != gs_paused && !gs_pause_archive_task(stage->paused)) gs_paused = stage->paused;
             }
             if (!__atomic_load_n(&stage->running, __ATOMIC_ACQUIRE) && stage->created) {
                 scePthreadJoin(stage->thread, NULL); stage->created = 0;
             }
             if (stage->canceled && !stage->created && strcmp(gs_job.id, stage->job.id)) {
-                if (gs_archive_cancel_before_start(&stage->job) ||
+                if (stage->release && stage->detach) {
+                    /* Remove anyway: no BGFT stop; the journal and the PS4 task stay as they are. */
+                    if (strcmp(stage->state, "canceled"))
+                        gs_log_write("resident", "stage-detach slot=%d job=%s generation=%s outcome=tracking-released reason=remove-anyway",
+                            i, stage->job.id, stage->job.generation);
+                } else if (gs_archive_cancel_before_start(&stage->job, stage->release) ||
                     (stage->job.expected_kind && gs_retire_parked_package(stage->job.id, stage->job.content, stage->job.expected_kind, stage->release))) {
                     gs_stage_status(stage, "failed", "Stopping the retained PS4 task is unconfirmed; job and files kept");
                     continue;
