@@ -2123,8 +2123,14 @@ namespace Orbis
         // drive can keep failing while SSPI itself reads it (storage check -5, reported
         // 3 Oct on firmware 12.52). Downloads staged on such a drive then run in SSPI
         // instead of waiting for the service. Choosing a staging location clears the note.
+        // A note is recorded only after the failure lasts a minute (a worker started right
+        // after a PS4 restart can fail briefly), holds only for the worker instance that
+        // reported it, and is cleared as soon as a background job writes to that drive.
         static readonly object BlockedUsbGate = new object();
-        static HashSet<string> _backgroundBlockedUsb;
+        static Dictionary<string, string> _backgroundBlockedUsb; // mount -> reporting worker epoch
+        static readonly Dictionary<string, long[]> _usbOpenFailing = new Dictionary<string, long[]>(StringComparer.Ordinal);
+        static readonly long UsbOpenFailureConfirmTicks = TimeSpan.TicksPerMinute;
+        static readonly long UsbOpenFailureGapTicks = 30 * TimeSpan.TicksPerSecond;
         static string BlockedUsbPath { get { return Path.Combine(AppSettings.DataDir, "usb-background-blocked"); } }
 
         static string UsbMountOf(string path)
@@ -2135,18 +2141,36 @@ namespace Orbis
                 ? normalized.Substring(0, 9) : null;
         }
 
-        static HashSet<string> BlockedUsb()
+        // Lines are "mount<TAB>worker epoch". A bare mount (5.11.7 to 5.11.11) has no epoch,
+        // so the drive gets one more try with the current worker.
+        static Dictionary<string, string> BlockedUsb()
         {
             if (_backgroundBlockedUsb != null) return _backgroundBlockedUsb;
-            var result = new HashSet<string>(StringComparer.Ordinal);
+            var result = new Dictionary<string, string>(StringComparer.Ordinal);
             try
             {
-                if (File.Exists(BlockedUsbPath) && new FileInfo(BlockedUsbPath).Length < 512)
+                if (File.Exists(BlockedUsbPath) && new FileInfo(BlockedUsbPath).Length < 1024)
                     foreach (string line in File.ReadAllLines(BlockedUsbPath))
-                    { string mount = UsbMountOf(line.Trim()); if (mount != null) result.Add(mount); }
+                    {
+                        string[] fields = line.Trim().Split('\t');
+                        string mount = UsbMountOf(fields[0].Trim());
+                        if (mount != null) result[mount] = fields.Length > 1 ? fields[1].Trim() : "";
+                    }
             }
             catch { }
             return _backgroundBlockedUsb = result;
+        }
+
+        static void SaveBlockedUsb(Dictionary<string, string> blocked)
+        {
+            try
+            {
+                if (blocked.Count == 0) { if (File.Exists(BlockedUsbPath)) File.Delete(BlockedUsbPath); return; }
+                var lines = new List<string>();
+                foreach (var entry in blocked) lines.Add(entry.Key + "\t" + entry.Value);
+                File.WriteAllText(BlockedUsbPath, string.Join("\n", lines) + "\n");
+            }
+            catch { }
         }
 
         /// <summary>True when downloads staged at this path must not wait for the background service.</summary>
@@ -2154,30 +2178,61 @@ namespace Orbis
         {
             string mount = UsbMountOf(path);
             if (mount == null) return false;
-            lock (BlockedUsbGate) return BlockedUsb().Contains(mount);
+            string recorded;
+            lock (BlockedUsbGate) if (!BlockedUsb().TryGetValue(mount, out recorded)) return false;
+            // Without a running worker nothing can be handed off anyway, so keep the note.
+            string epoch = ResidentDownloadService.CurrentWorkerEpoch();
+            return epoch == null || string.Equals(recorded, epoch, StringComparison.Ordinal);
         }
 
-        /// <summary>Records a drive the service reported it could not open. Only a drive SSPI
-        /// itself can open is recorded; a disconnected drive is a different problem.</summary>
+        /// <summary>Records a drive the service reported it could not open for a minute. Only a
+        /// drive SSPI itself can open is recorded; a disconnected drive is a different problem.</summary>
         internal static bool NoteBackgroundCannotOpen(string path)
         {
             string mount = UsbMountOf(path);
             if (mount == null || !UsbVolumeLabel.IsConnected(mount)) return false;
+            string epoch = ResidentDownloadService.CurrentWorkerEpoch() ?? "";
+            long now = DateTime.UtcNow.Ticks;
             lock (BlockedUsbGate)
             {
+                long[] seen;
+                if (!_usbOpenFailing.TryGetValue(mount, out seen) || now - seen[1] > UsbOpenFailureGapTicks || now < seen[1])
+                    _usbOpenFailing[mount] = seen = new[] { now, now };
+                seen[1] = now;
+                if (now - seen[0] < UsbOpenFailureConfirmTicks) return false;
                 var blocked = BlockedUsb();
-                if (!blocked.Add(mount)) return true;
-                try { File.WriteAllText(BlockedUsbPath, string.Join("\n", blocked) + "\n"); } catch { }
+                string recorded;
+                if (blocked.TryGetValue(mount, out recorded) && string.Equals(recorded, epoch, StringComparison.Ordinal)) return true;
+                blocked[mount] = epoch;
+                SaveBlockedUsb(blocked);
             }
-            SspiLog.Write("download", "usb-storage background service cannot open " + mount + "; downloads staged there run in SSPI");
+            SspiLog.Write("download", "usb-storage background service cannot open " + mount + " worker_epoch=" +
+                (epoch.Length == 0 ? "unknown" : epoch) + "; downloads staged there run in SSPI");
             return true;
+        }
+
+        /// <summary>A background job is writing to this drive, so the service can open it.</summary>
+        internal static void NoteBackgroundOpened(string path)
+        {
+            string mount = UsbMountOf(path);
+            if (mount == null) return;
+            bool cleared;
+            lock (BlockedUsbGate)
+            {
+                _usbOpenFailing.Remove(mount);
+                var blocked = BlockedUsb();
+                cleared = blocked.Remove(mount);
+                if (cleared) SaveBlockedUsb(blocked);
+            }
+            if (cleared) SspiLog.Write("download", "usb-storage background service opened " + mount + "; background downloads use it again");
         }
 
         internal static void ClearBackgroundUsbBlocks()
         {
             lock (BlockedUsbGate)
             {
-                _backgroundBlockedUsb = new HashSet<string>(StringComparer.Ordinal);
+                _backgroundBlockedUsb = new Dictionary<string, string>(StringComparer.Ordinal);
+                _usbOpenFailing.Clear();
                 try { if (File.Exists(BlockedUsbPath)) File.Delete(BlockedUsbPath); } catch { }
             }
         }
@@ -3105,9 +3160,12 @@ namespace Orbis
                             if (pending.State == DlState.Queued && !pending.Background && !pending.ParkedForProvider)
                                 pending.StatusText = waitingReason;
                     bool localPending = false;
+                    long localNow = DateTime.UtcNow.Ticks;
                     foreach (var pending in _items)
-                        if (pending.State == DlState.Queued && !pending.Background && File.Exists(pending.DestPath) &&
-                            InstallDependencyReady(pending)) { localPending = true; break; }
+                        if (QueueScheduler.CanHoldQueueForInstall(pending.State == DlState.Queued, pending.Background,
+                                pending.ParkedForProvider, pending.ResidentRemovePending, pending.PauseRequested || pending.CancelRequested,
+                                pending.RetryAfterUtcTicks, localNow, _activePaths.Contains(NormalizePath(pending.DestPath))) &&
+                            File.Exists(pending.DestPath) && InstallDependencyReady(pending)) { localPending = true; break; }
                     for (int index = backgroundBusy || _activeIds.Count >= WorkerCount || TransferClockMs() < _nextJobStartAt
                         ? -1 : _items.Count - 1; index >= 0; index--)
                     {
@@ -3220,6 +3278,7 @@ namespace Orbis
             TorBoxClient.PreparedPollResult poll = null;
             bool retryServerFault = false;
             bool serverFaultRetriesExhausted = false;
+            bool createThrottled = false;
             int serverFaultFailures = 0;
             try
             {
@@ -3240,15 +3299,15 @@ namespace Orbis
                         " retry_after=" + rejection.RetryAfterSeconds + " cached=" + (cachedAtTorBox ? 1 : 0));
                     if (serverFaultFailures <= 3)
                     {
-                        // The explicit provider error confirms no create was accepted;
-                        // GetOrCreatePending cleared only this refused intent.
+                        // TorBox listed no download for this link after the fault, so none was
+                        // kept. The retry checks the account again before sending the link; a
+                        // wait TorBox asked for applies to that create and is shown then.
                         retryServerFault = true;
                         poll = new TorBoxClient.PreparedPollResult
                         {
                             Kind = TorBoxClient.PreparedPollKind.Transient,
                             Transport = rejection,
-                            Error = rejection.Message,
-                            RetryAfterSeconds = rejection.RetryAfterSeconds
+                            Error = rejection.Message
                         };
                     }
                     else
@@ -3280,7 +3339,18 @@ namespace Orbis
                         else unavailableProviders = null;
                         return false;
                     }
-                    throw;
+                    // TorBox, or SSPI keeping to TorBox's hourly create limit, asked for a wait
+                    // before the next new download. Nothing was created: wait and retry by
+                    // itself, at most an hour, instead of failing the row.
+                    if (!TorBoxClient.IsCreateThrottle(rejection)) throw;
+                    createThrottled = true;
+                    poll = new TorBoxClient.PreparedPollResult
+                    {
+                        Kind = TorBoxClient.PreparedPollKind.Transient,
+                        Transport = rejection,
+                        Error = rejection.Message,
+                        RetryAfterSeconds = Math.Max(5, Math.Min(3600, rejection.RetryAfterSeconds))
+                    };
                 }
             }
             lock (_lock)
@@ -3320,13 +3390,14 @@ namespace Orbis
                 job.ParkProviderId = UnlockProviders.TorBoxId;
                 job.ResolvedProviderId = UnlockProviders.TorBoxId;
                 job.ParkHostUrl = string.IsNullOrEmpty(job.ArchiveVolumes) ? job.HosterUrl : "";
-                job.ParkRetryWithoutReceipt = retryServerFault || (string.IsNullOrEmpty(job.ArchiveVolumes)
+                job.ParkRetryWithoutReceipt = retryServerFault || createThrottled || (string.IsNullOrEmpty(job.ArchiveVolumes)
                     ? !TorBoxClient.HasPreparedDownload(_cfg.TorBoxApiKey, job.HosterUrl)
                     : !TorBoxPreparationUrls(job).Exists(url => TorBoxClient.HasPreparedDownload(_cfg.TorBoxApiKey, url)));
                 job.ParkStartedUrls = EncodeParkStartedUrls(PreparedUrlsForPark(job, urls, UnlockProviders.TorBoxId));
                 job.ParkStartedUtcTicks = nowTicks;
                 job.ParkPollCount = 1;
-                job.ParkTransientFailures = retryServerFault ? serverFaultFailures :
+                // A wait for TorBox's create limit is not a server fault: its count is kept.
+                job.ParkTransientFailures = retryServerFault ? serverFaultFailures : createThrottled ? job.ParkTransientFailures :
                     poll.Kind == TorBoxClient.PreparedPollKind.Transient ? 1 : 0;
                 job.ParkLastState = poll.ProviderState ?? "";
                 long retryDelayMs = retryServerFault
@@ -3339,10 +3410,12 @@ namespace Orbis
                 // The player has nothing to fix here: say that SSPI sends the request
                 // again by itself, when, and which TorBox code refused it.
                 long retrySeconds = Math.Max(1, (retryDelayMs + 999) / 1000);
+                string retryIn = retrySeconds < 120 ? retrySeconds + "s" : (retrySeconds + 59) / 60 + " min";
                 job.StatusText = retryServerFault
-                    ? "TorBox server error · retries automatically in " +
-                        (retrySeconds < 120 ? retrySeconds + "s" : (retrySeconds + 59) / 60 + " min") +
+                    ? "TorBox server error · retries automatically in " + retryIn +
                         " (" + serverFaultFailures + "/3) · DOWNLOAD_SERVER_ERROR"
+                    : createThrottled
+                    ? "Waiting for TorBox to accept new downloads · retries automatically in " + retryIn + " · other downloads continue"
                     : ParkedPreparationStatus(poll);
                 // A park must free the queue immediately: the post-claim cooldown
                 // exists to pace transfers, not to delay an unrelated game.
@@ -4769,6 +4842,25 @@ namespace Orbis
                     wait = new ProviderPreparationWaitException(provider, wait.HostUrl, wait.State,
                         Math.Min(8, 1 << (next - 1)), false, wait.InnerException);
             }
+            // A TorBox server fault on a create was parked for a second with no limit, so the link
+            // was sent again every few seconds. Like the TorBox-first path it gets three retries;
+            // each first checks the account for a download TorBox kept (TorBoxClient).
+            bool torBoxFault = string.Equals(provider, UnlockProviders.TorBoxId, StringComparison.OrdinalIgnoreCase) &&
+                TorBoxClient.ServerFault(wait.State);
+            if (torBoxFault)
+            {
+                int next = job.ProviderTransientRetries + 1;
+                if (next > 3)
+                {
+                    // Spent: a later Retry from Downloads gets its own three.
+                    lock (_lock) if (job.AttemptId == attempt) job.ProviderTransientRetries = 0;
+                    SetFailureIfCurrent(job, attempt, ResolutionFailureText(job, wait.InnerException ?? wait));
+                    return true;
+                }
+                job.ProviderTransientRetries = next;
+                wait = new ProviderPreparationWaitException(provider, wait.HostUrl, wait.State,
+                    (int)Math.Min(60L, 5L << (next - 1)), false, wait.InnerException);
+            }
             string parkHost = wait.HostUrl;
             bool batched = false;
             if (!string.IsNullOrEmpty(job.ArchiveVolumes))
@@ -4855,6 +4947,11 @@ namespace Orbis
                 job.ResolvedProviderId = provider;
                 job.StatusText = rdTransient
                     ? "Real-Debrid temporary error " + wait.State + " · retry " + job.ProviderTransientRetries + "/" + RealDebridClient.TransientCreateRetries + " · other downloads continue"
+                    : torBoxFault && !batched
+                        ? "TorBox server error · retries automatically in " + wait.RetryAfterSeconds + "s (" +
+                            job.ProviderTransientRetries + "/3) · " + wait.State
+                    : string.Equals(provider, UnlockProviders.TorBoxId, StringComparison.OrdinalIgnoreCase) && wait.State == "RATE_LIMITED"
+                        ? "Waiting for TorBox to accept new downloads · retries automatically · other downloads continue"
                     : wait.State == "provider request slot"
                         ? "Waiting for " + UnlockProviders.DisplayName(provider) + " request slot · other downloads continue"
                     // TorBox refuses new cloud downloads while every slot on the plan is busy.
@@ -8722,6 +8819,8 @@ namespace Orbis
                 item.StatusText = string.IsNullOrEmpty(status.Error)
                     ? "Queued; waiting for the current package to finish" : status.Error;
             }
+            if (status.Id == item.Id && (status.State == "feeding" || status.State == "validating" || status.State == "staged"))
+                NoteBackgroundOpened(item.DestPath);
             if (status.State == "installing") item.State = DlState.Installing;
             else if (status.State == "validating" || status.State == "extracting")
             { item.State = DlState.Finalizing; }

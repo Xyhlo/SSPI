@@ -162,9 +162,23 @@ namespace Orbis
             else if (status.StartsWith("LIMITED:", StringComparison.OrdinalIgnoreCase))
             { state = "limited"; message = "Key saved · provider reports a plan restriction"; }
             else if (status.StartsWith("RETRY:", StringComparison.OrdinalIgnoreCase))
-            { state = "unavailable"; message = "Key saved · service verification unavailable; retry shortly"; }
+            { state = "unavailable"; message = "Key saved · service verification unavailable" + TrailingDetail(status) + "; retry shortly"; }
             else
             { state = "unavailable"; message = "Key saved · validation unavailable; check the key or retry"; }
+        }
+
+        // The short cause a provider check ends with, such as " (HTTP 503)", so an outage can be
+        // told apart from a rejected key. Empty when the result names none or anything but a code.
+        static string TrailingDetail(string status)
+        {
+            int open = status.LastIndexOf(" (", StringComparison.Ordinal);
+            if (open < 0 || !status.EndsWith(")", StringComparison.Ordinal) || status.Length - open > 64) return "";
+            for (int i = open + 2; i < status.Length - 1; i++)
+            {
+                char c = status[i];
+                if (!(char.IsLetterOrDigit(c) || c == ' ' || c == '_' || c == '.' || c == '=' || c == ':' || c == '-')) return "";
+            }
+            return status.Substring(open);
         }
     }
 }

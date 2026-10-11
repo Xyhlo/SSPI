@@ -512,6 +512,10 @@ namespace Orbis
         public static bool NoteResponse(string url, int status, string retryAfter)
         {
             if (status != 429 && status != 503) return false;
+            // TorBox limits new web downloads (60 per hour) apart from its other requests, and
+            // TorBoxClient waits before its next create itself. A refused create must not stop
+            // the link and status requests that finish downloads TorBox already holds.
+            if (IsSeparatelyLimitedCreate(url)) return true;
             int wait = ServiceHttpException.ParseRetryAfter(retryAfter, DateTime.UtcNow);
             if (wait <= 0) wait = status == 429 ? 60 : 15;
             string host = Host(url);
@@ -564,6 +568,13 @@ namespace Orbis
                 return uri.Host ?? "";
             }
             catch { return ""; }
+        }
+
+        static bool IsSeparatelyLimitedCreate(string url)
+        {
+            Uri uri;
+            return Uri.TryCreate(url, UriKind.Absolute, out uri) &&
+                uri.AbsolutePath.EndsWith("/webdl/createwebdownload", StringComparison.OrdinalIgnoreCase);
         }
     }
 

@@ -112,10 +112,11 @@ namespace Orbis
                 "Retry from Downloads to ask again, or choose another mirror.", true, "PROVIDERS_REFUSED", false);
         }
 
-        internal static DebridResolutionError HostSupport(string provider, string url, bool unknown)
+        internal static DebridResolutionError HostSupport(string provider, string url, bool unknown, string reason = null)
         {
             return new DebridResolutionError(provider, HostName(url), unknown ?
                 "Host support could not be checked. Check the network and the key in Connections, then retry." :
+                !string.IsNullOrEmpty(reason) ? reason + " Choose another supported mirror." :
                 "This host is not currently supported or its allowance is exhausted. Choose another supported mirror.",
                 !unknown, unknown ? "SUPPORT_UNAVAILABLE" : "HOST_UNAVAILABLE", true) { IsTransient = unknown };
         }

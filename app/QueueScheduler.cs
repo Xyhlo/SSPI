@@ -34,6 +34,22 @@ namespace Orbis
         }
 
         /// <summary>
+        /// Whether a queued row whose package is already on disk may hold every download
+        /// without a package back so it installs first. Only a row the worker can claim soon
+        /// may: a parked, removing, stopping or already active row, or one waiting on a long
+        /// retry, cannot install, and letting it hold the slot stalled the whole queue.
+        /// The caller still checks that the package exists and its dependency is installed.
+        /// </summary>
+        internal static readonly long LocalInstallPriorityTicks = 60 * TimeSpan.TicksPerSecond;
+
+        internal static bool CanHoldQueueForInstall(bool queued, bool background, bool parked, bool removing,
+            bool stopRequested, long retryAfterTicks, long nowTicks, bool pathActive)
+        {
+            return queued && !background && !parked && !removing && !stopRequested && !pathActive &&
+                retryAfterTicks <= nowTicks + LocalInstallPriorityTicks;
+        }
+
+        /// <summary>
         /// A parked row is polled only while it is still the same queued row,
         /// unsolicited by pause/cancel/remove, bound to the same attempt, with a
         /// durable provider record to poll, and its backoff has elapsed.

@@ -671,6 +671,14 @@ namespace Orbis
         internal static bool HasPendingOwnership
         { get { return StagedTransfersActive || File.Exists(JobPath); } }
 
+        /// <summary>The running worker instance's epoch, or null when no live heartbeat is readable.</summary>
+        internal static string CurrentWorkerEpoch()
+        {
+            WorkerHeartbeat heartbeat;
+            return TryReadHeartbeat(out heartbeat) && heartbeat != null && !string.IsNullOrEmpty(heartbeat.Epoch)
+                ? heartbeat.Epoch : null;
+        }
+
         // True while another job owns the worker's single archive/install slot, so an archive
         // handoff can wait without resolving and probing every part only to be refused.
         internal static bool SingletonHeldByOther(string id)

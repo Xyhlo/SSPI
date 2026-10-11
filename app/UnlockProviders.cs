@@ -165,7 +165,8 @@ namespace Orbis
                 foreach (string id in EnabledIds(cfg))
                     if (DebridHostSupport.Load(cfg, id, false) != null) { unknown = false; break; }
                 // Name the services that were checked, so the player knows which one to fix.
-                throw DebridResolutionError.HostSupport(DisplayNames(EnabledIds(cfg)), hosterUrl, unknown);
+                throw DebridResolutionError.HostSupport(DisplayNames(EnabledIds(cfg)), hosterUrl, unknown,
+                    unknown ? null : DebridHostSupport.RefusalReason(cfg, hosterUrl, EnabledIds(cfg)));
             }
             Exception last = null;
             DebridResolutionError mirrorFailure = null;
@@ -306,7 +307,8 @@ namespace Orbis
             if (cancel != null && cancel()) throw new OperationCanceledException();
             var hosts = DebridHostSupport.Load(cfg, id, true);
             if (hosts == null || hosts.GetState(hosterUrl) != DebridHostState.Supported)
-                throw DebridResolutionError.HostSupport(DisplayName(id), hosterUrl, hosts == null);
+                throw DebridResolutionError.HostSupport(DisplayName(id), hosterUrl, hosts == null,
+                    hosts == null ? null : DebridHostSupport.RefusalReason(cfg, hosterUrl, id));
             if (refreshLease)
             {
                 if (string.Equals(id, DeepbridId, StringComparison.OrdinalIgnoreCase))

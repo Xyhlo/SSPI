@@ -350,6 +350,28 @@ namespace Orbis
             return hosts;
         }
 
+        /// <summary>Why the given services' last host lists refuse this link, or null when no
+        /// list has been read. Down, an exhausted allowance and no support need different action.</summary>
+        internal static string RefusalReason(AppSettings cfg, string url, params string[] providers)
+        {
+            bool down = false, unconfirmed = false, unsupported = false;
+            foreach (string id in providers)
+            {
+                var hosts = string.IsNullOrEmpty(id) ? null : Load(cfg, id, false);
+                if (hosts == null) continue;
+                DebridHostState state = hosts.GetState(url);
+                string note = hosts.AccountNote(url);
+                if (state == DebridHostState.Unavailable && note.IndexOf("allowance", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return note + " for this host; it resets on the service's schedule.";
+                if (state == DebridHostState.Unavailable) down = true;
+                else if (state == DebridHostState.Unknown) unconfirmed = true;
+                else if (state == DebridHostState.Unsupported) unsupported = true;
+            }
+            return down ? "The service reports this host as down right now; try again later." :
+                unconfirmed ? "The service's host list does not confirm this host right now." :
+                unsupported ? "The service does not support this host." : null;
+        }
+
         internal static string UnsupportedMessage(AppSettings cfg, string url, string provider)
         {
             Uri uri;

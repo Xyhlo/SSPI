@@ -18,6 +18,15 @@ namespace Orbis
         static readonly Stopwatch CreationClock = Stopwatch.StartNew();
         static readonly Dictionary<string, List<long>> ProcessAdmissions = new Dictionary<string, List<long>>();
         static long NextCreation;
+        // Links whose last create TorBox answered with a fault of its own, whose unconfirmed
+        // create was cleared by Retry, or whose record had to be set aside. TorBox may hold that
+        // download already, so the account is checked before the link is sent again.
+        static readonly HashSet<string> CheckBeforeCreate = new HashSet<string>();
+        // Per account: TorBox asked for a wait before the next create (Retry-After on a create).
+        // Only creates wait; listing and link requests keep working.
+        static readonly Dictionary<string, long> CreateBlockedUntil = new Dictionary<string, long>();
+        // Why a create got no usable reply, for the message if TorBox never lists it.
+        static readonly Dictionary<string, string> UnconfirmedCreateDetail = new Dictionary<string, string>();
 
         // Local-only seams used by the source-linked host regression harness.
         internal static string ApiRootForTests;
@@ -30,6 +39,9 @@ namespace Orbis
         {
             lock (PendingDownloads) PendingDownloads.Clear();
             lock (Activities) Activities.Clear();
+            lock (CheckBeforeCreate) CheckBeforeCreate.Clear();
+            lock (CreateBlockedUntil) CreateBlockedUntil.Clear();
+            lock (UnconfirmedCreateDetail) UnconfirmedCreateDetail.Clear();
             NextCreation = 0;
             ProcessAdmissions.Clear();
             CreationClock.Restart();
@@ -564,6 +576,14 @@ namespace Orbis
             if (reconciling)
             {
                 var matches = MatchingCreateAttempts(data, hostUrl, pending.AttemptUtc);
+                // A console clock far from TorBox's hides this attempt from the time window. A
+                // usable download TorBox holds for this exact link is the same file, so it is
+                // adopted instead of reporting an unconfirmed create.
+                if (matches.Count == 0)
+                {
+                    var existing = BestExisting(data, hostUrl);
+                    if (existing != null) matches.Add(existing);
+                }
                 if (matches.Count > 1)
                 {
                     result.Kind = PreparedPollKind.Rejected;
@@ -586,6 +606,7 @@ namespace Orbis
                     pending = new Pending { Id = id, FileId = fileId,
                         FileName = string.IsNullOrEmpty(fileId) ? "" : ReadyFileName(job), AttemptUtc = pending.AttemptUtc };
                     SavePending(key, pending);
+                    lock (UnconfirmedCreateDetail) UnconfirmedCreateDetail.Remove(key);
                     visible = true;
                 }
                 else
@@ -595,7 +616,7 @@ namespace Orbis
                     {
                         result.Kind = PreparedPollKind.Rejected;
                         result.NeedsAction = true;
-                        result.Error = "TorBox could not confirm whether this download was created, so SSPI stopped instead of risking a duplicate. Retry sends it again; check the TorBox account first if you want to avoid a duplicate.";
+                        result.Error = UnconfirmedCreateText(key);
                     }
                     else result.Kind = PreparedPollKind.Preparing;
                     return result;
@@ -746,6 +767,15 @@ namespace Orbis
                     if (cancel != null && cancel()) throw new OperationCanceledException();
                 try
                 {
+                    // TorBox may already hold this link after a fault or an unconfirmed create:
+                    // adopt that download instead of sending the link a second time.
+                    if (CheckFirst(key))
+                    {
+                        if (progress != null) progress("Checking your TorBox account");
+                        pending = AdoptExisting(token, hostUrl, key, cancel);
+                        if (pending != null) return pending;
+                    }
+                    ThrowIfCreateBlocked(token, hostUrl);
                     int delay = (int)Math.Max(0, NextCreation - CreationClock.ElapsedMilliseconds);
                     if (delay > 0) Wait(delay, cancel);
                     TakeCreateAdmission(token, hostUrl, cancel);
@@ -758,11 +788,17 @@ namespace Orbis
                     catch (OperationCanceledException) { throw; }
                     catch (DebridResolutionError ex)
                     {
-                        // These explicit HTTP responses prove the provider refused
-                        // the create, so only their intent is safe to clear.
-                        if (ex.HttpStatusCode == 401 || ex.HttpStatusCode == 403 || ex.HttpStatusCode == 429 ||
-                            ex.ProviderCode == "DOWNLOAD_SERVER_ERROR")
+                        NoteCreateWait(token, ex);
+                        // TorBox names its own faults with codes ending in ERROR. The account can
+                        // still hold the download afterwards, so it is checked before anything else.
+                        if (MayAlreadyExist(ex.ProviderCode)) return AfterServerFault(token, hostUrl, key, ex, cancel);
+                        // A TorBox error code or an HTTP 4xx refusal proves the create was not
+                        // made, so only that intent is safe to clear.
+                        if (!string.IsNullOrEmpty(ex.ProviderCode) ||
+                            (ex.HttpStatusCode >= 400 && ex.HttpStatusCode < 500 && ex.HttpStatusCode != 408))
                         {
+                            SspiLog.Write("download", "event=torbox-create-refused http=" + ex.HttpStatusCode +
+                                " code=" + CodeOrDash(ex.ProviderCode) + " retry_after=" + ex.RetryAfterSeconds);
                             ForgetPending(key);
                             throw;
                         }
@@ -771,6 +807,15 @@ namespace Orbis
                         // TorBox made it; nothing here sends the create again.
                         if (ex.HttpStatusCode == 0 || ex.HttpStatusCode == 408 || ex.HttpStatusCode >= 500)
                         {
+                            string detail = !string.IsNullOrEmpty(ex.Diagnostic) ? ex.Diagnostic :
+                                ex.HttpStatusCode != 0 ? "HTTP " + ex.HttpStatusCode : "no reply";
+                            lock (UnconfirmedCreateDetail)
+                            {
+                                if (UnconfirmedCreateDetail.Count >= 512) UnconfirmedCreateDetail.Clear();
+                                UnconfirmedCreateDetail[key] = detail;
+                            }
+                            SspiLog.Write("download", "event=torbox-create-unconfirmed http=" + ex.HttpStatusCode +
+                                " detail=" + detail.Replace(' ', '_'));
                             if (progress != null) progress("TorBox checking the submitted download");
                             return pending;
                         }
@@ -795,6 +840,8 @@ namespace Orbis
                                 "TorBox returned an unclear create response. Reconciliation is required before retrying.");
                         }
                         DebridResolutionError rejection = DebridResolutionError.FromResponse("TorBox", hostUrl, json);
+                        if (MayAlreadyExist(rejection.ProviderCode)) return AfterServerFault(token, hostUrl, key, rejection, cancel);
+                        SspiLog.Write("download", "event=torbox-create-refused http=200 code=" + CodeOrDash(rejection.ProviderCode) + " retry_after=0");
                         ForgetPending(key);
                         throw rejection;
                     }
@@ -815,6 +862,7 @@ namespace Orbis
 
                     pending = new Pending { Id = id, FileId = "", AttemptUtc = pending.AttemptUtc };
                     SavePending(key, pending);
+                    ClearCheckFirst(key);
                     string createdFile = ReadyFile(created);
                     if (!string.IsNullOrEmpty(createdFile))
                     {
@@ -827,6 +875,185 @@ namespace Orbis
                 }
                 finally { Monitor.Exit(CreationGate); }
             }
+        }
+
+        /// <summary>TorBox's own faults (its codes ending in ERROR), except AUTH_ERROR, which is about the key.</summary>
+        internal static bool ServerFault(string code)
+        {
+            return code == "DOWNLOAD_SERVER_ERROR" || code == "DATABASE_ERROR" || code == "UNKNOWN_ERROR" ||
+                code == "NO_SERVERS_AVAILABLE_ERROR" || code == "REDIRECT_ERROR";
+        }
+
+        // After these replies to a create the download may be in the account: a fault of TorBox's
+        // own, or its report that the item already exists.
+        static bool MayAlreadyExist(string code) { return ServerFault(code) || code == "DUPLICATE_ITEM"; }
+
+        /// <summary>A create TorBox refused for its request rate, or one SSPI held back to stay
+        /// within TorBox's create limit. Nothing was created, so the row can simply wait.</summary>
+        internal static bool IsCreateThrottle(DebridResolutionError error)
+        {
+            if (error == null || error.Provider != "TorBox" || !error.IsRateLimited) return false;
+            string code = error.ProviderCode ?? "";
+            return code.Length == 0 || code == "RATE_LIMITED" || code == "TOO_MANY_REQUESTS" || code == "API_RATE_LIMIT";
+        }
+
+        // TorBox answered the create with a fault of its own (or said the item exists), yet the
+        // download may be in the account. One it lists for this link is adopted; otherwise the
+        // reply is reported and the next attempt checks the account again before sending the link.
+        static Pending AfterServerFault(string token, string hostUrl, string key, DebridResolutionError fault, Func<bool> cancel)
+        {
+            MarkCheckFirst(key);
+            Pending adopted = AdoptExisting(token, hostUrl, key, cancel);
+            SspiLog.Write("download", "event=torbox-create-may-exist code=" + CodeOrDash(fault.ProviderCode) +
+                " http=" + fault.HttpStatusCode + " retry_after=" + fault.RetryAfterSeconds + " adopted=" + (adopted == null ? 0 : 1));
+            if (adopted != null) return adopted;
+            ForgetPending(key);
+            throw fault;
+        }
+
+        /// <summary>
+        /// Looks in the account for a usable web download of this exact link and keeps it as the
+        /// link's receipt. Returns null when none is listed or the list cannot be read; the caller
+        /// then sends the link as before. Never creates anything.
+        /// </summary>
+        static Pending AdoptExisting(string token, string hostUrl, string key, Func<bool> cancel)
+        {
+            Dictionary<string, object> job = null;
+            try
+            {
+                string list = NetHttp.GetString(ApiRoot + "/webdl/mylist?bypass_cache=true", 15000, null, token.Trim(), cancel: cancel);
+                var response = Response(list);
+                if (Flag(response, "success")) job = BestExisting(Value(response, "data"), hostUrl);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                SspiLog.Write("download", "event=torbox-account-check-failed exception=" + ex.GetType().Name);
+                return null;
+            }
+            if (job == null) return null;
+            string fileId = ReadyFile(job) ?? "";
+            var pending = new Pending { Id = First(job, "id", "webdownload_id", "webdownloadId"), FileId = fileId,
+                FileName = fileId.Length == 0 ? "" : ReadyFileName(job), AttemptUtc = DateTime.UtcNow };
+            SavePending(key, pending);
+            ClearCheckFirst(key);
+            lock (UnconfirmedCreateDetail) UnconfirmedCreateDetail.Remove(key);
+            SspiLog.Write("download", "event=torbox-existing-download-adopted ready=" + (fileId.Length == 0 ? 0 : 1));
+            return pending;
+        }
+
+        // The best download TorBox lists for this exact link that can still be used: never one
+        // that failed or whose files are gone. A finished one first, then the newest.
+        static Dictionary<string, object> BestExisting(object data, string sourceUrl)
+        {
+            var jobs = new List<Dictionary<string, object>>();
+            var single = data as Dictionary<string, object>;
+            if (single != null) jobs.Add(single);
+            var items = data as List<object>;
+            if (items != null)
+                foreach (object item in items) { var entry = item as Dictionary<string, object>; if (entry != null) jobs.Add(entry); }
+            Dictionary<string, object> best = null;
+            bool bestReady = false;
+            long bestCreated = 0, bestId = -1;
+            foreach (var job in jobs)
+            {
+                string id = First(job, "id", "webdownload_id", "webdownloadId");
+                if (!ValidId(id) || !SourceMatches(job, sourceUrl)) continue;
+                string state = Text(job, "download_state") ?? "";
+                if (state.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    state.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                object present = Value(job, "download_present");
+                if (Flag(job, "download_finished") && present is bool && !(bool)present) continue;
+                string file;
+                try { file = ReadyFile(job); }
+                catch (IOException) { continue; }
+                bool ready = !string.IsNullOrEmpty(file);
+                DateTime? created = CreateTime(job);
+                long createdTicks = created.HasValue ? created.Value.Ticks : 0, idValue = long.Parse(id, CultureInfo.InvariantCulture);
+                if (best != null)
+                {
+                    if (bestReady && !ready) continue;
+                    if (bestReady == ready && (createdTicks < bestCreated || (createdTicks == bestCreated && idValue <= bestId))) continue;
+                }
+                best = job; bestReady = ready; bestCreated = createdTicks; bestId = idValue;
+            }
+            return best;
+        }
+
+        // A record moved aside as unreadable also asks for the check, across restarts.
+        static bool CheckFirst(string key)
+        {
+            lock (CheckBeforeCreate) if (CheckBeforeCreate.Contains(key)) return true;
+            return File.Exists(PendingPath(key) + ".unreadable");
+        }
+        static void ClearCheckFirst(string key)
+        {
+            lock (CheckBeforeCreate) CheckBeforeCreate.Remove(key);
+            try { File.Delete(PendingPath(key) + ".unreadable"); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        static void MarkCheckFirst(string key)
+        {
+            lock (CheckBeforeCreate)
+            {
+                if (CheckBeforeCreate.Count >= 512) CheckBeforeCreate.Clear();
+                CheckBeforeCreate.Add(key);
+            }
+        }
+
+        // TorBox asked for a wait before the next create. Only creates wait, for at most an
+        // hour (TorBox's longest documented limit window); other requests keep working.
+        static void NoteCreateWait(string token, DebridResolutionError error)
+        {
+            int seconds = error.RetryAfterSeconds;
+            if (seconds <= 0 && error.HttpStatusCode == 429) seconds = 60;
+            else if (seconds <= 0 && error.HttpStatusCode == 503) seconds = 15;
+            if (seconds <= 0) return;
+            long until = CreationClock.ElapsedMilliseconds + Math.Min(3600, seconds) * 1000L;
+            string account = AccountKey(token);
+            lock (CreateBlockedUntil)
+            {
+                long current;
+                if (!CreateBlockedUntil.TryGetValue(account, out current) || until > current) CreateBlockedUntil[account] = until;
+            }
+        }
+
+        static void ThrowIfCreateBlocked(string token, string sourceUrl)
+        {
+            long until;
+            lock (CreateBlockedUntil) if (!CreateBlockedUntil.TryGetValue(AccountKey(token), out until)) return;
+            long remaining = until - CreationClock.ElapsedMilliseconds;
+            if (remaining > 0) throw CreateLimited(sourceUrl, (int)Math.Max(1, (remaining + 999) / 1000));
+        }
+
+        static DebridResolutionError CreateLimited(string sourceUrl, int retryAfterSeconds)
+        {
+            var limited = DebridResolutionError.FromResponse("TorBox", sourceUrl, "{\"error\":\"RATE_LIMITED\"}");
+            limited.IsRateLimited = true;
+            limited.IsTransient = true;
+            limited.RetryAfterSeconds = retryAfterSeconds;
+            limited.HttpStatusCode = 429;
+            return limited;
+        }
+
+        static string UnconfirmedCreateText(string key)
+        {
+            string detail;
+            lock (UnconfirmedCreateDetail) UnconfirmedCreateDetail.TryGetValue(key, out detail);
+            return "TorBox has not listed this download since its create request " +
+                (string.IsNullOrEmpty(detail) ? "got no clear answer" : "failed (" + detail + ")") +
+                ", so it was most likely not added. Retry checks your TorBox account first and sends it again only if it is missing.";
+        }
+
+        // A TorBox error code for logs and messages; never free text, which can echo a link.
+        static string CodeOrDash(string code)
+        {
+            if (string.IsNullOrEmpty(code)) return "-";
+            if (code.Length > 40) return "other";
+            foreach (char c in code)
+                if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return "other";
+            return code;
         }
 
         /// <summary>Request a fresh signed link for an already prepared TorBox task.</summary>
@@ -998,26 +1225,18 @@ namespace Orbis
             return !string.IsNullOrEmpty(id) && long.TryParse(id, NumberStyles.None, CultureInfo.InvariantCulture, out value) && value >= 0;
         }
 
+        // TorBox accepts at most 60 web download creates per hour for each API key.
+        internal const int CreatesPerHour = 60;
+        const string AdmissionHeader = "TORBOX-ADMISSIONS-1";
+
         static void TakeCreateAdmission(string token, string sourceUrl, Func<bool> cancel)
         {
             string account = AccountKey(token), path = AdmissionPath(AccountKey(token));
             using (AcquireFileLock(AdmissionLockPath(account), cancel))
             {
-                string[] lines = ReadLinesIfPresent(path, 8192);
                 var attempts = new List<long>();
-                if (lines != null)
-                {
-                    if (lines.Length == 0 || lines[0] != "TORBOX-ADMISSIONS-1")
-                        throw new IOException("TorBox create-admission history is unreadable; new creates are blocked to avoid exceeding the provider limit.");
-                    for (int i = 1; i < lines.Length; i++)
-                    {
-                        long ticks;
-                        if (!long.TryParse(lines[i], NumberStyles.None, CultureInfo.InvariantCulture, out ticks) ||
-                            ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
-                            throw new IOException("TorBox create-admission history is unreadable; new creates are blocked to avoid exceeding the provider limit.");
-                        attempts.Add(ticks);
-                    }
-                }
+                string problem = ReadAdmissions(path, attempts);
+                if (problem != null) attempts = RecoverAdmissions(path, problem);
                 DateTime utcNow = DateTime.UtcNow;
                 long now = utcNow.Ticks;
                 long cutoff = now - TimeSpan.FromHours(1).Ticks;
@@ -1034,35 +1253,99 @@ namespace Orbis
                     ProcessAdmissions[account] = processAttempts;
                 }
                 processAttempts.RemoveAll(at => elapsed - at >= window);
-                if (attempts.Count >= 60 || processAttempts.Count >= 60)
+                if (attempts.Count >= CreatesPerHour || processAttempts.Count >= CreatesPerHour)
                 {
                     int retry = 1;
-                    if (attempts.Count >= 60)
+                    if (attempts.Count >= CreatesPerHour)
                     {
                         attempts.Sort();
                         retry = (int)Math.Max(retry, Math.Ceiling(TimeSpan.FromHours(1).TotalSeconds -
-                            TimeSpan.FromTicks(now - attempts[0]).TotalSeconds));
+                            TimeSpan.FromTicks(now - attempts[attempts.Count - CreatesPerHour]).TotalSeconds));
                     }
-                    if (processAttempts.Count >= 60)
+                    if (processAttempts.Count >= CreatesPerHour)
                         retry = (int)Math.Max(retry, Math.Ceiling((window - (elapsed - processAttempts[0])) / 1000.0));
-                    var limited = (DebridResolutionError)DebridResolutionError.FromResponse("TorBox", sourceUrl,
-                        "{\"error\":\"RATE_LIMITED\"}");
-                    limited.IsRateLimited = true;
-                    limited.IsTransient = true;
-                    limited.RetryAfterSeconds = retry;
-                    limited.HttpStatusCode = 429;
-                    throw limited;
+                    throw CreateLimited(sourceUrl, retry);
                 }
                 if (utcNow.Year >= 2020)
                 {
                     attempts.Add(now);
-                    var text = new StringBuilder("TORBOX-ADMISSIONS-1\n");
-                    foreach (long ticks in attempts) text.Append(ticks.ToString(CultureInfo.InvariantCulture)).Append('\n');
-                    AtomicFile.WriteText(path, text.ToString());
+                    AtomicFile.WriteText(path, AdmissionText(attempts));
                 }
                 processAttempts.Add(elapsed);
             }
         }
+
+        static string AdmissionText(List<long> attempts)
+        {
+            var text = new StringBuilder(AdmissionHeader + "\n");
+            foreach (long ticks in attempts) text.Append(ticks.ToString(CultureInfo.InvariantCulture)).Append('\n');
+            return text.ToString();
+        }
+
+        // Reads the create history into attempts. Returns null when it is readable or absent,
+        // otherwise what made it unreadable. A storage error still fails this create only.
+        static string ReadAdmissions(string path, List<long> attempts)
+        {
+            string[] lines;
+            try { lines = ReadLinesIfPresent(path, 8192); }
+            catch (UnreadableRecordException) { return "size"; }
+            if (lines == null) return null;
+            if (lines.Length == 0) return "empty";
+            if (lines[0] != AdmissionHeader) return "header";
+            for (int i = 1; i < lines.Length; i++)
+            {
+                long ticks;
+                if (!long.TryParse(lines[i], NumberStyles.None, CultureInfo.InvariantCulture, out ticks) ||
+                    ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks) return "entry";
+                attempts.Add(ticks);
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// An unreadable create history (for example a write cut short when the console lost
+        /// power) used to block every TorBox create until the file was deleted by hand. It is
+        /// moved aside and replaced by a conservative estimate: every create it could have held
+        /// counts as made at its last write, so SSPI still never exceeds TorBox's hourly limit
+        /// and creates resume at the latest an hour after that write.
+        /// </summary>
+        static List<long> RecoverAdmissions(string path, string reason)
+        {
+            var info = new FileInfo(path);
+            long bytes = info.Exists ? info.Length : 0;
+            DateTime utcNow = DateTime.UtcNow;
+            long written = Math.Min(info.Exists ? info.LastWriteTimeUtc.Ticks : utcNow.Ticks, utcNow.Ticks);
+            MoveAside(path);
+            // A history is a 20-byte header and at least 19 bytes per create. A file too short
+            // for one entry (an empty one, say) may have lost all of them.
+            long perEntry = 19, header = AdmissionHeader.Length + 1;
+            int counted = bytes < header + perEntry ? CreatesPerHour :
+                (int)Math.Min(CreatesPerHour, (bytes - header + perEntry - 1) / perEntry);
+            var attempts = new List<long>();
+            for (int i = 0; i < counted; i++) attempts.Add(written);
+            // Keep the estimate if SSPI restarts before it expires.
+            if (utcNow.Year >= 2020 && utcNow.Ticks - written < TimeSpan.FromHours(1).Ticks)
+                AtomicFile.WriteText(path, AdmissionText(attempts));
+            SspiLog.Write("download", "event=torbox-admission-history-unreadable reason=" + reason + " bytes=" + bytes +
+                " age_s=" + (utcNow.Ticks - written) / TimeSpan.TicksPerSecond + " counted=" + counted + " action=moved-aside");
+            return attempts;
+        }
+
+        // Keeps one copy of an unreadable record for diagnosis; deleting it still unblocks SSPI.
+        static void MoveAside(string path)
+        {
+            string aside = path + ".unreadable";
+            try
+            {
+                if (File.Exists(aside)) File.Delete(aside);
+                File.Move(path, aside);
+            }
+            catch (IOException) { File.Delete(path); }
+            catch (UnauthorizedAccessException) { File.Delete(path); }
+        }
+
+        sealed class UnreadableRecordException : IOException
+        { internal UnreadableRecordException() : base("TorBox persistence record is too large to read safely.") { } }
 
         static string[] ReadLinesIfPresent(string path, int maximumBytes)
         {
@@ -1071,7 +1354,7 @@ namespace Orbis
             catch (FileNotFoundException) { return null; }
             catch (DirectoryNotFoundException) { return null; }
             if (Encoding.UTF8.GetByteCount(contents) > maximumBytes)
-                throw new IOException("TorBox persistence record is too large to read safely.");
+                throw new UnreadableRecordException();
             string[] lines = contents.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
             int count = lines.Length;
             while (count > 0 && lines[count - 1].Length == 0) count--;
@@ -1084,7 +1367,9 @@ namespace Orbis
         static Pending LoadPending(string key)
         {
             string path = PendingPath(key);
-            string[] lines = ReadLinesIfPresent(path, 4096);
+            string[] lines;
+            try { lines = ReadLinesIfPresent(path, 4096); }
+            catch (UnreadableRecordException) { return RecoverPending(key, path, "size"); }
             if (lines == null) return null;
             Pending pending;
             long ticks;
@@ -1112,9 +1397,21 @@ namespace Orbis
                 pending = new Pending { Id = lines[0], FileId = lines[1], AttemptUtc = DateTime.UtcNow };
                 SavePending(key, pending);
             }
-            else throw new IOException("TorBox prepared-download record is unreadable; automatic resubmission was blocked.");
+            else return RecoverPending(key, path, lines.Length == 0 ? "empty" : "format");
             CachePending(key, pending);
             return pending;
+        }
+
+        // An unreadable record (the same write failure as an unreadable create history) used to
+        // block this link, and every parked poll, until it was deleted by hand. It is moved aside;
+        // the next attempt checks the account first, so a download TorBox holds is adopted.
+        static Pending RecoverPending(string key, string path, string reason)
+        {
+            MoveAside(path);
+            lock (PendingDownloads) PendingDownloads.Remove(key);
+            MarkCheckFirst(key);
+            SspiLog.Write("download", "event=torbox-pending-record-unreadable reason=" + reason + " action=moved-aside");
+            return null;
         }
         static void SavePending(string key, Pending pending)
         {
@@ -1151,6 +1448,8 @@ namespace Orbis
             Pending pending = LookupPending(key);
             if (pending == null || !string.IsNullOrEmpty(pending.Id)) return;
             ForgetPending(key);
+            // TorBox may have made it after all: the next attempt checks the account first.
+            MarkCheckFirst(key);
             SspiLog.Write("download", "event=torbox-unconfirmed-create-cleared");
         }
 
@@ -1159,6 +1458,7 @@ namespace Orbis
             File.Delete(PendingPath(key));
             lock (PendingDownloads) PendingDownloads.Remove(key);
             lock (Activities) Activities.Remove(key);
+            lock (UnconfirmedCreateDetail) UnconfirmedCreateDetail.Remove(key);
         }
 
         public static string ProbeUser(string token)
@@ -1169,11 +1469,11 @@ namespace Orbis
                 try
                 {
                     string json;
-                    try { json = NetHttp.GetString(Api + "/user/me", 15000, null, token.Trim()); }
-                    catch (Exception ex) { throw DebridResolutionError.FromTransport("TorBox", Api, ex); }
+                    try { json = NetHttp.GetString(ApiRoot + "/user/me", 15000, null, token.Trim()); }
+                    catch (Exception ex) { throw DebridResolutionError.FromTransport("TorBox", ApiRoot, ex); }
                     var response = Response(json);
                     if (!Flag(response, "success"))
-                        throw DebridResolutionError.FromResponse("TorBox", Api, json);
+                        throw DebridResolutionError.FromResponse("TorBox", ApiRoot, json);
                     var data = Object(Value(response, "data"));
                     string user = First(data, "email", "base_email", "auth_id") ?? "?";
                     string plan = Text(data, "plan") ?? "?";
@@ -1198,7 +1498,9 @@ namespace Orbis
                     if (ex.IsRateLimited) return "RATE_LIMITED: TorBox is busy; wait before retrying";
                     if (ex.ProviderCode == "PLAN_RESTRICTED_FEATURE" || ex.ProviderCode == "PLAN_RESTRICTED" || ex.ProviderCode == "NO_PREMIUM")
                         return "LIMITED: TorBox reports a plan restriction";
-                    return "RETRY: TorBox account verification is unavailable; the saved key was kept";
+                    // Not a verdict on the key: name what failed (an HTTP status, a console
+                    // transport code or a TorBox code), so an outage is not mistaken for a bad key.
+                    return "RETRY: TorBox account verification is unavailable; the saved key was kept" + ProbeDetail(ex);
                 }
                 catch
                 {
@@ -1206,6 +1508,15 @@ namespace Orbis
                     return "RETRY: TorBox returned an unreadable account response; retry shortly";
                 }
             }
+        }
+
+        static string ProbeDetail(DebridResolutionError ex)
+        {
+            string detail = !string.IsNullOrEmpty(ex.Diagnostic) ? ex.Diagnostic :
+                ex.HttpStatusCode != 0 ? "HTTP " + ex.HttpStatusCode : "";
+            string code = CodeOrDash(ex.ProviderCode);
+            if (code != "-" && code != "other") detail = (detail.Length == 0 ? "" : detail + " ") + code;
+            return detail.Length == 0 ? " (no usable reply)" : " (" + detail + ")";
         }
 
         static bool IsHttp(string value)
