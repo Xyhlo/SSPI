@@ -1461,6 +1461,132 @@ namespace Orbis
             lock (UnconfirmedCreateDetail) UnconfirmedCreateDetail.Remove(key);
         }
 
+        // ---- Torrents: TorBox fetches the swarm; the PS4 only downloads finished files ----
+
+        internal sealed class TorrentFile
+        {
+            internal string Id = "", Name = "";
+            internal long Size;
+        }
+
+        internal sealed class Torrent
+        {
+            internal string Id = "", Hash = "", Name = "", State = "";
+            internal bool Finished, Present, Cached;
+            internal int Progress, Seeds;
+            internal long Speed;
+            internal readonly List<TorrentFile> Files = new List<TorrentFile>();
+            internal bool Ready { get { return Present && (Finished || Cached); } }
+            internal bool Failed
+            {
+                get { string s = State.ToLowerInvariant(); return s.Contains("error") || s.Contains("failed"); }
+            }
+        }
+
+        /// <summary>The account's existing torrent for this info hash, or "" when none is usable.
+        /// Reusing it keeps a retried or restarted magnet from adding a duplicate.</summary>
+        internal static string FindTorrent(string token, string infoHash, Func<bool> cancel)
+        {
+            var rows = TorrentCall(token, ApiRoot + "/torrents/mylist?bypass_cache=true", null, cancel) as System.Collections.IList;
+            if (rows == null) return "";
+            foreach (object item in rows)
+            {
+                Torrent row = ParseTorrent(item as Dictionary<string, object>);
+                if (row != null && !row.Failed && string.Equals(row.Hash, infoHash, StringComparison.OrdinalIgnoreCase))
+                    return row.Id;
+            }
+            return "";
+        }
+
+        internal static string CreateTorrent(string token, string magnet, Func<bool> cancel)
+        {
+            // seed=3: never seed from the account. allow_zip=false: list every file so
+            // each PKG or archive becomes its own queue row.
+            var data = TorrentCall(token, ApiRoot + "/torrents/createtorrent",
+                "magnet=" + Uri.EscapeDataString(magnet) + "&seed=3&allow_zip=false&as_queued=false", cancel) as Dictionary<string, object>;
+            string id = data == null ? null : First(data, "torrent_id", "id");
+            if (!ValidId(id)) throw new IOException("TorBox did not return a torrent ID");
+            return id;
+        }
+
+        internal static Torrent TorrentInfo(string token, string id, Func<bool> cancel)
+        {
+            if (!ValidId(id)) throw new IOException("Invalid TorBox torrent ID");
+            object data = TorrentCall(token, ApiRoot + "/torrents/mylist?id=" + id + "&bypass_cache=true", null, cancel);
+            var list = data as System.Collections.IList;
+            if (list != null) data = list.Count > 0 ? list[0] : null;
+            Torrent torrent = ParseTorrent(data as Dictionary<string, object>);
+            if (torrent == null || torrent.Id != id) throw new IOException("TorBox returned no torrent details");
+            return torrent;
+        }
+
+        /// <summary>A direct download URL for one finished torrent file.</summary>
+        internal static string TorrentFileLink(string token, string id, string fileId, Func<bool> cancel)
+        {
+            if (!ValidId(id) || !ValidId(fileId)) throw new IOException("Invalid TorBox file ID");
+            object data = TorrentCall(token, ApiRoot + "/torrents/requestdl?token=" + Uri.EscapeDataString(token.Trim()) +
+                "&torrent_id=" + id + "&file_id=" + fileId + "&zip_link=false", null, cancel);
+            string url = data as string;
+            Uri uri;
+            if (string.IsNullOrEmpty(url) || !Uri.TryCreate(url, UriKind.Absolute, out uri) || uri.Scheme != "https")
+                throw new IOException("TorBox returned no download link for this file");
+            DownloadTransferSettings.RememberProviderLimit(url, DownloadTransferSettings.MaxRangeCount);
+            return url;
+        }
+
+        static object TorrentCall(string token, string url, string form, Func<bool> cancel)
+        {
+            if (string.IsNullOrWhiteSpace(token)) throw new IOException("TorBox API key missing; connect it in Connections");
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            string json;
+            try
+            {
+                json = form == null ? NetHttp.GetString(url, 20000, null, token.Trim(), cancel: cancel)
+                    : NetHttp.PostForm(url, form, 30000, null, token.Trim(), cancel: cancel);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { throw DebridResolutionError.FromTransport("TorBox", StripToken(url), ex); }
+            var response = Response(json);
+            if (!Flag(response, "success")) throw DebridResolutionError.FromResponse("TorBox", StripToken(url), json);
+            return Value(response, "data");
+        }
+
+        // requestdl carries the key in its query; keep it out of error messages and logs.
+        static string StripToken(string url)
+        {
+            int query = url.IndexOf('?');
+            return query < 0 ? url : url.Substring(0, query);
+        }
+
+        static Torrent ParseTorrent(Dictionary<string, object> row)
+        {
+            if (row == null) return null;
+            string id = Text(row, "id");
+            if (!ValidId(id)) return null;
+            var torrent = new Torrent
+            {
+                Id = id, Hash = (Text(row, "hash") ?? "").ToLowerInvariant(), Name = Text(row, "name") ?? "",
+                State = Text(row, "download_state") ?? "", Finished = Flag(row, "download_finished"),
+                Present = Flag(row, "download_present"), Cached = Flag(row, "cached"),
+                // TorBox reports progress as a 0..1 fraction.
+                Progress = (int)Math.Max(0, Math.Min(100, Number(row, "progress") * 100)),
+                Seeds = (int)Math.Max(0, Math.Min(100000, Number(row, "seeds"))),
+                Speed = (long)Math.Max(0, Number(row, "download_speed"))
+            };
+            var files = Value(row, "files") as System.Collections.IList;
+            if (files != null)
+                foreach (object item in files)
+                {
+                    var file = item as Dictionary<string, object>;
+                    string fileId = file == null ? null : Text(file, "id");
+                    // A file TorBox flagged as infected is never offered for download.
+                    if (!ValidId(fileId) || Flag(file, "infected")) continue;
+                    torrent.Files.Add(new TorrentFile { Id = fileId, Name = First(file, "name", "short_name") ?? "",
+                        Size = (long)Math.Max(0, Number(file, "size")) });
+                }
+            return torrent;
+        }
+
         public static string ProbeUser(string token)
         {
             if (string.IsNullOrWhiteSpace(token)) return "REJECTED: TorBox API key missing";

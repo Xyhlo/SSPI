@@ -453,8 +453,8 @@ namespace Orbis
         {
             if (candidate == null) return false;
             Uri uri;
-            if (!Uri.TryCreate(candidate.Url, UriKind.Absolute, out uri) ||
-                !(uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)) return false;
+            if (!MagnetLink.IsValid(candidate.Url) && (!Uri.TryCreate(candidate.Url, UriKind.Absolute, out uri) ||
+                !(uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))) return false;
             return string.IsNullOrEmpty(candidate.TitleId) || string.IsNullOrEmpty(requestedTitleId) ||
                 string.Equals(candidate.TitleId, requestedTitleId, StringComparison.OrdinalIgnoreCase);
         }

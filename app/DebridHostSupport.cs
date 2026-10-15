@@ -422,6 +422,8 @@ namespace Orbis
 
         static bool SupportsUrl(AppSettings cfg, string url, bool direct)
         {
+            // Magnets are fetched by whichever link service is connected.
+            if (MagnetLink.IsMagnet(url)) return MagnetLink.IsValid(url) && DownloadManager.MagnetProvider(cfg).Length > 0;
             Uri uri;
             if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https")) return false;
             if (direct) return true;

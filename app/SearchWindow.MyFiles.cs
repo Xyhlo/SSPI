@@ -98,7 +98,7 @@ namespace Orbis
         }
         void QueuePersonalLink(string name,string link,bool cloud)
         {
-            if(!cloud&&!CloudCatalog.ValidLink(link))throw new IOException("Enter a complete HTTP or HTTPS file URL");
+            if(!cloud&&!CloudCatalog.ValidLink(link)&&!MagnetLink.IsValid(link))throw new IOException("Enter a complete HTTP, HTTPS or magnet link");
             RunDownloadAction(()=>{
                 string message;
                 _dlMgr.Enqueue(new GameHit{TitleId="",Name=string.IsNullOrWhiteSpace(name)?"My package":name,ImageUrl=""},

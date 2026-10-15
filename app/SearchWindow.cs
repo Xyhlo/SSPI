@@ -1124,7 +1124,8 @@ namespace Orbis
                 _pair.Settings = _cfg;
                 _pair.RefreshLibrary = () => InstalledTitleScan.Scan(256).ToArray();
                 _pair.QueueDownloadLink = url => {
-                    string name = Uri.UnescapeDataString(Path.GetFileName(new Uri(url).AbsolutePath));
+                    string name = MagnetLink.IsMagnet(url) ? MagnetLink.DisplayName(url)
+                        : Uri.UnescapeDataString(Path.GetFileName(new Uri(url).AbsolutePath));
                     if (string.IsNullOrWhiteSpace(name) || name.Length > 180 || name.IndexOf('.') < 0) name = "Resolving package";
                     string message;
                     return _dlMgr.Enqueue(new GameHit { TitleId = "", Name = name, ImageUrl = "" },

@@ -1379,7 +1379,8 @@ function parseLinks(text) {
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
-    if (line.length > 8192 || !/^https?:\/\/[^\s/?#]+\S*$/i.test(line)) { out.invalid++; continue; }
+    if (line.length > 8192 || !(/^https?:\/\/[^\s/?#]+\S*$/i.test(line) ||
+        /^magnet:\?\S*\bxt=urn:btih:([0-9a-f]{40}|[a-z2-7]{32})(&|$)/i.test(line))) { out.invalid++; continue; }
     if (seen.has(line)) { out.repeated++; continue; }
     seen.add(line); out.valid.push(line);
   }
@@ -1394,7 +1395,7 @@ function batchCount(urls, multipart) {
 }
 function openSendSheet() {
   openSheet('Send download links', `<p class="hint">Up to 50 links, one per line. Your PS4 uses its selected service and staging drive.</p>
-    <textarea class="area" id="links" rows="6" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste download links, one per line" aria-label="Download links"></textarea>
+    <textarea class="area" id="links" rows="6" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste download or magnet links, one per line" aria-label="Download links"></textarea>
     <div class="chips" id="linkTags" aria-live="polite"></div>
     <div class="toggle-row"><div><strong>One RAR archive</strong><small>Turn on when the links are parts of one archive, in volume order. Named parts are grouped automatically.</small></div><button class="switch" id="multipart" type="button" role="switch" aria-checked="false" aria-label="Links are parts of one RAR archive"></button></div>
     <div class="btn-row"><button class="btn" id="clearLinks" type="button">Clear</button><button class="btn primary" id="queueLinks" type="button">${icon('send', 'i sm')}<span>Queue on PS4</span></button></div>`, body => {

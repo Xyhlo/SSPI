@@ -101,8 +101,8 @@ namespace Orbis
             {
                 string url = line.Trim();
                 if (url.Length == 0) continue;
-                if (url.Length > 8192 || !CloudCatalog.ValidLink(url))
-                    throw new IOException("Enter one complete HTTP or HTTPS link per line. Nothing in this batch was queued.");
+                if (url.Length > 8192 || (!CloudCatalog.ValidLink(url) && !MagnetLink.IsValid(url)))
+                    throw new IOException("Enter one complete HTTP, HTTPS or magnet link per line. Nothing in this batch was queued.");
                 if (unique.Add(url)) validated.Add(url); else repeated++;
                 if (validated.Count > 50) throw new IOException("Send up to 50 links at a time. Nothing in this batch was queued.");
             }

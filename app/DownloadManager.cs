@@ -618,7 +618,16 @@ namespace Orbis
         {
             recheck = null;
             if (game == null || link == null) throw new Exception("Bad download");
-            if (accessType == "Personal")
+            // Pasted or source-declared alike, a magnet is recognized by its URL.
+            if (MagnetLink.IsMagnet(link.Url))
+            {
+                if (!MagnetLink.IsValid(link.Url)) throw new Exception("Magnet link has no BitTorrent info hash");
+                accessType = "Magnet";
+                string display = MagnetLink.DisplayName(link.Url);
+                if (display.Length > 0 && sourceId == "personal" && (string.IsNullOrEmpty(game.Name) || game.Name == "Resolving package" || game.Name == "My package"))
+                    game = new GameHit { TitleId = game.TitleId, Name = display, ImageUrl = game.ImageUrl ?? "" };
+            }
+            else if (accessType == "Personal")
             {
                 string locator = CloudCatalog.ImportLocator(link.Url);
                 if (locator != null) { link.Url = locator; accessType = "Cloud"; }
@@ -4214,6 +4223,14 @@ namespace Orbis
             try
             {
                 if (CommitRequestedStop(job, attempt)) return;
+                // A magnet transfers nothing itself, so no background or resident route
+                // applies: it waits for the link service, then becomes one queue row per
+                // package file, like a link list or an archive.
+                if (string.Equals(job.AccessType, "Magnet", StringComparison.Ordinal))
+                {
+                    RunMagnet(job, attempt);
+                    return;
+                }
                 if (UseInAppThemeLicense(job))
                 {
                     PkgContentKind kind; string kindName, content, title, error; long licenseSize;
@@ -7183,6 +7200,374 @@ namespace Orbis
             {
                 SetFailureIfCurrent(job, attempt, ex.Message);
             }
+        }
+
+        const int MagnetPollSeconds = 30;
+
+        // One finished torrent file: Locator queues it, as a renewable account file
+        // ("Cloud") or a plain URL ("Direct"); Direct asks the service for a plain URL,
+        // used for RAR set parts.
+        sealed class MagnetFile
+        {
+            public string Name, Locator, Access = "Cloud";
+            public bool Named;
+            public Func<string> Direct;
+        }
+
+        /// <summary>The service that fetches magnets: the preferred one when it can,
+        /// otherwise whichever is connected. "" when neither is.</summary>
+        internal static string MagnetProvider(AppSettings cfg)
+        {
+            if (cfg == null) return "";
+            string[] order = { UnlockProviders.RealDebridId, UnlockProviders.TorBoxId,
+                UnlockProviders.AllDebridId, UnlockProviders.PremiumizeId };
+            if (Array.IndexOf(order, cfg.UnlockProviderId) >= 0 &&
+                !string.IsNullOrWhiteSpace(UnlockProviders.ApiKey(cfg, cfg.UnlockProviderId)))
+                return cfg.UnlockProviderId;
+            foreach (string provider in order)
+                if (!string.IsNullOrWhiteSpace(UnlockProviders.ApiKey(cfg, provider))) return provider;
+            return "";
+        }
+
+        // The service fetches the torrent. Until it finishes, the row stays Queued with
+        // the provider's progress and a retry time, so the one worker serves other games.
+        // The torrent is found again by info hash, never re-added, after a retry or restart.
+        void RunMagnet(DlItem job, int attempt)
+        {
+            Func<bool> canceled = () => !_run || job.AttemptId != attempt || job.CancelRequested || job.PauseRequested;
+            string provider = MagnetProvider(_cfg);
+            try
+            {
+                if (provider.Length == 0)
+                { SetFailureIfCurrent(job, attempt, "Magnet links need a link service (Real-Debrid, TorBox, AllDebrid or Premiumize); connect one in Connections"); return; }
+                string hash = MagnetLink.InfoHash(job.HosterUrl);
+                if (hash.Length == 0)
+                { SetFailureIfCurrent(job, attempt, "Magnet link has no BitTorrent info hash"); return; }
+                List<MagnetFile> files = provider == UnlockProviders.TorBoxId ? PollTorBoxMagnet(job, attempt, hash, canceled)
+                    : provider == UnlockProviders.AllDebridId ? PollAllDebridMagnet(job, attempt, canceled)
+                    : provider == UnlockProviders.PremiumizeId ? PollPremiumizeMagnet(job, attempt, hash, canceled)
+                    : PollRealDebridMagnet(job, attempt, hash, canceled);
+                if (files != null) FanOutMagnet(job, attempt, files, canceled);
+            }
+            catch (OperationCanceledException) { CommitRequestedStop(job, attempt); }
+            catch (DebridResolutionError ex)
+            {
+                if (ex.IsTransient || ex.IsRateLimited)
+                    DeferMagnet(job, attempt, UnlockProviders.DisplayName(provider) + " busy; retrying shortly",
+                        Math.Max(MagnetPollSeconds, Math.Min(3600, ex.RetryAfterSeconds)));
+                else SetFailureIfCurrent(job, attempt, ex.Message);
+            }
+            catch (Exception ex) { SetFailureIfCurrent(job, attempt, ex.Message); }
+        }
+
+        /// <summary>The finished torrent's files, or null after the row was deferred or failed.</summary>
+        List<MagnetFile> PollRealDebridMagnet(DlItem job, int attempt, string hash, Func<bool> canceled)
+        {
+            string token = _cfg.RealDebridToken;
+            SetMagnetStatus(job, attempt, "Checking Real-Debrid for this torrent...");
+            string id = RealDebridClient.FindTorrent(token, hash, canceled);
+            if (id.Length == 0)
+            {
+                SetMagnetStatus(job, attempt, "Adding magnet to Real-Debrid...");
+                id = RealDebridClient.AddMagnet(token, job.HosterUrl, canceled);
+            }
+            RealDebridClient.Torrent torrent = RealDebridClient.TorrentInfo(token, id, canceled);
+            if (torrent.Status == "waiting_files_selection")
+            {
+                string selection = MagnetSelection(torrent);
+                if (selection.Length == 0)
+                { SetFailureIfCurrent(job, attempt, "Torrent has no PKG or archive files"); return null; }
+                RealDebridClient.SelectFiles(token, id, selection, canceled);
+                torrent = RealDebridClient.TorrentInfo(token, id, canceled);
+            }
+            if (torrent.Failed)
+            { SetFailureIfCurrent(job, attempt, "Real-Debrid could not fetch this torrent (" + torrent.Status + ")"); return null; }
+            if (torrent.Status != "downloaded")
+            { DeferMagnet(job, attempt, RealDebridProgress(torrent), MagnetPollSeconds); return null; }
+
+            var selected = torrent.Files.FindAll(file => file.Selected);
+            // Real-Debrid lists one link per selected file, in file order. Any other
+            // count means it bundled the files, so their names are unknown.
+            bool named = selected.Count == torrent.Links.Count;
+            var files = new List<MagnetFile>();
+            for (int n = 0; n < torrent.Links.Count; n++)
+            {
+                string link = torrent.Links[n];
+                if (!CloudCatalog.ValidLink(link)) continue;
+                string name = named ? MagnetFileName(selected[n].Path)
+                    : torrent.Filename + (torrent.Links.Count > 1 ? " - file " + (n + 1) : "");
+                if (named && !IsMagnetPackageFile(name)) continue;
+                files.Add(new MagnetFile { Name = name, Named = named, Locator = "rd-link/" + Uri.EscapeDataString(link),
+                    Direct = () => RealDebridClient.Unrestrict(token, link, _cfg.RealDebridLocation, canceled) });
+            }
+            return files;
+        }
+
+        /// <summary>The finished torrent's files, or null after the row was deferred or failed.</summary>
+        List<MagnetFile> PollTorBoxMagnet(DlItem job, int attempt, string hash, Func<bool> canceled)
+        {
+            string token = _cfg.TorBoxApiKey;
+            SetMagnetStatus(job, attempt, "Checking TorBox for this torrent...");
+            string id = TorBoxClient.FindTorrent(token, hash, canceled);
+            if (id.Length == 0)
+            {
+                SetMagnetStatus(job, attempt, "Adding magnet to TorBox...");
+                id = TorBoxClient.CreateTorrent(token, job.HosterUrl, canceled);
+            }
+            TorBoxClient.Torrent torrent = TorBoxClient.TorrentInfo(token, id, canceled);
+            if (torrent.Failed)
+            { SetFailureIfCurrent(job, attempt, "TorBox could not fetch this torrent (" + torrent.State + ")"); return null; }
+            if (!torrent.Ready)
+            { DeferMagnet(job, attempt, TorBoxProgress(torrent), MagnetPollSeconds); return null; }
+
+            // TorBox fetches every file; only packages and archives are queued.
+            var files = new List<MagnetFile>();
+            foreach (TorBoxClient.TorrentFile file in torrent.Files)
+            {
+                string name = MagnetFileName(file.Name), fileId = file.Id;
+                if (!IsMagnetPackageFile(name)) continue;
+                files.Add(new MagnetFile { Name = name, Named = true, Locator = "tb-file/torrents/" + id + "/" + fileId,
+                    Direct = () => TorBoxClient.TorrentFileLink(token, id, fileId, canceled) });
+            }
+            return files;
+        }
+
+        /// <summary>The finished torrent's files, or null after the row was deferred or failed.</summary>
+        List<MagnetFile> PollAllDebridMagnet(DlItem job, int attempt, Func<bool> canceled)
+        {
+            string key = _cfg.AllDebridApiKey;
+            SetMagnetStatus(job, attempt, "Sending magnet to AllDebrid...");
+            string id = AllDebridClient.UploadMagnet(key, job.HosterUrl, canceled);
+            AllDebridClient.Magnet magnet = AllDebridClient.MagnetStatus(key, id, canceled);
+            if (magnet.Failed)
+            { SetFailureIfCurrent(job, attempt, "AllDebrid could not fetch this torrent (" + magnet.Status + ")"); return null; }
+            if (!magnet.Ready)
+            { DeferMagnet(job, attempt, AllDebridProgress(magnet), MagnetPollSeconds); return null; }
+
+            // AllDebrid fetches every file; only packages and archives are queued.
+            var files = new List<MagnetFile>();
+            foreach (AllDebridClient.MagnetFile file in AllDebridClient.MagnetFiles(key, id, canceled))
+            {
+                string name = MagnetFileName(file.Path), link = file.Link;
+                if (!IsMagnetPackageFile(name)) continue;
+                files.Add(new MagnetFile { Name = name, Named = true, Locator = "ad-link/" + Uri.EscapeDataString(link),
+                    Direct = () => AllDebridClient.Unrestrict(key, link, null, canceled) });
+            }
+            return files;
+        }
+
+        /// <summary>The finished torrent's files, or null after the row was deferred or failed.</summary>
+        List<MagnetFile> PollPremiumizeMagnet(DlItem job, int attempt, string hash, Func<bool> canceled)
+        {
+            string key = _cfg.PremiumizeApiKey;
+            SetMagnetStatus(job, attempt, "Checking Premiumize for this torrent...");
+            // A cached torrent needs no transfer: its files can be listed at once.
+            if (!PremiumizeClient.IsCached(key, job.HosterUrl, canceled))
+            {
+                PremiumizeClient.Transfer transfer = PremiumizeClient.FindTransfer(key, hash, MagnetLink.DisplayName(job.HosterUrl), null, canceled);
+                if (transfer == null)
+                {
+                    SetMagnetStatus(job, attempt, "Adding magnet to Premiumize...");
+                    string id = PremiumizeClient.CreateTransfer(key, job.HosterUrl, canceled);
+                    transfer = PremiumizeClient.FindTransfer(key, hash, "", id, canceled);
+                    if (transfer == null) { DeferMagnet(job, attempt, "Premiumize: queued", MagnetPollSeconds); return null; }
+                }
+                if (transfer.Failed)
+                {
+                    SetFailureIfCurrent(job, attempt, "Premiumize could not fetch this torrent" +
+                        (transfer.Message.Length > 0 ? ": " + transfer.Message : ""));
+                    return null;
+                }
+                if (!transfer.Ready)
+                {
+                    DeferMagnet(job, attempt, transfer.Status == "running"
+                        ? "Premiumize: downloading " + transfer.Progress + "%" + (transfer.Message.Length > 0 ? " · " + transfer.Message : "")
+                        : "Premiumize: " + (transfer.Status.Length > 0 ? transfer.Status : "waiting"), MagnetPollSeconds);
+                    return null;
+                }
+            }
+
+            // Premiumize fetches every file; only packages and archives are queued.
+            // Its links are plain URLs: SSPI cannot renew them through the account.
+            var files = new List<MagnetFile>();
+            foreach (PremiumizeClient.MagnetFile file in PremiumizeClient.DirectFiles(key, job.HosterUrl, canceled))
+            {
+                string name = MagnetFileName(file.Path), link = file.Link;
+                if (!IsMagnetPackageFile(name)) continue;
+                DownloadTransferSettings.RememberProviderLimit(link, 1);
+                files.Add(new MagnetFile { Name = name, Named = true, Locator = link, Access = "Direct", Direct = () => link });
+            }
+            return files;
+        }
+
+        void SetMagnetStatus(DlItem job, int attempt, string text)
+        {
+            lock (_lock) { if (job.AttemptId == attempt) { job.State = DlState.Resolving; job.StatusText = text; } }
+        }
+
+        void DeferMagnet(DlItem job, int attempt, string text, int seconds)
+        {
+            lock (_lock)
+            {
+                if (job.AttemptId != attempt || CommitRequestedStop(job, attempt)) return;
+                job.State = DlState.Queued;
+                job.StatusText = text;
+                job.Error = null;
+                job.BytesPerSec = 0; job.EtaSeconds = 0;
+                job.RetryAfterUtcTicks = DateTime.UtcNow.AddSeconds(seconds).Ticks;
+            }
+            SaveManifest();
+        }
+
+        static bool IsMagnetPackageFile(string path)
+        {
+            string name = MagnetFileName(path), set; int index;
+            string lower = name.ToLowerInvariant();
+            return lower.EndsWith(".pkg", StringComparison.Ordinal) || lower.EndsWith(".zip", StringComparison.Ordinal) ||
+                lower.EndsWith(".rar", StringComparison.Ordinal) || lower.EndsWith(".7z", StringComparison.Ordinal) ||
+                lower.EndsWith(".7zip", StringComparison.Ordinal) || ArchiveVolumeSet.TryIndex(name, out set, out index);
+        }
+
+        static string MagnetFileName(string path)
+        {
+            string name = (path ?? "").Replace('\\', '/');
+            return name.Substring(name.LastIndexOf('/') + 1);
+        }
+
+        /// <summary>Only package and archive files are fetched; samples, NFOs and covers are skipped.</summary>
+        internal static string MagnetSelection(RealDebridClient.Torrent torrent)
+        {
+            var ids = new List<string>();
+            foreach (var file in torrent.Files)
+                if (IsMagnetPackageFile(file.Path)) ids.Add(file.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            return string.Join(",", ids.ToArray());
+        }
+
+        static string RealDebridProgress(RealDebridClient.Torrent torrent)
+        {
+            switch (torrent.Status)
+            {
+                case "magnet_conversion": return "Real-Debrid: reading torrent details";
+                case "queued": return "Real-Debrid: queued";
+                case "compressing": case "uploading": return "Real-Debrid: preparing files " + torrent.Progress + "%";
+                case "downloading":
+                    return "Real-Debrid: downloading " + torrent.Progress + "%" + MagnetRate(torrent.Speed, torrent.Seeders);
+                default: return "Real-Debrid: " + (torrent.Status.Length > 0 ? torrent.Status : "waiting");
+            }
+        }
+
+        static string TorBoxProgress(TorBoxClient.Torrent torrent)
+        {
+            string state = torrent.State.ToLowerInvariant();
+            if (state == "metadl" || state.Contains("metadata")) return "TorBox: reading torrent details";
+            if (state.Contains("stalled")) return "TorBox: stalled, waiting for seeders " + torrent.Progress + "%";
+            if (state.Contains("download"))
+                return "TorBox: downloading " + torrent.Progress + "%" + MagnetRate(torrent.Speed, torrent.Seeds);
+            return "TorBox: " + (torrent.State.Length > 0 ? torrent.State : "waiting") +
+                (torrent.Progress > 0 ? " " + torrent.Progress + "%" : "");
+        }
+
+        static string AllDebridProgress(AllDebridClient.Magnet magnet)
+        {
+            switch (magnet.StatusCode)
+            {
+                case 0: return "AllDebrid: queued";
+                case 1: return "AllDebrid: downloading " + magnet.Progress + "%" + MagnetRate(magnet.Speed, magnet.Seeders);
+                case 2: return "AllDebrid: preparing files";
+                case 3: return "AllDebrid: uploading files";
+                default: return "AllDebrid: " + (magnet.Status.Length > 0 ? magnet.Status : "waiting");
+            }
+        }
+
+        static string MagnetRate(long speed, int seeders)
+        {
+            return (speed > 0 ? " · " + Human(speed) + "/s" : "") + " · " + seeders + (seeders == 1 ? " seeder" : " seeders");
+        }
+
+        void FanOutMagnet(DlItem job, int attempt, List<MagnetFile> files, Func<bool> canceled)
+        {
+            var singles = new List<MagnetFile>();
+            var sets = new Dictionary<string, List<MagnetFile>>(StringComparer.OrdinalIgnoreCase);
+            var setOrder = new List<string>();
+            foreach (MagnetFile file in files)
+            {
+                string set; int index;
+                if (file.Named && ArchiveVolumeSet.TryIndex(file.Name, out set, out index))
+                {
+                    List<MagnetFile> parts;
+                    if (!sets.TryGetValue(set, out parts)) { sets.Add(set, parts = new List<MagnetFile>()); setOrder.Add(set); }
+                    parts.Add(file);
+                }
+                else singles.Add(file);
+            }
+            // A one-part "set" is an ordinary archive.
+            foreach (string set in setOrder.ToArray())
+                if (sets[set].Count == 1) { singles.Add(sets[set][0]); sets.Remove(set); setOrder.Remove(set); }
+
+            var children = new List<DlItem>();
+            foreach (MagnetFile single in singles)
+                children.Add(MagnetChild(job, children.Count, single.Name, single.Locator, single.Access));
+            foreach (string set in setOrder)
+            {
+                // Archive parts are fetched by URL, so each part's link is requested
+                // now. Requeue the magnet if these links expire before use.
+                var volumes = new List<ArchiveVolume>();
+                List<MagnetFile> parts = sets[set];
+                for (int i = 0; i < parts.Count; i++)
+                {
+                    if (canceled()) throw new OperationCanceledException();
+                    SetMagnetStatus(job, attempt, "Preparing RAR part " + (i + 1) + "/" + parts.Count + "...");
+                    volumes.Add(new ArchiveVolume { Name = parts[i].Name, Url = parts[i].Direct(), AccessType = "Direct" });
+                }
+                volumes = ArchiveVolumeSet.Validate(volumes);
+                DlItem first = MagnetChild(job, children.Count, volumes[0].Name, volumes[0].Url, "Direct");
+                first.DestPath = BuildDerivedDestination(first.TitleId, first.Kind, parts[0].Locator);
+                first.ArchiveVolumes = ArchiveVolumeSet.Encode(volumes);
+                first.Label = volumes[0].Name + " (" + volumes.Count + " volumes)";
+                children.Add(first);
+            }
+            if (children.Count == 0)
+            { SetFailureIfCurrent(job, attempt, "Torrent has no PKG or archive files"); return; }
+
+            string commitError;
+            bool stopRequested;
+            if (!ReplaceClaimedJobWithChildren(job, attempt, children, out commitError, out stopRequested))
+            {
+                if (stopRequested) CommitRequestedStop(job, attempt);
+                else SetFailureIfCurrent(job, attempt, commitError);
+                return;
+            }
+            FinalizeFanOutSource(job);
+            User.NotifyToast("Queued " + children.Count + (children.Count == 1 ? " package" : " packages") + " from magnet");
+        }
+
+        DlItem MagnetChild(DlItem job, int index, string name, string url, string accessType)
+        {
+            string titleId = job.TitleId, title = job.Name, derivedTitleId, derivedTitle;
+            if (DownloadLinkParser.TryPackageIdentity(name, "", out derivedTitleId, out derivedTitle))
+            { titleId = derivedTitleId; if (derivedTitle.Length > 0) title = derivedTitle; }
+            return new DlItem
+            {
+                Id = job.Id + "_magnet_" + (index + 1),
+                TitleId = titleId,
+                Name = title,
+                ImageUrl = job.ImageUrl,
+                Kind = job.Kind,
+                Label = name,
+                HosterUrl = url,
+                ContainerFormat = ContainerFormatFromFileName(name),
+                SourceId = job.SourceId,
+                SourceVersion = job.SourceVersion,
+                CandidateId = (string.IsNullOrEmpty(job.CandidateId) ? job.Id : job.CandidateId) + ":magnet:" + (index + 1),
+                AccessType = accessType,
+                SourcePageUrl = job.SourcePageUrl,
+                ExpiresUtc = job.ExpiresUtc,
+                SourceAttribution = job.SourceAttribution,
+                DestPath = BuildDerivedDestination(titleId, job.Kind, url),
+                State = DlState.Queued,
+                StatusText = "Queued from magnet",
+                BgftTaskId = -1
+            };
         }
 
         bool ReplaceClaimedJobWithChildren(DlItem parent, int attempt, List<DlItem> children,

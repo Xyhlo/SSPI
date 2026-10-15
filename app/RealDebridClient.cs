@@ -233,6 +233,138 @@ namespace Orbis
             return false;
         }
 
+        // ---- Torrents: Real-Debrid fetches the swarm; the PS4 only downloads finished files ----
+
+        internal sealed class TorrentFile
+        {
+            internal int Id;
+            internal string Path = "";
+            internal long Bytes;
+            internal bool Selected;
+        }
+
+        internal sealed class Torrent
+        {
+            internal string Id = "", Hash = "", Filename = "", Status = "";
+            internal int Progress, Seeders;
+            internal long Speed, Bytes;
+            internal readonly List<TorrentFile> Files = new List<TorrentFile>();
+            internal readonly List<string> Links = new List<string>();
+            internal bool Failed
+            {
+                get { return Status == "magnet_error" || Status == "error" || Status == "virus" || Status == "dead"; }
+            }
+        }
+
+        /// <summary>The account's existing torrent for this info hash, or "" when none is usable.
+        /// Reusing it keeps a retried or restarted magnet from adding a duplicate.</summary>
+        internal static string FindTorrent(string token, string infoHash, Func<bool> cancel)
+        {
+            var rows = Call(token, Api + "/torrents?limit=100", null, cancel) as System.Collections.IList;
+            if (rows == null) return "";
+            foreach (object item in rows)
+            {
+                Torrent row = ParseTorrent(item as Dictionary<string, object>);
+                if (row != null && !row.Failed && string.Equals(row.Hash, infoHash, StringComparison.OrdinalIgnoreCase))
+                    return row.Id;
+            }
+            return "";
+        }
+
+        internal static string AddMagnet(string token, string magnet, Func<bool> cancel)
+        {
+            var row = Call(token, Api + "/torrents/addMagnet", "magnet=" + Uri.EscapeDataString(magnet), cancel) as Dictionary<string, object>;
+            string id = Field(row, "id");
+            if (!ValidTorrentId(id)) throw new Exception("Real-Debrid did not return a torrent ID");
+            return id;
+        }
+
+        internal static Torrent TorrentInfo(string token, string id, Func<bool> cancel)
+        {
+            if (!ValidTorrentId(id)) throw new Exception("Invalid Real-Debrid torrent ID");
+            Torrent torrent = ParseTorrent(Call(token, Api + "/torrents/info/" + id, null, cancel) as Dictionary<string, object>);
+            if (torrent == null) throw new Exception("Real-Debrid returned no torrent details");
+            return torrent;
+        }
+
+        /// <summary>files is "all" or comma-separated file IDs from TorrentInfo.</summary>
+        internal static void SelectFiles(string token, string id, string files, Func<bool> cancel)
+        {
+            if (!ValidTorrentId(id)) throw new Exception("Invalid Real-Debrid torrent ID");
+            Call(token, Api + "/torrents/selectFiles/" + id, "files=" + Uri.EscapeDataString(files), cancel);
+        }
+
+        static object Call(string token, string url, string form, Func<bool> cancel)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                throw new Exception("Magnet links need Real-Debrid; connect it in Connections");
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            string json;
+            try
+            {
+                json = form == null ? NetHttp.GetString(url, 20000, null, token.Trim(), null, cancel)
+                    : NetHttp.PostForm(url, form, 30000, null, token.Trim(), null, cancel);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { throw DebridResolutionError.FromTransport("Real-Debrid", url, ex); }
+            if (string.IsNullOrWhiteSpace(json)) return null;
+            if (!string.IsNullOrEmpty(JsonLite.GetString(json, "error")))
+                throw DebridResolutionError.FromResponse("Real-Debrid", url, json);
+            return PackageSourceJson.Parse(json);
+        }
+
+        static Torrent ParseTorrent(Dictionary<string, object> row)
+        {
+            if (row == null || !ValidTorrentId(Field(row, "id"))) return null;
+            var torrent = new Torrent
+            {
+                Id = Field(row, "id"), Hash = Field(row, "hash").ToLowerInvariant(),
+                Filename = Field(row, "filename"), Status = Field(row, "status"),
+                Progress = (int)Math.Max(0, Math.Min(100, Number(row, "progress"))),
+                Seeders = (int)Math.Max(0, Math.Min(100000, Number(row, "seeders"))),
+                Speed = Math.Max(0, Number(row, "speed")), Bytes = Math.Max(0, Number(row, "bytes"))
+            };
+            object value;
+            if (row.TryGetValue("files", out value) && value is System.Collections.IList)
+                foreach (object item in (System.Collections.IList)value)
+                {
+                    var file = item as Dictionary<string, object>;
+                    if (file == null) continue;
+                    torrent.Files.Add(new TorrentFile
+                    {
+                        Id = (int)Number(file, "id"), Path = Field(file, "path"),
+                        Bytes = Math.Max(0, Number(file, "bytes")), Selected = Number(file, "selected") == 1
+                    });
+                }
+            if (row.TryGetValue("links", out value) && value is System.Collections.IList)
+                foreach (object link in (System.Collections.IList)value)
+                    torrent.Links.Add(Convert.ToString(link, System.Globalization.CultureInfo.InvariantCulture) ?? "");
+            return torrent;
+        }
+
+        static string Field(Dictionary<string, object> row, string name)
+        {
+            object value;
+            return row != null && row.TryGetValue(name, out value) && value != null
+                ? Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) : "";
+        }
+
+        static long Number(Dictionary<string, object> row, string name)
+        {
+            string text = Field(row, name);
+            if (text == "True" || text == "true") return 1;
+            double parsed;
+            return double.TryParse(text, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out parsed) ? (long)parsed : 0;
+        }
+
+        static bool ValidTorrentId(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.Length > 64) return false;
+            foreach (char c in id) if (!char.IsLetterOrDigit(c)) return false;
+            return true;
+        }
+
         public static string UserInfo(string token)
         {
             return ProbeUser(token);
