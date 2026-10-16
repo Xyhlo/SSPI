@@ -367,6 +367,125 @@ namespace Orbis
             return data;
         }
 
+        // ---- Magnets: AllDebrid fetches the swarm; the PS4 only downloads finished files ----
+
+        internal sealed class MagnetFile
+        {
+            internal string Path = "", Link = "";
+            internal long Size;
+        }
+
+        internal sealed class Magnet
+        {
+            internal string Id = "", Status = "";
+            internal int StatusCode, Seeders;
+            internal long Size, Downloaded, Speed;
+            // 4 is ready; 5 to 15 are AllDebrid's failure codes.
+            internal bool Ready { get { return StatusCode == 4; } }
+            internal bool Failed { get { return StatusCode >= 5; } }
+            internal int Progress { get { return Size > 0 ? (int)Math.Max(0, Math.Min(100, Downloaded * 100 / Size)) : 0; } }
+        }
+
+        /// <summary>Adds the magnet, or returns the account's existing one: AllDebrid answers
+        /// a repeated upload with the same ID, so a retry or restart never adds a duplicate.</summary>
+        internal static string UploadMagnet(string apiKey, string magnet, Func<bool> cancel)
+        {
+            var data = MagnetPost(Api + "/magnet/upload", "magnets%5B%5D=" + Uri.EscapeDataString(magnet), apiKey, cancel);
+            var list = Value(data, "magnets") as System.Collections.IList;
+            var entry = list != null && list.Count > 0 ? list[0] as Dictionary<string, object> : null;
+            var error = Object(entry, "error");
+            if (error != null)
+                throw new Exception("AllDebrid could not add this magnet: " + Text(error, "message") + " (" + Text(error, "code") + ")");
+            string id = Text(entry, "id");
+            if (!ValidMagnetId(id)) throw new Exception("AllDebrid did not return a magnet ID");
+            return id;
+        }
+
+        internal static Magnet MagnetStatus(string apiKey, string id, Func<bool> cancel)
+        {
+            if (!ValidMagnetId(id)) throw new Exception("Invalid AllDebrid magnet ID");
+            var data = MagnetPost("https://api.alldebrid.com/v4.1/magnet/status", "id=" + id, apiKey, cancel);
+            object value = Value(data, "magnets");
+            var list = value as System.Collections.IList;
+            var row = list != null ? (list.Count > 0 ? list[0] as Dictionary<string, object> : null) : value as Dictionary<string, object>;
+            if (row == null || Text(row, "id") != id) throw new Exception("AllDebrid returned no magnet details");
+            return new Magnet
+            {
+                Id = id, Status = Text(row, "status"), StatusCode = (int)MagnetNumber(row, "statusCode"),
+                Seeders = (int)Math.Min(100000, MagnetNumber(row, "seeders")), Size = MagnetNumber(row, "size"),
+                Downloaded = MagnetNumber(row, "downloaded"), Speed = MagnetNumber(row, "downloadSpeed")
+            };
+        }
+
+        /// <summary>Every file of a ready magnet, with its folder path and alldebrid.com/f/ link.</summary>
+        internal static List<MagnetFile> MagnetFiles(string apiKey, string id, Func<bool> cancel)
+        {
+            if (!ValidMagnetId(id)) throw new Exception("Invalid AllDebrid magnet ID");
+            var data = MagnetPost(Api + "/magnet/files", "id%5B%5D=" + id, apiKey, cancel);
+            var result = new List<MagnetFile>();
+            var list = Value(data, "magnets") as System.Collections.IList;
+            if (list != null)
+                foreach (object item in list)
+                {
+                    var entry = item as Dictionary<string, object>;
+                    if (Text(entry, "id") != id) continue;
+                    var error = Object(entry, "error");
+                    if (error != null) throw new Exception("AllDebrid could not list this magnet's files (" + Text(error, "code") + ")");
+                    AddMagnetFiles(result, Value(entry, "files"), "", 0);
+                }
+            return result;
+        }
+
+        static void AddMagnetFiles(List<MagnetFile> output, object nodes, string prefix, int depth)
+        {
+            var list = nodes as System.Collections.IList;
+            if (list == null || depth > 16) return;
+            foreach (object item in list)
+            {
+                if (output.Count >= 2000) return;
+                var node = item as Dictionary<string, object>;
+                if (node == null) continue;
+                string name = prefix + Text(node, "n"), link = Text(node, "l");
+                if (IsHttp(link)) output.Add(new MagnetFile { Path = name, Link = link.Trim(), Size = MagnetNumber(node, "s") });
+                else AddMagnetFiles(output, Value(node, "e"), name + "/", depth + 1);
+            }
+        }
+
+        static Dictionary<string, object> MagnetPost(string url, string form, string apiKey, Func<bool> cancel)
+        {
+            if (string.IsNullOrWhiteSpace(apiKey)) throw new Exception("Connect AllDebrid in Connections");
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            string json;
+            try { json = NetHttp.PostForm(url, form, 30000, null, apiKey.Trim(), null, cancel); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { throw DebridResolutionError.FromTransport("AllDebrid", url, ex); }
+            var root = Parse(json);
+            if (Text(root, "status") != "success") throw DebridResolutionError.FromResponse("AllDebrid", url, json);
+            var data = Object(root, "data");
+            if (data == null) throw new Exception("AllDebrid returned an invalid magnet response");
+            return data;
+        }
+
+        static object Value(Dictionary<string, object> row, string key)
+        {
+            object item;
+            return row != null && row.TryGetValue(key, out item) ? item : null;
+        }
+
+        static long MagnetNumber(Dictionary<string, object> row, string key)
+        {
+            double parsed;
+            return double.TryParse(Text(row, key), NumberStyles.Float, CultureInfo.InvariantCulture, out parsed)
+                ? (long)Math.Max(0, parsed) : 0;
+        }
+
+        static bool ValidMagnetId(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.Length > 20) return false;
+            foreach (char c in id) if (c < '0' || c > '9') return false;
+            return true;
+        }
+
         static void Wait(int milliseconds, Func<bool> cancel)
         {
             for (int remaining = milliseconds; remaining > 0; remaining -= Math.Min(100, remaining))
