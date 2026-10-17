@@ -1024,12 +1024,18 @@ namespace Orbis
             long until;
             lock (CreateBlockedUntil) if (!CreateBlockedUntil.TryGetValue(AccountKey(token), out until)) return;
             long remaining = until - CreationClock.ElapsedMilliseconds;
-            if (remaining > 0) throw CreateLimited(sourceUrl, (int)Math.Max(1, (remaining + 999) / 1000));
+            if (remaining > 0) throw CreateLimited(sourceUrl, (int)Math.Max(1, (remaining + 999) / 1000), CreateWaitRequested);
         }
 
-        static DebridResolutionError CreateLimited(string sourceUrl, int retryAfterSeconds)
+        // Why creates wait: TorBox asked for it (Retry-After on a create), or SSPI is keeping to
+        // TorBox's documented limit of 60 new web downloads per hour per key.
+        internal const string CreateWaitRequested = "TorBox asked to wait before new downloads";
+        internal const string CreateWaitHourlyLimit = "TorBox allows 60 new downloads an hour";
+
+        static DebridResolutionError CreateLimited(string sourceUrl, int retryAfterSeconds, string why)
         {
             var limited = DebridResolutionError.FromResponse("TorBox", sourceUrl, "{\"error\":\"RATE_LIMITED\"}");
+            limited.Diagnostic = why;
             limited.IsRateLimited = true;
             limited.IsTransient = true;
             limited.RetryAfterSeconds = retryAfterSeconds;
@@ -1264,7 +1270,7 @@ namespace Orbis
                     }
                     if (processAttempts.Count >= CreatesPerHour)
                         retry = (int)Math.Max(retry, Math.Ceiling((window - (elapsed - processAttempts[0])) / 1000.0));
-                    throw CreateLimited(sourceUrl, retry);
+                    throw CreateLimited(sourceUrl, retry, CreateWaitHourlyLimit);
                 }
                 if (utcNow.Year >= 2020)
                 {

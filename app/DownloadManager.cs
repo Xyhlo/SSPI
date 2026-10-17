@@ -3049,6 +3049,23 @@ namespace Orbis
         // local processing must wait until the resident gives up disk ownership.
         // Failed jobs retain their files without holding the queue. An unconfirmed
         // submission keeps its install dependency, but eventually releases the queue.
+        // Says whose limit holds a TorBox create back: SSPI keeping to TorBox's hourly limit for
+        // new web downloads, or a wait TorBox asked for. Players read the plain "waiting" as a fault.
+        static string TorBoxCreateWaitText(Exception cause)
+        {
+            var limited = cause as DebridResolutionError;
+            return limited != null && limited.Diagnostic == TorBoxClient.CreateWaitHourlyLimit
+                ? TorBoxClient.CreateWaitHourlyLimit : TorBoxClient.CreateWaitRequested;
+        }
+
+        // A paused, canceled or installed background job transfers nothing and holds no
+        // installer. Like the general background check below, it must not hold every other
+        // download behind "Waiting for the resident worker to release local files".
+        internal static bool HoldsResidentForOthers(DlItem item)
+        {
+            return item.State != DlState.Paused && item.State != DlState.Canceled && item.State != DlState.Installed;
+        }
+
         bool HasBlockingPipelineOwner(out bool residentBusy, out string waitingReason)
         {
             residentBusy = false;
@@ -3080,7 +3097,7 @@ namespace Orbis
                 if (item.ResidentRemovePending && (item.ResidentRemoveStuck || item.ResidentDetachRequested)) continue;
                 if (item.State == DlState.Failed || item.SubmittedNeedsAttention) continue;
                 if (item.Background && item.ResidentStaged && item.ResidentAutoInstall)
-                { residentBusy = true; continue; }
+                { if (HoldsResidentForOthers(item)) residentBusy = true; continue; }
                 if ((item.Background && (item.State != DlState.Installed && item.State != DlState.Canceled && item.State != DlState.Paused)) ||
                     item.State == DlState.Installing || (item.State == DlState.Submitted && !item.InstallOrderReady))
                     waitingReason = "Waiting for " + ClipMsg(item.Name ?? item.TitleId ?? "another package", 48) +
@@ -3415,7 +3432,7 @@ namespace Orbis
                     ? "TorBox server error · retries automatically in " + retryIn +
                         " (" + serverFaultFailures + "/3) · DOWNLOAD_SERVER_ERROR"
                     : createThrottled
-                    ? "Waiting for TorBox to accept new downloads · retries automatically in " + retryIn + " · other downloads continue"
+                    ? TorBoxCreateWaitText(poll.Transport) + " · retries automatically in " + retryIn + " · other downloads continue"
                     : ParkedPreparationStatus(poll);
                 // A park must free the queue immediately: the post-claim cooldown
                 // exists to pace transfers, not to delay an unrelated game.
@@ -4951,7 +4968,7 @@ namespace Orbis
                         ? "TorBox server error · retries automatically in " + wait.RetryAfterSeconds + "s (" +
                             job.ProviderTransientRetries + "/3) · " + wait.State
                     : string.Equals(provider, UnlockProviders.TorBoxId, StringComparison.OrdinalIgnoreCase) && wait.State == "RATE_LIMITED"
-                        ? "Waiting for TorBox to accept new downloads · retries automatically · other downloads continue"
+                        ? TorBoxCreateWaitText(wait.InnerException) + " · retries automatically · other downloads continue"
                     : wait.State == "provider request slot"
                         ? "Waiting for " + UnlockProviders.DisplayName(provider) + " request slot · other downloads continue"
                     // TorBox refuses new cloud downloads while every slot on the plan is busy.
@@ -6195,6 +6212,7 @@ namespace Orbis
             if (!InstallDependencyReady(job)) return false;
             lock (_lock) foreach (var other in _items)
                 if (other != job && other.Background && other.State != DlState.Failed && !other.SubmittedNeedsAttention &&
+                    HoldsResidentForOthers(other) &&
                     !(other.ResidentRemovePending && (other.ResidentRemoveStuck || other.ResidentDetachRequested))) return false;
             if (_cfg == null || !_cfg.UseBgftDirect || !ResidentDownloadService.HasDownloader) return false;
             if (ResidentDownloadService.SingletonHeldByOther(job.Id)) return false;

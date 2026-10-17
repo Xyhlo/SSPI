@@ -328,6 +328,15 @@ namespace Orbis
                 int remaining = timeoutMs - (int)elapsed.ElapsedMilliseconds;
                 if (provider == UnlockProviders.RealDebridId && remaining >= 500 && (canceled == null || !canceled()))
                     try { hosts = Parse(provider, NetHttp.GetStringDirect("https://api.real-debrid.com/rest/1.0/hosts", remaining)); } catch { }
+                // TorBox serves the same host list without a key. A key TorBox refuses (an expired
+                // trial, say) then no longer hides every mirror; the key error shows when resolving.
+                else if (provider == UnlockProviders.TorBoxId && remaining >= 500 && (canceled == null || !canceled()))
+                    try
+                    {
+                        hosts = Parse(provider, NetHttp.GetStringDirect("https://api.torbox.app/v1/api/webdl/hosters", remaining));
+                        SspiLog.Write("download", "event=torbox-hosters-public-fallback");
+                    }
+                    catch { }
             }
             int aliasTimeout = timeoutMs - (int)elapsed.ElapsedMilliseconds;
             if (provider == UnlockProviders.RealDebridId && hosts != null && aliasTimeout >= 500 && (canceled == null || !canceled()))
