@@ -305,7 +305,7 @@ namespace Orbis
                     string publishedKind = Text(row, "kind", 16, true); string kind = CheckKind(publishedKind);
                     var candidate = new PackageCandidate { SourceId = catalog.Descriptor.SourceId, SourceVersion = catalog.Descriptor.Version,
                         SourceAttribution = catalog.Descriptor.DisplayName, CandidateId = packageId, TitleId = id, DisplayName = record.Title.DisplayName,
-                        Region = record.Title.Region.Length > 0 ? record.Title.Region : region, Url = Url(Text(row, "url", 4096, true), true), PackageKindHint = kind,
+                        Region = record.Title.Region.Length > 0 ? record.Title.Region : region, Url = Url(Text(row, "url", 4096, true), true, true), PackageKindHint = kind,
                         Label = Text(row, "label", 512, false), HosterName = Text(row, "hoster", 256, false),
                         PackageVersion = Text(row, "version", 64, false), RequiredFirmware = Text(row, "requiredFirmware", 64, false),
                         PackageGroupId = Text(row, "groupId", 256, false), SourcePageUrl = Url(Text(row, "sourcePageUrl", 2048, false), false),
@@ -409,9 +409,12 @@ namespace Orbis
         static string CheckKind(string kind) { if (kind != "base" && kind != "update" && kind != "dlc" && kind != "unknown" && kind != "backport") throw Bad("Unsupported package kind"); return kind == "backport" ? "unknown" : kind; }
         static PackageAccessType Access(string value) { if (value == "Direct") return PackageAccessType.Direct; if (value == "HosterLanding") return PackageAccessType.HosterLanding; throw Bad("Unsupported package access type"); }
         static string Sha(string value) { if (value.Length > 0 && (value.Length != 64 || !Regex.IsMatch(value, "\\A[0-9a-fA-F]{64}\\z"))) throw Bad("Invalid package SHA-256"); return value; }
-        static string Url(string value, bool required)
+        // A package URL may also be a magnet link; it is queued through the link service.
+        static string Url(string value, bool required, bool allowMagnet = false)
         {
             if (value.Length == 0 && !required) return ""; Uri uri;
+            if (allowMagnet && MagnetLink.IsMagnet(value))
+            { if (!MagnetLink.IsValid(value)) throw Bad("Magnet link needs one BitTorrent info hash"); return value; }
             if (!Uri.TryCreate(value, UriKind.Absolute, out uri) || (uri.Scheme != "http" && uri.Scheme != "https") || !string.IsNullOrEmpty(uri.UserInfo) || string.IsNullOrEmpty(uri.Host)) throw Bad("Catalog URL must be HTTP or HTTPS without embedded credentials");
             return value;
         }

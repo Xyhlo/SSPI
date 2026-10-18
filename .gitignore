@@ -68,6 +68,7 @@
 !/app/QrCode.cs
 !/app/QueryCache.cs
 !/app/RealDebridClient.cs
+!/app/MagnetLink.cs
 !/app/ResidentDownloadService.cs
 !/app/ResidentSfo.cs
 !/app/ResolverPageCache.cs
