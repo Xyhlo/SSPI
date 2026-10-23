@@ -21,6 +21,9 @@ namespace Orbis
                     case '\n': sb.Append("\\n"); break;
                     case '\r': sb.Append("\\r"); break;
                     case '\t': sb.Append("\\t"); break;
+                    // JavaScript line terminators (U+2028, U+2029): valid in JSON, but they end a string literal in a script.
+                    case (char)0x2028: sb.Append("\\u2028"); break;
+                    case (char)0x2029: sb.Append("\\u2029"); break;
                     default:
                         if (c < 32) sb.AppendFormat("\\u{0:x4}", (int)c);
                         else sb.Append(c);
@@ -30,59 +33,84 @@ namespace Orbis
             return sb.ToString();
         }
 
+        /// <summary>
+        /// Value of the first field named <paramref name="key"/> in document order, nested or not.
+        /// Only a string token in key position (followed by ':') names a field, so text inside
+        /// another string value never matches. An object, array or null value returns null.
+        /// </summary>
         public static string GetString(string json, string key)
         {
             if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
                 return null;
 
-            // "key" : "value"
-            string pat = "\"" + key + "\"";
             int i = 0;
             while (true)
             {
-                int k = json.IndexOf(pat, i, StringComparison.Ordinal);
-                if (k < 0) return null;
-                int colon = json.IndexOf(':', k + pat.Length);
-                if (colon < 0) return null;
-                int p = colon + 1;
-                while (p < json.Length && char.IsWhiteSpace(json[p])) p++;
-                if (p >= json.Length) return null;
-                if (json[p] == 'n' && json.IndexOf("null", p, StringComparison.Ordinal) == p)
-                    return null;
-                if (json[p] != '"')
-                {
-                    // number/bool
-                    int e = p;
-                    while (e < json.Length && ",}] \r\n\t".IndexOf(json[e]) < 0) e++;
-                    return json.Substring(p, e - p).Trim();
-                }
-                p++;
-                var sb = new StringBuilder();
-                while (p < json.Length)
-                {
-                    char c = json[p++];
-                    if (c == '\\' && p < json.Length)
-                    {
-                        char n = json[p++];
-                        if (n == 'n') sb.Append('\n');
-                        else if (n == 'r') sb.Append('\r');
-                        else if (n == 't') sb.Append('\t');
-                        else if (n == 'u' && p + 3 < json.Length)
-                        {
-                            int code;
-                            if (int.TryParse(json.Substring(p, 4), NumberStyles.HexNumber, null, out code))
-                                sb.Append((char)code);
-                            p += 4;
-                        }
-                        else sb.Append(n);
-                    }
-                    else if (c == '"')
-                        return sb.ToString();
-                    else
-                        sb.Append(c);
-                }
-                return null;
+                int open = json.IndexOf('"', i);
+                if (open < 0) return null;
+                int close = StringEnd(json, open + 1);
+                if (close < 0) return null;
+                i = close + 1;
+                if (close - open - 1 != key.Length || string.CompareOrdinal(json, open + 1, key, 0, key.Length) != 0)
+                    continue;
+                int colon = i;
+                while (colon < json.Length && char.IsWhiteSpace(json[colon])) colon++;
+                if (colon < json.Length && json[colon] == ':') return ReadValue(json, colon + 1);
             }
+        }
+
+        // Index of the quote that ends the string whose contents start at 'from', or -1.
+        static int StringEnd(string json, int from)
+        {
+            for (int p = from; p < json.Length; p++)
+            {
+                char c = json[p];
+                if (c == '\\') p++;
+                else if (c == '"') return p;
+            }
+            return -1;
+        }
+
+        static string ReadValue(string json, int p)
+        {
+            while (p < json.Length && char.IsWhiteSpace(json[p])) p++;
+            if (p >= json.Length) return null;
+            if (json[p] == '{' || json[p] == '[') return null;
+            if (json[p] == 'n' && json.IndexOf("null", p, StringComparison.Ordinal) == p)
+                return null;
+            if (json[p] != '"')
+            {
+                // number/bool
+                int e = p;
+                while (e < json.Length && ",}] \r\n\t".IndexOf(json[e]) < 0) e++;
+                return json.Substring(p, e - p).Trim();
+            }
+            p++;
+            var sb = new StringBuilder();
+            while (p < json.Length)
+            {
+                char c = json[p++];
+                if (c == '\\' && p < json.Length)
+                {
+                    char n = json[p++];
+                    if (n == 'n') sb.Append('\n');
+                    else if (n == 'r') sb.Append('\r');
+                    else if (n == 't') sb.Append('\t');
+                    else if (n == 'u' && p + 3 < json.Length)
+                    {
+                        int code;
+                        if (int.TryParse(json.Substring(p, 4), NumberStyles.HexNumber, null, out code))
+                            sb.Append((char)code);
+                        p += 4;
+                    }
+                    else sb.Append(n);
+                }
+                else if (c == '"')
+                    return sb.ToString();
+                else
+                    sb.Append(c);
+            }
+            return null;
         }
 
         public static bool GetBool(string json, string key, bool defaultValue = false)

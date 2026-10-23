@@ -559,10 +559,15 @@ namespace Orbis
     /// <summary>Bounded JSON parser used only for hostile Package Source metadata.</summary>
     internal static class PackageSourceJson
     {
-        public static object Parse(string json)
+        public static object Parse(string json) { return Parse(json, 512 * 1024, 1024); }
+
+        /// <summary>Parses with caller-chosen size limits, for provider replies that list a whole
+        /// account. Nesting and string limits are unchanged; input over a limit throws an
+        /// InvalidDataException whose message ends with "is too large".</summary>
+        public static object Parse(string json, int maxChars, int maxArrayElements)
         {
-            if (json == null || json.Length > 512 * 1024) throw new InvalidDataException("JSON is too large");
-            var parser = new Parser(json);
+            if (json == null || json.Length > maxChars) throw new InvalidDataException("JSON is too large");
+            var parser = new Parser(json, maxArrayElements);
             object value = parser.Value(0);
             parser.White();
             if (!parser.End) throw new InvalidDataException("Trailing JSON data");
@@ -572,8 +577,9 @@ namespace Orbis
         sealed class Parser
         {
             readonly string _text;
+            readonly int _maxArrayElements;
             int _at;
-            public Parser(string text) { _text = text; }
+            public Parser(string text, int maxArrayElements) { _text = text; _maxArrayElements = maxArrayElements; }
             public bool End { get { return _at == _text.Length; } }
             public void White() { while (_at < _text.Length && char.IsWhiteSpace(_text[_at])) _at++; }
 
@@ -621,7 +627,7 @@ namespace Orbis
                 if (Take(']')) return result;
                 while (true)
                 {
-                    if (result.Count >= 1024) throw new InvalidDataException("JSON array is too large");
+                    if (result.Count >= _maxArrayElements) throw new InvalidDataException("JSON array is too large");
                     result.Add(Value(depth));
                     White();
                     if (Take(']')) return result;

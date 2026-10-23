@@ -38,7 +38,11 @@ namespace Orbis
             { WriteResponse(stream, 400, "text/plain", "Downloads are not ready. Reopen Downloads on your PS4."); return true; }
             string error;
             try { error = QueueAction(id, action); }
-            catch (Exception ex) { error = "Could not update the download: " + ex.Message; }
+            catch (Exception ex)
+            {
+                SspiLog.Write("network", "phone queue action " + action + " failed: " + ex.GetType().Name + ": " + ex.Message);
+                error = "Could not update the download (" + ex.GetType().Name + "). Try again on your PS4.";
+            }
             if (error != null) { WriteResponse(stream, 400, "text/plain", error); return true; }
             WriteResponse(stream, 200, "application/json", "{\"requested\":true}");
             return true;

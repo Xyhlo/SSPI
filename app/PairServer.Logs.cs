@@ -24,16 +24,27 @@ namespace Orbis
             public bool Text;
         }
 
+        // Up to four phone requests run at once: the latest scan is read, made and published under one gate.
+        readonly object _logsGate = new object();
         LogFile[] _logFiles = new LogFile[0];
         DateTime _logsReadAt;
+
+        // The cached scan, rebuilt first when it is older than maxAge (TimeSpan.Zero: always).
+        LogFile[] LatestLogs(TimeSpan maxAge)
+        {
+            lock (_logsGate)
+            {
+                if (maxAge == TimeSpan.Zero || DateTime.UtcNow - _logsReadAt > maxAge) { _logFiles = ScanLogs(); _logsReadAt = DateTime.UtcNow; }
+                return _logFiles;
+            }
+        }
 
         bool HandleLogs(NetworkStream stream, string method, string path, string prefix)
         {
             if (method != "GET" || !path.StartsWith(prefix + "/logs", StringComparison.Ordinal)) return false;
             string rest = path.Substring(prefix.Length + 5);
             if (rest == "" || rest == "/") {
-                if (DateTime.UtcNow - _logsReadAt > TimeSpan.FromSeconds(10)) { _logFiles = ScanLogs(); _logsReadAt = DateTime.UtcNow; }
-                WriteResponse(stream, 200, "application/json", LogListJson(_logFiles)); return true;
+                WriteResponse(stream, 200, "application/json", LogListJson(LatestLogs(TimeSpan.FromSeconds(10)))); return true;
             }
             if (rest == "/kernel") { WriteResponse(stream, 200, "application/json", KernelLogJson()); return true; }
             bool raw = rest.StartsWith("/raw/", StringComparison.Ordinal);
@@ -53,16 +64,21 @@ namespace Orbis
                     "\",\"group\":\"" + JsonLite.Escape(file.Group) + "\",\"path\":\"" + JsonLite.Escape(file.Path) + "\",\"size\":" + length +
                     ",\"truncated\":" + (cut ? "true" : "false") + ",\"text\":\"" + JsonLite.Escape(text) + "\"}");
             } catch (Exception e) {
-                WriteResponse(stream, 400, "text/plain", "Your PS4 could not read " + file.Name + ": " + e.Message);
+                // Framework messages can name paths and mounts: the phone gets a stable sentence, the log the detail.
+                SspiLog.Write("network", "phone log read failed: " + file.Name + " " + e.GetType().Name + ": " + e.Message);
+                WriteResponse(stream, 400, "text/plain", "Your PS4 could not read " + file.Name + " (" + e.GetType().Name + "). Refresh Logs and try again.");
             }
             return true;
         }
 
         LogFile FindLog(string id)
         {
+            // The cached scan first; a log that appeared since then needs a new scan.
             foreach (var pass in new[] { false, true }) {
-                if (pass) { _logFiles = ScanLogs(); _logsReadAt = DateTime.UtcNow; }
-                foreach (var file in _logFiles) if (file.Id == id) return file;
+                LogFile[] files;
+                if (pass) files = LatestLogs(TimeSpan.Zero);
+                else lock (_logsGate) files = _logFiles;
+                foreach (var file in files) if (file.Id == id) return file;
             }
             return null;
         }
@@ -274,7 +290,8 @@ namespace Orbis
             } catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is BadImageFormatException) {
                 reason = "The kernel log can only be read on a PS4.";
             } catch (Exception e) {
-                reason = "The kernel log could not be read: " + e.Message;
+                SspiLog.Write("network", "phone kernel log read failed: " + e.GetType().Name + ": " + e.Message);
+                reason = "The kernel log could not be read (" + e.GetType().Name + ").";
             }
             return null;
         }

@@ -724,22 +724,37 @@ function markEnded() {
   ended = true; conn.classList.remove('offline'); conn.classList.add('ended'); $('#connText').textContent = 'Session ended';
   toast('This phone session ended', 'Open a new QR code in SSPI on your PS4 and scan it again.', 'error');
 }
+/* Every request has a deadline: a PS4 that accepted the connection and then stopped answering (rest mode, a
+   Wi-Fi roam) would otherwise keep the page waiting forever. Past the deadline the PS4 counts as not answering.
+   Logs, the library scan and cover uploads get longer. */
+const NOT_ANSWERING = 'Your PS4 is not answering. Keep SSPI open and stay on the same network.';
+const REQUEST_MS = 15000, LONG_REQUEST_MS = 60000;
+function deadline(ms) {
+  if (typeof AbortController !== 'function') return { signal: undefined, expired: () => false, done() {} };
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), ms);
+  return { signal: ctl.signal, expired: () => ctl.signal.aborted, done() { clearTimeout(timer); } };
+}
 async function request(path, body, type) {
   if (ended) throw Error('This phone session ended. Open a new QR code in SSPI on your PS4.');
-  let r;
+  const slow = /^\/(logs|library|cover)/.test(path) || type === 'application/octet-stream';
+  const limit = deadline(slow ? LONG_REQUEST_MS : REQUEST_MS);
+  const lost = () => { markOffline(); return Error(NOT_ANSWERING); };
+  const read = how => how().catch(e => { throw limit.expired() ? lost() : e; });
   try {
-    r = await fetch(base + path, { method: body === undefined ? 'GET' : 'POST', body, cache: 'no-store', headers: type ? { 'Content-Type': type } : undefined });
-  } catch {
-    markOffline();
-    throw Error('Your PS4 is not answering. Keep SSPI open and stay on the same network.');
-  }
-  if (r.status === 410) { markEnded(); throw Error('This phone session ended. Open a new QR code in SSPI on your PS4.'); }
-  markOnline();
-  if (!r.ok) {
-    const text = await r.text();
-    throw Error(text && !text.startsWith('<') ? text.slice(0, 300) : `Your PS4 could not do that (error ${r.status}).`);
-  }
-  return (r.headers.get('Content-Type') || '').includes('json') ? r.json() : r.text();
+    let r;
+    try {
+      r = await fetch(base + path, { method: body === undefined ? 'GET' : 'POST', body, cache: 'no-store', headers: type ? { 'Content-Type': type } : undefined, signal: limit.signal });
+    } catch {
+      throw lost();
+    }
+    if (r.status === 410) { markEnded(); throw Error('This phone session ended. Open a new QR code in SSPI on your PS4.'); }
+    markOnline();
+    if (!r.ok) {
+      const text = await read(() => r.text());
+      throw Error(text && !text.startsWith('<') ? text.slice(0, 300) : `Your PS4 could not do that (error ${r.status}).`);
+    }
+    return await read(() => (r.headers.get('Content-Type') || '').includes('json') ? r.json() : r.text());
+  } finally { limit.done(); }
 }
 let chain = Promise.resolve();
 function enqueue(fn) { const run = chain.catch(() => {}).then(fn); chain = run.catch(() => {}); return run; }
@@ -1608,15 +1623,19 @@ renderServices(); renderSources(); renderSwatches(); renderQueue(); renderGames(
 /* Logs: crash reports, a kernel log snapshot and log files from the PS4. Everything opened here is kept on this
    phone, so the page can still show and save it after SSPI closes. Plain HTTP pages cannot install an offline
    copy of themselves, so the open tab and this storage are what remain when the PS4 stops answering. */
-const LOG_KEEP_CHARS = 2400000, LOG_FILE_CHARS = 600000, LOG_VIEW_LINES = 3000;
+/* Browsers allow about 5 MB per site and count two bytes per character, so the cache stays near 2.4 MB. */
+const LOG_KEEP_CHARS = 1200000, LOG_FILE_CHARS = 600000, LOG_VIEW_LINES = 3000;
 const logCache = Object.assign({ at: 0, list: null, files: {}, kernel: null }, store.get('logs', {}));
 const issueBad = /panic|fatal|crash|exception|error|fail|abort|denied|segfault|sigsegv|sigbus|assert/i, issueWarn = /warn|timeout|timed out|retry|unavailable/i;
 let logsLoadedAt = 0, logsBusy = false, logsOnline = null;
 const logWhen = ms => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 const lineCount = text => text ? text.replace(/\n$/, '').split('\n').length : 0;
+let logSaveWarned = false;
 function saveLogCache() {
   const ids = Object.keys(logCache.files).sort((a, b) => logCache.files[b].at - logCache.files[a].at);
-  let total = logCache.kernel ? logCache.kernel.text.length : 0;
+  const k = logCache.kernel;
+  if (k && k.text && k.text.length > LOG_FILE_CHARS) k.text = k.text.slice(-LOG_FILE_CHARS);
+  let total = k && k.text ? k.text.length : 0;
   for (const id of ids) {
     const f = logCache.files[id];
     if (f.text.length > LOG_FILE_CHARS) { f.text = f.text.slice(-LOG_FILE_CHARS); f.truncated = true; }
@@ -1624,13 +1643,15 @@ function saveLogCache() {
     if (total > LOG_KEEP_CHARS) delete logCache.files[id];
   }
   for (let tries = 0; tries < 6; tries++) {
-    try { localStorage.setItem('sspi.phone.logs', JSON.stringify(logCache)); return; }
+    try { localStorage.setItem('sspi.phone.logs', JSON.stringify(logCache)); logSaveWarned = false; return; }
     catch {
       const oldest = Object.keys(logCache.files).sort((a, b) => logCache.files[a].at - logCache.files[b].at)[0];
-      if (!oldest) return;
+      if (!oldest) break;
       delete logCache.files[oldest];
     }
   }
+  // Once per failure streak: the logs stay on screen, but they are not kept if SSPI or this page closes.
+  if (!logSaveWarned) { logSaveWarned = true; toast('Could not save logs on this phone', 'Its browser storage is full. Use Save to phone to keep a copy.', 'warning'); }
 }
 function logFileName(parts, ext = '.txt') {
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '-');
@@ -1697,9 +1718,9 @@ async function loadLogList() {
 }
 async function fetchLog(id) {
   const f = await request('/logs/file/' + encodeURIComponent(id));
-  logCache.files[id] = { name: f.name, group: f.group, path: f.path, size: f.size, truncated: f.truncated, text: f.text, at: Date.now() };
+  const entry = logCache.files[id] = { name: f.name, group: f.group, path: f.path, size: f.size, truncated: f.truncated, text: f.text, at: Date.now() };
   saveLogCache();
-  return logCache.files[id];
+  return entry;
 }
 async function takeKernelSnapshot() {
   const k = await request('/logs/kernel');
@@ -1789,23 +1810,30 @@ function openBinaryCrash(f) {
     <button class="btn primary block" id="crashSave" type="button">${icon('download', 'i sm')}<span>Save to phone</span></button>`, body => {
     $('#crashSave', body).addEventListener('click', async e => {
       const btn = e.currentTarget; busy(btn, true);
+      const limit = deadline(LONG_REQUEST_MS);
       try {
-        const r = await fetch(base + '/logs/raw/' + encodeURIComponent(f.id), { cache: 'no-store' });
+        const r = await fetch(base + '/logs/raw/' + encodeURIComponent(f.id), { cache: 'no-store', signal: limit.signal });
         if (!r.ok) throw Error((await r.text()).slice(0, 300) || `Your PS4 could not send it (error ${r.status}).`);
         saveToPhone(f.name, await r.blob());
-      } catch (err) { toast('Could not save the crash report', err instanceof TypeError ? 'Your PS4 is not answering. Keep SSPI open and stay on the same network.' : err.message, 'error'); }
-      finally { busy(btn, false); }
+      } catch (err) {
+        const gone = err instanceof TypeError || limit.expired();
+        if (limit.expired()) markOffline();
+        toast('Could not save the crash report', gone ? NOT_ANSWERING : err.message, 'error');
+      }
+      finally { limit.done(); busy(btn, false); }
     });
   });
 }
 async function saveReport(btn) {
   busy(btn, true);
+  // Logs fetched for this report go into it even when the phone's storage budget cannot keep them all.
+  const fresh = {};
   try {
     if (!ended) {
       try {
         const list = await loadLogList();
         const wanted = list.files.filter(f => (f.group === 'SSPI' && f.name === 'combined.log') || (f.kind === 'crash' && f.text && f.size < 2097152)).slice(0, 6);
-        for (const f of wanted) await fetchLog(f.id).catch(() => {});
+        for (const f of wanted) await fetchLog(f.id).then(entry => { fresh[f.id] = entry; }).catch(() => {});
         await takeKernelSnapshot().catch(() => {});
       } catch {}
     }
@@ -1818,7 +1846,7 @@ async function saveReport(btn) {
     if (list) out.push('', '== Log files on the PS4 ==', ...list.files.filter(f => f.kind !== 'crash').map(f => `${f.path} · ${fmtSize(f.size)} · ${new Date(f.modified).toLocaleString()}`));
     const k = logCache.kernel;
     out.push('', `== Kernel log snapshot${k && k.at ? ', taken ' + new Date(k.at).toLocaleString() : ''} ==`, k && k.text ? k.text : (k && k.reason) || 'No snapshot');
-    for (const f of Object.values(logCache.files).sort((a, b) => (a.group === 'SSPI' ? 0 : 1) - (b.group === 'SSPI' ? 0 : 1) || b.at - a.at))
+    for (const f of Object.values(Object.assign({}, logCache.files, fresh)).sort((a, b) => (a.group === 'SSPI' ? 0 : 1) - (b.group === 'SSPI' ? 0 : 1) || b.at - a.at))
       out.push('', `== ${f.group} / ${f.name} (${f.path}), saved ${new Date(f.at).toLocaleString()}${f.truncated ? ', last part only' : ''} ==`, f.text);
     saveToPhone(logFileName(['sspi-log-report']), out.join('\n') + '\n');
   } finally { busy(btn, false); renderLogs(); }
@@ -1836,8 +1864,15 @@ refreshers.logs = async () => { await loadLogList(); toast('Logs refreshed', `${
 $('#refreshLogs').onclick = async e => { buzz('tap'); const b = e.currentTarget; b.disabled = true; try { await refreshers.logs(); } catch (err) { toast('Could not refresh', err.message + ' Showing logs saved on this phone.', 'warning'); } b.disabled = false; };
 onEnter.logs = () => { renderLogs(); if (Date.now() - logsLoadedAt > 15000) prefetchLogs(); };
 renderLogs();
-setTimeout(prefetchLogs, 4000);
-setInterval(prefetchLogs, 180000);
+/* Log prefetch every 3 minutes while the page is visible; it stops while hidden and resumes on return. */
+const LOG_PREFETCH_MS = 180000;
+let logsTimer = 0;
+function scheduleLogs(delay) {
+  clearTimeout(logsTimer);
+  if (ended || document.hidden) return;
+  logsTimer = setTimeout(() => prefetchLogs().finally(() => scheduleLogs(LOG_PREFETCH_MS)), delay);
+}
+scheduleLogs(4000);
 
 onEnter.downloads = () => { refreshQueueView(true); pollQueue(); };
 onEnter.library = () => { if (!libraryLoaded) loadLibrary().catch(e => toast('Could not load your library', e.message, 'error')); };
@@ -1855,7 +1890,8 @@ pollQueue();
   }, Date.now() < fastConfigUntil ? 1500 : 5000);
 })();
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { rememberSeen(); clearTimeout(queueTimer); return; }
+  if (document.hidden) { rememberSeen(); clearTimeout(queueTimer); clearTimeout(logsTimer); return; }
+  scheduleLogs(Math.max(4000, LOG_PREFETCH_MS - (Date.now() - logsLoadedAt)));
   catchingUp = true;
   pollQueue().finally(() => { catchingUp = false; summarizeAway(); });
   loadConfig().catch(() => {});

@@ -139,8 +139,16 @@ namespace Orbis
         int _sessionMinutes = 5;
         volatile bool _stop;
         readonly object _lock = new object();
+        // Serialises Start and Stop: a second Start sees the running listener instead of
+        // failing to bind the port and reporting the server as stopped.
+        readonly object _lifecycleGate = new object();
 
         public void Start(int minutes = 5)
+        {
+            lock (_lifecycleGate) StartLocked(minutes);
+        }
+
+        void StartLocked(int minutes)
         {
             if (Running)
             {
@@ -212,16 +220,19 @@ namespace Orbis
 
         public void Stop()
         {
-            lock (_clientsLock)
+            lock (_lifecycleGate)
             {
-                _stop = true;
-                Running = false;
-                try { if (_listener != null) _listener.Stop(); } catch { }
-                _listener = null;
-                foreach (TcpClient client in _clients)
-                    try { client.Close(); } catch { }
+                lock (_clientsLock)
+                {
+                    _stop = true;
+                    Running = false;
+                    try { if (_listener != null) _listener.Stop(); } catch { }
+                    _listener = null;
+                    foreach (TcpClient client in _clients)
+                        try { client.Close(); } catch { }
+                }
+                Status = "Stopped";
             }
-            Status = "Stopped";
         }
 
         public bool Expired
@@ -279,7 +290,11 @@ namespace Orbis
             }
             catch (Exception ex)
             {
-                if (!_stop && ReferenceEquals(_listener, listener)) Status = "Listen fail: " + ex.Message;
+                if (!_stop && ReferenceEquals(_listener, listener))
+                {
+                    SspiLog.Write("network", "pair server listen failed: " + ex.GetType().Name + ": " + ex.Message);
+                    Status = "Listen fail: " + ex.GetType().Name;
+                }
             }
             finally
             {

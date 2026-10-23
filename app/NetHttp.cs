@@ -184,6 +184,22 @@ namespace Orbis
             }
         }
 
+        /// <summary>GetString with a caller-chosen response cap, for provider lists that grow with the account.</summary>
+        public static string GetString(string url, int timeoutMs, string referer, string bearer, int maxBytes, Func<bool> cancel = null)
+        {
+            if (cancel != null && cancel()) throw new OperationCanceledException();
+            ProviderCooldown.Check(url);
+            try
+            {
+                return GetStringInternal(url, timeoutMs, referer, bearer, allowProxy: true, userAgent: null, maxBytes: maxBytes, cancel: cancel);
+            }
+            catch (Exception ex)
+            {
+                ProviderCooldown.NoteException(url, ex);
+                throw;
+            }
+        }
+
         static string GetStringInternal(string url, int timeoutMs, string referer, string bearer,
             bool allowProxy, string userAgent, int maxBytes = DefaultResponseBytes, Func<bool> cancel = null,
             Func<Uri, bool> allowOrigin = null)

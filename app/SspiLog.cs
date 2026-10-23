@@ -76,13 +76,31 @@ namespace Orbis
 
         static void Append(string path, string line, long limit)
         {
+            Rotate(path, limit);
             using (var file = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
             {
+                // Rotation failed (another process holds the file): fall back to starting over.
                 if (file.Length >= limit) file.SetLength(0);
                 file.Seek(0, SeekOrigin.End);
                 byte[] bytes = Encoding.UTF8.GetBytes(line);
                 file.Write(bytes, 0, bytes.Length);
             }
+        }
+
+        // A full log becomes <name>.1 (one previous generation), so a failure that repeats
+        // until the log is full does not erase its first occurrence.
+        static void Rotate(string path, long limit)
+        {
+            try
+            {
+                var info = new FileInfo(path);
+                if (!info.Exists || info.Length < limit) return;
+                string previous = path + ".1";
+                if (File.Exists(previous)) File.Delete(previous);
+                File.Move(path, previous);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
     }
 }

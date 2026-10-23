@@ -976,12 +976,13 @@ namespace Orbis
                 ? TorBoxClient.CreateWaitHourlyLimit : TorBoxClient.CreateWaitRequested;
         }
 
-        // A paused, canceled or installed background job transfers nothing and holds no
+        // A paused, canceled, installed or failed background job transfers nothing and holds no
         // installer. Like the general background check below, it must not hold every other
         // download behind "Waiting for the resident worker to release local files".
         internal static bool HoldsResidentForOthers(DlItem item)
         {
-            return item.State != DlState.Paused && item.State != DlState.Canceled && item.State != DlState.Installed;
+            return item.State != DlState.Paused && item.State != DlState.Canceled && item.State != DlState.Installed &&
+                item.State != DlState.Failed;
         }
 
         bool HasBlockingPipelineOwner(out bool residentBusy, out string waitingReason)

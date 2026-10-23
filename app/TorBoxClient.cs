@@ -160,10 +160,47 @@ namespace Orbis
         sealed class UnreadableResponseException : IOException
         { internal UnreadableResponseException() : base("TorBox returned an invalid JSON response. Retry shortly.") { } }
 
+        // The web download list holds every download in the account, so a busy account's reply
+        // outgrows the limits meant for source files (512 K characters, 1,024 array elements)
+        // and NetHttp's 2 MB default for ordinary replies.
+        internal const int ResponseChars = 16 * 1024 * 1024, ResponseArrayElements = 100000;
+        internal const int ListResponseBytes = 16 * 1024 * 1024;
+
         static Dictionary<string, object> Response(string json)
         {
-            try { return Object(PackageSourceJson.Parse(json)); }
+            try { return Object(PackageSourceJson.Parse(json, ResponseChars, ResponseArrayElements)); }
+            catch (InvalidDataException ex)
+            {
+                // PackageSourceJson names every size limit "... is too large".
+                if (json != null && (ex.Message ?? "").EndsWith("is too large", StringComparison.Ordinal))
+                    SspiLog.Write("download", "event=torbox-response-too-large chars=" + json.Length +
+                        " limit_chars=" + ResponseChars + " limit_elements=" + ResponseArrayElements);
+                throw new UnreadableResponseException();
+            }
             catch { throw new UnreadableResponseException(); }
+        }
+
+        static string GetList(string url, string token, Func<bool> cancel)
+        {
+            try { return NetHttp.GetString(url, 15000, null, token.Trim(), ListResponseBytes, cancel); }
+            catch (Exception ex)
+            {
+                if (!(ex is OperationCanceledException) && OverByteLimit(ex))
+                    SspiLog.Write("download", "event=torbox-response-too-large limit_bytes=" + ListResponseBytes);
+                throw;
+            }
+        }
+
+        // The native and managed transports name an over-limit reply in their messages.
+        static bool OverByteLimit(Exception ex)
+        {
+            for (; ex != null; ex = ex.InnerException)
+            {
+                string message = ex.Message ?? "";
+                if (message.IndexOf("Response too large", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    message.IndexOf("exceeds byte limit", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -530,7 +567,7 @@ namespace Orbis
             bool reconciling = string.IsNullOrEmpty(pending.Id);
             string url = ApiRoot + "/webdl/mylist?" + (reconciling ? "" : "id=" + Uri.EscapeDataString(pending.Id) + "&") + "bypass_cache=true";
             string list;
-            try { list = NetHttp.GetString(url, 15000, null, token.Trim(), cancel: cancel); }
+            try { list = GetList(url, token, cancel); }
             catch (Exception ex)
             {
                 if (ex is OperationCanceledException) throw;
@@ -921,7 +958,7 @@ namespace Orbis
             Dictionary<string, object> job = null;
             try
             {
-                string list = NetHttp.GetString(ApiRoot + "/webdl/mylist?bypass_cache=true", 15000, null, token.Trim(), cancel: cancel);
+                string list = GetList(ApiRoot + "/webdl/mylist?bypass_cache=true", token, cancel);
                 var response = Response(list);
                 if (Flag(response, "success")) job = BestExisting(Value(response, "data"), hostUrl);
             }
@@ -984,14 +1021,28 @@ namespace Orbis
         static bool CheckFirst(string key)
         {
             lock (CheckBeforeCreate) if (CheckBeforeCreate.Contains(key)) return true;
-            return File.Exists(PendingPath(key) + ".unreadable");
+            string path = PendingPath(key);
+            return File.Exists(path + ".unreadable") || StampedCopies(path).Length > 0;
         }
         static void ClearCheckFirst(string key)
         {
             lock (CheckBeforeCreate) CheckBeforeCreate.Remove(key);
-            try { File.Delete(PendingPath(key) + ".unreadable"); }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
+            string path = PendingPath(key);
+            var copies = new List<string>(StampedCopies(path));
+            copies.Add(path + ".unreadable");
+            foreach (string copy in copies)
+            {
+                try { File.Delete(copy); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+        // Copies MoveAside kept under a timestamped name because the usual one was unavailable.
+        static string[] StampedCopies(string path)
+        {
+            try { return Directory.GetFiles(Path.GetDirectoryName(path), Path.GetFileName(path) + ".unreadable-*"); }
+            catch (IOException) { return new string[0]; }
+            catch (UnauthorizedAccessException) { return new string[0]; }
         }
         static void MarkCheckFirst(string key)
         {
@@ -1313,15 +1364,18 @@ namespace Orbis
         /// power) used to block every TorBox create until the file was deleted by hand. It is
         /// moved aside and replaced by a conservative estimate: every create it could have held
         /// counts as made at its last write, so SSPI still never exceeds TorBox's hourly limit
-        /// and creates resume at the latest an hour after that write.
+        /// and creates resume at the latest an hour after that write. A write time before 2020
+        /// (a reset clock or a missing file time) or in the future says nothing about when the
+        /// creates were made, so they count as made now.
         /// </summary>
         static List<long> RecoverAdmissions(string path, string reason)
         {
             var info = new FileInfo(path);
             long bytes = info.Exists ? info.Length : 0;
             DateTime utcNow = DateTime.UtcNow;
-            long written = Math.Min(info.Exists ? info.LastWriteTimeUtc.Ticks : utcNow.Ticks, utcNow.Ticks);
-            MoveAside(path);
+            DateTime modified = info.Exists ? info.LastWriteTimeUtc : utcNow;
+            long written = modified.Year < 2020 || modified > utcNow ? utcNow.Ticks : modified.Ticks;
+            string action = MoveAside(path);
             // A history is a 20-byte header and at least 19 bytes per create. A file too short
             // for one entry (an empty one, say) may have lost all of them.
             long perEntry = 19, header = AdmissionHeader.Length + 1;
@@ -1333,21 +1387,35 @@ namespace Orbis
             if (utcNow.Year >= 2020 && utcNow.Ticks - written < TimeSpan.FromHours(1).Ticks)
                 AtomicFile.WriteText(path, AdmissionText(attempts));
             SspiLog.Write("download", "event=torbox-admission-history-unreadable reason=" + reason + " bytes=" + bytes +
-                " age_s=" + (utcNow.Ticks - written) / TimeSpan.TicksPerSecond + " counted=" + counted + " action=moved-aside");
+                " age_s=" + (utcNow.Ticks - written) / TimeSpan.TicksPerSecond + " counted=" + counted + " action=" + action);
             return attempts;
         }
 
-        // Keeps one copy of an unreadable record for diagnosis; deleting it still unblocks SSPI.
-        static void MoveAside(string path)
+        // Keeps a copy of an unreadable record for diagnosis and never deletes the record. When
+        // the usual name cannot be used, a timestamped one is tried; a record that cannot be
+        // moved at all (a sharing violation or a permission fault) stays where it is. Returns
+        // the action for the log line.
+        static string MoveAside(string path)
         {
+            if (!File.Exists(path)) return "none";
             string aside = path + ".unreadable";
             try
             {
                 if (File.Exists(aside)) File.Delete(aside);
                 File.Move(path, aside);
+                return "moved-aside";
             }
-            catch (IOException) { File.Delete(path); }
-            catch (UnauthorizedAccessException) { File.Delete(path); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            Exception failure;
+            try
+            {
+                File.Move(path, aside + "-" + DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture));
+                return "moved-aside-stamped";
+            }
+            catch (IOException ex) { failure = ex; }
+            catch (UnauthorizedAccessException ex) { failure = ex; }
+            return "kept-in-place exception=" + failure.GetType().Name;
         }
 
         sealed class UnreadableRecordException : IOException
@@ -1413,10 +1481,10 @@ namespace Orbis
         // the next attempt checks the account first, so a download TorBox holds is adopted.
         static Pending RecoverPending(string key, string path, string reason)
         {
-            MoveAside(path);
+            string action = MoveAside(path);
             lock (PendingDownloads) PendingDownloads.Remove(key);
             MarkCheckFirst(key);
-            SspiLog.Write("download", "event=torbox-pending-record-unreadable reason=" + reason + " action=moved-aside");
+            SspiLog.Write("download", "event=torbox-pending-record-unreadable reason=" + reason + " action=" + action);
             return null;
         }
         static void SavePending(string key, Pending pending)
